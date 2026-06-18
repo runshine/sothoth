@@ -191,6 +191,57 @@ class TaskRuntimeServiceMixin:
                 with suppress(Exception):
                     db.close()
 
+    def _active_dispatch_count(self: TaskManager, db: Session) -> int:
+        from app.service import task_manager as task_manager_module
+
+        return int(
+            db.query(func.count(task_manager_module.BinarySecurityTask.id))
+            .filter(task_manager_module.BinarySecurityTask.status.in_(["dispatching", "running"]))
+            .scalar()
+            or 0
+        )
+
+    async def _reconcile_work_queues(self: TaskManager, db: Session) -> None:
+        from app.service import task_manager as task_manager_module
+
+        now_value = task_manager_module._now()
+        interval_seconds = max(5, int(getattr(self.cfg.queue, "reconcile_interval_seconds", 30) or 30))
+        if self._last_queue_reconcile_at is not None:
+            elapsed = (now_value - self._last_queue_reconcile_at).total_seconds()
+            if elapsed < interval_seconds:
+                return
+        queue = task_manager_module.get_task_queue()
+        seed_batch_size = max(1, int(getattr(self.cfg.queue, "seed_batch_size", 20) or 20))
+        task_rows = (
+            db.query(task_manager_module.BinarySecurityTask.id)
+            .filter(task_manager_module.BinarySecurityTask.status.in_(["pending", "dispatching", "running"]))
+            .order_by(
+                task_manager_module.BinarySecurityTask.updated_at.asc(),
+                task_manager_module.BinarySecurityTask.created_at.asc(),
+                task_manager_module.BinarySecurityTask.id.asc(),
+            )
+            .limit(seed_batch_size)
+            .all()
+        )
+        for (task_id,) in task_rows:
+            await queue.push_task(str(task_id))
+        operation_rows = (
+            db.query(task_manager_module.BinarySecurityTaskOperation.id)
+            .filter(task_manager_module.BinarySecurityTaskOperation.status.in_(["pending", "queued", "running", "accepted"]))
+            .order_by(
+                task_manager_module.BinarySecurityTaskOperation.updated_at.asc(),
+                task_manager_module.BinarySecurityTaskOperation.created_at.asc(),
+                task_manager_module.BinarySecurityTaskOperation.id.asc(),
+            )
+            .limit(seed_batch_size)
+            .all()
+        )
+        for (operation_id,) in operation_rows:
+            await queue.push_operation(str(operation_id))
+        await queue.cleanup_dedupe_orphans(self.cfg.queue.task_queue_key)
+        await queue.cleanup_dedupe_orphans(self.cfg.queue.operation_queue_key)
+        self._last_queue_reconcile_at = now_value
+
     async def _stage_item_dispatch_loop(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module
 

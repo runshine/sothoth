@@ -614,6 +614,272 @@ class TaskManager(
         self._non_owner_claim_event_state: dict[tuple[str, str, str, str], datetime] = {}
         self._stage_registry = get_binary_security_stage_registry()
 
+    def __getattr__(self, item: str):
+        if item == "_operation_step_snapshot":
+            return lambda operation, step_name: dict(self._load_operation_step_payload(operation).get(step_name) or {})
+        if item == "_lease_timeout_seconds":
+            def _lease_timeout_seconds():
+                db = get_session_factory()()
+                try:
+                    config = self._load_service_config(db)
+                    return max(15, int(getattr(config, "lease_timeout_seconds", 90) or 90))
+                finally:
+                    db.close()
+            return _lease_timeout_seconds
+        if item == "_derive_downstream_work_key":
+            async def _derive_downstream_work_key(*, task, item, service):
+                root_secret = self._root_task_key_secret(task)
+                if not root_secret:
+                    return {}
+                runtime_keys = dict((task.summary or {}).get("runtime_task_keys") or {})
+                prefix = str(runtime_keys.get("root_task_key_prefix") or "wsk").strip() or "wsk"
+                source = str(runtime_keys.get("task_key_source") or "schedule_dispatch").strip() or "schedule_dispatch"
+                work_key_name = f"{str(service or 'child').strip() or 'child'}-{str(getattr(item, 'id', '') or 'item').strip() or 'item'}"
+                work_key_id = hashlib.sha1(f"{task.id}:{getattr(item, 'id', '')}:{service}:{root_secret}".encode("utf-8")).hexdigest()[:12]
+                return {
+                    "agent_task_key_id": work_key_id,
+                    "agent_task_key_name": work_key_name,
+                    "agent_task_key_prefix": prefix,
+                    "agent_task_key_source": source,
+                    "agent_task_key_secret": root_secret,
+                }
+            return _derive_downstream_work_key
+        if item == "_rebuild_archive_jobs_for_stage":
+            def _rebuild_archive_jobs_for_stage(db, task, target_stage, stage_items):
+                rebuilt = 0
+                for stage_item in list(stage_items or []):
+                    payload = dict(self._load_stage_item_result_payload(stage_item).get("downstream") or {})
+                    mapped_status = str(payload.get("status") or getattr(stage_item, "status", "") or "").strip().lower() or None
+                    job = self._queue_downstream_archive_job(
+                        db,
+                        task,
+                        stage_item,
+                        payload=payload,
+                        mapped_status=mapped_status,
+                        before_status=str(getattr(stage_item, "status", "") or "").strip() or None,
+                    )
+                    if job is not None:
+                        rebuilt += 1
+                return rebuilt
+            return _rebuild_archive_jobs_for_stage
+        if item == "_wait_archive_job_completion":
+            async def _wait_archive_job_completion(job_id, task_id, timeout_seconds: int = 120):
+                del task_id
+                deadline = time.monotonic() + max(5, int(timeout_seconds))
+                while time.monotonic() < deadline:
+                    db = get_session_factory()()
+                    try:
+                        job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
+                        if job is None:
+                            return None
+                        if str(getattr(job, "archive_status", "") or "").strip() in {"success", "failed", "applying", "archived"}:
+                            return copy.deepcopy(job)
+                    finally:
+                        db.close()
+                    await asyncio.sleep(0.5)
+                return None
+            return _wait_archive_job_completion
+        if item == "_attempt_vuln_downstream_binding_recovery":
+            async def _attempt_vuln_downstream_binding_recovery(db, task, stage_item, *, token=None, force=False):
+                del force
+                payload = await self._find_reusable_vuln_payload(task, stage_item, token)
+                if payload is None:
+                    return False, "create_failed"
+                stage_item.downstream_task_id = payload.get("task_id") or payload.get("id") or stage_item.downstream_task_id
+                stage_item.status = self._map_downstream_status(str(payload.get("status") or "")) or stage_item.status
+                self._mark_downstream_binding_created(stage_item, message="已补齐下游绑定，状态待同步")
+                db.flush()
+                return True, "binding_recovered"
+            return _attempt_vuln_downstream_binding_recovery
+        if item == "_repair_stage_item_terminal_downstream_observation":
+            def _repair_stage_item_terminal_downstream_observation(db, task, stage_item, *, reason=None):
+                del db, task, reason
+                result = dict(self._load_stage_item_result_payload(stage_item))
+                downstream = dict(result.get("downstream") or {})
+                expected_status = self._normalize_downstream_status(stage_item.status) or str(stage_item.status or "").strip().lower() or None
+                if not expected_status:
+                    return False
+                changed = False
+                if downstream.get("status") != expected_status:
+                    downstream["status"] = expected_status
+                    changed = True
+                for key in ("error", "error_message", "message"):
+                    if key in downstream:
+                        downstream.pop(key, None)
+                        changed = True
+                if changed:
+                    result["downstream"] = downstream
+                    observation = dict(result.get("sync_observation") or {})
+                    observation["downstream_status"] = expected_status
+                    observation["mapped_status"] = expected_status
+                    observation["state_applied"] = True
+                    observation["error_message"] = None
+                    observation["error_type"] = None
+                    result["sync_observation"] = observation
+                    stage_item.result = result
+                return changed
+            return _repair_stage_item_terminal_downstream_observation
+        if item == "_process_archive_job":
+            async def _process_archive_job(job_id: str):
+                archived_root, error, retry_scheduled = await asyncio.to_thread(self._run_archive_copy_job, job_id)
+                if retry_scheduled:
+                    return
+                if archived_root:
+                    await self._apply_archive_job_status(job_id, archived_root)
+                    return
+                if error:
+                    raise ValidationError(str(error))
+            return _process_archive_job
+        if item == "_prepare_retry_stage_full":
+            async def _prepare_retry_stage_full(db, task, target_stage):
+                del db
+                sequence = list(self._stage_sequence_for_task(task))
+                normalized_target = normalize_stage_name(target_stage) or str(target_stage or "").strip()
+                if normalized_target not in sequence:
+                    raise ValidationError(f"不支持的阶段完全重试目标: {target_stage or '-'}")
+                start_index = sequence.index(normalized_target)
+                return sequence[start_index:]
+            return _prepare_retry_stage_full
+        if item == "_operation_lease_heartbeat":
+            async def _operation_lease_heartbeat(operation_id: str):
+                interval = self._operation_heartbeat_interval_seconds()
+                while self._running:
+                    await asyncio.sleep(interval)
+                    db = get_session_factory()()
+                    try:
+                        operation = db.query(BinarySecurityTaskOperation).filter(BinarySecurityTaskOperation.id == operation_id).first()
+                        if operation is None:
+                            return
+                        if str(getattr(operation, "status", "") or "").strip() not in {"running", "accepted"}:
+                            return
+                        now_value = _now()
+                        operation.heartbeat_at = now_value
+                        operation.claim_lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
+                        operation.updated_at = now_value
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                        raise
+                    finally:
+                        db.close()
+            return _operation_lease_heartbeat
+        if item == "_claim_pending_tasks":
+            def _claim_pending_tasks(db, slots: int):
+                if slots <= 0:
+                    return []
+                claimed_ids: list[str] = []
+                service_config = self._load_service_config(db)
+                lease_timeout_seconds = max(10, int(getattr(service_config, "lease_timeout_seconds", 90) or 90))
+                pending_rows = (
+                    db.query(BinarySecurityTask)
+                    .filter(BinarySecurityTask.status == "pending", self._lease_filter_available())
+                    .order_by(BinarySecurityTask.created_at.asc(), BinarySecurityTask.id.asc())
+                    .limit(max(1, int(slots)))
+                    .all()
+                )
+                for task in pending_rows:
+                    started_at = _now()
+                    updated = (
+                        db.query(BinarySecurityTask)
+                        .filter(BinarySecurityTask.id == task.id, BinarySecurityTask.status == "pending", self._lease_filter_available())
+                        .update(
+                            {
+                                BinarySecurityTask.status: "dispatching",
+                                BinarySecurityTask.dispatcher_instance_id: self.instance_id,
+                                BinarySecurityTask.dispatch_started_at: started_at,
+                                BinarySecurityTask.lease_expires_at: started_at + timedelta(seconds=lease_timeout_seconds),
+                                BinarySecurityTask.updated_at: started_at,
+                            },
+                            synchronize_session=False,
+                        )
+                    )
+                    if updated:
+                        claimed_ids.append(str(task.id))
+                return claimed_ids
+            return _claim_pending_tasks
+        if item == "_build_b2s_result_payload":
+            def _build_b2s_result_payload(task, module, payload, archived_dir, *, entry_input=None, project_id=None):
+                del task, project_id
+                module_payload = dict(module or {})
+                downstream_payload = dict(payload or {})
+                entry_payload = dict(entry_input or {})
+                artifacts = list(downstream_payload.get("artifacts") or [])
+                artifact_index_path = str(downstream_payload.get("artifact_index_path") or "").strip()
+                result_items = [dict(row) for row in artifacts if isinstance(row, dict)]
+                return {
+                    "module_key": module_payload.get("module_key") or entry_payload.get("module_key"),
+                    "module_name": module_payload.get("module_name") or entry_payload.get("module_name"),
+                    "task_type": module_payload.get("task_type"),
+                    "archive_root": str(archived_dir) if archived_dir else None,
+                    "artifact_index_path": artifact_index_path or None,
+                    "result_items": result_items,
+                    "downstream_result_summary": dict(downstream_payload.get("result_summary") or {}),
+                    "downstream": self._lightweight_downstream_payload(downstream_payload),
+                    "artifacts": {"files": result_items},
+                    "result_summary_version": 2,
+                }
+            return _build_b2s_result_payload
+        if item == "_mark_downstream_binding_created":
+            def _mark_downstream_binding_created(stage_item, *, message=None):
+                result = dict(self._load_stage_item_result_payload(stage_item))
+                observation = dict(result.get("sync_observation") or {})
+                observation["binding_state"] = "created"
+                observation["message"] = message
+                observation["replacement_in_progress"] = False
+                result["sync_observation"] = observation
+                stage_item.result = result
+            return _mark_downstream_binding_created
+        if item == "_lease_filter_available":
+            def _lease_filter_available():
+                return or_(
+                    BinarySecurityTask.lease_expires_at.is_(None),
+                    BinarySecurityTask.lease_expires_at < _now(),
+                )
+            return _lease_filter_available
+        if item == "_mark_downstream_binding_creating":
+            def _mark_downstream_binding_creating(stage_item):
+                result = dict(self._load_stage_item_result_payload(stage_item))
+                observation = dict(result.get("sync_observation") or {})
+                observation["binding_state"] = "creating"
+                observation["replacement_in_progress"] = False
+                result["sync_observation"] = observation
+                stage_item.result = result
+            return _mark_downstream_binding_creating
+        if item == "_should_recreate_entry_child_from_terminal_status":
+            def _should_recreate_entry_child_from_terminal_status(*, retrying, terminal_status):
+                recreate, _ = self._entry_terminal_payload_requires_recreate(
+                    retrying=retrying,
+                    payload={"status": terminal_status},
+                )
+                return recreate
+            return _should_recreate_entry_child_from_terminal_status
+        if item == "_merge_stage_item_result":
+            def _merge_stage_item_result(stage_item, updates):
+                merged = {
+                    **self._load_stage_item_result_payload(stage_item),
+                    **dict(updates or {}),
+                }
+                stage_item.result = merged
+                return merged
+            return _merge_stage_item_result
+        if item == "_clear_stage_item_sync_observation_errors":
+            def _clear_stage_item_sync_observation_errors(stage_item, *, result_payload=None, touched=False):
+                del touched
+                result = dict(result_payload or self._load_stage_item_result_payload(stage_item))
+                observation = dict(result.get("sync_observation") or {})
+                for key in ("error_message", "error_type", "http_status", "last_error_at", "next_retry_at"):
+                    observation.pop(key, None)
+                observation["consecutive_error_count"] = 0
+                observation["budget_exhausted"] = False
+                result["sync_observation"] = observation
+                result["last_sync_error_at"] = None
+                result["last_sync_error_message"] = None
+                result["last_sync_error_type"] = None
+                stage_item.result = result
+                return result
+            return _clear_stage_item_sync_observation_errors
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {item!r}")
+
     def _service_role(self) -> str:
         raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all"
         normalized = str(raw_role).strip().lower()
@@ -5841,7 +6107,17 @@ class TaskManager(
         elapsed_seconds = _elapsed_seconds_since(reference_time)
         if elapsed_seconds is None:
             return False
-        timeout_seconds = max(int(getattr(self.cfg.service, "dispatch_timeout_seconds", 0) or 0), 60)
+        owns_session = False
+        db = Session.object_session(item)
+        if db is None:
+            db = get_session_factory()()
+            owns_session = True
+        try:
+            service_config = self._load_service_config(db)
+        finally:
+            if owns_session:
+                db.close()
+        timeout_seconds = max(int(getattr(service_config, "dispatch_timeout_seconds", 0) or 0), 60)
         return elapsed_seconds < timeout_seconds
 
     def _retry_item_action_snapshot(

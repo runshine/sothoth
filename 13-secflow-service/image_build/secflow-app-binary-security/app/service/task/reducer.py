@@ -34,6 +34,61 @@ if TYPE_CHECKING:
 
 
 class TaskReducerServiceMixin:
+    def _apply_stage_worker_start_requested_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
+        from app.service import task_manager as task_manager_module
+
+        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == event.task_id).first()
+        if task is None:
+            return
+        payload = dict(event.payload or {})
+        stage_name = str(payload.get("stage_name") or event.stage_name or "").strip()
+        if not stage_name:
+            return
+        sequence = self._stage_sequence_for_task(task)
+        current_stage = str(getattr(task, "current_stage", "") or "").strip()
+        if current_stage and current_stage in sequence and stage_name in sequence and sequence.index(current_stage) > sequence.index(stage_name):
+            return
+        stage_run = self._ensure_stage_run(db, task, stage_name)
+        if str(getattr(stage_run, "status", "") or "").strip() in TASK_TERMINAL_STATUSES and getattr(stage_run, "finished_at", None):
+            return
+        now_value = task_shared._now()
+        stage_run.status = "running"
+        stage_run.started_at = stage_run.started_at or now_value
+        stage_run.finished_at = None
+        stage_run.updated_at = now_value
+        stage_run.counts = self._stage_counts(db, stage_run)
+        task.current_stage = stage_name
+        if str(task.status or "").strip() != "cancelled":
+            task.status = "running"
+        task.started_at = task.started_at or now_value
+        task.finished_at = None
+        task.updated_at = now_value
+        if self._is_streaming_tail_stage(task, stage_name):
+            self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+            task.tail_reconcile_state = "idle"
+        stage_summary = dict(task.stage_summary or {})
+        stage_summary[stage_name] = {
+            **dict(stage_summary.get(stage_name) or {}),
+            "status": "running",
+            "counts": stage_run.counts,
+            "started_at": stage_run.started_at.isoformat() if stage_run.started_at else None,
+            "finished_at": None,
+        }
+        task.stage_summary = stage_summary
+        self._record_event(
+            db,
+            task,
+            "stage_started",
+            f"阶段开始执行: {stage_name}",
+            stage_name=stage_name,
+            payload={
+                "state_event_id": event.id,
+                "stage_retry_mode": bool(payload.get("stage_retry_mode")),
+                "task_retry_mode": bool(payload.get("task_retry_mode")),
+                "target_stage_name": payload.get("target_stage_name"),
+            },
+        )
+
     async def _state_reducer_loop(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module
 

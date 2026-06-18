@@ -585,6 +585,19 @@ class TaskQueryServiceMixin:
             items=[self._operation_response(operation) for operation in self._list_task_operations(db, task.id)],
         )
 
+    def _list_task_operations(self: TaskManager, db: Session, task_id: str):
+        from app.service import task_manager as task_manager_module
+
+        return (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.task_id == task_id)
+            .order_by(
+                task_manager_module.BinarySecurityTaskOperation.created_at.desc(),
+                task_manager_module.BinarySecurityTaskOperation.id.desc(),
+            )
+            .all()
+        )
+
     def clear_timeline(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
         task = self._task_or_404(db, project_id, task_id)
         deleted_count = (

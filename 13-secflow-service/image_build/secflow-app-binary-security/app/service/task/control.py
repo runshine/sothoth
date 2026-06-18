@@ -841,6 +841,7 @@ class TaskControlServiceMixin:
             request_payload={
                 "current_stage": task.current_stage,
                 "force": bool(force),
+                "force_delete": bool(force),
             },
             accepted_event_type="task_delete_accepted",
             accepted_message="任务删除已受理，后台正在清理任务及下游资源",

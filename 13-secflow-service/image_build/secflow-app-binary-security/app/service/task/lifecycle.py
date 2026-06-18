@@ -197,6 +197,7 @@ class TaskLifecycleServiceMixin:
 
         db = task_manager_module.get_session_factory()()
         try:
+            service_config = self._load_service_config(db)
             pending_tasks = int(
                 db.query(task_manager_module.func.count(task_manager_module.BinarySecurityTask.id))
                 .filter(task_manager_module.BinarySecurityTask.status == "pending")
@@ -242,8 +243,17 @@ class TaskLifecycleServiceMixin:
             "archive_running_jobs": archive_running_jobs,
             "archive_applying_jobs": archive_applying_jobs,
             "leased_tasks": leased_tasks,
-            "task_capacity": int(getattr(self.cfg.service, "max_concurrent_tasks", 0) or 0),
+            "task_capacity": int(getattr(service_config, "max_concurrent_tasks", 0) or 0),
         }
+
+    def _observe_worker_counts(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        task_manager_module.observe_worker_counts(
+            task_workers=len([task for task in self._workers.values() if not task.done()]),
+            operation_workers=len([task for task in self._operation_workers.values() if not task.done()]),
+            archive_workers=len([task for task in self._archive_workers if not task.done()]),
+        )
 
     async def _observe_runtime_metrics(self: TaskManager, db: Session | None, *, reconcile_candidates: int = 0) -> None:
         from app.service import task_manager as task_manager_module
@@ -322,6 +332,180 @@ class TaskLifecycleServiceMixin:
         finally:
             db.close()
 
+    def _list_tasks_with_deferred_cleanup(self: TaskManager, db: Session) -> list[dict[str, str]]:
+        from app.service import task_manager as task_manager_module
+
+        now_value = task_shared._now()
+        refs: list[dict[str, str]] = []
+        for task in db.query(task_manager_module.BinarySecurityTask).all():
+            snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
+            deferred_refs = [
+                dict(row)
+                for row in list(snapshot.get("deferred_downstream_refs") or [])
+                if isinstance(row, dict)
+            ]
+            if not deferred_refs:
+                continue
+            if not bool(snapshot.get("cleanup_partial_failed")) and str(snapshot.get("deferred_cleanup_status") or "").strip() == "succeeded":
+                continue
+            next_retry_at = task_shared._parse_iso_datetime(snapshot.get("deferred_cleanup_next_retry_at"))
+            if next_retry_at is not None and next_retry_at > now_value:
+                continue
+            task_id = str(getattr(task, "id", "") or "").strip()
+            project_id = str(getattr(task, "project_id", "") or "").strip()
+            if not task_id or not project_id:
+                continue
+            refs.append({"project_id": project_id, "task_id": task_id})
+        return refs
+
+    async def _reconcile_deferred_cleanup_task_ref(self: TaskManager, ref: dict[str, str], token: str | None) -> None:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            task = (
+                db.query(task_manager_module.BinarySecurityTask)
+                .filter(
+                    task_manager_module.BinarySecurityTask.project_id == ref["project_id"],
+                    task_manager_module.BinarySecurityTask.id == ref["task_id"],
+                )
+                .first()
+            )
+            if task is None:
+                return
+            snapshot = dict(task.cleanup_snapshot or {})
+            deferred_refs = [
+                dict(row)
+                for row in list(snapshot.get("deferred_downstream_refs") or [])
+                if isinstance(row, dict)
+            ]
+            if not deferred_refs:
+                return
+
+            deleted_before = int(snapshot.get("deleted_downstream_count") or 0)
+            attempts = int(snapshot.get("deferred_cleanup_attempts") or 0) + 1
+            attempted_at = task_shared._now()
+
+            await self._delete_downstream_refs(
+                db,
+                task,
+                deferred_refs,
+                token,
+                cleanup_scope="deferred_cleanup_reconcile",
+            )
+            cleanup_results = [
+                dict(result)
+                for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
+                if isinstance(result, dict)
+            ]
+            result_map = {
+                (str(result.get("service") or "").strip(), str(result.get("task_id") or "").strip()): result
+                for result in cleanup_results
+                if str(result.get("service") or "").strip() and str(result.get("task_id") or "").strip()
+            }
+
+            remaining_refs: list[dict[str, object]] = []
+            deleted_now = 0
+            for deferred_ref in deferred_refs:
+                key = (str(deferred_ref.get("service") or "").strip(), str(deferred_ref.get("task_id") or "").strip())
+                result = dict(result_map.get(key) or {})
+                delete_status = str(result.get("delete_status") or "").strip().lower()
+                if bool(result.get("deferred")) or bool(result.get("blocking")):
+                    remaining_refs.append({**deferred_ref, **result})
+                    continue
+                if delete_status in {"succeeded", "missing", "not_found"}:
+                    deleted_now += 1
+                    continue
+                if result:
+                    remaining_refs.append({**deferred_ref, **result, "deferred": True})
+                else:
+                    remaining_refs.append({**deferred_ref, "deferred": True, "deferred_reason": "cleanup_result_missing"})
+            for result in cleanup_results:
+                if not bool(result.get("deferred")):
+                    continue
+                key = (str(result.get("service") or "").strip(), str(result.get("task_id") or "").strip())
+                if any(
+                    str(existing.get("service") or "").strip() == key[0]
+                    and str(existing.get("task_id") or "").strip() == key[1]
+                    for existing in remaining_refs
+                ):
+                    continue
+                remaining_refs.append(dict(result))
+
+            blocking_refs = [dict(row) for row in remaining_refs if bool(row.get("blocking"))]
+            first_error = next(
+                (
+                    str(row.get("error") or row.get("deferred_reason") or "").strip()
+                    for row in remaining_refs
+                    if str(row.get("error") or row.get("deferred_reason") or "").strip()
+                ),
+                None,
+            )
+            snapshot.update(
+                {
+                    "cleanup_partial_failed": bool(remaining_refs),
+                    "deleted_downstream_count": deleted_before + deleted_now,
+                    "deferred_cleanup_attempts": attempts,
+                    "deferred_cleanup_status": "partial_failed" if remaining_refs else "succeeded",
+                    "deferred_cleanup_last_error": first_error,
+                    "deferred_cleanup_last_attempt_at": task_shared._isoformat_or_none(attempted_at),
+                    "deferred_cleanup_next_retry_at": (
+                        task_shared._isoformat_or_none(
+                            attempted_at
+                            + timedelta(
+                                seconds=max(
+                                    30,
+                                    int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30),
+                                )
+                            )
+                        )
+                        if remaining_refs
+                        else None
+                    ),
+                    "deferred_downstream_refs": remaining_refs,
+                    "downstream_cleanup_blocking_refs": blocking_refs,
+                }
+            )
+            task.cleanup_snapshot = snapshot
+
+            if not remaining_refs:
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_cleanup_reconciled",
+                    "后台补偿删除已完成，任务已彻底删除",
+                    payload={
+                        "task_id": task.id,
+                        "project_id": task.project_id,
+                        "attempts": attempts,
+                        "deleted_downstream_count": snapshot.get("deleted_downstream_count"),
+                    },
+                )
+                with suppress(Exception):
+                    self._clear_runtime_lease(db, task.id)
+                db.delete(task)
+                db.commit()
+                return
+
+            self._record_event(
+                db,
+                task,
+                "task_delete_cleanup_retry_deferred",
+                "后台补偿删除仍未完成，任务保留等待下轮重试",
+                level="warning",
+                payload={
+                    "task_id": task.id,
+                    "project_id": task.project_id,
+                    "attempts": attempts,
+                    "remaining_deferred_count": len(remaining_refs),
+                    "blocking_ref_count": len(blocking_refs),
+                    "last_error": first_error,
+                },
+            )
+            db.commit()
+        finally:
+            db.close()
+
     async def _reconcile_stale_stage_item_sync_ref(self: TaskManager, ref: dict[str, Any], token: str | None) -> None:
         from app.service import task_manager as task_manager_module
 
@@ -355,6 +539,63 @@ class TaskLifecycleServiceMixin:
             )
         finally:
             db.close()
+
+    def _list_tasks_with_stale_stage_item_syncs(self: TaskManager, db: Session) -> list[dict[str, Any]]:
+        from app.service import task_manager as task_manager_module
+
+        now_value = task_shared._now()
+        stale_threshold_seconds = self._stage_item_sync_stale_seconds()
+        batch_size = max(1, int(getattr(self.cfg.scheduler, "stage_item_sync_reconcile_batch_size", 100) or 100))
+        refs: list[dict[str, Any]] = []
+        for task in db.query(task_manager_module.BinarySecurityTask).all():
+            task_id = str(getattr(task, "id", "") or "").strip()
+            project_id = str(getattr(task, "project_id", "") or "").strip()
+            if not task_id or not project_id:
+                continue
+            if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
+                continue
+            items = self._task_reconcile_candidate_items(
+                db,
+                task,
+                force=False,
+                include_failed_terminal_items=True,
+            )
+            if not items:
+                continue
+            stage_item_ids: dict[str, list[str]] = {}
+            for item in items:
+                item_id = str(getattr(item, "id", "") or "").strip()
+                stage_name = str(getattr(item, "stage_name", "") or "").strip()
+                if not item_id or not stage_name:
+                    continue
+                stale = False
+                if self._item_needs_downstream_binding_reconcile(item) or self._item_missing_recorded_downstream_status(item):
+                    stale = True
+                else:
+                    next_retry_at = self._stage_item_next_sync_retry_at_value(item)
+                    if next_retry_at is not None and next_retry_at <= now_value:
+                        stale = True
+                    else:
+                        attempt_at = self._stage_item_sync_attempt_at_value(item)
+                        if attempt_at is None:
+                            stale = True
+                        else:
+                            stale = (now_value - attempt_at).total_seconds() >= stale_threshold_seconds
+                if not stale:
+                    continue
+                stage_item_ids.setdefault(stage_name, []).append(item_id)
+            for stage_name, item_ids in stage_item_ids.items():
+                refs.append(
+                    {
+                        "project_id": project_id,
+                        "task_id": task_id,
+                        "stage_name": stage_name,
+                        "item_ids": item_ids,
+                    }
+                )
+                if len(refs) >= batch_size:
+                    return refs
+        return refs
 
     async def _task_heartbeat_loop(self: TaskManager) -> None:
         interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))

@@ -214,6 +214,37 @@ class TaskOperationEventServiceMixin:
     def _operation_result_data(self: TaskManager, operation: BinarySecurityTaskOperation) -> dict[str, Any]:
         return self._load_operation_result_payload(operation)
 
+    def _operation_response(self: TaskManager, operation: BinarySecurityTaskOperation):
+        from app.service import task_manager as task_manager_module
+
+        return task_manager_module.BinarySecurityTaskOperationResponse(
+            id=str(operation.id or ""),
+            task_id=str(operation.task_id or ""),
+            project_id=str(operation.project_id or ""),
+            operation_type=str(operation.operation_type or ""),
+            target_stage=str(operation.target_stage or "").strip() or None,
+            requested_by=str(operation.requested_by or "").strip() or None,
+            request_source=str(operation.request_source or "").strip() or None,
+            status=str(operation.status or ""),
+            operation_token=str(operation.operation_token or ""),
+            owner_instance_id=str(operation.owner_instance_id or "").strip() or None,
+            claim_lease_expires_at=getattr(operation, "claim_lease_expires_at", None),
+            heartbeat_at=getattr(operation, "heartbeat_at", None),
+            request_payload=self._load_operation_request_payload(operation),
+            result_payload=self._load_operation_result_payload(operation),
+            error_code=str(operation.error_code or "").strip() or None,
+            error_message=str(operation.error_message or "").strip() or None,
+            current_step=str(operation.current_step or "").strip() or None,
+            step_attempts=dict(operation.step_attempts or {}),
+            step_payload=self._load_operation_step_payload(operation),
+            resume_cursor=dict(operation.resume_cursor or {}),
+            superseded_by_operation_id=str(operation.superseded_by_operation_id or "").strip() or None,
+            created_at=getattr(operation, "created_at", None),
+            updated_at=getattr(operation, "updated_at", None),
+            started_at=getattr(operation, "started_at", None),
+            finished_at=getattr(operation, "finished_at", None),
+        )
+
     def _update_operation_result_payload(
         self: TaskManager,
         operation: BinarySecurityTaskOperation,

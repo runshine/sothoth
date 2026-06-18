@@ -31,6 +31,8 @@ from app.schemas import (
     BinarySecurityStageSummary,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskListResponse,
+    BinarySecurityTaskOperationPageResponse,
+    BinarySecurityTaskOperationResponse,
     BinarySecurityTaskResponse,
     TokenUser,
 )
@@ -209,6 +211,27 @@ class _RouteManagerStub:
     def get_task_overview(self, db, project_id, task_id):
         self.calls.append(("get_task_overview", db, project_id, task_id))
         return BinarySecurityOverviewResponse(task_id=task_id, nodes=[])
+
+    def get_operations(self, db, project_id, task_id):
+        self.calls.append(("get_operations", db, project_id, task_id))
+        return BinarySecurityTaskOperationPageResponse(
+            task_id=task_id,
+            items=[
+                BinarySecurityTaskOperationResponse(
+                    id="op-1",
+                    task_id=task_id,
+                    project_id=project_id,
+                    operation_type="delete",
+                    status="failed",
+                    operation_token="tok-1",
+                    request_payload={"force_delete": True},
+                    result_payload={},
+                    step_attempts={},
+                    step_payload={},
+                    resume_cursor={},
+                )
+            ],
+        )
 
     def get_task_archive_jobs_page(self, db, project_id, task_id, stage_name, page, per_page):
         self.calls.append(("get_task_archive_jobs_page", db, project_id, task_id, stage_name, page, per_page))
@@ -599,6 +622,22 @@ class TaskApiRouteTests(unittest.TestCase):
             ("get_task_archive_jobs_page", fake_db, "p1", "t1", "dataflow_vuln_scan", 3, 10),
             manager.calls[0],
         )
+
+    def test_get_operations_route_delegates_to_manager(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1/operations",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("delete", payload["items"][0]["operation_type"])
+        self.assertEqual(("get_operations", fake_db, "p1", "t1"), manager.calls[0])
 
     def test_get_task_abnormal_reason_history_route_delegates_to_manager(self):
         app, fake_db = self._build_client()

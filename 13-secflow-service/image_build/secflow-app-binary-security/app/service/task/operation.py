@@ -285,6 +285,40 @@ class TaskOperationServiceMixin:
         except Exception:
             task_manager_module.logger.exception("binary-security enqueue operation failed: %s", operation_id)
 
+    def _claim_operation_by_id(self: TaskManager, db: Session, operation_id: str):
+        from app.service import task_manager as task_manager_module
+
+        operation = (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.id == operation_id)
+            .first()
+        )
+        if operation is None:
+            return None
+        status = str(getattr(operation, "status", "") or "").strip().lower()
+        if status in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+            return None
+        now_value = task_manager_module._now()
+        lease_expires_at = getattr(operation, "claim_lease_expires_at", None)
+        owner_instance_id = str(getattr(operation, "owner_instance_id", "") or "").strip()
+        if (
+            status in {"claimed", "running"}
+            and owner_instance_id
+            and owner_instance_id != self.instance_id
+            and lease_expires_at is not None
+            and lease_expires_at > now_value
+        ):
+            return None
+        operation.status = "running"
+        operation.owner_instance_id = self.instance_id
+        operation.claim_lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
+        operation.heartbeat_at = now_value
+        operation.updated_at = now_value
+        if getattr(operation, "started_at", None) is None:
+            operation.started_at = now_value
+        db.flush()
+        return operation
+
     def _active_cancel_operation(self: TaskManager, db: Session, task_id: str):
         from app.service import task_manager as task_manager_module
 
@@ -1853,6 +1887,181 @@ class TaskOperationServiceMixin:
                 if str(stage_run.stage_name or "").strip()
             }
         )
+
+    async def _prepare_delete_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> None:
+        from app.service import task_manager as task_manager_module
+
+        operation = None
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+        if current_operation_id:
+            operation = db.query(task_manager_module.BinarySecurityTaskOperation).filter(
+                task_manager_module.BinarySecurityTaskOperation.id == current_operation_id
+            ).first()
+        request_payload = dict(getattr(operation, "request_payload", None) or {})
+        force_delete = bool(request_payload.get("force_delete") or request_payload.get("force"))
+        event_prefix = "task_force_delete" if force_delete else "task_delete"
+        stage_names = list(self._stage_sequence_for_task(task))
+        token = self._service_token()
+        task.last_error = None
+
+        stage_items = db.query(task_manager_module.BinarySecurityStageItem).filter(
+            task_manager_module.BinarySecurityStageItem.task_id == task.id
+        ).all()
+        downstream_refs = self._dedupe_downstream_refs(
+            self._collect_downstream_refs(task, stage_items) + self._discover_parent_linked_downstream_refs(db, task)
+        )
+        await self._cancel_local_worker(task.id)
+        if downstream_refs:
+            with suppress(Exception):
+                await self._cancel_downstream_refs(db, task, downstream_refs, token)
+            await self._delete_downstream_refs(
+                db,
+                task,
+                downstream_refs,
+                token,
+                force_delete=force_delete,
+                cleanup_scope="task_delete",
+            )
+
+        downstream_cleanup_results = [
+            dict(result)
+            for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
+            if isinstance(result, dict)
+        ]
+        downstream_cleanup_deferred_refs = [
+            dict(result)
+            for result in downstream_cleanup_results
+            if bool(result.get("deferred"))
+        ]
+        downstream_cleanup_blocking_refs = [
+            dict(result)
+            for result in downstream_cleanup_results
+            if bool(result.get("blocking"))
+        ]
+
+        cleanup_counts = {
+            "archive_jobs_deleted": self._delete_archive_children_for_stages(db, task, stage_names),
+            "stage_items_deleted": self._delete_stage_items_for_stages(db, task.id, stage_names),
+            "stage_runs_deleted": self._delete_stage_run_rows(db, task.id),
+            "timeline_events_deleted": self._delete_task_timeline_rows(db, task.id),
+            "state_events_deleted": self._delete_task_state_event_rows(db, task.id),
+        }
+        self._record_event(
+            db,
+            task,
+            f"{event_prefix}_requested",
+            "后台已开始删除任务及其下游痕迹",
+            stage_name=task.current_stage,
+            payload={
+                "force_delete": force_delete,
+                "downstream_ref_count": len(downstream_refs),
+                "stage_item_count": len(stage_items),
+                "cleanup_counts": cleanup_counts,
+            },
+        )
+        db.commit()
+
+        cleanup_status = await self._cleanup_task_workspace(task, token=token)
+        if cleanup_status != "deleted":
+            task.status = task_manager_module.TASK_STATUS_DELETE_FAILED
+            task.finished_at = task_manager_module._now()
+            task.last_error = "任务目录清理失败"
+            self._record_event(
+                db,
+                task,
+                "task_delete_failed",
+                "删除失败，任务目录清理失败",
+                stage_name=task.current_stage,
+                level="error",
+                payload={
+                    "force_delete": force_delete,
+                    "workspace_cleanup_status": cleanup_status,
+                },
+            )
+            db.commit()
+            raise ValidationError("任务目录清理失败")
+
+        deleted_downstream_count = sum(
+            1
+            for result in downstream_cleanup_results
+            if str(result.get("delete_status") or "").strip().lower() in {"succeeded", "missing", "not_found"}
+            and not bool(result.get("deferred"))
+        )
+        cleanup_result = {
+            "downstream_cleanup_results": downstream_cleanup_results,
+            "downstream_cleanup_deferred_refs": downstream_cleanup_deferred_refs,
+            "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
+            "cleanup_partial_failed": bool(downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs),
+            "deleted_downstream_count": deleted_downstream_count,
+            "cleanup_counts": cleanup_counts,
+            "workspace_cleanup_status": cleanup_status,
+        }
+        if operation is not None:
+            self._update_operation_result_payload(
+                operation,
+                {"cleanup_result": cleanup_result},
+                workspace_root=task.workspace_root,
+            )
+
+        if downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs:
+            snapshot = {
+                "cleanup_partial_failed": True,
+                "deleted_downstream_count": deleted_downstream_count,
+                "deferred_cleanup_attempts": 1,
+                "deferred_cleanup_status": "partial_failed",
+                "deferred_cleanup_last_error": next(
+                    (
+                        str(row.get("error") or row.get("deferred_reason") or "").strip()
+                        for row in downstream_cleanup_deferred_refs + downstream_cleanup_blocking_refs
+                        if str(row.get("error") or row.get("deferred_reason") or "").strip()
+                    ),
+                    None,
+                ),
+                "deferred_cleanup_last_attempt_at": task_manager_module._isoformat_or_none(task_manager_module._now()),
+                "deferred_cleanup_next_retry_at": task_manager_module._isoformat_or_none(
+                    task_manager_module._now()
+                    + timedelta(seconds=max(30, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30)))
+                ),
+                "deferred_downstream_refs": downstream_cleanup_deferred_refs,
+                "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
+                "cleanup_counts": cleanup_counts,
+            }
+            task.cleanup_snapshot = snapshot
+            task.status = "cancelled"
+            task.finished_at = task_manager_module._now()
+            task.current_operation_id = None
+            task.last_error = None
+            self._record_event(
+                db,
+                task,
+                "task_delete_cleanup_deferred",
+                "删除已完成本地清理，但仍有下游子任务等待后台补偿",
+                stage_name=task.current_stage,
+                level="warning",
+                payload=cleanup_result,
+            )
+            await self._write_task_metadata_async(
+                task,
+                Path(task.workspace_root) / "input" / "task-metadata.json",
+                status=task.status,
+            )
+            db.commit()
+            return
+
+        db.delete(task)
+        self._record_event(
+            db,
+            task,
+            f"{event_prefix}_completed",
+            "任务删除完成",
+            stage_name=task.current_stage,
+            payload={
+                "force_delete": force_delete,
+                "deleted_downstream_count": deleted_downstream_count,
+                "cleanup_counts": cleanup_counts,
+            },
+        )
+        db.commit()
 
     async def _run_scheduled_coroutine(self: TaskManager, coro, *, label: str) -> None:
         from app.service import task_manager as task_manager_module

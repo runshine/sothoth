@@ -24,6 +24,8 @@ from test_task_manager import _ModelAwareDb, _now
 class TaskRuntimeServiceStructureTests(unittest.TestCase):
     def test_runtime_mixin_methods_remain_task_manager_entrypoints(self):
         self.assertIs(TaskManager._dispatch_loop, TaskRuntimeServiceMixin._dispatch_loop)
+        self.assertIs(TaskManager._active_dispatch_count, TaskRuntimeServiceMixin._active_dispatch_count)
+        self.assertIs(TaskManager._reconcile_work_queues, TaskRuntimeServiceMixin._reconcile_work_queues)
         self.assertIs(TaskManager._dispatch_once, TaskRuntimeServiceMixin._dispatch_once)
         self.assertIs(TaskManager._dispatch_task_by_id, TaskRuntimeServiceMixin._dispatch_task_by_id)
         self.assertIs(TaskManager._run_task, TaskRuntimeServiceMixin._run_task)
