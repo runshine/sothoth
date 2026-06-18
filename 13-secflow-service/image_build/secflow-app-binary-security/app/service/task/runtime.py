@@ -419,7 +419,7 @@ class TaskRuntimeServiceMixin:
                 ):
                     db.commit()
                     self._enqueue_task(task.id)
-                return None
+                    return None
         if (
             self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._tail_requires_execution_takeover(db, task)
