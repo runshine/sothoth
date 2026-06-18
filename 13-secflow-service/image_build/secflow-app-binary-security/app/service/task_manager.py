@@ -798,6 +798,7 @@ class TaskManager(
                         .update(
                             {
                                 BinarySecurityTask.status: "dispatching",
+                                BinarySecurityTask.runtime_phase: TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                                 BinarySecurityTask.dispatcher_instance_id: self.instance_id,
                                 BinarySecurityTask.dispatch_started_at: started_at,
                                 BinarySecurityTask.lease_expires_at: started_at + timedelta(seconds=lease_timeout_seconds),

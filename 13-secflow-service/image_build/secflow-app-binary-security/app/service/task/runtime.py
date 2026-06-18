@@ -445,6 +445,7 @@ class TaskRuntimeServiceMixin:
             .update(
                 {
                     task_manager_module.BinarySecurityTask.status: "dispatching",
+                    task_manager_module.BinarySecurityTask.runtime_phase: task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     task_manager_module.BinarySecurityTask.dispatcher_instance_id: self.instance_id,
                     task_manager_module.BinarySecurityTask.dispatch_started_at: started_at,
                     task_manager_module.BinarySecurityTask.lease_expires_at: lease_expires_at,
