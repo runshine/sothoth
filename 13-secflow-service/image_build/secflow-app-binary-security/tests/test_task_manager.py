@@ -7464,7 +7464,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.finished_at)
 
-    def test_requeue_stale_operations_is_disabled_under_owner_only_runtime(self):
+    def test_requeue_stale_operations_requeues_failed_task_with_active_operation_and_no_owner(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -7486,11 +7486,90 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             status="running",
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation])
+        queued: list[str] = []
+        events: list[str] = []
+        self.manager._enqueue_task = queued.append
+        self.manager._record_event = lambda *args, **kwargs: events.append(args[2])
 
         changed = self.manager._requeue_stale_operations(db)
 
-        self.assertFalse(changed)
+        self.assertTrue(changed)
+        self.assertEqual("failed", task.status)
+        self.assertEqual(["t1"], queued)
+        self.assertIn("task_row_owner_released_without_local_runtime", events)
         self.assertEqual("running", operation.status)
+
+    def test_requeue_stale_operations_releases_stale_dispatch_owner_for_active_operation(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="dispatching",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="stale-worker",
+            dispatch_started_at=_now() - timedelta(minutes=5),
+            lease_expires_at=_now() - timedelta(minutes=4),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            target_stage="system_analysis",
+            status="running",
+            current_step="cancel_local_execution",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        queued: list[str] = []
+        events: list[str] = []
+        cleared_leases: list[tuple[str, str | None]] = []
+        self.manager.instance_id = "new-worker"
+        self.manager._enqueue_task = queued.append
+        self.manager._record_event = lambda *args, **kwargs: events.append(args[2])
+        self.manager._clear_runtime_lease = lambda db_arg, task_id, owner_instance_id=None: cleared_leases.append((task_id, owner_instance_id))
+
+        changed = self.manager._requeue_stale_operations(db)
+
+        self.assertTrue(changed)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertEqual(["t1"], queued)
+        self.assertIn("task_row_owner_released_without_local_runtime", events)
+        self.assertEqual([("t1", "stale-worker")], cleared_leases)
+
+    def test_task_row_owner_is_runtime_supported_rejects_active_operation_without_owner_support(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="stale-worker",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="delete",
+            target_stage="system_analysis",
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+        self.manager.instance_id = "new-worker"
+
+        supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+
+        self.assertFalse(supported)
 
     def test_run_task_operation_steps_resumes_from_requeue_step(self):
         task = BinarySecurityTask(

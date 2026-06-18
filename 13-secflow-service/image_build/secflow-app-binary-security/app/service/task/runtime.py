@@ -140,6 +140,7 @@ class TaskRuntimeServiceMixin:
 
         if not isinstance(db, Session):
             return (
+                self._requeue_stale_operations(db),
                 self._reclaim_stale_dispatching_locked(db),
                 self._requeue_orphaned_owned_execution_locked(db),
                 self._reclaim_stale_streaming_stage_items_locked(db),
@@ -148,8 +149,9 @@ class TaskRuntimeServiceMixin:
                 self._recover_missing_stage_terminal_events_locked(db),
             )
         if not self._acquire_coordinator_lease(task_manager_module.PARENT_RECLAIM_COORDINATOR_LEASE):
-            return False, False, False, False, False, False
+            return False, False, False, False, False, False, False
         return (
+            self._requeue_stale_operations(db),
             self._reclaim_stale_dispatching_locked(db),
             self._requeue_orphaned_owned_execution_locked(db),
             self._reclaim_stale_streaming_stage_items_locked(db),
@@ -325,6 +327,7 @@ class TaskRuntimeServiceMixin:
 
     def _dispatch_once(self: TaskManager, db: Session) -> list[str]:
         (
+            stale_operations_requeued,
             stale_reclaimed,
             orphaned_owned_execution_requeued,
             stale_stage_item_reclaimed,
@@ -337,7 +340,8 @@ class TaskRuntimeServiceMixin:
         slots = max(0, service_config.max_concurrent_tasks - active_count)
         claimed_ids = self._claim_pending_tasks(db, slots)
         if (
-            stale_reclaimed
+            stale_operations_requeued
+            or stale_reclaimed
             or orphaned_owned_execution_requeued
             or stale_stage_item_reclaimed
             or stale_running_reclaimed

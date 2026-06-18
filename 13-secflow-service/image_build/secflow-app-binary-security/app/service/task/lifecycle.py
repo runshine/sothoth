@@ -24,8 +24,44 @@ if TYPE_CHECKING:
 
 class TaskLifecycleServiceMixin:
     def _requeue_stale_operations(self: TaskManager, db: Session) -> bool:
-        del db
-        return False
+        from app.service import task_manager as task_manager_module
+
+        changed = False
+        active_operations = (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(
+                task_manager_module.BinarySecurityTaskOperation.status.in_(
+                    list(task_manager_module.TASK_OPERATION_ACTIVE_STATUSES)
+                )
+            )
+            .all()
+        )
+        for operation in active_operations:
+            task_id = str(getattr(operation, "task_id", "") or "").strip()
+            if not task_id:
+                continue
+            task = (
+                db.query(task_manager_module.BinarySecurityTask)
+                .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                .first()
+            )
+            if task is None:
+                continue
+            if self._task_row_owner_is_runtime_supported(db, task, active_operation=operation):
+                continue
+            released = self._release_unsupported_task_row_owner(
+                db,
+                task,
+                active_operation=operation,
+                reason="stale_active_operation_without_supported_runtime",
+            )
+            if not released:
+                continue
+            self._enqueue_task(task.id)
+            changed = True
+        if changed:
+            db.flush()
+        return changed
 
     async def _seed_work_queues(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module

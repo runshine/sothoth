@@ -2016,22 +2016,6 @@ class TaskManager(
     ) -> bool:
         if task is None:
             return False
-        current_status = str(getattr(task, "status", "") or "").strip().lower()
-        if current_status not in {"dispatching", "running"}:
-            return True
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-        if not dispatcher_instance_id:
-            return True
-        if dispatcher_instance_id == str(self.instance_id or "").strip():
-            return self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
-        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
-        if (
-            self._runtime_lease_is_active(lease)
-            and str(getattr(lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
-        ):
-            return True
-        if current_status == "dispatching":
-            return False
         operation = active_operation
         if operation is None:
             current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
@@ -2042,6 +2026,23 @@ class TaskManager(
                     .first()
                 )
         operation_status = str(getattr(operation, "status", "") or "").strip().lower() if operation is not None else ""
+        has_active_operation = operation_status in TASK_OPERATION_ACTIVE_STATUSES
+        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if current_status not in {"dispatching", "running"} and not has_active_operation:
+            return True
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if not dispatcher_instance_id:
+            return not has_active_operation
+        if dispatcher_instance_id == str(self.instance_id or "").strip():
+            return self._task_owner_runtime_supported_locally(task, active_operation=operation)
+        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
+        if (
+            self._runtime_lease_is_active(lease)
+            and str(getattr(lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+        ):
+            return True
+        if current_status == "dispatching" or has_active_operation:
+            return False
         if operation_status in TASK_OPERATION_ACTIVE_STATUSES:
             return False
         return True
@@ -3604,8 +3605,6 @@ class TaskManager(
             return candidates
         if not modules:
             return []
-        if allowed and all(not str(module.get("risk_level") or "").strip() for module in modules):
-            return [dict(module) for module in modules]
         return candidates
 
     def _module_metrics(self, modules: list[dict[str, Any]], candidate_modules: list[dict[str, Any]], selected_modules: list[dict[str, Any]]) -> dict[str, int]:
