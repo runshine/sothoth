@@ -2736,13 +2736,39 @@ class TaskOperationServiceMixin:
         if not bool(requeue_payload.get("requested")):
             return False
         target_stage = str(operation.target_stage or task.current_stage or "").strip() or None
-        if str(task.status or "").strip() != "pending":
+        in_place_runtime_resume = bool(requeue_payload.get("in_place_runtime_resume"))
+        task_status = str(task.status or "").strip()
+        if in_place_runtime_resume:
+            if task_status not in {"running", "dispatching"}:
+                return False
+            if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                return False
+        elif task_status != "pending":
             return False
         if target_stage and str(task.current_stage or "").strip() != target_stage:
             return False
         if task.last_error not in {None, ""}:
             return False
         return True
+
+    def _can_resume_retry_operation_in_place(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> bool:
+        operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+        if operation_type not in {
+            task_manager_module.TASK_ACTION_RETRY,
+            task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
+            task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
+            task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+        }:
+            return False
+        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+            return False
+        if not self._lease_is_active(task, db=None):
+            return False
+        return self._task_owner_runtime_supported_locally(task, active_operation=operation)
 
     def _requeue_task_after_retry_operation(
         self: TaskManager,
@@ -2762,6 +2788,43 @@ class TaskOperationServiceMixin:
             payload={"operation_id": operation.id},
         )
         resume_decision.event_type = "task_requeued"
+        if self._can_resume_retry_operation_in_place(task, operation):
+            task.status = "running"
+            task.current_stage = target_stage or task.current_stage
+            task.last_error = None
+            task.finished_at = None
+            task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
+            self._clear_task_abnormal_reason_snapshot(db, task)
+            self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+            self._update_operation_result_payload(
+                operation,
+                {
+                    "requeue": {
+                        "requested": True,
+                        "in_place_runtime_resume": True,
+                        "task_status_before": "retry_operation_succeeded",
+                        "task_status_after": task.status,
+                        "resume_reason": resume_decision.resume_reason,
+                        "source": resume_decision.source,
+                    },
+                },
+                workspace_root=task.workspace_root,
+            )
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "task_requeued",
+                f"失败项重试完成，当前 runtime 将继续推进任务: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload={
+                    "next_stage": task.current_stage,
+                    "resume_reason": resume_decision.resume_reason,
+                    "source": resume_decision.source,
+                    "in_place_runtime_resume": True,
+                },
+            )
+            return
         if not resume_decision.should_resume:
             task.status = "pending"
             task.current_stage = target_stage or task.current_stage

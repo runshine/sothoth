@@ -28259,6 +28259,62 @@ def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
     self.assertEqual("retry_failed_items", applied[0]["source"])
 
 
+def _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry(self):
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-1",
+        dispatch_started_at=now_value - timedelta(seconds=10),
+        lease_expires_at=now_value + timedelta(seconds=60),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op1",
+        task_id="task1",
+        project_id="p1",
+        operation_type="retry",
+        target_stage="entry_analysis",
+        status="running",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+    original_instance_id = self.manager.instance_id
+    original_enqueue = self.manager._enqueue_task
+    original_should_auto = self.manager._should_auto_advance_to_stage
+    queued = []
+    self.manager.instance_id = "worker-1"
+    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
+    self.manager._register_task_execution_owner(task.id, "primary_task_worker")
+    try:
+        self.manager._requeue_task_after_retry_operation(
+            db,
+            task,
+            target_stage="entry_analysis",
+            operation=operation,
+        )
+    finally:
+        self.manager._release_task_execution_owner(task.id, "primary_task_worker")
+        self.manager.instance_id = original_instance_id
+        self.manager._enqueue_task = original_enqueue
+        self.manager._should_auto_advance_to_stage = original_should_auto
+
+    self.assertEqual("running", task.status)
+    self.assertEqual("worker-1", task.dispatcher_instance_id)
+    self.assertEqual([], queued)
+    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("requested")))
+    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+
+
 def _test_archive_input_repair_uses_resume_decision(self):
     task = BinarySecurityTask(
         id="t1",
@@ -28584,6 +28640,7 @@ TaskManagerTests.test_prepare_retry_failed_items_reconciles_affected_stages_in_s
 TaskManagerTests.test_finalize_retry_failed_items_reconciles_stages_before_task_layer_decision = _test_finalize_retry_failed_items_reconciles_stages_before_task_layer_decision
 TaskManagerTests.test_retry_stage_full_cleanup_reconciles_affected_stages_in_session = _test_retry_stage_full_cleanup_reconciles_affected_stages_in_session
 TaskManagerTests.test_requeue_task_after_retry_operation_uses_resume_decision = _test_requeue_task_after_retry_operation_uses_resume_decision
+TaskManagerTests.test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry = _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry
 TaskManagerTests.test_archive_input_repair_uses_resume_decision = _test_archive_input_repair_uses_resume_decision
 TaskManagerTests.test_run_task_operation_steps_requeue_uses_resume_decision = _test_run_task_operation_steps_requeue_uses_resume_decision
 TaskManagerTests.test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision = _test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision
