@@ -32965,6 +32965,133 @@ def _test_compact_stage_success_items_delegates_to_dataflow_handler(self):
     self.assertEqual("dataflow_results", handler.called[2])
 
 
+def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source-task",
+        status="success",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        task_key_source="schedule_dispatch",
+        root_task_key_id="584",
+        root_task_key_name="dispatch-root-key",
+        root_task_key_prefix="rtk",
+    )
+    task.summary = {
+        "runtime_task_keys": {
+            "root_task_key_secret": "root-secret-1",
+            "root_task_key_id": "584",
+            "root_task_key_name": "dispatch-root-key",
+            "root_task_key_prefix": "rtk",
+            "task_key_source": "schedule_dispatch",
+        }
+    }
+    item = BinarySecurityStageItem(
+        id="si-1",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id="sr-1",
+        stage_name="system_analysis",
+        item_key="source_project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id=None,
+    )
+    item.payload = {
+        "downstream_agent_task_key_id": "585",
+        "downstream_agent_task_key_name": "system_analyse-si-1",
+        "downstream_agent_task_key_prefix": "wsk",
+        "downstream_key_source": "schedule_dispatch",
+    }
+    created = BinarySecurityEvent(
+        id="evt-work-key-created-1",
+        task_id="t1",
+        project_id="p1",
+        event_type="downstream_work_key_created",
+        message="created",
+        payload={
+            "stage_item_id": "si-1",
+            "stage_name": "system_analysis",
+            "service": "system_analyse",
+            "agent_task_key_id": "585",
+            "agent_task_key_prefix": "wsk",
+            "agent_task_key_source": "schedule_dispatch",
+        },
+    )
+    duplicate = BinarySecurityEvent(
+        id="evt-work-key-created-2",
+        task_id="t1",
+        project_id="p1",
+        event_type="downstream_work_key_created",
+        message="created-duplicate",
+        payload={
+            "stage_item_id": "si-1",
+            "stage_name": "system_analysis",
+            "service": "system_analyse",
+            "agent_task_key_id": "585",
+            "agent_task_key_prefix": "wsk",
+            "agent_task_key_source": "schedule_dispatch",
+        },
+    )
+    child_retry = BinarySecurityEvent(
+        id="evt-child-retry",
+        task_id="t1",
+        project_id="p1",
+        event_type="child_task_retry_accepted",
+        message="retry accepted",
+        payload={
+            "parent_stage_item_id": "si-1",
+            "downstream_task_id": "sat-1",
+        },
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[created, duplicate, child_retry])
+
+    detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+    self.assertEqual("dispatch-root-key", detail.root_task_key_name)
+    self.assertTrue(detail.task_key_snapshot.root_task_key.used)
+    self.assertTrue(detail.task_key_snapshot.root_task_key.has_secret)
+    self.assertEqual("schedule_dispatch", detail.task_key_snapshot.root_task_key.source)
+    self.assertEqual(1, len(detail.task_key_snapshot.work_keys))
+    work_key = detail.task_key_snapshot.work_keys[0]
+    self.assertEqual("system_analysis", work_key.stage_name)
+    self.assertEqual("system_analyse", work_key.service)
+    self.assertEqual("si-1", work_key.stage_item_id)
+    self.assertEqual("source_project", work_key.stage_item_key)
+    self.assertEqual("sat-1", work_key.downstream_task_id)
+    self.assertEqual("585", work_key.agent_task_key_id)
+    self.assertEqual("system_analyse-si-1", work_key.agent_task_key_name)
+    self.assertEqual("wsk", work_key.agent_task_key_prefix)
+    self.assertTrue(work_key.has_secret)
+    self.assertNotIn("root-secret-1", json.dumps(detail.model_dump(mode="json"), ensure_ascii=False))
+
+
+def _test_get_task_detail_task_key_snapshot_reports_unused_without_keys(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary-task",
+        status="pending",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[], events=[])
+
+    detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+    self.assertFalse(detail.has_root_task_key)
+    self.assertFalse(detail.task_key_snapshot.root_task_key.used)
+    self.assertFalse(detail.task_key_snapshot.root_task_key.has_secret)
+    self.assertEqual([], detail.task_key_snapshot.work_keys)
+
+
 TaskManagerTests.test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings = _test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings
 TaskManagerTests.test_tail_stage_work_summary_keeps_replacement_binding_active = _test_tail_stage_work_summary_keeps_replacement_binding_active
 TaskManagerTests.test_tail_stage_work_summary_keeps_transport_error_binding_active = _test_tail_stage_work_summary_keeps_transport_error_binding_active
@@ -32983,6 +33110,8 @@ TaskManagerTests.test_descendant_stages_for_stage_delegates_to_handler = _test_d
 TaskManagerTests.test_reconcile_stage_domain_in_session_delegates_to_entry_handler_refresh = _test_reconcile_stage_domain_in_session_delegates_to_entry_handler_refresh
 TaskManagerTests.test_archive_apply_repaired_stage_refresh_delegates_to_binary_to_source_handler = _test_archive_apply_repaired_stage_refresh_delegates_to_binary_to_source_handler
 TaskManagerTests.test_compact_stage_success_items_delegates_to_dataflow_handler = _test_compact_stage_success_items_delegates_to_dataflow_handler
+TaskManagerTests.test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets = _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets
+TaskManagerTests.test_get_task_detail_task_key_snapshot_reports_unused_without_keys = _test_get_task_detail_task_key_snapshot_reports_unused_without_keys
 
 
 if __name__ == "__main__":

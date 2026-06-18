@@ -142,14 +142,17 @@ from app.schemas import (
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskEventResponse,
+    BinarySecurityTaskKeySnapshot,
     BinarySecurityTaskListResponse,
     BinarySecurityTaskOperationPageResponse,
     BinarySecurityTaskOperationResponse,
     BinarySecurityTaskPolicyUpdatePayload,
+    BinarySecurityRootTaskKeySnapshot,
     BinarySecurityTaskRuntimePolicyUpdatePayload,
     BinarySecurityTaskResponse,
     BinarySecurityTimelineResponse,
     BinarySecurityUploadCompletePayload,
+    BinarySecurityWorkKeySnapshot,
 )
 
 _GLOBAL_BINARY_SECURITY_CONFIG_PROJECT_ID = "__global__"

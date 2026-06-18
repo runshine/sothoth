@@ -549,6 +549,34 @@ class BinarySecurityRuntimeHealthResponse(BaseModel):
     units: list[BinarySecurityRuntimeHealthUnit] = Field(default_factory=list)
 
 
+class BinarySecurityRootTaskKeySnapshot(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    prefix: Optional[str] = None
+    source: Optional[str] = None
+    has_secret: bool = False
+    used: bool = False
+
+
+class BinarySecurityWorkKeySnapshot(BaseModel):
+    stage_name: Optional[str] = None
+    service: Optional[str] = None
+    stage_item_id: Optional[str] = None
+    stage_item_key: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    agent_task_key_id: Optional[str] = None
+    agent_task_key_name: Optional[str] = None
+    agent_task_key_prefix: Optional[str] = None
+    agent_task_key_source: Optional[str] = None
+    has_secret: bool = False
+    created_at: Optional[datetime] = None
+
+
+class BinarySecurityTaskKeySnapshot(BaseModel):
+    root_task_key: BinarySecurityRootTaskKeySnapshot = Field(default_factory=BinarySecurityRootTaskKeySnapshot)
+    work_keys: list[BinarySecurityWorkKeySnapshot] = Field(default_factory=list)
+
+
 class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     description: Optional[str] = None
     output_root: str
@@ -569,8 +597,10 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     abnormal_reason_history: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
     task_key_source: Optional[str] = None
     root_task_key_id: Optional[str] = None
+    root_task_key_name: Optional[str] = None
     root_task_key_prefix: Optional[str] = None
     has_root_task_key: bool = False
+    task_key_snapshot: BinarySecurityTaskKeySnapshot = Field(default_factory=BinarySecurityTaskKeySnapshot)
 
 
 class BinarySecurityStageItemPageResponse(BaseModel):

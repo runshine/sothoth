@@ -211,6 +211,180 @@ class TaskReadModelServiceMixin:
             },
         }
 
+    def _runtime_task_keys_snapshot(self: TaskManager, task) -> dict[str, Any]:
+        summary_payload = task.summary if isinstance(task.summary, dict) else {}
+        runtime_task_keys = summary_payload.get("runtime_task_keys")
+        return runtime_task_keys if isinstance(runtime_task_keys, dict) else {}
+
+    def _task_summary_for_detail_response(self: TaskManager, task) -> dict[str, Any]:
+        summary_payload = copy.deepcopy(task.summary if isinstance(task.summary, dict) else {})
+        runtime_task_keys = summary_payload.get("runtime_task_keys")
+        if isinstance(runtime_task_keys, dict):
+            runtime_task_keys.pop("root_task_key_secret", None)
+        return summary_payload
+
+    def _build_task_key_snapshot(self: TaskManager, db: Session, task):
+        from app.service import task_manager as task_manager_module
+
+        runtime_task_keys = self._runtime_task_keys_snapshot(task)
+        root_task_key_id = str(
+            getattr(task, "root_task_key_id", "") or runtime_task_keys.get("root_task_key_id") or ""
+        ).strip() or None
+        root_task_key_name = str(
+            getattr(task, "root_task_key_name", "") or runtime_task_keys.get("root_task_key_name") or ""
+        ).strip() or None
+        root_task_key_prefix = str(
+            getattr(task, "root_task_key_prefix", "") or runtime_task_keys.get("root_task_key_prefix") or ""
+        ).strip() or None
+        root_task_key_source = str(
+            getattr(task, "task_key_source", "") or runtime_task_keys.get("task_key_source") or ""
+        ).strip() or None
+        root_task_key_has_secret = bool(self._root_task_key_secret(task))
+        root_task_key_used = bool(
+            root_task_key_has_secret
+            or root_task_key_id
+            or root_task_key_name
+            or root_task_key_prefix
+            or root_task_key_source
+        )
+
+        created_rows = (
+            db.query(task_manager_module.BinarySecurityEvent)
+            .filter(
+                task_manager_module.BinarySecurityEvent.task_id == task.id,
+                task_manager_module.BinarySecurityEvent.event_type == "downstream_work_key_created",
+            )
+            .order_by(
+                task_manager_module.BinarySecurityEvent.created_at.asc(),
+                task_manager_module.BinarySecurityEvent.id.asc(),
+            )
+            .all()
+        )
+        item_ids: set[str] = set()
+        for event in created_rows:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            stage_item_id = str(payload.get("stage_item_id") or event.item_id or "").strip()
+            if stage_item_id:
+                item_ids.add(stage_item_id)
+
+        stage_items_by_id: dict[str, Any] = {}
+        if item_ids:
+            stage_item_rows = (
+                db.query(task_manager_module.BinarySecurityStageItem)
+                .options(
+                    load_only(
+                        task_manager_module.BinarySecurityStageItem.id,
+                        task_manager_module.BinarySecurityStageItem.item_key,
+                        task_manager_module.BinarySecurityStageItem.downstream_task_id,
+                        task_manager_module.BinarySecurityStageItem.payload_json,
+                    )
+                )
+                .filter(task_manager_module.BinarySecurityStageItem.id.in_(list(item_ids)))
+                .all()
+            )
+            stage_items_by_id = {str(getattr(item, "id", "") or ""): item for item in stage_item_rows}
+
+        downstream_task_ids_by_item: dict[str, str] = {}
+        supplemental_rows = (
+            db.query(task_manager_module.BinarySecurityEvent)
+            .filter(
+                task_manager_module.BinarySecurityEvent.task_id == task.id,
+                task_manager_module.BinarySecurityEvent.event_type.in_(
+                    ["downstream_create_with_agent_task_key", "child_task_retry_accepted"]
+                ),
+            )
+            .order_by(
+                task_manager_module.BinarySecurityEvent.created_at.asc(),
+                task_manager_module.BinarySecurityEvent.id.asc(),
+            )
+            .all()
+        )
+        for event in supplemental_rows:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            stage_item_id = str(
+                payload.get("stage_item_id")
+                or payload.get("parent_stage_item_id")
+                or event.item_id
+                or ""
+            ).strip()
+            downstream_task_id = str(
+                payload.get("downstream_task_id")
+                or payload.get("task_id")
+                or ""
+            ).strip()
+            if stage_item_id and downstream_task_id and not downstream_task_ids_by_item.get(stage_item_id):
+                downstream_task_ids_by_item[stage_item_id] = downstream_task_id
+
+        work_keys: list[Any] = []
+        seen_work_key_dedupe: set[tuple[str, str, str]] = set()
+        for event in created_rows:
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            stage_item_id = str(payload.get("stage_item_id") or event.item_id or "").strip()
+            service = str(payload.get("service") or "").strip() or None
+            agent_task_key_id = str(payload.get("agent_task_key_id") or "").strip() or None
+            dedupe_key = (stage_item_id, service or "", agent_task_key_id or "")
+            if dedupe_key in seen_work_key_dedupe:
+                continue
+            seen_work_key_dedupe.add(dedupe_key)
+
+            stage_item = stage_items_by_id.get(stage_item_id)
+            stage_item_payload = stage_item.payload if stage_item is not None and isinstance(stage_item.payload, dict) else {}
+            work_key_name = str(
+                stage_item_payload.get("downstream_agent_task_key_name")
+                or payload.get("agent_task_key_name")
+                or ""
+            ).strip() or None
+            work_key_prefix = str(
+                payload.get("agent_task_key_prefix")
+                or stage_item_payload.get("downstream_agent_task_key_prefix")
+                or ""
+            ).strip() or None
+            work_key_source = str(
+                payload.get("agent_task_key_source")
+                or stage_item_payload.get("downstream_key_source")
+                or ""
+            ).strip() or None
+            downstream_task_id = None
+            if stage_item is not None:
+                downstream_task_id = str(getattr(stage_item, "downstream_task_id", "") or "").strip() or None
+            if not downstream_task_id:
+                downstream_task_id = downstream_task_ids_by_item.get(stage_item_id)
+            work_key_has_secret = bool(
+                agent_task_key_id
+                or stage_item_payload.get("downstream_agent_task_key_id")
+                or stage_item_payload.get("downstream_agent_task_key_name")
+            )
+
+            work_keys.append(
+                task_manager_module.BinarySecurityWorkKeySnapshot(
+                    stage_name=str(payload.get("stage_name") or event.stage_name or "").strip() or None,
+                    service=service,
+                    stage_item_id=stage_item_id or None,
+                    stage_item_key=(
+                        str(getattr(stage_item, "item_key", "") or "").strip() or None if stage_item is not None else None
+                    ),
+                    downstream_task_id=downstream_task_id,
+                    agent_task_key_id=agent_task_key_id,
+                    agent_task_key_name=work_key_name,
+                    agent_task_key_prefix=work_key_prefix,
+                    agent_task_key_source=work_key_source,
+                    has_secret=work_key_has_secret,
+                    created_at=event.created_at,
+                )
+            )
+
+        return task_manager_module.BinarySecurityTaskKeySnapshot(
+            root_task_key=task_manager_module.BinarySecurityRootTaskKeySnapshot(
+                id=root_task_key_id,
+                name=root_task_key_name,
+                prefix=root_task_key_prefix,
+                source=root_task_key_source,
+                has_secret=root_task_key_has_secret,
+                used=root_task_key_used,
+            ),
+            work_keys=work_keys,
+        )
+
     def _stage_item_downstream_summary(
         self: TaskManager,
         item,
