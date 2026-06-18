@@ -154,6 +154,8 @@ class VulnVerifyWorker:
                 output_dir = Path(task.output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
                 _sync_llm_providers_before_task()
+                session_dir = output_dir.parent / "run"
+                session_dir.mkdir(parents=True, exist_ok=True)
                 stdout_path = output_dir / "service.stdout"
                 stderr_path = output_dir / "service.stderr"
                 cmd = [
@@ -164,16 +166,18 @@ class VulnVerifyWorker:
                     task.reports_dir,
                     "--source-root",
                     task.source_root,
-                    "--binary-root",
-                    task.binary_root,
-                    "--threat",
-                    task.threat_path,
                     "--output",
                     task.output_dir,
+                    "--session-dir",
+                    str(session_dir),
                     "-j",
                     str(int(task.concurrency or 1)),
                     "-v",
                 ]
+                if task.binary_root:
+                    cmd.extend(["--binary-root", task.binary_root])
+                if task.threat_path:
+                    cmd.extend(["--threat", task.threat_path])
                 if task.model:
                     cmd.extend(["--model", task.model])
                 if task.resume:

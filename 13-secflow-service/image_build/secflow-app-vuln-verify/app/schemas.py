@@ -17,8 +17,8 @@ class TaskCreate(BaseModel):
     description: str | None = None
     reports_dir: str
     source_root: str
-    binary_root: str
-    threat_path: str
+    binary_root: str | None = None
+    threat_path: str | None = None
     model: str | None = None
     concurrency: int | None = Field(default=None, ge=1, le=64)
     resume: bool = False
@@ -33,8 +33,8 @@ class TaskResponse(BaseModel):
     status: str
     reports_dir: str
     source_root: str
-    binary_root: str
-    threat_path: str
+    binary_root: str | None = None
+    threat_path: str | None = None
     output_dir: str
     model: str | None = None
     concurrency: int

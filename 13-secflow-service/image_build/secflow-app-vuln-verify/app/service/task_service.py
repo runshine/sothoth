@@ -139,8 +139,8 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
 
     reports_dir = ensure_path_in_project(project_id, req.reports_dir, must_be_dir=True)
     source_root = ensure_path_in_project(project_id, req.source_root, must_be_dir=True)
-    binary_root = ensure_path_in_project(project_id, req.binary_root, must_be_dir=True)
-    threat_path = ensure_path_in_project(project_id, req.threat_path, must_be_file=True)
+    binary_root = ensure_path_in_project(project_id, req.binary_root, must_be_dir=True) if req.binary_root else None
+    threat_path = ensure_path_in_project(project_id, req.threat_path, must_be_file=True) if req.threat_path else None
     output_dir = safe_output_dir(project_id, task_id)
 
     requested_model = str(req.model or "").strip() or None
@@ -156,8 +156,8 @@ async def create_task(db: Session, project_id: str, req: TaskCreate, operator: T
         status="pending",
         reports_dir=str(reports_dir),
         source_root=str(source_root),
-        binary_root=str(binary_root),
-        threat_path=str(threat_path),
+        binary_root=str(binary_root) if binary_root else None,
+        threat_path=str(threat_path) if threat_path else None,
         output_dir=str(output_dir),
         model=resolved_model,
         concurrency=_normalize_concurrency(req.concurrency),
