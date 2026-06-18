@@ -3433,11 +3433,12 @@ class TaskReadModelServiceMixin:
         cache_group: str,
         project_id: str,
         task_type: str | None,
+        pipeline_profile: str | None,
         ttl_seconds: float,
         loader,
         fallback,
     ):
-        cache_key = (cache_group, project_id, str(task_type or "all"))
+        cache_key = (cache_group, project_id, str(task_type or "all"), str(pipeline_profile or "all"))
         now_ts = time.monotonic()
         with self._task_list_cache_lock:
             cached = self._task_list_cache.get(cache_key)

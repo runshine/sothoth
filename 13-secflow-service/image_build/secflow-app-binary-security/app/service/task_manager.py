@@ -5382,6 +5382,7 @@ class TaskManager(
         *,
         project_id: str,
         task_type: str | None = None,
+        pipeline_profile: str | None = None,
     ) -> BinarySecurityProjectStats:
         base_query = db.query(BinarySecurityTask).filter(BinarySecurityTask.project_id == project_id)
         normalized_task_type = self._validate_task_type(task_type) if task_type else None
@@ -5395,6 +5396,8 @@ class TaskManager(
                 )
             else:
                 base_query = base_query.filter(BinarySecurityTask.task_type == normalized_task_type)
+        if pipeline_profile and normalized_task_type == TASK_TYPE_SOURCE:
+            base_query = self._apply_pipeline_profile_filter(base_query, pipeline_profile)
         active_statuses = (
             "pending",
             "dispatching",
@@ -5539,9 +5542,12 @@ class TaskManager(
         *,
         project_id: str,
         task_type: str | None = None,
+        pipeline_profile: str | None = None,
     ) -> list[BinarySecurityProjectStageAggregate]:
         normalized_task_type = self._validate_task_type(task_type) if task_type else None
-        if normalized_task_type:
+        if normalized_task_type == TASK_TYPE_SOURCE and pipeline_profile:
+            stage_sequence = list(TASK_PIPELINE_PROFILE_SEQUENCES.get((TASK_TYPE_SOURCE, pipeline_profile), TASK_STAGE_SEQUENCES[TASK_TYPE_SOURCE]))
+        elif normalized_task_type:
             stage_sequence = list(TASK_STAGE_SEQUENCES.get(normalized_task_type, STAGE_SEQUENCE))
         else:
             stage_sequence = list(TASK_STAGE_SEQUENCES[TASK_TYPE_BINARY])
@@ -5562,6 +5568,26 @@ class TaskManager(
                 )
             else:
                 task_join_filters.append(BinarySecurityTask.task_type == normalized_task_type)
+        if pipeline_profile and normalized_task_type == TASK_TYPE_SOURCE:
+            compact_like = f'%"pipeline_profile":"{pipeline_profile}"%'
+            spaced_like = f'%"pipeline_profile": "{pipeline_profile}"%'
+            if pipeline_profile == PIPELINE_PROFILE_DEFAULT:
+                task_join_filters.append(
+                    or_(
+                        BinarySecurityTask.policy_json.is_(None),
+                        BinarySecurityTask.policy_json == "",
+                        ~BinarySecurityTask.policy_json.like('%"pipeline_profile"%'),
+                        BinarySecurityTask.policy_json.like(compact_like),
+                        BinarySecurityTask.policy_json.like(spaced_like),
+                    )
+                )
+            else:
+                task_join_filters.append(
+                    or_(
+                        BinarySecurityTask.policy_json.like(compact_like),
+                        BinarySecurityTask.policy_json.like(spaced_like),
+                    )
+                )
 
         def _safe_all(query, section: str):
             try:

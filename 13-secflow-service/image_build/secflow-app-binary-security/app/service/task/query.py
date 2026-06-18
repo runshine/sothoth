@@ -10,7 +10,16 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session, load_only
 
 from app.exception import NotFoundError
-from app.model import BinarySecurityArchiveJob, BinarySecurityEvent, BinarySecurityStageItem, BinarySecurityTask, normalize_stage_name
+from app.model import (
+    PIPELINE_PROFILE_DEFAULT,
+    PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+    TASK_TYPE_SOURCE,
+    BinarySecurityArchiveJob,
+    BinarySecurityEvent,
+    BinarySecurityStageItem,
+    BinarySecurityTask,
+    normalize_stage_name,
+)
 from app.observability import observe_task_list_query, observe_task_list_query_stage
 from app.schemas import (
     BinarySecurityActionResponse,
@@ -41,6 +50,7 @@ class TaskQueryServiceMixin:
         project_id: str,
         status: str | None = None,
         task_type: str | None = None,
+        pipeline_profile: str | None = None,
         search: str | None = None,
         sort_by: str = "created_at",
         sort_order: str = "desc",
@@ -49,6 +59,11 @@ class TaskQueryServiceMixin:
     ) -> BinarySecurityTaskListResponse:
         started = time.perf_counter()
         normalized_task_type = self._validate_task_type(task_type) if task_type else None
+        normalized_pipeline_profile = (
+            self._validate_pipeline_profile(normalized_task_type or TASK_TYPE_SOURCE, pipeline_profile)
+            if pipeline_profile
+            else None
+        )
         metrics_task_type = normalized_task_type or "all"
         result = "success"
         stage_durations: dict[str, float] = {}
@@ -65,6 +80,8 @@ class TaskQueryServiceMixin:
                     )
                 else:
                     base_query = base_query.filter(BinarySecurityTask.task_type == normalized_task_type)
+            if normalized_pipeline_profile and normalized_task_type == TASK_TYPE_SOURCE:
+                base_query = self._apply_pipeline_profile_filter(base_query, normalized_pipeline_profile)
             observe_task_list_query_stage(
                 stage="build_base_query",
                 task_type=metrics_task_type,
@@ -144,6 +161,7 @@ class TaskQueryServiceMixin:
                 cache_group="queue_info",
                 project_id=project_id,
                 task_type=normalized_task_type,
+                pipeline_profile=normalized_pipeline_profile,
                 ttl_seconds=3.0,
                 loader=lambda: self._build_queue_info(db, project_id=project_id),
                 fallback={"running_count": 0, "queued_count": 0, "pending_positions": {}, "last_reconcile_at": None},
@@ -169,8 +187,14 @@ class TaskQueryServiceMixin:
                 cache_group="project_stats",
                 project_id=project_id,
                 task_type=normalized_task_type,
+                pipeline_profile=normalized_pipeline_profile,
                 ttl_seconds=5.0,
-                loader=lambda: self._build_project_stats_sql(db, project_id=project_id, task_type=normalized_task_type),
+                loader=lambda: self._build_project_stats_sql(
+                    db,
+                    project_id=project_id,
+                    task_type=normalized_task_type,
+                    pipeline_profile=normalized_pipeline_profile,
+                ),
                 fallback=BinarySecurityProjectStats(total=0),
             )
             observe_task_list_query_stage(
@@ -185,11 +209,13 @@ class TaskQueryServiceMixin:
                 cache_group="project_stage_aggregates",
                 project_id=project_id,
                 task_type=normalized_task_type,
+                pipeline_profile=normalized_pipeline_profile,
                 ttl_seconds=5.0,
                 loader=lambda: self._build_project_stage_aggregates_sql(
                     db,
                     project_id=project_id,
                     task_type=normalized_task_type,
+                    pipeline_profile=normalized_pipeline_profile,
                 ),
                 fallback=[],
             )
@@ -266,6 +292,28 @@ class TaskQueryServiceMixin:
                 task_type=metrics_task_type,
                 duration_seconds=total_duration,
             )
+
+    def _apply_pipeline_profile_filter(self: TaskManager, query, pipeline_profile: str):
+        compact_like = f'%"pipeline_profile":"{pipeline_profile}"%'
+        spaced_like = f'%"pipeline_profile": "{pipeline_profile}"%'
+        if pipeline_profile == PIPELINE_PROFILE_DEFAULT:
+            return query.filter(
+                or_(
+                    BinarySecurityTask.policy_json.is_(None),
+                    BinarySecurityTask.policy_json == "",
+                    ~BinarySecurityTask.policy_json.like('%"pipeline_profile"%'),
+                    BinarySecurityTask.policy_json.like(compact_like),
+                    BinarySecurityTask.policy_json.like(spaced_like),
+                )
+            )
+        if pipeline_profile == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return query.filter(
+                or_(
+                    BinarySecurityTask.policy_json.like(compact_like),
+                    BinarySecurityTask.policy_json.like(spaced_like),
+                )
+            )
+        return query
 
     def get_task_detail(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
         def _build() -> BinarySecurityTaskDetailResponse:
