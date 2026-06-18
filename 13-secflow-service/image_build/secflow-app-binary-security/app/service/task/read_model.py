@@ -2068,6 +2068,11 @@ class TaskReadModelServiceMixin:
         operation_lock_heartbeat_at: datetime | None,
     ) -> list[dict[str, Any]]:
         worker_handle = self._workers.get(task_id)
+        operation_handle = None
+        for candidate in self._operation_workers.values():
+            if candidate is not None and not candidate.done():
+                operation_handle = candidate
+                break
         cards = [
             {
                 "card_key": "local_task_runtime",
@@ -2089,7 +2094,14 @@ class TaskReadModelServiceMixin:
                     {"label": "local_worker_alive", "value": str(local_worker_alive).lower()},
                     {"label": "worker_handle_present", "value": str(worker_handle is not None).lower()},
                     {"label": "worker_done", "value": None if worker_handle is None else str(worker_handle.done()).lower()},
+                    {"label": "worker_cancel_requested", "value": None if worker_handle is None else str(bool(worker_handle.cancel_requested)).lower()},
+                    {"label": "worker_execution_token", "value": None if worker_handle is None else worker_handle.execution_token},
+                    {"label": "worker_lease_owner_instance_id", "value": None if worker_handle is None else worker_handle.lease_owner_instance_id},
+                    {"label": "worker_claimed_at", "value": None if worker_handle is None else task_shared._isoformat_or_none(worker_handle.claimed_at)},
+                    {"label": "worker_last_progress_at", "value": None if worker_handle is None else task_shared._isoformat_or_none(worker_handle.last_progress_at)},
+                    {"label": "runner_task_name", "value": None if worker_handle is None else worker_handle.runner_task.get_name()},
                     {"label": "heartbeat_task_present", "value": None if worker_handle is None else str(worker_handle.heartbeat_task is not None).lower()},
+                    {"label": "heartbeat_task_name", "value": None if worker_handle is None or worker_handle.heartbeat_task is None else worker_handle.heartbeat_task.get_name()},
                     {"label": "heartbeat_task_done", "value": None if worker_handle is None or worker_handle.heartbeat_task is None else str(worker_handle.heartbeat_task.done()).lower()},
                     {"label": "local_owner", "value": str(has_local_owner).lower()},
                     {"label": "local_owner_count", "value": str(owner_count)},
@@ -2151,6 +2163,9 @@ class TaskReadModelServiceMixin:
                 ),
                 "rows": [
                     {"label": "local_operation_alive", "value": str(local_operation_alive).lower()},
+                    {"label": "operation_handle_present", "value": str(operation_handle is not None).lower()},
+                    {"label": "operation_handle_name", "value": None if operation_handle is None else operation_handle.get_name()},
+                    {"label": "operation_handle_done", "value": None if operation_handle is None else str(operation_handle.done()).lower()},
                     {"label": "operation_lock_owner", "value": operation_lock_owner},
                     {"label": "operation_lock_heartbeat_at", "value": task_shared._isoformat_or_none(operation_lock_heartbeat_at)},
                     {"label": "operation_worker_handles", "value": str(len(self._operation_workers))},

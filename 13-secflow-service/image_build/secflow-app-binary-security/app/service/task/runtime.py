@@ -172,8 +172,35 @@ class TaskRuntimeServiceMixin:
                     if task_id:
                         claimed_id = self._dispatch_task_by_id(db, task_id)
                         if claimed_id:
+                            task = (
+                                db.query(task_manager_module.BinarySecurityTask)
+                                .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
+                                .first()
+                            )
+                            task_manager_module.logger.info(
+                                "binary-security dispatch claimed task and is attempting runtime start: "
+                                "task_id=%s queue_task_id=%s status=%s runtime_phase=%s dispatcher_instance_id=%s "
+                                "current_operation_id=%s lease_expires_at=%s",
+                                claimed_id,
+                                task_id,
+                                str(getattr(task, "status", "") or "").strip() if task is not None else "",
+                                str(self._task_runtime_phase(task)) if task is not None else "",
+                                str(getattr(task, "dispatcher_instance_id", "") or "").strip() if task is not None else "",
+                                str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else "",
+                                task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None))
+                                if task is not None
+                                else None,
+                            )
                             started = await self._start_task_runtime(claimed_id)
-                            if not started:
+                            if started:
+                                task_manager_module.logger.info(
+                                    "binary-security dispatch successfully handed task to local runtime: "
+                                    "task_id=%s queue_task_id=%s local_handle_present=%s",
+                                    claimed_id,
+                                    task_id,
+                                    self._runtime_handle(claimed_id) is not None,
+                                )
+                            else:
                                 task = (
                                     db.query(task_manager_module.BinarySecurityTask)
                                     .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
@@ -1049,8 +1076,41 @@ class TaskRuntimeServiceMixin:
                     },
                 )
             db.commit()
+            task_manager_module.logger.info(
+                "binary-security run_task committed active execution state: "
+                "task_id=%s status=%s runtime_phase=%s current_operation_id=%s execution_token=%s",
+                task_id,
+                str(task.status or "").strip(),
+                self._task_runtime_phase(task),
+                str(getattr(task, "current_operation_id", "") or "").strip(),
+                execution_token,
+            )
+            operation_passes = 0
             while await self._run_current_task_operation(task_id):
-                pass
+                operation_passes += 1
+                task_manager_module.logger.info(
+                    "binary-security run_task consumed task operation pass: task_id=%s passes=%s",
+                    task_id,
+                    operation_passes,
+                )
+            verification_db = session_factory()
+            try:
+                task_after_operation = (
+                    verification_db.query(task_manager_module.BinarySecurityTask)
+                    .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                    .first()
+                )
+                if task_after_operation is not None and str(getattr(task_after_operation, "current_operation_id", "") or "").strip():
+                    task_manager_module.logger.warning(
+                        "binary-security run_task stopped consuming task operations while current_operation_id is still present: "
+                        "task_id=%s current_operation_id=%s status=%s runtime_phase=%s",
+                        task_id,
+                        str(getattr(task_after_operation, "current_operation_id", "") or "").strip(),
+                        str(getattr(task_after_operation, "status", "") or "").strip(),
+                        self._task_runtime_phase(task_after_operation),
+                    )
+            finally:
+                verification_db.close()
             while await self._run_task_runtime_signals(task_id):
                 pass
             await self._execute_task(task_id)

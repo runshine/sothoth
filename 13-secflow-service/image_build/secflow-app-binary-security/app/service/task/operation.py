@@ -2263,8 +2263,23 @@ class TaskOperationServiceMixin:
                 return False
             self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            task_manager_module.logger.info(
+                "binary-security task owner evaluating current operation: "
+                "task_id=%s current_operation_id=%s status=%s runtime_phase=%s dispatcher_instance_id=%s",
+                task_id,
+                current_operation_id or None,
+                str(getattr(task, "status", "") or "").strip(),
+                self._task_runtime_phase(task),
+                str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+            )
             if not current_operation_id:
                 if self._repair_active_operations_for_task(db, task):
+                    task_manager_module.logger.warning(
+                        "binary-security task owner repaired active operation binding before execution: "
+                        "task_id=%s repaired_current_operation_id=%s",
+                        task_id,
+                        str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    )
                     db.commit()
                     return True
                 return False
@@ -2274,11 +2289,24 @@ class TaskOperationServiceMixin:
                 .first()
             )
             if operation is None:
+                task_manager_module.logger.warning(
+                    "binary-security task owner found dangling current_operation_id and cleared it: "
+                    "task_id=%s current_operation_id=%s",
+                    task_id,
+                    current_operation_id,
+                )
                 task.current_operation_id = None
                 db.commit()
                 return False
             if str(getattr(operation, "status", "") or "").strip().lower() in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
                 if str(getattr(task, "current_operation_id", "") or "").strip() == operation.id:
+                    task_manager_module.logger.info(
+                        "binary-security task owner observed terminal operation and cleared binding: "
+                        "task_id=%s operation_id=%s operation_status=%s",
+                        task_id,
+                        operation.id,
+                        str(getattr(operation, "status", "") or "").strip().lower(),
+                    )
                     task.current_operation_id = None
                     db.commit()
                 return False
@@ -2302,6 +2330,15 @@ class TaskOperationServiceMixin:
                     payload={"source": "task_owner"},
                 )
             db.commit()
+            task_manager_module.logger.info(
+                "binary-security task owner started operation execution: "
+                "task_id=%s operation_id=%s operation_type=%s operation_status=%s current_step=%s",
+                task_id,
+                operation.id,
+                str(operation.operation_type or "").strip(),
+                str(operation.status or "").strip(),
+                str(getattr(operation, "current_step", "") or "").strip() or None,
+            )
 
             await self._run_task_operation_steps(db, task, operation)
             self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
@@ -2336,10 +2373,24 @@ class TaskOperationServiceMixin:
                         payload={"source": "task_owner"},
                     )
             db.commit()
+            task_manager_module.logger.info(
+                "binary-security task owner finished operation execution: "
+                "task_id=%s operation_id=%s operation_type=%s final_status=%s current_step=%s",
+                task_id,
+                operation.id,
+                str(operation.operation_type or "").strip(),
+                str(operation.status or "").strip(),
+                str(getattr(operation, "current_step", "") or "").strip() or None,
+            )
             task_manager_module.observe_control_operation(operation_type, "succeeded")
             return True
         except Exception as exc:
             db.rollback()
+            task_manager_module.logger.exception(
+                "binary-security task owner operation execution crashed: task_id=%s current_operation_id=%s",
+                task_id,
+                str(current_operation_id if "current_operation_id" in locals() else "") or None,
+            )
             operation = (
                 db.query(task_manager_module.BinarySecurityTaskOperation)
                 .filter(task_manager_module.BinarySecurityTaskOperation.id == str(current_operation_id if 'current_operation_id' in locals() else ""))
