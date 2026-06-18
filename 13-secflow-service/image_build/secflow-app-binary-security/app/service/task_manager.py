@@ -2006,6 +2006,45 @@ class TaskManager(
             return True
         return self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
 
+    def _task_row_owner_is_runtime_supported(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> bool:
+        if task is None:
+            return False
+        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if current_status not in {"dispatching", "running"}:
+            return True
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if not dispatcher_instance_id:
+            return True
+        if dispatcher_instance_id == str(self.instance_id or "").strip():
+            return self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
+        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
+        if (
+            self._runtime_lease_is_active(lease)
+            and str(getattr(lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+        ):
+            return True
+        if current_status == "dispatching":
+            return False
+        operation = active_operation
+        if operation is None:
+            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            if current_operation_id:
+                operation = (
+                    db.query(BinarySecurityTaskOperation)
+                    .filter(BinarySecurityTaskOperation.id == current_operation_id)
+                    .first()
+                )
+        operation_status = str(getattr(operation, "status", "") or "").strip().lower() if operation is not None else ""
+        if operation_status in TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        return True
+
     def _release_unsupported_task_row_owner(
         self,
         db: Session,
@@ -2014,10 +2053,11 @@ class TaskManager(
         active_operation=None,
         reason: str,
     ) -> bool:
-        if self._task_row_owner_is_supported_locally(task, active_operation=active_operation):
+        if self._task_row_owner_is_runtime_supported(db, task, active_operation=active_operation):
             return False
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
+        previous_dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
         if previous_status == "running":
             task.status = "pending"
         elif previous_status == "dispatching":
@@ -2027,7 +2067,7 @@ class TaskManager(
         task.lease_expires_at = None
         task.finished_at = None
         task.last_error = None
-        self._clear_runtime_lease(db, task.id, owner_instance_id=self.instance_id)
+        self._clear_runtime_lease(db, task.id, owner_instance_id=previous_dispatcher_instance_id)
         self._record_event(
             db,
             task,
@@ -2039,7 +2079,8 @@ class TaskManager(
                 "reason": reason,
                 "previous_status": previous_status,
                 "current_operation_id": current_operation_id,
-                "dispatcher_instance_id": str(self.instance_id or "").strip() or None,
+                "previous_dispatcher_instance_id": previous_dispatcher_instance_id,
+                "released_by_instance_id": str(self.instance_id or "").strip() or None,
             },
         )
         return True

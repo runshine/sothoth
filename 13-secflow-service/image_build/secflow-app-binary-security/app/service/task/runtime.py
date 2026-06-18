@@ -396,6 +396,26 @@ class TaskRuntimeServiceMixin:
                     str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
                     str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
                 )
+            if not self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation):
+                task_manager_module.logger.warning(
+                    "binary-security dispatch observed active owner inbox work but task row owner is unsupported and will be reclaimed: "
+                    "task_id=%s status=%s runtime_phase=%s current_operation_id=%s operation_status=%s dispatcher_instance_id=%s",
+                    task_id,
+                    current_status,
+                    self._task_runtime_phase(task),
+                    current_operation_id,
+                    str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                )
+                if self._release_unsupported_task_row_owner(
+                    db,
+                    task,
+                    active_operation=current_operation,
+                    reason="dispatch_attempt_with_unsupported_foreign_owner",
+                ):
+                    db.commit()
+                    self._enqueue_task(task.id)
+                return None
         if (
             self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._tail_requires_execution_takeover(db, task)
