@@ -35,7 +35,7 @@ class TaskOperationServiceMixin:
     @staticmethod
     def _cancel_target_observation_status(payload: dict[str, Any] | None) -> str:
         status = str((payload or {}).get("status") or "").strip().lower()
-        if status == "succeeded":
+        if status in {"succeeded", "passed", "completed", "complete", "done"}:
             return "success"
         if status in {"success", "failed", "cancelled", "missing", "downstream_missing", "running", "pending", "queued", "dispatching"}:
             return status
@@ -138,7 +138,37 @@ class TaskOperationServiceMixin:
 
     @staticmethod
     def _cancel_target_is_terminal(status: str | None) -> bool:
-        return str(status or "").strip().lower() in {"success", "failed", "cancelled", "missing", "downstream_missing"}
+        return str(status or "").strip().lower() in {
+            "success",
+            "failed",
+            "cancelled",
+            "missing",
+            "downstream_missing",
+            "passed",
+            "completed",
+            "complete",
+            "done",
+        }
+
+    async def _request_local_worker_cancel(
+        self: TaskManager,
+        task_id: str,
+        *,
+        wait_for_runner: bool,
+    ) -> None:
+        async with self._worker_lock:
+            handle = self._workers.get(task_id)
+        if handle is None or handle.done():
+            return
+        handle.cancel()
+        current_task = asyncio.current_task()
+        tasks: list[asyncio.Task] = []
+        if wait_for_runner and handle.runner_task is not current_task:
+            tasks.append(handle.runner_task)
+        if handle.heartbeat_task is not None and handle.heartbeat_task is not current_task:
+            tasks.append(handle.heartbeat_task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _find_retry_created_child_payload(
         self: TaskManager,
@@ -1821,7 +1851,7 @@ class TaskOperationServiceMixin:
             Path(task.workspace_root) / "input" / "task-metadata.json",
             status=task_manager_module.TASK_STATUS_CANCELLING,
         )
-        await self._cancel_local_worker(task.id)
+        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
         for item in running_items:
             if str(item.downstream_task_id or "").strip():
                 await self._cancel_downstream(item, token)
@@ -1857,10 +1887,27 @@ class TaskOperationServiceMixin:
         downstream_refs = self._dedupe_downstream_refs(
             self._collect_downstream_refs(task, stage_items) + self._discover_parent_linked_downstream_refs(db, task)
         )
-        await self._cancel_local_worker(task.id)
+        task_manager_module.logger.info(
+            "binary-security prepare_delete_task starting cleanup: task_id=%s stage_item_count=%s downstream_ref_count=%s force_delete=%s",
+            task.id,
+            len(stage_items),
+            len(downstream_refs),
+            force_delete,
+        )
+        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
         if downstream_refs:
             with suppress(Exception):
+                task_manager_module.logger.info(
+                    "binary-security prepare_delete_task requesting downstream cancellation: task_id=%s downstream_ref_count=%s",
+                    task.id,
+                    len(downstream_refs),
+                )
                 await self._cancel_downstream_refs(db, task, downstream_refs, token)
+            task_manager_module.logger.info(
+                "binary-security prepare_delete_task requesting downstream deletion: task_id=%s downstream_ref_count=%s",
+                task.id,
+                len(downstream_refs),
+            )
             await self._delete_downstream_refs(
                 db,
                 task,
@@ -1868,6 +1915,11 @@ class TaskOperationServiceMixin:
                 token,
                 force_delete=force_delete,
                 cleanup_scope="task_delete",
+            )
+            task_manager_module.logger.info(
+                "binary-security prepare_delete_task downstream cleanup returned: task_id=%s cleanup_result_count=%s",
+                task.id,
+                len(list(getattr(self, "_last_downstream_cleanup_results", []) or [])),
             )
 
         downstream_cleanup_results = [

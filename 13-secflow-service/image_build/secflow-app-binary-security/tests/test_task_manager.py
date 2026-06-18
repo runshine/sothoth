@@ -9174,11 +9174,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         async def fake_write_task_metadata_async(*args, **kwargs):
             return None
 
-        async def fake_cancel_local_worker(task_id: str):
-            cancelled.append(task_id)
+        async def fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
+            cancelled.append(f"{task_id}:{wait_for_runner}")
 
         self.manager._write_task_metadata_async = fake_write_task_metadata_async
-        self.manager._cancel_local_worker = fake_cancel_local_worker
+        self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
 
         response = asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
 
@@ -9190,7 +9190,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_cancel_accepted", event_types)
         asyncio.run(self.manager._prepare_cancel_task(db, task))
 
-        self.assertEqual(["t1"], cancelled)
+        self.assertEqual(["t1:False"], cancelled)
         self.assertEqual("cancelling", task.status)
         self.assertEqual("cancelled", stage_run.status)
         self.assertEqual("cancelled", item.status)
@@ -9779,6 +9779,37 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._cancel_target_observation_status({"status": "succeeded"}),
         )
 
+    def test_cancel_target_observation_status_treats_passed_as_success(self):
+        self.assertEqual(
+            "success",
+            self.manager._cancel_target_observation_status({"status": "passed"}),
+        )
+
+    def test_request_local_worker_cancel_skips_waiting_on_current_runner_task(self):
+        async def _run():
+            current = asyncio.current_task()
+            heartbeat = asyncio.create_task(asyncio.sleep(3600), name="hb")
+            try:
+                handle = task_manager_module.TaskRuntimeHandle(
+                    task_id="t1",
+                    runner_task=current,
+                    heartbeat_task=heartbeat,
+                    claimed_at=_now(),
+                    execution_token="tok",
+                    lease_owner_instance_id="worker-1",
+                )
+                self.manager._workers["t1"] = handle
+                await asyncio.wait_for(
+                    self.manager._request_local_worker_cancel("t1", wait_for_runner=False),
+                    timeout=1,
+                )
+                self.assertTrue(handle.cancel_requested)
+            finally:
+                self.manager._workers.pop("t1", None)
+                heartbeat.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await heartbeat
+
     def test_run_cancel_operation_steps_treats_succeeded_downstream_as_terminal(self):
         task = BinarySecurityTask(
             id="t1",
@@ -9835,6 +9866,77 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         async def fake_fetch_child_ref_payload(ref, token):
             del ref, token
             return {"status": "succeeded"}
+
+        controller = self.manager._downstream_tasks()
+        original_write = self.manager._write_task_metadata_async
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        try:
+            with patch.object(controller, "fetch_child_ref_payload", side_effect=fake_fetch_child_ref_payload):
+                asyncio.run(self.manager._run_cancel_operation_steps(db, task, operation, "verify_downstream_quiesced"))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("cancelled", task.status)
+        self.assertEqual(0, self.manager._cancel_state_from_operation(task, operation)["targets_blocking"])
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("task_cancel_succeeded", event_types)
+
+    def test_run_cancel_operation_steps_treats_passed_downstream_as_terminal(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="source_project",
+            status="cancelled",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="system_analysis",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "system_analysis",
+                    "item_id": "si1",
+                    "item_key": "source_project",
+                    "downstream_service": "system_analyse",
+                    "downstream_task_id": "sat-1",
+                    "project_id": "p1",
+                    "blocking": True,
+                    "cancel_request_status": "requested",
+                    "terminal_observation_status": "unknown",
+                }
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], operations=[operation])
+        db.expire_all = lambda: None
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_fetch_child_ref_payload(ref, token):
+            del ref, token
+            return {"task_id": "sat-1", "status": "passed"}
 
         controller = self.manager._downstream_tasks()
         original_write = self.manager._write_task_metadata_async
@@ -25243,7 +25345,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         async def _run():
             with (
-                patch.object(self.manager, "_cancel_local_worker", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_request_local_worker_cancel", unittest.mock.AsyncMock()) as cancel_mock,
                 patch.object(self.manager, "_cancel_downstream_refs", unittest.mock.AsyncMock()),
                 patch.object(self.manager, "_delete_downstream_refs", unittest.mock.AsyncMock(return_value=0)),
                 patch.object(self.manager, "_cleanup_task_workspace", unittest.mock.AsyncMock(return_value="partial_failed")),
@@ -25251,6 +25353,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             ):
                 with self.assertRaises(ValidationError):
                     await self.manager._prepare_delete_task(db, task)
+                cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
 
         asyncio.run(_run())
 
@@ -25332,7 +25435,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         async def _run():
             with (
-                patch.object(self.manager, "_cancel_local_worker", unittest.mock.AsyncMock()),
+                patch.object(self.manager, "_request_local_worker_cancel", unittest.mock.AsyncMock()) as cancel_mock,
                 patch.object(self.manager, "_cancel_downstream_refs", unittest.mock.AsyncMock()),
                 patch.object(self.manager, "_delete_downstream_refs", unittest.mock.AsyncMock(return_value=0)) as delete_mock,
                 patch.object(self.manager, "_cleanup_task_workspace", unittest.mock.AsyncMock(return_value="deleted")),
@@ -25340,6 +25443,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             ):
                 await self.manager._prepare_delete_task(db, task)
                 self.assertTrue(delete_mock.await_args.kwargs.get("force_delete"))
+                cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
 
         asyncio.run(_run())
 
@@ -25386,7 +25490,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         async def _run():
             with (
-                patch.object(self.manager, "_cancel_local_worker", AsyncMock()),
+                patch.object(self.manager, "_request_local_worker_cancel", AsyncMock()) as cancel_mock,
                 patch.object(self.manager, "_cancel_downstream_refs", AsyncMock()),
                 patch.object(
                     self.manager,
@@ -25416,6 +25520,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                     ],
                 )
                 await self.manager._prepare_delete_task(db, task)
+                cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
 
         asyncio.run(_run())
 
