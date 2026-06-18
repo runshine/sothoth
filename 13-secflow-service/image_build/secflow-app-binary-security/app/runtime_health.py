@@ -77,7 +77,7 @@ def _scheduler_readiness() -> tuple[bool, dict[str, Any]]:
         return True, {"enabled": False, "running": False, "loops": loops, "loop_details": loop_details}
 
     running = bool(runtime.get("running"))
-    required_loops = ("task_dispatch", "operation_dispatch", "archive_dispatch", "stage_item_dispatch", "task_heartbeat")
+    required_loops = ("task_dispatch", "archive_dispatch", "stage_item_dispatch")
     missing = [loop_name for loop_name in required_loops if not _loop_ready(loop_name, runtime)]
     return running and not missing, {
         "enabled": True,
@@ -97,16 +97,16 @@ def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
         return True, {"enabled": False, "running": False, "loops": loops, "loop_details": loop_details}
 
     running = bool(runtime.get("running"))
-    required_loops = ("state_reducer", "reducer_metrics_snapshot", "task_heartbeat")
+    required_loops = ("state_reducer", "reducer_metrics_snapshot")
     missing = [loop_name for loop_name in required_loops if not _loop_ready(loop_name, runtime)]
-    lease_capable = bool(runtime.get("tail_reconcile_active"))
+    lease_capable = bool(runtime.get("lease_auditor_active", runtime.get("tail_reconcile_active")))
     return running and not missing and lease_capable, {
         "enabled": True,
         "running": running,
         "loops": loops,
         "loop_details": loop_details,
         "missing_loops": missing,
-        "tail_reconcile_active": lease_capable,
+        "lease_auditor_active": lease_capable,
     }
 
 

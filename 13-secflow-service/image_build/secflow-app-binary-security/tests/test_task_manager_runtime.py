@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 from datetime import timedelta
+from contextlib import suppress
 from unittest.mock import patch
 
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -9,6 +11,7 @@ from app.model import (
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityTask,
+    BinarySecurityTaskOperation,
     BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
@@ -66,14 +69,8 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.assertEqual(
             {
                 "task_dispatch": True,
-                "operation_dispatch": True,
                 "archive_dispatch": False,
                 "stage_item_dispatch": True,
-                "downstream_reconcile": True,
-                "stage_item_sync_reconcile": False,
-                "archive_runtime_reconcile": False,
-                "state_repair_reconcile": False,
-                "readless_reconcile": True,
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
             },
@@ -88,15 +85,15 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
             def done(self):
                 return False
 
-        self.manager._operation_loop_task = _Task()
+        self.manager._archive_loop_task = _Task()
         self.manager.cfg.scheduler.worker_ready_loop_stale_seconds = 30
         self.manager.cfg.queue.block_timeout_seconds = 5
-        self.manager._loop_heartbeats["operation_dispatch"] = _now() - timedelta(seconds=60)
+        self.manager._loop_heartbeats["archive_dispatch"] = _now() - timedelta(seconds=60)
 
         status = self.manager.runtime_status()
 
-        self.assertTrue(status["loops"]["operation_dispatch"])
-        self.assertTrue(status["loop_details"]["operation_dispatch"]["stale"])
+        self.assertTrue(status["loops"]["archive_dispatch"])
+        self.assertTrue(status["loop_details"]["archive_dispatch"]["stale"])
 
     def test_runtime_status_uses_recent_heartbeat_when_task_handle_is_done(self):
         self.manager._running = True
@@ -105,16 +102,16 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
             def done(self):
                 return True
 
-        self.manager._operation_loop_task = _Task()
+        self.manager._archive_loop_task = _Task()
         self.manager.cfg.scheduler.worker_ready_loop_stale_seconds = 30
-        self.manager._loop_heartbeats["operation_dispatch"] = _now()
+        self.manager._loop_heartbeats["archive_dispatch"] = _now()
 
         status = self.manager.runtime_status()
 
-        self.assertTrue(status["loops"]["operation_dispatch"])
-        self.assertFalse(status["loop_details"]["operation_dispatch"]["stale"])
-        self.assertFalse(status["loop_details"]["operation_dispatch"]["task_running"])
-        self.assertTrue(status["loop_details"]["operation_dispatch"]["heartbeat_alive"])
+        self.assertTrue(status["loops"]["archive_dispatch"])
+        self.assertFalse(status["loop_details"]["archive_dispatch"]["stale"])
+        self.assertFalse(status["loop_details"]["archive_dispatch"]["task_running"])
+        self.assertTrue(status["loop_details"]["archive_dispatch"]["heartbeat_alive"])
 
     def test_runtime_status_marks_tail_reconcile_capable_for_live_reducer_loops(self):
         self.manager._running = True
@@ -134,14 +131,92 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
         self.assertTrue(status["tail_reconcile_active"])
 
-    def test_operation_lease_uses_short_configured_ttl(self):
-        self.manager.cfg.scheduler.operation_lease_ttl_seconds = 60
+    def test_task_operation_lock_uses_short_configured_ttl(self):
+        self.manager.cfg.scheduler.task_operation_lock_ttl_seconds = 60
         now_value = _now()
-        expires_at = self.manager._operation_lease_expires_at(now_value=now_value)
+        expires_at = self.manager._task_operation_lock_expires_at(now_value=now_value)
         self.assertEqual(60, int((expires_at - now_value).total_seconds()))
 
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_task_runtime_creates_runner_and_heartbeat_handle(self):
+        manager = TaskManager()
+        started: list[str] = []
+        heartbeat_started = asyncio.Event()
+
+        async def _run_task(task_id):
+            started.append(f"runner:{task_id}")
+            await asyncio.sleep(0)
+
+        async def _run_heartbeat(task_id):
+            started.append(f"heartbeat:{task_id}")
+            heartbeat_started.set()
+            await asyncio.sleep(3600)
+
+        manager._run_task = _run_task
+        manager._run_task_heartbeat = _run_heartbeat
+
+        created = await manager._start_task_runtime("task-1")
+        self.assertTrue(created)
+        await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+
+        handle = manager._workers.get("task-1")
+        self.assertIsNotNone(handle)
+        self.assertIsNotNone(handle.runner_task)
+        self.assertIsNotNone(handle.heartbeat_task)
+        self.assertIn("runner:task-1", started)
+        self.assertIn("heartbeat:task-1", started)
+
+        handle.cancel()
+        await asyncio.gather(handle.runner_task, handle.heartbeat_task, return_exceptions=True)
+        manager._workers.pop("task-1", None)
+
+    async def test_run_task_finally_cancels_paired_heartbeat(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        heartbeat_cancelled = asyncio.Event()
+
+        async def _heartbeat():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                heartbeat_cancelled.set()
+                raise
+
+        manager._workers["task-1"] = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=asyncio.current_task(),
+            heartbeat_task=asyncio.create_task(_heartbeat()),
+            claimed_at=_now(),
+            execution_token=None,
+            lease_owner_instance_id="worker-a",
+        )
+        manager._run_current_task_operation = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._run_task_runtime_signals = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._execute_task = lambda *_args, **_kwargs: asyncio.sleep(0)
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            with suppress(asyncio.CancelledError):
+                await manager._run_task("task-1")
+
+        self.assertTrue(heartbeat_cancelled.is_set())
+        self.assertNotIn("task-1", manager._workers)
+
     def test_recover_loop_db_error_disposes_engine_for_operational_and_timeout_errors(self):
         manager = TaskManager()
 
@@ -237,34 +312,362 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["called", "called"], reconcile_calls)
         logger_exception.assert_not_called()
 
-    async def test_operation_dispatch_loop_does_not_log_crash_for_redis_timeout_empty_poll(self):
+    async def test_run_current_task_operation_repairs_missing_binding_to_latest_active_operation(self):
         manager = TaskManager()
-        manager._running = True
-        manager.cfg.queue.enabled = True
-        manager.cfg.queue.block_timeout_seconds = 1
-        pop_calls = []
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        older = BinarySecurityTaskOperation(
+            id="op-old",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="continue",
+            target_stage="system_analysis",
+            status="accepted",
+            created_at=_now() - timedelta(minutes=2),
+            updated_at=_now() - timedelta(minutes=2),
+        )
+        newer = BinarySecurityTaskOperation(
+            id="op-new",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="retry_stage_full",
+            target_stage="system_analysis",
+            status="queued",
+            created_at=_now() - timedelta(minutes=1),
+            updated_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[older, newer], events=[])
 
-        class _Queue:
-            async def pop_operation(self, _timeout_seconds):
-                pop_calls.append("called")
-                if len(pop_calls) == 1:
-                    return None
-                manager._running = False
-                return None
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            repaired = await manager._run_current_task_operation(task.id)
 
-        async def _observe(_db):
+        self.assertTrue(repaired)
+        self.assertEqual("op-new", task.current_operation_id)
+        self.assertEqual("superseded", older.status)
+        self.assertEqual("op-new", older.superseded_by_operation_id)
+        self.assertIn("task_operation_binding_repaired", [event.event_type for event in db.events])
+
+    async def test_run_task_runtime_signals_consumes_pending_tail_finalize(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-tail",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        task.summary = {
+            "runtime_workset": {
+                "pending_tail_finalize": {
+                    "requested_at": _now().isoformat(),
+                    "source": "task_owner",
+                    "reason": "finalize_requested",
+                }
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], events=[])
+        finalized = []
+
+        def _finalize(_db, _task):
+            finalized.append(_task.id)
+            _task.status = "success"
+
+        manager._finalize_task = _finalize
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            changed = await manager._run_task_runtime_signals(task.id)
+
+        self.assertTrue(changed)
+        self.assertEqual(["task-tail"], finalized)
+        self.assertEqual({}, task.summary.get("runtime_workset") or {})
+
+    async def test_operation_progress_heartbeat_keeps_legacy_operation_lease_fields_cleared(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="retry_stage_full",
+            target_stage="system_analysis",
+            status="running",
+            current_step="prepare",
+        )
+
+        class _Db:
+            def __init__(self):
+                self.commits = 0
+
+            def commit(self):
+                self.commits += 1
+
+        db = _Db()
+
+        await manager._operation_progress_heartbeat(
+            db,
+            task,
+            operation,
+            step_name="prepare",
+            payload={"phase": "resume"},
+        )
+
+        self.assertEqual(1, db.commits)
+        self.assertEqual("running", operation.step_payload["prepare"]["status"])
+
+    async def test_run_task_runtime_signals_repairs_replacement_binding_by_marking_binding_cleared(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-bind",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        task.summary = {
+            "runtime_workset": {
+                "pending_binding_repair": {
+                    "requested_at": _now().isoformat(),
+                    "source": "lease_auditor_signal",
+                    "reason": "replacement_repair",
+                }
+            }
+        }
+        item = BinarySecurityStageItem(
+            id="item-bind",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            item_key="module-a",
+            downstream_service="entry_analyse",
+            downstream_task_id="child-old",
+            result={
+                "sync_observation": {
+                    "replacement_in_progress": True,
+                    "binding_cleared": False,
+                    "verification_status": "pending",
+                    "old_downstream_task_id": "child-old",
+                }
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            changed = await manager._run_task_runtime_signals(task.id)
+
+        self.assertTrue(changed)
+        state = manager._replacement_in_progress_state(item)
+        self.assertTrue(state["replacement_in_progress"])
+        self.assertTrue(state["binding_cleared"])
+        self.assertEqual("pending", state["verification_status"])
+        self.assertEqual({}, task.summary.get("runtime_workset") or {})
+
+    async def test_run_task_runtime_signals_repairs_replacement_binding_by_clearing_stale_flag_after_new_child_bound(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-bind-new",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        task.summary = {
+            "runtime_workset": {
+                "pending_binding_repair": {
+                    "requested_at": _now().isoformat(),
+                    "source": "lease_auditor_signal",
+                    "reason": "replacement_repair",
+                }
+            }
+        }
+        item = BinarySecurityStageItem(
+            id="item-bind-new",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            item_key="module-b",
+            downstream_service="entry_analyse",
+            downstream_task_id="child-new",
+            result={
+                "sync_observation": {
+                    "replacement_in_progress": True,
+                    "binding_cleared": False,
+                    "verification_status": "pending",
+                    "old_downstream_task_id": "child-old",
+                }
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            changed = await manager._run_task_runtime_signals(task.id)
+
+        self.assertTrue(changed)
+        state = manager._replacement_in_progress_state(item)
+        self.assertFalse(state["replacement_in_progress"])
+        self.assertFalse(state["binding_cleared"])
+        self.assertIsNone(state["verification_status"])
+        self.assertEqual({}, task.summary.get("runtime_workset") or {})
+
+    async def test_run_task_runtime_signals_consumes_archive_rebuild_before_tail_finalize(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-archive-first",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        task.summary = {
+            "runtime_workset": {
+                "pending_archive_rebuild": {
+                    "requested_at": _now().isoformat(),
+                    "source": "lease_auditor_signal",
+                    "reason": "stale_running_archive_job",
+                    "stage_name": "system_analysis",
+                },
+                "pending_tail_finalize": {
+                    "requested_at": _now().isoformat(),
+                    "source": "task_owner",
+                    "reason": "finalize_requested",
+                },
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], events=[])
+        rebuilt = []
+        finalized = []
+
+        async def _prepare_archive_retry_full(_db, _task, stage_name):
+            rebuilt.append(stage_name)
+            return [stage_name]
+
+        def _finalize(_db, _task):
+            finalized.append(_task.id)
+
+        manager._prepare_archive_retry_full = _prepare_archive_retry_full
+        manager._finalize_task = _finalize
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            first = await manager._run_task_runtime_signals(task.id)
+            second = await manager._run_task_runtime_signals(task.id)
+
+        self.assertTrue(first)
+        self.assertTrue(second)
+        self.assertEqual(["system_analysis"], rebuilt)
+        self.assertEqual(["task-archive-first"], finalized)
+        self.assertEqual({}, task.summary.get("runtime_workset") or {})
+
+    async def test_run_task_processes_operation_before_runtime_signals(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-order",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+            dispatch_started_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        order = []
+
+        async def _run_current_task_operation(_task_id):
+            order.append("operation")
+            if order.count("operation") == 1:
+                return True
+            return False
+
+        async def _run_task_runtime_signals(_task_id):
+            order.append("signal")
+            if order.count("signal") == 1:
+                return True
+            return False
+
+        async def _execute_task(_task_id):
+            order.append("execute")
             return None
 
-        manager._observe_runtime_metrics = _observe
-        manager._requeue_stale_operations = lambda _db: False
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
 
-        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()), patch(
-            "app.service.task_manager.logger.exception"
-        ) as logger_exception:
-            await manager._operation_dispatch_loop()
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task(task.id)
 
-        self.assertEqual(["called", "called"], pop_calls)
-        logger_exception.assert_not_called()
+        self.assertEqual(["operation", "operation", "signal", "signal", "execute"], order)
 
 
 class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
@@ -744,7 +1147,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _snapshot():
             return {
                 "task_queue": {"length": 2, "oldest_age_seconds": 11.0},
-                "operation_queue": {"length": 3, "oldest_age_seconds": 7.0},
+                "operation_queue": {"length": 0, "oldest_age_seconds": 0.0, "enabled": 0},
             }
 
         collected = []
@@ -781,7 +1184,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         observe_slot_usage.assert_called_once()
         self.assertEqual(10, observe_slot_usage.call_args.kwargs["task_capacity"])
         self.assertEqual(1, observe_slot_usage.call_args.kwargs["task_active"])
-        self.assertEqual(1, observe_slot_usage.call_args.kwargs["action_active"])
+        self.assertEqual(0, observe_slot_usage.call_args.kwargs["action_active"])
 
     async def test_claim_state_event_returns_none_on_retryable_lock_conflict(self):
         manager = TaskManager()

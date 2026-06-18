@@ -187,11 +187,6 @@ class BinarySecurityTaskResponse(BaseModel):
     tail_has_downstream_refs: bool = False
     tail_takeover_required: bool = False
     tail_takeover_reason: Optional[str] = None
-    reconcile_owner_instance_id: Optional[str] = None
-    reconcile_lease_expires_at: Optional[datetime] = None
-    reconcile_owner_pod_uid: Optional[str] = None
-    reconcile_owner_boot_id: Optional[str] = None
-    reconcile_generation: Optional[int] = None
     runtime_override_version: int = 0
     runtime_override_updated_at: Optional[datetime] = None
     runtime_override_updated_by: Optional[str] = None
@@ -253,9 +248,8 @@ class BinarySecurityTaskOperationResponse(BaseModel):
     request_source: Optional[str] = None
     status: str
     operation_token: str
-    owner_instance_id: Optional[str] = None
-    claim_lease_expires_at: Optional[datetime] = None
-    heartbeat_at: Optional[datetime] = None
+    execution_model: str = "task_owner_inbox"
+    owner_model: str = "task_lease_owner"
     request_payload: dict[str, Any] = Field(default_factory=dict)
     result_payload: dict[str, Any] = Field(default_factory=dict)
     error_code: Optional[str] = None

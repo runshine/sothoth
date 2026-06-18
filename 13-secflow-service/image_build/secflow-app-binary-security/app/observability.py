@@ -352,9 +352,9 @@ STAGE_DURATION_SECONDS = Histogram(
     labelnames=("stage", "result"),
     buckets=(0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800, 3600),
 )
-AI_ROLE_COUNT = Gauge(
-    "secflow_binary_security_ai_role_count",
-    "Aggregated AI-oriented orchestration role counts.",
+RUNTIME_ROLE_COUNT = Gauge(
+    "secflow_binary_security_runtime_role_count",
+    "Aggregated owner-only orchestration runtime role counts.",
     labelnames=("role",),
 )
 AI_ROUND_TOTAL = Counter(
@@ -738,8 +738,15 @@ def observe_auth_token_cache(*, result: str, entries: int | None = None) -> None
         AUTH_TOKEN_CACHE_ENTRIES.set(max(0, int(entries)))
 
 
-def observe_worker_counts(*, task_workers: int, operation_workers: int, archive_workers: int) -> None:
+def observe_worker_counts(
+    *,
+    task_workers: int,
+    operation_workers: int,
+    archive_workers: int,
+    task_heartbeat_workers: int = 0,
+) -> None:
     ACTIVE_WORKERS.labels(kind="task").set(max(0, int(task_workers)))
+    ACTIVE_WORKERS.labels(kind="task_heartbeat").set(max(0, int(task_heartbeat_workers)))
     ACTIVE_WORKERS.labels(kind="operation").set(max(0, int(operation_workers)))
     ACTIVE_WORKERS.labels(kind="archive").set(max(0, int(archive_workers)))
 
@@ -753,25 +760,24 @@ def observe_queue_depths(
     archive_applying_jobs: int,
     reconcile_candidates: int,
     redis_task_queue: int = 0,
-    redis_operation_queue: int = 0,
     leased_tasks: int = 0,
     task_queue_oldest_age_seconds: float | None = None,
-    operation_queue_oldest_age_seconds: float | None = None,
 ) -> None:
     QUEUE_DEPTH.labels(queue="task_pending").set(max(0, int(pending_tasks)))
     QUEUE_DEPTH.labels(queue="task_running").set(max(0, int(running_tasks)))
     QUEUE_DEPTH.labels(queue="task_queued").set(max(0, int(redis_task_queue)))
-    QUEUE_DEPTH.labels(queue="operation_queued").set(max(0, int(redis_operation_queue)))
     QUEUE_DEPTH.labels(queue="task_leased").set(max(0, int(leased_tasks)))
     QUEUE_DEPTH.labels(queue="archive_pending").set(max(0, int(archive_pending_jobs)))
     QUEUE_DEPTH.labels(queue="archive_running").set(max(0, int(archive_running_jobs)))
     QUEUE_DEPTH.labels(queue="archive_applying").set(max(0, int(archive_applying_jobs)))
     QUEUE_DEPTH.labels(queue="downstream_reconcile_candidates").set(max(0, int(reconcile_candidates)))
     QUEUE_AGE_SECONDS.labels(queue="task_queued").set(max(0.0, float(task_queue_oldest_age_seconds or 0.0)))
-    QUEUE_AGE_SECONDS.labels(queue="operation_queued").set(max(0.0, float(operation_queue_oldest_age_seconds or 0.0)))
-    AI_ROLE_COUNT.labels(role="agent").set(max(0, int(running_tasks)))
-    AI_ROLE_COUNT.labels(role="worker").set(max(0, int(redis_operation_queue)))
-    AI_ROLE_COUNT.labels(role="advisor").set(max(0, int(reconcile_candidates)))
+    RUNTIME_ROLE_COUNT.labels(role="task_owner").set(max(0, int(running_tasks)))
+    try:
+        RUNTIME_ROLE_COUNT.remove("worker")
+    except KeyError:
+        pass
+    RUNTIME_ROLE_COUNT.labels(role="lease_auditor").set(max(0, int(reconcile_candidates)))
 
 
 def observe_slot_usage(*, task_active: int, task_capacity: int, action_active: int, action_capacity: int) -> None:

@@ -1736,7 +1736,6 @@ class TaskReadModelServiceMixin:
         lease_owner, lease_expires_at, lease_source, lease_pod_uid, lease_boot_id, lease_generation = self._task_runtime_lease_view(db, task)
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
-        reconcile_owner, reconcile_lease_expires_at, reconcile_pod_uid, reconcile_boot_id, reconcile_generation = self._reconcile_lease_view(db, task)
         base_policy = self._task_base_policy(task)
         runtime_override = self._task_runtime_override(task)
         effective_runtime_policy = self._effective_runtime_policy(task)
@@ -1819,8 +1818,6 @@ class TaskReadModelServiceMixin:
             tail_has_downstream_refs=bool(tail_summary.get("has_downstream_refs")),
             tail_takeover_required=bool(tail_summary.get("takeover_required")),
             tail_takeover_reason=self._string_or_none(tail_summary.get("takeover_reason")),
-            reconcile_owner_instance_id=reconcile_owner,
-            reconcile_lease_expires_at=reconcile_lease_expires_at,
             runtime_override_version=int(getattr(task, "runtime_override_version", 0) or 0),
             runtime_override_updated_at=getattr(task, "runtime_override_updated_at", None),
             runtime_override_updated_by=getattr(task, "runtime_override_updated_by", None),
@@ -1962,9 +1959,9 @@ class TaskReadModelServiceMixin:
         }
         active_task_statuses = {"pending", "dispatching", "running"}
         heartbeat_interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15))
-        operation_heartbeat_interval_seconds = max(
+        task_operation_lock_heartbeat_interval_seconds = max(
             5,
-            int(getattr(self.cfg.scheduler, "operation_heartbeat_interval_seconds", 15) or 15),
+            int(getattr(self.cfg.scheduler, "task_operation_lock_heartbeat_interval_seconds", 15) or 15),
         )
         worker_stale_seconds = max(
             heartbeat_interval_seconds * 3,
@@ -2227,15 +2224,14 @@ class TaskReadModelServiceMixin:
             )
 
         if active_operation is not None or operation_lock_owner or operation_lock_expires_at:
-            operation_heartbeat = (active_operation.heartbeat_at if active_operation is not None else None) or operation_lock_heartbeat_at
+            operation_heartbeat = operation_lock_heartbeat_at
             operation_age_status = self._runtime_health_age_status(
                 task_shared._elapsed_seconds_since(operation_heartbeat),
-                healthy_threshold_seconds=operation_heartbeat_interval_seconds * 2,
-                degraded_threshold_seconds=max(operation_heartbeat_interval_seconds * 4, worker_stale_seconds),
+                healthy_threshold_seconds=task_operation_lock_heartbeat_interval_seconds * 2,
+                degraded_threshold_seconds=max(task_operation_lock_heartbeat_interval_seconds * 4, worker_stale_seconds),
             )
             local_operation_alive = bool(
                 active_operation is not None
-                and str(active_operation.owner_instance_id or "").strip() == self.instance_id
                 and (worker := self._operation_workers.get(str(active_operation.id or ""))) is not None
                 and not worker.done()
             )
@@ -2250,7 +2246,7 @@ class TaskReadModelServiceMixin:
                     unit_label="任务操作协程 / 锁",
                     unit_kind="operation",
                     status=operation_status,
-                    owner_instance_id=(str(active_operation.owner_instance_id or "").strip() if active_operation is not None else operation_lock_owner) or None,
+                    owner_instance_id=(str(operation_lock_owner or "").strip() if operation_lock_owner else (self.instance_id if local_operation_alive else None)) or None,
                     started_at=active_operation.started_at if active_operation is not None else None,
                     last_heartbeat_at=operation_heartbeat,
                     detail=(f"当前操作类型：{active_operation.operation_type}" if active_operation is not None else "当前存在任务级 operation lock"),
@@ -2576,6 +2572,7 @@ class TaskReadModelServiceMixin:
 
         if active_operation is not None:
             reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
+            task_owner = str(task.dispatcher_instance_id or "").strip() or None
             return {
                 "overall": "in_progress",
                 "summary": reason,
@@ -2585,10 +2582,9 @@ class TaskReadModelServiceMixin:
                 "operation_id": active_operation.id,
                 "operation_type": active_operation.operation_type,
                 "operation_status": active_operation.status,
-                "operation_owner": active_operation.owner_instance_id,
+                "operation_owner": task_owner,
+                "operation_owner_model": "task_lease_owner" if task_owner else "owner_unknown",
                 "operation_started_at": task_shared._isoformat_or_none(active_operation.started_at),
-                "operation_expires_at": task_shared._isoformat_or_none(active_operation.claim_lease_expires_at),
-                "operation_heartbeat_at": task_shared._isoformat_or_none(active_operation.heartbeat_at),
                 "can_cancel": False,
                 "can_continue": False,
                 "can_retry": False,
@@ -2614,8 +2610,7 @@ class TaskReadModelServiceMixin:
             "operation_in_progress": False,
             "operation_type": None,
             "operation_owner": None,
-            "operation_expires_at": None,
-            "operation_heartbeat_at": None,
+            "operation_owner_model": None,
             "can_cancel": False,
             "can_continue": False,
             "can_retry": False,
@@ -2726,6 +2721,7 @@ class TaskReadModelServiceMixin:
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             blocking_reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
+            task_owner = str(task.dispatcher_instance_id or "").strip() or None
             result_payload = dict(active_operation.result_payload or {})
             item_actions = [dict(row) for row in list(result_payload.get("item_actions") or []) if isinstance(row, dict)]
             validation = dict(result_payload.get("validation") or {})
@@ -2756,10 +2752,9 @@ class TaskReadModelServiceMixin:
                 "operation_id": active_operation.id,
                 "operation_type": active_operation.operation_type,
                 "operation_status": active_operation.status,
-                "operation_owner": active_operation.owner_instance_id,
+                "operation_owner": task_owner,
+                "operation_owner_model": "task_lease_owner" if task_owner else "owner_unknown",
                 "operation_started_at": task_shared._isoformat_or_none(active_operation.started_at),
-                "operation_expires_at": task_shared._isoformat_or_none(active_operation.claim_lease_expires_at),
-                "operation_heartbeat_at": task_shared._isoformat_or_none(active_operation.heartbeat_at),
                 "current_step": active_operation.current_step,
                 "target_stage": active_operation.target_stage,
                 "item_actions": item_actions,
@@ -2861,8 +2856,7 @@ class TaskReadModelServiceMixin:
             "operation_in_progress": False,
             "operation_type": None,
             "operation_owner": None,
-            "operation_expires_at": None,
-            "operation_heartbeat_at": None,
+            "operation_owner_model": None,
             "can_cancel": can_cancel,
             "can_continue": can_continue,
             "can_retry": can_retry,
@@ -2922,7 +2916,6 @@ class TaskReadModelServiceMixin:
         del reconcile_pod_uid_unused, reconcile_boot_id_unused, reconcile_generation_unused
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
-        reconcile_owner, reconcile_lease_expires_at, reconcile_pod_uid, reconcile_boot_id, reconcile_generation = self._reconcile_lease_view(db, task)
         base_policy = self._task_base_policy(task)
         runtime_override = self._task_runtime_override(task)
         effective_runtime_policy = self._effective_runtime_policy(task)
@@ -2989,11 +2982,6 @@ class TaskReadModelServiceMixin:
             tail_takeover_required=bool(tail_summary.get("takeover_required")),
             tail_takeover_reason=self._string_or_none(tail_summary.get("takeover_reason")),
             tail_reconcile_state=self._tail_reconcile_state(task),
-            reconcile_owner_instance_id=reconcile_owner,
-            reconcile_lease_expires_at=reconcile_lease_expires_at,
-            reconcile_owner_pod_uid=reconcile_pod_uid,
-            reconcile_owner_boot_id=reconcile_boot_id,
-            reconcile_generation=reconcile_generation,
             runtime_override_version=int(getattr(task, "runtime_override_version", 0) or 0),
             runtime_override_updated_at=getattr(task, "runtime_override_updated_at", None),
             runtime_override_updated_by=getattr(task, "runtime_override_updated_by", None),

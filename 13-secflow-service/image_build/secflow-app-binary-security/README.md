@@ -1,6 +1,6 @@
 # secflow-app-binary-security
 
-Release note: 2026-06-18 compatibility sweep for task manager helper facades and worker/reducer runtime recovery.
+Release note: 2026-06-18 owner-only runtime final compatibility cleanup for task-owner inbox execution and per-task heartbeat ownership.
 
 统一的二进制软件包安全编排微服务，负责按固定阶段顺序调用：
 

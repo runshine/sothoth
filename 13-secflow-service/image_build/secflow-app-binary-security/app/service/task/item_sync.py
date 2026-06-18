@@ -1188,6 +1188,12 @@ class TaskItemSyncServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        ownership_required = bool(
+            str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+            or self._lease_is_active(task, db=db)
+        )
+        if apply_state and ownership_required:
+            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
         if (
             self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._is_reducer_role()
@@ -1362,6 +1368,8 @@ class TaskItemSyncServiceMixin:
                 if exc is not None:
                     raise exc
                 assert isinstance(payload, dict)
+                if observed_apply_state and ownership_required:
+                    self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
                 if item.downstream_service == "entry_analyse":
                     payload, rebound_notice_payload = await self._reconcile_entry_payload_binding(task, item, payload, auth_token)
                     if rebound_notice_payload is not None:
@@ -1410,34 +1418,52 @@ class TaskItemSyncServiceMixin:
                         continue
                     binding_mismatch_count += 1
                     skipped_count += 1
-                    self._record_binding_mismatch_event(
-                        db,
-                        task,
-                        item,
-                        event_type="stale_downstream_payload_ignored",
-                        message="旧 child 的下游状态已忽略，不再回写当前阶段项",
-                        payload=self._binding_mismatch_payload(
-                            source="downstream_sync",
-                            expected_downstream_task_id=self._current_downstream_task_id(item),
-                            actual_downstream_task_id=self._payload_downstream_task_id(payload),
-                            payload_downstream_task_id=self._payload_downstream_task_id(payload),
-                        ),
+                    mismatch_payload = self._binding_mismatch_payload(
+                        source="task_owner",
+                        expected_downstream_task_id=self._current_downstream_task_id(item),
+                        actual_downstream_task_id=self._payload_downstream_task_id(payload),
+                        current_downstream_task_id=self._current_downstream_task_id(item),
+                        payload_downstream_task_id=self._payload_downstream_task_id(payload),
+                        replacement_state=replacement_state,
                     )
-                    if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]:
-                        self._record_event(
+                    if self._replacement_window_active_for_stale_ignore(item):
+                        self._record_binding_mismatch_event(
                             db,
                             task,
-                            "stale_downstream_terminal_ignored",
-                            "旧 child 终态在重建切换期间晚到，已忽略",
-                            stage_name=item.stage_name,
-                            item=item,
-                            level="warning",
+                            item,
+                            event_type="stale_downstream_payload_ignored",
+                            message="旧 child 的下游状态已忽略，不再回写当前阶段项",
                             payload={
-                                "downstream_service": item.downstream_service,
-                                "current_downstream_task_id": self._current_downstream_task_id(item),
-                                "payload_downstream_task_id": self._payload_downstream_task_id(payload),
-                                "superseded": True,
+                                **mismatch_payload,
+                                "ignored_reason": "replacement_window_active",
                             },
+                        )
+                        payload_status = str(payload.get("status") or "").strip().lower()
+                        payload_mapped_status = self._map_downstream_status(payload_status) or payload_status
+                        if payload_mapped_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+                            self._record_event(
+                                db,
+                                task,
+                                "stale_downstream_terminal_ignored",
+                                "旧 child 终态在重建切换期间晚到，已忽略",
+                                stage_name=item.stage_name,
+                                item=item,
+                                level="warning",
+                                payload={
+                                    **mismatch_payload,
+                                    "downstream_service": item.downstream_service,
+                                    "ignored_reason": "replacement_window_active",
+                                    "superseded": True,
+                                },
+                            )
+                    else:
+                        self._record_binding_mismatch_event(
+                            db,
+                            task,
+                            item,
+                            event_type="downstream_binding_mismatch_detected",
+                            message="下游状态来自非 authoritative child，本次仅记录绑定不匹配观测",
+                            payload=mismatch_payload,
                         )
                     continue
                 downstream_status = str(payload.get("status") or "").lower()
@@ -2706,6 +2732,17 @@ class TaskItemSyncServiceMixin:
                 payload={
                     "tail_control_mode": "execution_takeover",
                     "reason": takeover_reason,
+                },
+            )
+            self._merge_task_runtime_signal(
+                task,
+                "pending_operation_repair",
+                source="lease_auditor_signal",
+                reason="tail_execution_takeover_required",
+                stage_name=str(task.current_stage or "").strip() or None,
+                extra={
+                    "tail_control_mode": "execution_takeover",
+                    "takeover_reason": takeover_reason,
                 },
             )
             session.commit()

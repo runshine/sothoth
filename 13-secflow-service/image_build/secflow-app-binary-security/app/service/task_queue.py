@@ -52,24 +52,6 @@ class TaskQueue:
             if not injected_client:
                 await self._close_client(client)
 
-    async def push_operation(self, operation_id: str) -> None:
-        client = self._new_client()
-        injected_client = self._client is client
-        try:
-            await self._push_unique(client, self.config.operation_queue_key, str(operation_id))
-        finally:
-            if not injected_client:
-                await self._close_client(client)
-
-    async def force_requeue_operation(self, operation_id: str) -> None:
-        client = self._new_client()
-        injected_client = self._client is client
-        try:
-            await self._force_requeue(client, self.config.operation_queue_key, str(operation_id))
-        finally:
-            if not injected_client:
-                await self._close_client(client)
-
     async def pop_task(self, timeout_seconds: int | None = None) -> Optional[str]:
         client = self._new_client()
         injected_client = self._client is client
@@ -84,26 +66,6 @@ class TaskQueue:
             except (RedisConnectionError, OSError):
                 return None
             return await self._consume_result(client, self.config.task_queue_key, result)
-        finally:
-            await self._close_client(client)
-            if injected_client:
-                self._client = None
-
-    async def pop_operation(self, timeout_seconds: int | None = None) -> Optional[str]:
-        client = self._new_client()
-        injected_client = self._client is client
-        queue_key = self.config.operation_queue_key
-        try:
-            try:
-                result = await client.blpop(
-                    queue_key,
-                    timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
-                )
-            except RedisTimeoutError:
-                return None
-            except (RedisConnectionError, OSError):
-                return None
-            return await self._consume_result(client, queue_key, result)
         finally:
             await self._close_client(client)
             if injected_client:
@@ -204,13 +166,14 @@ class TaskQueue:
         }
 
     async def snapshot(self) -> dict[str, dict[str, float | int]]:
-        task_queue, operation_queue = await asyncio.gather(
-            self.queue_stats(self.config.task_queue_key),
-            self.queue_stats(self.config.operation_queue_key),
-        )
+        task_queue = await self.queue_stats(self.config.task_queue_key)
         return {
             "task_queue": task_queue,
-            "operation_queue": operation_queue,
+            "operation_queue": {
+                "length": 0,
+                "oldest_age_seconds": 0.0,
+                "enabled": 0,
+            },
         }
 
     async def dedupe_orphans(self, queue_key: str) -> dict[str, Any]:

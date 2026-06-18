@@ -11,12 +11,10 @@ class RuntimeHealthTests(unittest.TestCase):
             "loops": {
                 "state_reducer": True,
                 "reducer_metrics_snapshot": False,
-                "task_heartbeat": True,
             },
             "loop_details": {
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": False, "stale": False},
-                "task_heartbeat": {"alive": True, "stale": False},
             },
             "tail_reconcile_active": True,
         }
@@ -35,12 +33,10 @@ class RuntimeHealthTests(unittest.TestCase):
             "loops": {
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
-                "task_heartbeat": True,
             },
             "loop_details": {
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
-                "task_heartbeat": {"alive": True, "stale": False},
             },
             "tail_reconcile_active": True,
         }
@@ -59,12 +55,10 @@ class RuntimeHealthTests(unittest.TestCase):
             "loops": {
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
-                "task_heartbeat": True,
             },
             "loop_details": {
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
-                "task_heartbeat": {"alive": True, "stale": False},
             },
             "tail_reconcile_active": False,
         }
@@ -75,20 +69,18 @@ class RuntimeHealthTests(unittest.TestCase):
             mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
             ok, detail = runtime_health._reducer_readiness()
         self.assertFalse(ok)
-        self.assertFalse(detail["tail_reconcile_active"])
+        self.assertFalse(detail["lease_auditor_active"])
 
-    def test_reducer_readiness_requires_task_heartbeat_loop(self):
+    def test_reducer_readiness_no_longer_requires_compat_heartbeat_loop(self):
         fake_runtime = {
             "running": True,
             "loops": {
                 "state_reducer": True,
                 "reducer_metrics_snapshot": True,
-                "task_heartbeat": False,
             },
             "loop_details": {
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
-                "task_heartbeat": {"alive": False, "stale": False},
             },
             "tail_reconcile_active": True,
         }
@@ -98,29 +90,21 @@ class RuntimeHealthTests(unittest.TestCase):
             mock_get_config.return_value.scheduler.enabled = True
             mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
             ok, detail = runtime_health._reducer_readiness()
-        self.assertFalse(ok)
-        self.assertEqual(["task_heartbeat"], detail["missing_loops"])
+        self.assertTrue(ok)
+        self.assertEqual([], detail["missing_loops"])
 
     def test_scheduler_readiness_rejects_stale_loop(self):
         fake_runtime = {
             "running": True,
             "loops": {
                 "task_dispatch": True,
-                "operation_dispatch": True,
                 "archive_dispatch": True,
                 "stage_item_dispatch": True,
-                "downstream_reconcile": True,
-                "readless_reconcile": True,
-                "task_heartbeat": True,
             },
             "loop_details": {
                 "task_dispatch": {"alive": True, "stale": False},
-                "operation_dispatch": {"alive": True, "stale": True},
-                "archive_dispatch": {"alive": True, "stale": False},
+                "archive_dispatch": {"alive": True, "stale": True},
                 "stage_item_dispatch": {"alive": True, "stale": False},
-                "downstream_reconcile": {"alive": True, "stale": False},
-                "readless_reconcile": {"alive": True, "stale": False},
-                "task_heartbeat": {"alive": True, "stale": False},
             },
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
@@ -130,7 +114,7 @@ class RuntimeHealthTests(unittest.TestCase):
             mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
             ok, detail = runtime_health._scheduler_readiness()
         self.assertFalse(ok)
-        self.assertEqual(["operation_dispatch"], detail["missing_loops"])
+        self.assertEqual(["archive_dispatch"], detail["missing_loops"])
 
     def test_collect_probe_snapshot_contains_startup_phase_and_last_error(self):
         fake_runtime = {"running": False, "loops": {}, "loop_details": {}}

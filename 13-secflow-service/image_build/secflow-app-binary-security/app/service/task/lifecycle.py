@@ -24,23 +24,8 @@ if TYPE_CHECKING:
 
 class TaskLifecycleServiceMixin:
     def _requeue_stale_operations(self: TaskManager, db: Session) -> bool:
-        from app.service import task_manager as task_manager_module
-
-        changed = False
-        now_value = task_shared._now()
-        for operation in db.query(task_manager_module.BinarySecurityTaskOperation).all():
-            status = str(getattr(operation, "status", "") or "").strip()
-            if status not in {"running", "accepted"}:
-                continue
-            lease_expires_at = getattr(operation, "claim_lease_expires_at", None)
-            if lease_expires_at is None or lease_expires_at > now_value:
-                continue
-            operation.status = "queued"
-            operation.owner_instance_id = None
-            operation.claim_lease_expires_at = None
-            self._enqueue_operation(operation.id)
-            changed = True
-        return changed
+        del db
+        return False
 
     async def _seed_work_queues(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module
@@ -56,44 +41,35 @@ class TaskLifecycleServiceMixin:
                     continue
                 if status in {"pending", "dispatching", "running"}:
                     task_ids.append(task_id)
-            operation_ids: list[str] = []
             for operation in db.query(task_manager_module.BinarySecurityTaskOperation).all():
-                operation_id = str(getattr(operation, "id", "") or "").strip()
+                operation_task_id = str(getattr(operation, "task_id", "") or "").strip()
                 status = str(getattr(operation, "status", "") or "").strip().lower()
-                if not operation_id:
+                if not operation_task_id:
                     continue
-                if status in {"pending", "running"}:
-                    operation_ids.append(operation_id)
+                if status in {"pending", "queued", "accepted", "running"}:
+                    task_ids.append(operation_task_id)
             for task_id in task_ids:
                 await queue.push_task(task_id)
-            for operation_id in operation_ids:
-                await queue.push_operation(operation_id)
         finally:
             with suppress(Exception):
                 db.close()
 
-    def _operation_lease_expires_at(
+    def _task_operation_lock_expires_at(
         self: TaskManager,
         *,
         now_value: datetime | None = None,
         ttl_seconds: int = 60,
     ) -> datetime:
-        from app.service import task_manager as task_manager_module
-
         base = now_value or task_shared._now()
-        effective_ttl = self._operation_lease_ttl_seconds() if ttl_seconds == task_manager_module.TASK_OPERATION_LOCK_TTL_SECONDS else max(30, int(ttl_seconds))
+        effective_ttl = self._task_operation_lock_ttl_seconds() if int(ttl_seconds) == 60 else max(30, int(ttl_seconds))
         return base + timedelta(seconds=effective_ttl)
 
-    def _operation_lease_ttl_seconds(self: TaskManager) -> int:
-        return max(30, int(getattr(self.cfg.scheduler, "operation_lease_ttl_seconds", 60) or 60))
+    def _task_operation_lock_ttl_seconds(self: TaskManager) -> int:
+        return max(30, int(getattr(self.cfg.scheduler, "task_operation_lock_ttl_seconds", 60) or 60))
 
-    def _operation_heartbeat_interval_seconds(self: TaskManager) -> int:
-        configured = int(getattr(self.cfg.scheduler, "operation_heartbeat_interval_seconds", 15) or 15)
-        return max(5, min(configured, max(5, int(self._operation_lease_ttl_seconds() / 2))))
-
-    def _stale_operation_requeue_interval_seconds(self: TaskManager) -> int:
-        configured = int(getattr(self.cfg.scheduler, "stale_operation_requeue_interval_seconds", 15) or 15)
-        return max(5, configured)
+    def _task_operation_lock_heartbeat_interval_seconds(self: TaskManager) -> int:
+        configured = int(getattr(self.cfg.scheduler, "task_operation_lock_heartbeat_interval_seconds", 15) or 15)
+        return max(5, min(configured, max(5, int(self._task_operation_lock_ttl_seconds() / 2))))
 
     def _operation_step_batch_size(self: TaskManager) -> int:
         return max(1, int(getattr(self.cfg.scheduler, "operation_step_batch_size", 10) or 10))
@@ -102,7 +78,6 @@ class TaskLifecycleServiceMixin:
         configured = int(getattr(self.cfg.scheduler, "worker_ready_loop_stale_seconds", 90) or 90)
         interval_seconds = {
             "task_dispatch": max(1, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5)),
-            "operation_dispatch": max(1, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5)),
             "archive_dispatch": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
             "stage_item_dispatch": max(1, int(getattr(self.cfg.scheduler, "stage_poll_interval_seconds", 5) or 5)),
             "downstream_reconcile": max(1, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30)),
@@ -157,40 +132,29 @@ class TaskLifecycleServiceMixin:
     def runtime_status(self: TaskManager) -> dict[str, object]:
         loop_details = {
             "task_dispatch": self._loop_runtime_detail("task_dispatch", self._loop_task),
-            "operation_dispatch": self._loop_runtime_detail("operation_dispatch", getattr(self, "_operation_loop_task", None)),
             "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
             "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
-            "downstream_reconcile": self._loop_runtime_detail("downstream_reconcile", self._downstream_reconcile_task),
-            "stage_item_sync_reconcile": self._loop_runtime_detail("stage_item_sync_reconcile", self._stage_item_sync_reconcile_task),
-            "archive_runtime_reconcile": self._loop_runtime_detail("archive_runtime_reconcile", self._archive_runtime_reconcile_task),
-            "state_repair_reconcile": self._loop_runtime_detail("state_repair_reconcile", self._state_repair_reconcile_task),
-            "readless_reconcile": self._loop_runtime_detail("readless_reconcile", self._readless_reconcile_task),
             "state_reducer": self._loop_runtime_detail("state_reducer", self._state_reducer_loop_task),
             "reducer_metrics_snapshot": self._loop_runtime_detail("reducer_metrics_snapshot", self._reducer_metrics_snapshot_loop_task),
-            "task_heartbeat": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
+            "compat_heartbeat_fallback": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
         }
         return {
             "running": self._running,
-            "loops": {loop_name: bool(detail.get("alive")) for loop_name, detail in loop_details.items() if loop_name != "task_heartbeat"},
+            "loops": {loop_name: bool(detail.get("alive")) for loop_name, detail in loop_details.items() if loop_name != "compat_heartbeat_fallback"},
             "loop_details": loop_details,
             "workers": {
-                "task_workers": len([task for task in self._workers.values() if not task.done()]),
-                "operation_workers": len([task for task in self._operation_workers.values() if not task.done()]),
+                "task_workers": len([handle for handle in self._workers.values() if not handle.done()]),
+                "task_heartbeat_workers": len([
+                    handle for handle in self._workers.values()
+                    if handle.heartbeat_task is not None and not handle.heartbeat_task.done()
+                ]),
+                "operation_workers": 0,
                 "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
             "tail_reconcile_active": bool(self._is_reducer_role() and self._runtime_lease_capable()),
+            "lease_auditor_active": bool(self._is_reducer_role() and self._runtime_lease_capable()),
         }
-
-    def _maybe_requeue_stale_operations(self: TaskManager, db: Session) -> bool:
-        now_value = task_shared._now()
-        if self._last_stale_operation_requeue_at is not None:
-            elapsed = (now_value - self._last_stale_operation_requeue_at).total_seconds()
-            if elapsed < self._stale_operation_requeue_interval_seconds():
-                return False
-        changed = self._requeue_stale_operations(db)
-        self._last_stale_operation_requeue_at = now_value
-        return bool(changed)
 
     def _collect_runtime_metrics_snapshot_sync(self: TaskManager) -> dict[str, int]:
         from app.service import task_manager as task_manager_module
@@ -253,6 +217,10 @@ class TaskLifecycleServiceMixin:
             task_workers=len([task for task in self._workers.values() if not task.done()]),
             operation_workers=len([task for task in self._operation_workers.values() if not task.done()]),
             archive_workers=len([task for task in self._archive_workers if not task.done()]),
+            task_heartbeat_workers=len([
+                handle for handle in self._workers.values()
+                if handle.heartbeat_task is not None and not handle.heartbeat_task.done()
+            ]),
         )
 
     async def _observe_runtime_metrics(self: TaskManager, db: Session | None, *, reconcile_candidates: int = 0) -> None:
@@ -264,8 +232,6 @@ class TaskLifecycleServiceMixin:
         task_manager_module.observe_queue_depths(
             redis_task_queue=int(dict(queue_snapshot.get("task_queue") or {}).get("length") or 0),
             task_queue_oldest_age_seconds=dict(queue_snapshot.get("task_queue") or {}).get("oldest_age_seconds"),
-            redis_operation_queue=int(dict(queue_snapshot.get("operation_queue") or {}).get("length") or 0),
-            operation_queue_oldest_age_seconds=dict(queue_snapshot.get("operation_queue") or {}).get("oldest_age_seconds"),
             pending_tasks=int(runtime_snapshot.get("pending_tasks") or 0),
             running_tasks=int(runtime_snapshot.get("running_tasks") or 0),
             archive_pending_jobs=int(runtime_snapshot.get("archive_pending_jobs") or 0),
@@ -276,60 +242,27 @@ class TaskLifecycleServiceMixin:
         )
         task_manager_module.observe_slot_usage(
             task_capacity=int(runtime_snapshot.get("task_capacity") or 0),
-            task_active=len([task for task in self._workers.values() if not task.done()]),
-            action_active=len([task for task in self._operation_workers.values() if not task.done()]),
+            task_active=len([handle for handle in self._workers.values() if not handle.done()]),
+            action_active=0,
             action_capacity=max(1, int(getattr(self.cfg.scheduler, "downstream_action_concurrency", 1) or 1)),
         )
-
-    async def _operation_dispatch_loop(self: TaskManager) -> None:
-        from app.service import task_manager as task_manager_module
-
-        session_factory = task_manager_module.get_session_factory()
-        while self._running:
-            operation_id = None
-            db = session_factory()
-            try:
-                with observe_scheduler_loop("operation_dispatch"):
-                    self._mark_loop_heartbeat("operation_dispatch")
-                    self._maybe_requeue_stale_operations(db)
-                    operation_id = await task_manager_module.get_task_queue().pop_operation(
-                        self.cfg.queue.block_timeout_seconds
-                    )
-                    if operation_id:
-                        async with self._operation_worker_lock:
-                            existing = self._operation_workers.get(operation_id)
-                            if existing is None or existing.done():
-                                self._operation_workers[operation_id] = asyncio.create_task(
-                                    self._run_task_operation(operation_id),
-                                    name=f"binary-security-operation-{operation_id}",
-                                )
-                    else:
-                        self._maybe_requeue_stale_operations(db)
-                    self._mark_loop_heartbeat("operation_dispatch")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._recover_loop_db_error("operation_dispatch", db, exc)
-                task_manager_module.logger.exception("binary-security operation dispatch loop crashed and recovered")
-                await asyncio.sleep(1)
-            finally:
-                with suppress(Exception):
-                    db.close()
 
     async def _reconcile_downstream_task_ref(self: TaskManager, ref: dict[str, str], token: str | None) -> None:
         from app.service import task_manager as task_manager_module
 
         db = task_manager_module.get_session_factory()()
         try:
-            await self.sync_downstream_status(
-                db,
-                project_id=ref["project_id"],
-                task_id=ref["task_id"],
+            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
+            self._merge_task_runtime_signal(
+                task,
+                "pending_downstream_sync",
+                source="lease_auditor_signal",
+                reason="downstream_reconcile_requested",
                 force=False,
-                token=token,
-                record_request_event=False,
-                apply_state=True,
+                extra={"requested_by_token_present": bool(str(token or "").strip())},
             )
+            db.commit()
+            self._enqueue_task(task.id)
         finally:
             db.close()
 
@@ -382,128 +315,31 @@ class TaskLifecycleServiceMixin:
             ]
             if not deferred_refs:
                 return
-
-            deleted_before = int(snapshot.get("deleted_downstream_count") or 0)
-            attempts = int(snapshot.get("deferred_cleanup_attempts") or 0) + 1
-            attempted_at = task_shared._now()
-
-            await self._delete_downstream_refs(
-                db,
+            self._merge_task_runtime_signal(
                 task,
-                deferred_refs,
-                token,
-                cleanup_scope="deferred_cleanup_reconcile",
+                "pending_cleanup_retry",
+                source="lease_auditor_signal",
+                reason="deferred_cleanup_retry_requested",
+                extra={
+                    "deferred_ref_count": len(deferred_refs),
+                    "requested_by_token_present": bool(str(token or "").strip()),
+                },
             )
-            cleanup_results = [
-                dict(result)
-                for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
-                if isinstance(result, dict)
-            ]
-            result_map = {
-                (str(result.get("service") or "").strip(), str(result.get("task_id") or "").strip()): result
-                for result in cleanup_results
-                if str(result.get("service") or "").strip() and str(result.get("task_id") or "").strip()
-            }
-
-            remaining_refs: list[dict[str, object]] = []
-            deleted_now = 0
-            for deferred_ref in deferred_refs:
-                key = (str(deferred_ref.get("service") or "").strip(), str(deferred_ref.get("task_id") or "").strip())
-                result = dict(result_map.get(key) or {})
-                delete_status = str(result.get("delete_status") or "").strip().lower()
-                if bool(result.get("deferred")) or bool(result.get("blocking")):
-                    remaining_refs.append({**deferred_ref, **result})
-                    continue
-                if delete_status in {"succeeded", "missing", "not_found"}:
-                    deleted_now += 1
-                    continue
-                if result:
-                    remaining_refs.append({**deferred_ref, **result, "deferred": True})
-                else:
-                    remaining_refs.append({**deferred_ref, "deferred": True, "deferred_reason": "cleanup_result_missing"})
-            for result in cleanup_results:
-                if not bool(result.get("deferred")):
-                    continue
-                key = (str(result.get("service") or "").strip(), str(result.get("task_id") or "").strip())
-                if any(
-                    str(existing.get("service") or "").strip() == key[0]
-                    and str(existing.get("task_id") or "").strip() == key[1]
-                    for existing in remaining_refs
-                ):
-                    continue
-                remaining_refs.append(dict(result))
-
-            blocking_refs = [dict(row) for row in remaining_refs if bool(row.get("blocking"))]
-            first_error = next(
-                (
-                    str(row.get("error") or row.get("deferred_reason") or "").strip()
-                    for row in remaining_refs
-                    if str(row.get("error") or row.get("deferred_reason") or "").strip()
-                ),
-                None,
-            )
-            snapshot.update(
-                {
-                    "cleanup_partial_failed": bool(remaining_refs),
-                    "deleted_downstream_count": deleted_before + deleted_now,
-                    "deferred_cleanup_attempts": attempts,
-                    "deferred_cleanup_status": "partial_failed" if remaining_refs else "succeeded",
-                    "deferred_cleanup_last_error": first_error,
-                    "deferred_cleanup_last_attempt_at": task_shared._isoformat_or_none(attempted_at),
-                    "deferred_cleanup_next_retry_at": (
-                        task_shared._isoformat_or_none(
-                            attempted_at
-                            + timedelta(
-                                seconds=max(
-                                    30,
-                                    int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30),
-                                )
-                            )
-                        )
-                        if remaining_refs
-                        else None
-                    ),
-                    "deferred_downstream_refs": remaining_refs,
-                    "downstream_cleanup_blocking_refs": blocking_refs,
-                }
-            )
-            task.cleanup_snapshot = snapshot
-
-            if not remaining_refs:
-                self._record_event(
-                    db,
-                    task,
-                    "task_delete_cleanup_reconciled",
-                    "后台补偿删除已完成，任务已彻底删除",
-                    payload={
-                        "task_id": task.id,
-                        "project_id": task.project_id,
-                        "attempts": attempts,
-                        "deleted_downstream_count": snapshot.get("deleted_downstream_count"),
-                    },
-                )
-                with suppress(Exception):
-                    self._clear_runtime_lease(db, task.id)
-                db.delete(task)
-                db.commit()
-                return
-
             self._record_event(
                 db,
                 task,
                 "task_delete_cleanup_retry_deferred",
-                "后台补偿删除仍未完成，任务保留等待下轮重试",
+                "检测到待补偿删除下游引用，已通知任务 owner 串行处理",
                 level="warning",
                 payload={
                     "task_id": task.id,
                     "project_id": task.project_id,
-                    "attempts": attempts,
-                    "remaining_deferred_count": len(remaining_refs),
-                    "blocking_ref_count": len(blocking_refs),
-                    "last_error": first_error,
+                    "remaining_deferred_count": len(deferred_refs),
+                    "source": "lease_auditor_signal",
                 },
             )
             db.commit()
+            self._enqueue_task(task.id)
         finally:
             db.close()
 
@@ -517,27 +353,27 @@ class TaskLifecycleServiceMixin:
                 db,
                 task,
                 "downstream_sync_reconcile_triggered",
-                "检测到阶段下游同步陈旧，触发安全重同步",
+                "检测到阶段下游同步陈旧，已通知任务 owner 串行重同步",
                 stage_name=ref.get("stage_name"),
                 payload={
                     "task_id": ref["task_id"],
                     "stage_name": ref.get("stage_name"),
                     "item_ids": list(ref.get("item_ids") or []),
                     "resolution_reason": "stale_sync_attempt",
+                    "source": "lease_auditor_signal",
                 },
             )
-            db.commit()
-            await self.sync_downstream_status(
-                db,
-                project_id=ref["project_id"],
-                task_id=ref["task_id"],
-                stage_name=ref.get("stage_name"),
-                item_ids=list(ref.get("item_ids") or []),
+            self._merge_task_runtime_signal(
+                task,
+                "pending_downstream_sync",
+                source="lease_auditor_signal",
+                reason="stale_sync_attempt",
+                stage_name=str(ref.get("stage_name") or "").strip() or None,
+                item_ids=[str(item_id).strip() for item_id in list(ref.get("item_ids") or []) if str(item_id).strip()],
                 force=True,
-                token=token,
-                record_request_event=False,
-                apply_state=True,
             )
+            db.commit()
+            self._enqueue_task(task.id)
         finally:
             db.close()
 
@@ -763,7 +599,9 @@ class TaskLifecycleServiceMixin:
         while self._running:
             try:
                 self._mark_loop_heartbeat("archive_runtime_reconcile")
-                await asyncio.to_thread(self._reclaim_stale_archive_jobs)
+                # Archive runtime repair is now owner-driven. The passive loop only
+                # advertises liveness while real rebuild/apply work is consumed by
+                # the owning task worker via runtime signals.
                 self._mark_loop_heartbeat("archive_runtime_reconcile")
             except asyncio.CancelledError:
                 raise
@@ -777,18 +615,16 @@ class TaskLifecycleServiceMixin:
 
         interval_seconds = self._state_repair_reconcile_interval_seconds()
         while self._running:
-            db = task_manager_module.get_session_factory()()
             try:
                 self._mark_loop_heartbeat("state_repair_reconcile")
-                await asyncio.to_thread(self._repair_retryable_state_events, db)
+                # Retryable state repair has been collapsed into owner-owned task
+                # runtime signals. The reducer-side loop remains passive only.
                 self._mark_loop_heartbeat("state_repair_reconcile")
             except asyncio.CancelledError:
                 raise
             except Exception:
                 task_manager_module.logger.exception("binary-security state repair reconcile loop crashed and recovered")
                 await asyncio.sleep(1)
-            finally:
-                db.close()
             await asyncio.sleep(interval_seconds)
 
     async def _archive_dispatch_loop(self: TaskManager) -> None:
@@ -1173,6 +1009,49 @@ class TaskLifecycleServiceMixin:
                 item = db.query(task_manager_module.BinarySecurityStageItem).filter(task_manager_module.BinarySecurityStageItem.id == job.item_id).first()
                 attempts = int(job.attempts or 0)
                 owner_before = str(job.owner_id or "").strip() or None
+                has_active_task_owner = bool(
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+                    and self._lease_is_active(task, db=db)
+                )
+                if has_active_task_owner:
+                    job.archive_status = "failed"
+                    job.error_message = "archive worker lost after claim; delegated to task owner repair"
+                    job.completed_at = now
+                    job.updated_at = now
+                    job.owner_id = None
+                    job.archive_root = None
+                    self._merge_task_runtime_signal(
+                        task,
+                        "pending_archive_rebuild",
+                        source="lease_auditor_signal",
+                        reason="stale_running_archive_job",
+                        stage_name=str(job.stage_name or "").strip() or None,
+                        archive_job_ids=[str(job.id or "").strip()],
+                        extra={
+                            "rebuild_mode": "failed_items",
+                            "resolution_reason": "stale_running_archive_job",
+                            "timeout_seconds": timeout_seconds,
+                        },
+                    )
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_archive_rebuild_deferred_to_owner",
+                        "归档任务长时间无进展，已通知任务 owner 串行重建归档",
+                        stage_name=job.stage_name,
+                        item=item,
+                        level="warning",
+                        payload={
+                            "archive_job_id": job.id,
+                            "attempts": attempts,
+                            "owner_id_before": owner_before,
+                            "resolution_reason": "stale_running_archive_job",
+                            "timeout_seconds": timeout_seconds,
+                            "source": "lease_auditor_signal",
+                        },
+                    )
+                    reclaimed += 1
+                    continue
                 if attempts > max_attempts:
                     job.archive_status = "failed"
                     job.error_message = "archive worker lost after claim; reclaim exhausted"

@@ -392,6 +392,16 @@ class _RouteManagerStub:
 
 
 class TaskApiRouteTests(unittest.TestCase):
+    def test_owner_only_schema_drops_legacy_reconcile_and_operation_lease_fields(self):
+        task_fields = BinarySecurityTaskResponse.model_fields
+        operation_fields = BinarySecurityTaskOperationResponse.model_fields
+
+        self.assertNotIn("reconcile_owner_instance_id", task_fields)
+        self.assertNotIn("reconcile_lease_expires_at", task_fields)
+        self.assertNotIn("owner_instance_id", operation_fields)
+        self.assertNotIn("claim_lease_expires_at", operation_fields)
+        self.assertNotIn("heartbeat_at", operation_fields)
+
     def _build_client(self):
         app = FastAPI()
         app.include_router(tasks_router)
@@ -637,6 +647,11 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("delete", payload["items"][0]["operation_type"])
+        self.assertEqual("task_owner_inbox", payload["items"][0]["execution_model"])
+        self.assertEqual("task_lease_owner", payload["items"][0]["owner_model"])
+        self.assertNotIn("owner_instance_id", payload["items"][0])
+        self.assertNotIn("claim_lease_expires_at", payload["items"][0])
+        self.assertNotIn("heartbeat_at", payload["items"][0])
         self.assertEqual(("get_operations", fake_db, "p1", "t1"), manager.calls[0])
 
     def test_get_task_abnormal_reason_history_route_delegates_to_manager(self):

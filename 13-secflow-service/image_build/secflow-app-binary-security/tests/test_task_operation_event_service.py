@@ -38,7 +38,6 @@ class TaskOperationEventServiceBehaviorTests(unittest.TestCase):
             operation_type="continue",
             target_stage="system_analysis",
             status="running",
-            owner_instance_id="worker-a",
         )
         self.db = _ModelAwareDb(tasks=[self.task], operations=[self.operation])
 
@@ -87,3 +86,12 @@ class TaskOperationEventServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("collect_cleanup_plan", self.operation.resume_cursor["current_step"])
         self.assertEqual("failed", self.operation.step_payload["collect_cleanup_plan"]["status"])
         self.assertIn("payload_path", self.operation.step_payload["collect_cleanup_plan"])
+
+    def test_operation_response_marks_owner_only_inbox_model(self):
+        response = self.manager._operation_response(self.operation)
+
+        self.assertEqual("task_owner_inbox", response.execution_model)
+        self.assertEqual("task_lease_owner", response.owner_model)
+        self.assertFalse(hasattr(response, "owner_instance_id"))
+        self.assertFalse(hasattr(response, "claim_lease_expires_at"))
+        self.assertFalse(hasattr(response, "heartbeat_at"))

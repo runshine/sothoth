@@ -548,6 +548,28 @@ class OrchestrationSupervisorState:
     last_result: str | None = None
 
 
+@dataclass
+class TaskRuntimeHandle:
+    task_id: str
+    runner_task: asyncio.Task
+    heartbeat_task: asyncio.Task | None
+    claimed_at: datetime
+    execution_token: str | None
+    lease_owner_instance_id: str | None
+    cancel_requested: bool = False
+    last_progress_at: datetime | None = None
+
+    def done(self) -> bool:
+        return self.runner_task.done()
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        if self.heartbeat_task is not None and not self.heartbeat_task.done():
+            self.heartbeat_task.cancel()
+        if not self.runner_task.done():
+            self.runner_task.cancel()
+
+
 class TaskManager(
     TaskQueryServiceMixin,
     TaskReadModelServiceMixin,
@@ -588,7 +610,7 @@ class TaskManager(
         self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
         self._task_heartbeat_loop_task: Optional[asyncio.Task] = None
         self._stage_item_loop_task: Optional[asyncio.Task] = None
-        self._workers: dict[str, asyncio.Task] = {}
+        self._workers: dict[str, TaskRuntimeHandle] = {}
         self._operation_workers: dict[str, asyncio.Task] = {}
         self._stage_item_workers: dict[str, asyncio.Task] = {}
         self._archive_workers: set[asyncio.Task] = set()
@@ -740,29 +762,6 @@ class TaskManager(
                 start_index = sequence.index(normalized_target)
                 return sequence[start_index:]
             return _prepare_retry_stage_full
-        if item == "_operation_lease_heartbeat":
-            async def _operation_lease_heartbeat(operation_id: str):
-                interval = self._operation_heartbeat_interval_seconds()
-                while self._running:
-                    await asyncio.sleep(interval)
-                    db = get_session_factory()()
-                    try:
-                        operation = db.query(BinarySecurityTaskOperation).filter(BinarySecurityTaskOperation.id == operation_id).first()
-                        if operation is None:
-                            return
-                        if str(getattr(operation, "status", "") or "").strip() not in {"running", "accepted"}:
-                            return
-                        now_value = _now()
-                        operation.heartbeat_at = now_value
-                        operation.claim_lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
-                        operation.updated_at = now_value
-                        db.commit()
-                    except Exception:
-                        db.rollback()
-                        raise
-                    finally:
-                        db.close()
-            return _operation_lease_heartbeat
         if item == "_claim_pending_tasks":
             def _claim_pending_tasks(db, slots: int):
                 if slots <= 0:
@@ -1166,8 +1165,6 @@ class TaskManager(
             workspace_root=task.workspace_root,
         )
         now_value = _now()
-        operation.heartbeat_at = now_value
-        operation.claim_lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
         operation.updated_at = now_value
         if record_event:
             self._record_operation_event(
@@ -1396,17 +1393,13 @@ class TaskManager(
         if self._running:
             return
         self._running = True
-        observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0)
+        observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
         role = str(os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all").strip().lower()
         run_worker_loops = role in {"", "all", "worker"}
         run_reducer_loop = role in {"", "all", "reducer"}
         if run_worker_loops:
             self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
             self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
-            self._operation_loop_task = asyncio.create_task(
-                self._operation_dispatch_loop(),
-                name="binary-security-operation-dispatcher",
-            )
             self._stage_item_loop_task = asyncio.create_task(
                 self._stage_item_dispatch_loop(),
                 name="binary-security-stage-item-dispatcher",
@@ -1415,27 +1408,6 @@ class TaskManager(
             self._task_heartbeat_loop_task = asyncio.create_task(
                 self._task_heartbeat_loop(),
                 name="binary-security-task-heartbeat",
-            )
-        if run_reducer_loop:
-            self._downstream_reconcile_task = asyncio.create_task(
-                self._downstream_reconcile_loop(),
-                name="binary-security-downstream-reconcile",
-            )
-            self._readless_reconcile_task = asyncio.create_task(
-                self._readless_reconcile_loop(),
-                name="binary-security-readless-reconcile",
-            )
-            self._stage_item_sync_reconcile_task = asyncio.create_task(
-                self._stage_item_sync_reconcile_loop(),
-                name="binary-security-stage-item-sync-reconcile",
-            )
-            self._archive_runtime_reconcile_task = asyncio.create_task(
-                self._archive_runtime_reconcile_loop(),
-                name="binary-security-archive-runtime-reconcile",
-            )
-            self._state_repair_reconcile_task = asyncio.create_task(
-                self._state_repair_reconcile_loop(),
-                name="binary-security-state-repair-reconcile",
             )
         if run_reducer_loop:
             self._state_reducer_loop_task = asyncio.create_task(
@@ -1462,13 +1434,7 @@ class TaskManager(
         self._running = False
         await self._cancel_loop_task(self._loop_task)
         await self._cancel_loop_task(self._archive_loop_task)
-        await self._cancel_loop_task(getattr(self, "_operation_loop_task", None))
         await self._cancel_loop_task(self._stage_item_loop_task)
-        await self._cancel_loop_task(self._downstream_reconcile_task)
-        await self._cancel_loop_task(self._readless_reconcile_task)
-        await self._cancel_loop_task(self._stage_item_sync_reconcile_task)
-        await self._cancel_loop_task(self._archive_runtime_reconcile_task)
-        await self._cancel_loop_task(self._state_repair_reconcile_task)
         await self._cancel_loop_task(self._task_heartbeat_loop_task)
         await self._cancel_loop_task(self._state_reducer_loop_task)
         await self._cancel_loop_task(self._reducer_metrics_snapshot_loop_task)
@@ -1478,16 +1444,18 @@ class TaskManager(
         if archive_active:
             await asyncio.gather(*archive_active, return_exceptions=True)
         await asyncio.to_thread(self._requeue_owned_running_archive_jobs)
-        active = list(self._workers.values())
-        for task in active:
-            task.cancel()
-        if active:
-            await asyncio.gather(*active, return_exceptions=True)
-        operation_active = list(self._operation_workers.values())
-        for task in operation_active:
-            task.cancel()
-        if operation_active:
-            await asyncio.gather(*operation_active, return_exceptions=True)
+        active_handles = list(self._workers.values())
+        for handle in active_handles:
+            handle.cancel()
+        active_tasks: list[asyncio.Task] = []
+        for handle in active_handles:
+            active_tasks.append(handle.runner_task)
+            if handle.heartbeat_task is not None:
+                active_tasks.append(handle.heartbeat_task)
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+        self._workers.clear()
+        self._operation_workers.clear()
         stage_item_active = list(self._stage_item_workers.values())
         for task in stage_item_active:
             task.cancel()
@@ -1497,7 +1465,7 @@ class TaskManager(
             self._task_execution_owners.clear()
         self._last_task_heartbeat_at.clear()
         observe_task_heartbeat_candidates(0)
-        observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0)
+        observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
 
     def _register_task_execution_owner(self, task_id: str, owner_kind: str) -> None:
         normalized_task_id = str(task_id or "").strip()
@@ -1530,6 +1498,59 @@ class TaskManager(
 
     def _has_local_task_execution_owner(self, task_id: str) -> bool:
         return self._task_execution_owner_count(task_id) > 0
+
+    def _runtime_handle(self, task_id: str) -> TaskRuntimeHandle | None:
+        return self._workers.get(str(task_id or "").strip())
+
+    async def _start_task_runtime(self, task_id: str) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        async with self._worker_lock:
+            existing = self._workers.get(normalized_task_id)
+            if existing is not None and not existing.done():
+                return False
+            runner_task = asyncio.create_task(
+                self._run_task(normalized_task_id),
+                name=f"binary-security-{normalized_task_id}",
+            )
+            heartbeat_task = asyncio.create_task(
+                self._run_task_heartbeat(normalized_task_id),
+                name=f"binary-security-heartbeat-{normalized_task_id}",
+            )
+            handle = TaskRuntimeHandle(
+                task_id=normalized_task_id,
+                runner_task=runner_task,
+                heartbeat_task=heartbeat_task,
+                claimed_at=_now(),
+                execution_token=None,
+                lease_owner_instance_id=str(self.instance_id or "").strip() or None,
+            )
+            self._workers[normalized_task_id] = handle
+            return True
+
+    async def _run_task_heartbeat(self, task_id: str) -> None:
+        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
+        failure_count = 0
+        while self._running:
+            handle = self._runtime_handle(task_id)
+            if handle is None or handle.cancel_requested or handle.runner_task.done():
+                return
+            try:
+                await asyncio.to_thread(self._touch_task_heartbeat, task_id)
+                handle.last_progress_at = _now()
+                failure_count = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failure_count += 1
+                logger.exception("binary-security per-task heartbeat failed: task_id=%s failures=%s", task_id, failure_count)
+                if failure_count >= 3:
+                    handle.cancel_requested = True
+                    if not handle.runner_task.done():
+                        handle.runner_task.cancel()
+                    return
+            await asyncio.sleep(interval_seconds)
 
     def _acquire_tail_reconcile_owner(self, task_id: str) -> None:
         if not self._is_reducer_role():
@@ -1927,7 +1948,11 @@ class TaskManager(
     def _refresh_task_heartbeats_once(self) -> None:
         session = get_session_factory()()
         try:
-            candidate_ids = self._collect_heartbeat_candidates()
+            candidate_ids = sorted(
+                task_id
+                for task_id, handle in self._workers.items()
+                if handle is not None and not handle.done()
+            )
             observe_task_heartbeat_candidates(len(candidate_ids))
             if not candidate_ids:
                 return
@@ -2386,19 +2411,28 @@ class TaskManager(
         source: str,
         expected_downstream_task_id: str | None,
         actual_downstream_task_id: str | None,
+        current_downstream_task_id: str | None = None,
         archive_job_id: str | None = None,
         payload_downstream_task_id: str | None = None,
+        replacement_state: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         mismatch_payload = {
             "source": source,
             "expected_downstream_task_id": str(expected_downstream_task_id or "").strip() or None,
             "actual_downstream_task_id": str(actual_downstream_task_id or "").strip() or None,
+            "current_downstream_task_id": str(current_downstream_task_id or "").strip() or None,
         }
         if archive_job_id:
             mismatch_payload["archive_job_id"] = archive_job_id
         if payload_downstream_task_id:
             mismatch_payload["payload_downstream_task_id"] = str(payload_downstream_task_id or "").strip() or None
+        if replacement_state is not None:
+            mismatch_payload["replacement_state"] = dict(replacement_state)
         return mismatch_payload
+
+    def _replacement_window_active_for_stale_ignore(self, item: BinarySecurityStageItem) -> bool:
+        replacement_state = self._replacement_in_progress_state(item)
+        return bool(replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"])
 
     def _record_binding_mismatch_event(
         self,
@@ -2690,6 +2724,125 @@ class TaskManager(
 
     async def _ensure_task_execution_current_async(self, task: BinarySecurityTask) -> None:
         await asyncio.to_thread(self._ensure_task_execution_current, task)
+
+    def _task_runtime_workset(self, task: BinarySecurityTask) -> dict[str, Any]:
+        summary = dict(getattr(task, "summary", None) or {})
+        workset = summary.get("runtime_workset")
+        normalized = dict(workset) if isinstance(workset, dict) else {}
+        for signal_name in (
+            "pending_downstream_sync",
+            "pending_archive_rebuild",
+            "pending_cleanup_retry",
+            "pending_binding_repair",
+            "pending_tail_finalize",
+            "pending_operation_repair",
+        ):
+            value = normalized.get(signal_name)
+            if value is None:
+                continue
+            normalized[signal_name] = dict(value) if isinstance(value, dict) else {}
+        return normalized
+
+    def _set_task_runtime_workset(self, task: BinarySecurityTask, workset: dict[str, Any] | None) -> dict[str, Any]:
+        summary = dict(getattr(task, "summary", None) or {})
+        normalized = dict(workset or {})
+        summary["runtime_workset"] = normalized
+        task.summary = summary
+        return normalized
+
+    def _merge_task_runtime_signal(
+        self,
+        task: BinarySecurityTask,
+        signal_name: str,
+        *,
+        source: str,
+        reason: str,
+        stage_name: str | None = None,
+        item_ids: list[str] | None = None,
+        archive_job_ids: list[str] | None = None,
+        force: bool | None = None,
+        next_retry_at: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        workset = self._task_runtime_workset(task)
+        current = dict(workset.get(signal_name) or {})
+        merged = {
+            **current,
+            **dict(extra or {}),
+            "requested_at": current.get("requested_at") or _now().isoformat(),
+            "last_requested_at": _now().isoformat(),
+            "source": str(source or "").strip() or current.get("source") or "unknown",
+            "reason": str(reason or "").strip() or current.get("reason") or "signal_requested",
+            "stage_name": str(stage_name or "").strip() or current.get("stage_name") or None,
+            "item_ids": sorted(
+                {
+                    str(value).strip()
+                    for value in list(current.get("item_ids") or []) + list(item_ids or [])
+                    if str(value).strip()
+                }
+            ),
+            "archive_job_ids": sorted(
+                {
+                    str(value).strip()
+                    for value in list(current.get("archive_job_ids") or []) + list(archive_job_ids or [])
+                    if str(value).strip()
+                }
+            ),
+            "attempts": int(current.get("attempts") or 0),
+            "last_error": current.get("last_error"),
+            "next_retry_at": next_retry_at or current.get("next_retry_at"),
+        }
+        if force is not None:
+            merged["force"] = bool(force)
+        workset[signal_name] = merged
+        self._set_task_runtime_workset(task, workset)
+        return merged
+
+    def _clear_task_runtime_signal(self, task: BinarySecurityTask, signal_name: str) -> None:
+        workset = self._task_runtime_workset(task)
+        if signal_name in workset:
+            workset.pop(signal_name, None)
+            self._set_task_runtime_workset(task, workset)
+
+    def _has_task_write_ownership(
+        self,
+        task: BinarySecurityTask,
+        db: Session | None = None,
+        *,
+        allow_dispatching: bool = False,
+    ) -> bool:
+        expected_statuses = {"running", "dispatching"} if allow_dispatching else {"running"}
+        if str(getattr(task, "status", "") or "").strip() not in expected_statuses:
+            return False
+        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+            return False
+        if not self._lease_is_active(task, db=db):
+            return False
+        return True
+
+    def _ensure_task_write_ownership(
+        self,
+        task: BinarySecurityTask,
+        db: Session | None = None,
+        *,
+        allow_dispatching: bool = False,
+    ) -> None:
+        if not self._has_task_write_ownership(task, db=db, allow_dispatching=allow_dispatching):
+            raise StaleTaskExecution(f"任务 {task.id} 当前 owner/lease 已失效，禁止继续写入状态")
+
+    async def _ensure_task_write_ownership_async(
+        self,
+        task: BinarySecurityTask,
+        db: Session | None = None,
+        *,
+        allow_dispatching: bool = False,
+    ) -> None:
+        await asyncio.to_thread(
+            self._ensure_task_write_ownership,
+            task,
+            db,
+            allow_dispatching=allow_dispatching,
+        )
 
     def _invalidate_task_execution(self, task: BinarySecurityTask) -> None:
         task.dispatcher_instance_id = None
@@ -8363,10 +8516,13 @@ class TaskManager(
 
     async def _cancel_local_worker(self, task_id: str) -> None:
         async with self._worker_lock:
-            worker = self._workers.get(task_id)
-        if worker and not worker.done():
-            worker.cancel()
-            await asyncio.gather(worker, return_exceptions=True)
+            handle = self._workers.get(task_id)
+        if handle and not handle.done():
+            handle.cancel()
+            tasks = [handle.runner_task]
+            if handle.heartbeat_task is not None:
+                tasks.append(handle.heartbeat_task)
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _cancel_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
         return await self._downstream_cancel_refs(db, task, refs, token)

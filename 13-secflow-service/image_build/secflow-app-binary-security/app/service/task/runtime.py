@@ -172,12 +172,7 @@ class TaskRuntimeServiceMixin:
                     if task_id:
                         claimed_id = self._dispatch_task_by_id(db, task_id)
                         if claimed_id:
-                            async with self._worker_lock:
-                                if claimed_id not in self._workers or self._workers[claimed_id].done():
-                                    self._workers[claimed_id] = asyncio.create_task(
-                                        self._run_task(claimed_id),
-                                        name=f"binary-security-{claimed_id}",
-                                    )
+                            await self._start_task_runtime(claimed_id)
                     await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
                     self._mark_loop_heartbeat("task_dispatch")
@@ -226,20 +221,21 @@ class TaskRuntimeServiceMixin:
         for (task_id,) in task_rows:
             await queue.push_task(str(task_id))
         operation_rows = (
-            db.query(task_manager_module.BinarySecurityTaskOperation.id)
+            db.query(task_manager_module.BinarySecurityTaskOperation.task_id)
             .filter(task_manager_module.BinarySecurityTaskOperation.status.in_(["pending", "queued", "running", "accepted"]))
             .order_by(
                 task_manager_module.BinarySecurityTaskOperation.updated_at.asc(),
                 task_manager_module.BinarySecurityTaskOperation.created_at.asc(),
-                task_manager_module.BinarySecurityTaskOperation.id.asc(),
+                task_manager_module.BinarySecurityTaskOperation.task_id.asc(),
             )
             .limit(seed_batch_size)
             .all()
         )
-        for (operation_id,) in operation_rows:
-            await queue.push_operation(str(operation_id))
+        for (operation_task_id,) in operation_rows:
+            normalized_task_id = str(operation_task_id or "").strip()
+            if normalized_task_id:
+                await queue.push_task(normalized_task_id)
         await queue.cleanup_dedupe_orphans(self.cfg.queue.task_queue_key)
-        await queue.cleanup_dedupe_orphans(self.cfg.queue.operation_queue_key)
         self._last_queue_reconcile_at = now_value
 
     async def _stage_item_dispatch_loop(self: TaskManager) -> None:
@@ -313,6 +309,19 @@ class TaskRuntimeServiceMixin:
         ).first()
         if task is None:
             return None
+        current_operation = None
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+        if current_operation_id:
+            current_operation = (
+                db.query(task_manager_module.BinarySecurityTaskOperation)
+                .filter(task_manager_module.BinarySecurityTaskOperation.id == current_operation_id)
+                .first()
+            )
+        has_owner_inbox_work = bool(
+            current_operation is not None
+            and str(getattr(current_operation, "status", "") or "").strip().lower()
+            in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+        )
         if (
             self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._tail_requires_execution_takeover(db, task)
@@ -326,13 +335,17 @@ class TaskRuntimeServiceMixin:
             db.flush()
         if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
             return None
+        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if current_status != "pending" and not has_owner_inbox_work:
+            return None
+        if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not has_owner_inbox_work:
+            return None
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
         updated = (
             db.query(task_manager_module.BinarySecurityTask)
             .filter(
                 task_manager_module.BinarySecurityTask.id == task_id,
-                task_manager_module.BinarySecurityTask.status == "pending",
                 self._lease_filter_available(),
             )
             .update(
@@ -941,6 +954,10 @@ class TaskRuntimeServiceMixin:
                 f"任务由实例 {self.instance_id} 启动执行",
                 payload={"dispatcher_instance_id": self.instance_id},
             )
+            async with self._worker_lock:
+                handle = self._workers.get(task.id)
+                if handle is not None:
+                    handle.execution_token = execution_token
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
             current_stage_is_streaming_tail = self._is_streaming_tail_stage(task, task.current_stage)
             if (active_item_count <= 0 and not has_downstream_refs) and current_stage_is_streaming_tail:
@@ -969,6 +986,10 @@ class TaskRuntimeServiceMixin:
                     },
                 )
             db.commit()
+            while await self._run_current_task_operation(task_id):
+                pass
+            while await self._run_task_runtime_signals(task_id):
+                pass
             await self._execute_task(task_id)
         except task_manager_module.StaleTaskExecution:
             return
@@ -1008,6 +1029,12 @@ class TaskRuntimeServiceMixin:
         finally:
             if owner_registered:
                 self._release_task_execution_owner(task_id, "primary_task_worker")
+            async with self._worker_lock:
+                handle = self._workers.get(task_id)
+            if handle is not None and handle.heartbeat_task is not None and not handle.heartbeat_task.done():
+                handle.heartbeat_task.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await handle.heartbeat_task
             cleanup_db = session_factory()
             try:
                 task = cleanup_db.query(task_manager_module.BinarySecurityTask).filter(

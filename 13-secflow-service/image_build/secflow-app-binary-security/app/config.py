@@ -108,8 +108,8 @@ class SchedulerConfig(BaseModel):
     task_lease_ttl_seconds: int = 120
     task_reclaim_grace_seconds: int = 180
     task_lease_write_retry_attempts: int = 3
-    operation_lease_ttl_seconds: int = 60
-    operation_heartbeat_interval_seconds: int = 15
+    task_operation_lock_ttl_seconds: int = 60
+    task_operation_lock_heartbeat_interval_seconds: int = 15
     stale_operation_requeue_interval_seconds: int = 15
     operation_step_batch_size: int = 10
     worker_ready_loop_stale_seconds: int = 90
@@ -142,7 +142,6 @@ class QueueConfig(BaseModel):
     enabled: bool = True
     redis_url: str = "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
     task_queue_key: str = "secflow:binary-security:tasks"
-    operation_queue_key: str = "secflow:binary-security:operations"
     block_timeout_seconds: int = 5
     reconcile_interval_seconds: int = 30
     seed_batch_size: int = 20

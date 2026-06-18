@@ -262,61 +262,8 @@ class TaskOperationServiceMixin:
         )
         db.flush()
         db.commit()
-        self._enqueue_operation(operation.id)
+        self._enqueue_task(task.id)
         task_manager_module.observe_control_operation(operation.operation_type, "queued")
-        return operation
-
-    def _enqueue_operation(self: TaskManager, operation_id: str) -> None:
-        from app.service import task_manager as task_manager_module
-
-        if not self.cfg.queue.enabled:
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        try:
-            loop.create_task(
-                self._run_scheduled_coroutine(
-                    task_manager_module.get_task_queue().push_operation(operation_id),
-                    label=f"enqueue-operation:{operation_id}",
-                )
-            )
-        except Exception:
-            task_manager_module.logger.exception("binary-security enqueue operation failed: %s", operation_id)
-
-    def _claim_operation_by_id(self: TaskManager, db: Session, operation_id: str):
-        from app.service import task_manager as task_manager_module
-
-        operation = (
-            db.query(task_manager_module.BinarySecurityTaskOperation)
-            .filter(task_manager_module.BinarySecurityTaskOperation.id == operation_id)
-            .first()
-        )
-        if operation is None:
-            return None
-        status = str(getattr(operation, "status", "") or "").strip().lower()
-        if status in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
-            return None
-        now_value = task_manager_module._now()
-        lease_expires_at = getattr(operation, "claim_lease_expires_at", None)
-        owner_instance_id = str(getattr(operation, "owner_instance_id", "") or "").strip()
-        if (
-            status in {"claimed", "running"}
-            and owner_instance_id
-            and owner_instance_id != self.instance_id
-            and lease_expires_at is not None
-            and lease_expires_at > now_value
-        ):
-            return None
-        operation.status = "running"
-        operation.owner_instance_id = self.instance_id
-        operation.claim_lease_expires_at = self._operation_lease_expires_at(now_value=now_value)
-        operation.heartbeat_at = now_value
-        operation.updated_at = now_value
-        if getattr(operation, "started_at", None) is None:
-            operation.started_at = now_value
-        db.flush()
         return operation
 
     def _active_cancel_operation(self: TaskManager, db: Session, task_id: str):
@@ -339,12 +286,12 @@ class TaskOperationServiceMixin:
         self: TaskManager,
         *,
         now_value=None,
-        ttl_seconds: int = 180,
+        ttl_seconds: int = 60,
     ):
         from app.service import task_manager as task_manager_module
 
         base = now_value or task_manager_module._now()
-        effective_ttl = self._operation_lease_ttl_seconds() if ttl_seconds == task_manager_module.TASK_OPERATION_LOCK_TTL_SECONDS else max(30, int(ttl_seconds))
+        effective_ttl = self._task_operation_lock_ttl_seconds() if int(ttl_seconds) == 60 else max(30, int(ttl_seconds))
         return base + timedelta(seconds=effective_ttl)
 
     def _raise_task_operation_locked(self: TaskManager, task_id: str) -> None:
@@ -2071,7 +2018,234 @@ class TaskOperationServiceMixin:
         except Exception:
             task_manager_module.logger.exception("binary-security scheduled coroutine failed: %s", label)
 
-    async def _run_task_operation(self: TaskManager, operation_id: str) -> None:
+    def _repair_active_operations_for_task(self: TaskManager, db: Session, task) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        active_operations = [
+            operation
+            for operation in db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.task_id == task.id)
+            .all()
+            if str(getattr(operation, "status", "") or "").strip().lower() not in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES
+        ]
+        if not active_operations:
+            return False
+
+        active_operations.sort(
+            key=lambda operation: (
+                getattr(operation, "updated_at", None) or getattr(operation, "created_at", None) or task_manager_module._now(),
+                getattr(operation, "created_at", None) or task_manager_module._now(),
+                str(getattr(operation, "id", "") or ""),
+            ),
+            reverse=True,
+        )
+        authoritative = active_operations[0]
+        changed = False
+        if str(getattr(task, "current_operation_id", "") or "").strip() != str(getattr(authoritative, "id", "") or "").strip():
+            task.current_operation_id = authoritative.id
+            changed = True
+
+        for superseded in active_operations[1:]:
+            if str(getattr(superseded, "status", "") or "").strip().lower() == "superseded":
+                continue
+            superseded.status = "superseded"
+            superseded.finished_at = task_manager_module._now()
+            superseded.superseded_by_operation_id = authoritative.id
+            self._record_operation_event(
+                db,
+                task,
+                superseded,
+                "operation_superseded",
+                f"后台操作已被新的 authoritative operation 收口: {authoritative.operation_type}",
+                stage_name=superseded.target_stage,
+                level="warning",
+                payload={
+                    "source": "task_owner",
+                    "superseded_by_operation_id": authoritative.id,
+                    "superseded_by_operation_type": authoritative.operation_type,
+                },
+            )
+            task_manager_module.observe_control_operation_superseded(str(superseded.operation_type or "").strip() or "unknown")
+            changed = True
+
+        if changed:
+            self._record_event(
+                db,
+                task,
+                "task_operation_binding_repaired",
+                "任务 owner 已修复 active operation 绑定",
+                stage_name=getattr(authoritative, "target_stage", None),
+                payload={
+                    "source": "task_owner",
+                    "current_operation_id": authoritative.id,
+                    "active_operation_count": len(active_operations),
+                },
+            )
+        return changed
+
+    def _repair_replacement_binding_state_for_task(self: TaskManager, db: Session, task) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        changed = False
+        for item in db.query(task_manager_module.BinarySecurityStageItem).filter(
+            task_manager_module.BinarySecurityStageItem.task_id == task.id
+        ).all():
+            replacement_state = self._replacement_in_progress_state(item)
+            if not replacement_state["replacement_in_progress"]:
+                continue
+            current_task_id = str(getattr(item, "downstream_task_id", "") or "").strip() or None
+            old_task_id = replacement_state["old_downstream_task_id"]
+            if current_task_id and old_task_id and current_task_id != old_task_id:
+                self._clear_replacement_in_progress(item)
+                self._record_event(
+                    db,
+                    task,
+                    "replacement_binding_repaired",
+                    "任务 owner 已修复 replacement 脏状态并确认新的 authoritative child 绑定",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "source": "task_owner",
+                        "old_downstream_task_id": old_task_id,
+                        "current_downstream_task_id": current_task_id,
+                        "repair_action": "clear_replacement_state",
+                    },
+                )
+                changed = True
+                continue
+            if current_task_id and old_task_id and current_task_id == old_task_id and not replacement_state["binding_cleared"]:
+                self._mark_replacement_in_progress(
+                    item,
+                    old_downstream_task_id=old_task_id,
+                    binding_cleared=True,
+                    verification_status="pending",
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "replacement_binding_repaired",
+                    "任务 owner 已清理 replacement 残留，旧 child 绑定已标记为可重建",
+                    stage_name=item.stage_name,
+                    item=item,
+                    payload={
+                        "source": "task_owner",
+                        "old_downstream_task_id": old_task_id,
+                        "current_downstream_task_id": current_task_id,
+                        "repair_action": "mark_binding_cleared",
+                    },
+                )
+                changed = True
+        return changed
+
+    async def _run_task_runtime_signals(self: TaskManager, task_id: str) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        session_factory = task_manager_module.get_session_factory()
+        db = session_factory()
+        try:
+            task = (
+                db.query(task_manager_module.BinarySecurityTask)
+                .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                .first()
+            )
+            if task is None:
+                return False
+            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
+            workset = self._task_runtime_workset(task)
+            if not workset:
+                return False
+            if workset.get("pending_operation_repair"):
+                self._clear_task_runtime_signal(task, "pending_operation_repair")
+                changed = self._repair_active_operations_for_task(db, task)
+                db.commit()
+                return changed
+            if workset.get("pending_cleanup_retry"):
+                self._clear_task_runtime_signal(task, "pending_cleanup_retry")
+                db.commit()
+                await self._reconcile_deferred_cleanup_task_ref(
+                    {"project_id": task.project_id, "task_id": task.id},
+                    self._service_token(),
+                )
+                return True
+            if workset.get("pending_archive_rebuild"):
+                signal = dict(workset.get("pending_archive_rebuild") or {})
+                stage_name = str(signal.get("stage_name") or "").strip() or None
+                self._clear_task_runtime_signal(task, "pending_archive_rebuild")
+                db.commit()
+                if not stage_name:
+                    return True
+                rebuild_db = session_factory()
+                try:
+                    rebuild_task = (
+                        rebuild_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task.id)
+                        .first()
+                    )
+                    if rebuild_task is None:
+                        return False
+                    self._ensure_task_write_ownership(rebuild_task, db=rebuild_db, allow_dispatching=True)
+                    await self._prepare_archive_retry_full(rebuild_db, rebuild_task, stage_name)
+                    rebuild_db.commit()
+                finally:
+                    rebuild_db.close()
+                return True
+            if workset.get("pending_tail_finalize"):
+                self._clear_task_runtime_signal(task, "pending_tail_finalize")
+                db.commit()
+                finalize_db = session_factory()
+                try:
+                    finalize_task = (
+                        finalize_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task.id)
+                        .first()
+                    )
+                    if finalize_task is None:
+                        return False
+                    self._ensure_task_write_ownership(finalize_task, db=finalize_db, allow_dispatching=True)
+                    self._finalize_task(finalize_db, finalize_task)
+                    finalize_db.commit()
+                finally:
+                    finalize_db.close()
+                return True
+            if workset.get("pending_binding_repair") or workset.get("pending_downstream_sync"):
+                signal = dict(workset.get("pending_binding_repair") or workset.get("pending_downstream_sync") or {})
+                stage_name = str(signal.get("stage_name") or "").strip() or None
+                item_ids = [
+                    str(item_id).strip()
+                    for item_id in list(signal.get("item_ids") or [])
+                    if str(item_id).strip()
+                ]
+                force = bool(signal.get("force"))
+                self._clear_task_runtime_signal(task, "pending_binding_repair")
+                self._clear_task_runtime_signal(task, "pending_downstream_sync")
+                repaired = self._repair_replacement_binding_state_for_task(db, task)
+                db.commit()
+                if repaired:
+                    return True
+                sync_db = session_factory()
+                try:
+                    await self.sync_downstream_status(
+                        sync_db,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        stage_name=stage_name,
+                        item_ids=item_ids or None,
+                        force=force,
+                        token=self._service_token(),
+                        record_request_event=False,
+                        apply_state=True,
+                    )
+                finally:
+                    sync_db.close()
+                return True
+            return False
+        except task_manager_module.StaleTaskExecution:
+            db.rollback()
+            return False
+        finally:
+            db.close()
+
+    async def _run_current_task_operation(self: TaskManager, task_id: str) -> bool:
         from app.service import task_manager as task_manager_module
 
         session_factory = task_manager_module.get_session_factory()
@@ -2079,63 +2253,100 @@ class TaskOperationServiceMixin:
         started = time.perf_counter()
         operation_type = "unknown"
         task_deleted = False
-        heartbeat_task: asyncio.Task | None = None
         try:
-            operation = self._claim_operation_by_id(db, operation_id)
-            if operation is None:
-                return
-            task = db.query(task_manager_module.BinarySecurityTask).filter(
-                task_manager_module.BinarySecurityTask.id == operation.task_id
-            ).first()
+            task = (
+                db.query(task_manager_module.BinarySecurityTask)
+                .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                .first()
+            )
             if task is None:
-                operation.status = "failed"
-                operation.error_code = "task_not_found"
-                operation.error_message = f"任务不存在: {operation.task_id}"
-                operation.finished_at = task_manager_module._now()
-                db.commit()
-                return
-            operation_type = operation.operation_type
-            task.current_operation_id = operation.id
-            heartbeat_task = asyncio.create_task(
-                self._operation_lease_heartbeat(operation.id),
-                name=f"binary-security-operation-heartbeat-{operation.id}",
+                return False
+            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
+            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            if not current_operation_id:
+                if self._repair_active_operations_for_task(db, task):
+                    db.commit()
+                    return True
+                return False
+            operation = (
+                db.query(task_manager_module.BinarySecurityTaskOperation)
+                .filter(task_manager_module.BinarySecurityTaskOperation.id == current_operation_id)
+                .first()
             )
-            self._record_operation_event(
-                db,
-                task,
-                operation,
-                "operation_started",
-                f"后台操作已开始: {operation.operation_type}",
-                stage_name=operation.target_stage,
-            )
-            db.commit()
-            await self._run_task_operation_steps(db, task, operation)
-            if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
-                task_deleted = db.query(task_manager_module.BinarySecurityTask.id).filter(
-                    task_manager_module.BinarySecurityTask.id == operation.task_id
-                ).first() is None
-            operation.heartbeat_at = task_manager_module._now()
-            operation.claim_lease_expires_at = task_manager_module._now()
-            operation.status = "succeeded"
-            operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
-            operation.finished_at = task_manager_module._now()
-            if not task_deleted:
+            if operation is None:
                 task.current_operation_id = None
+                db.commit()
+                return False
+            if str(getattr(operation, "status", "") or "").strip().lower() in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+                if str(getattr(task, "current_operation_id", "") or "").strip() == operation.id:
+                    task.current_operation_id = None
+                    db.commit()
+                return False
+
+            operation_type = operation.operation_type
+            should_record_start = str(getattr(operation, "status", "") or "").strip().lower() != "running"
+            now_value = task_manager_module._now()
+            operation.status = "running"
+            operation.updated_at = now_value
+            if getattr(operation, "started_at", None) is None:
+                operation.started_at = now_value
+            task.current_operation_id = operation.id
+            if should_record_start:
                 self._record_operation_event(
                     db,
                     task,
                     operation,
-                    "operation_succeeded",
-                    f"后台操作已完成: {operation.operation_type}",
+                    "operation_started",
+                    f"任务 owner 已开始串行执行后台操作: {operation.operation_type}",
                     stage_name=operation.target_stage,
+                    payload={"source": "task_owner"},
                 )
             db.commit()
+
+            await self._run_task_operation_steps(db, task, operation)
+            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
+
+            if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
+                task_deleted = (
+                    db.query(task_manager_module.BinarySecurityTask.id)
+                    .filter(task_manager_module.BinarySecurityTask.id == operation.task_id)
+                    .first()
+                    is None
+                )
+
+            operation.status = "succeeded"
+            operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+            operation.finished_at = task_manager_module._now()
+            if not task_deleted:
+                refreshed_task = (
+                    db.query(task_manager_module.BinarySecurityTask)
+                    .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                    .first()
+                )
+                if refreshed_task is not None and str(getattr(refreshed_task, "current_operation_id", "") or "").strip() == operation.id:
+                    refreshed_task.current_operation_id = None
+                if refreshed_task is not None:
+                    self._record_operation_event(
+                        db,
+                        refreshed_task,
+                        operation,
+                        "operation_succeeded",
+                        f"任务 owner 已完成后台操作: {operation.operation_type}",
+                        stage_name=operation.target_stage,
+                        payload={"source": "task_owner"},
+                    )
+            db.commit()
             task_manager_module.observe_control_operation(operation_type, "succeeded")
+            return True
         except Exception as exc:
             db.rollback()
-            operation = db.query(task_manager_module.BinarySecurityTaskOperation).filter(
-                task_manager_module.BinarySecurityTaskOperation.id == operation_id
-            ).first()
+            operation = (
+                db.query(task_manager_module.BinarySecurityTaskOperation)
+                .filter(task_manager_module.BinarySecurityTaskOperation.id == str(current_operation_id if 'current_operation_id' in locals() else ""))
+                .first()
+                if 'current_operation_id' in locals() and current_operation_id
+                else None
+            )
             if operation is not None:
                 operation_type = operation.operation_type
                 operation.status = "failed"
@@ -2144,28 +2355,28 @@ class TaskOperationServiceMixin:
                 operation.finished_at = task_manager_module._now()
             task = (
                 db.query(task_manager_module.BinarySecurityTask)
-                .filter(task_manager_module.BinarySecurityTask.id == getattr(operation, "task_id", None))
+                .filter(task_manager_module.BinarySecurityTask.id == getattr(operation, "task_id", task_id))
                 .first()
-                if operation is not None
-                else None
             )
             if task is not None:
                 if operation is not None and operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
                     task.status = task_manager_module.TASK_STATUS_DELETE_FAILED
                     task.finished_at = task_manager_module._now()
                     task.current_operation_id = operation.id
-                else:
+                elif operation is not None and str(getattr(task, "current_operation_id", "") or "").strip() == operation.id:
                     task.current_operation_id = None
                 task.last_error = str(exc)
-                self._record_operation_event(
-                    db,
-                    task,
-                    operation,
-                    "operation_failed",
-                    f"后台操作失败: {exc}",
-                    level="error",
-                    stage_name=operation.target_stage,
-                )
+                if operation is not None:
+                    self._record_operation_event(
+                        db,
+                        task,
+                        operation,
+                        "operation_failed",
+                        f"任务 owner 执行后台操作失败: {exc}",
+                        level="error",
+                        stage_name=operation.target_stage,
+                        payload={"source": "task_owner"},
+                    )
                 if operation is not None and operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
                     self._record_event(
                         db,
@@ -2179,17 +2390,13 @@ class TaskOperationServiceMixin:
                             "operation_id": operation.id,
                             "operation_error": str(exc),
                             "force_delete": bool(dict(operation.request_payload or {}).get("force_delete")),
+                            "source": "task_owner",
                         },
                     )
             db.commit()
             task_manager_module.observe_control_operation(operation_type, "failed")
+            return True
         finally:
-            if heartbeat_task is not None:
-                heartbeat_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await heartbeat_task
-            async with self._operation_worker_lock:
-                self._operation_workers.pop(operation_id, None)
             task_manager_module.observe_control_operation_duration(
                 operation_type=operation_type,
                 status="finished",

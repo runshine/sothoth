@@ -572,23 +572,45 @@ class TaskArchiveServiceMixin:
             mapped_status=mapped_status,
         )
         if not allowed:
-            self._record_event(
-                db,
-                task,
-                "stale_archive_trigger_ignored",
-                "旧 child 的终态归档触发已忽略",
-                stage_name=item.stage_name,
-                item=item,
-                level="warning",
-                payload={
-                    "downstream_service": item.downstream_service,
-                    "downstream_task_id": item.downstream_task_id,
-                    "payload_downstream_task_id": self._payload_downstream_task_id(payload),
-                    "mapped_status": mapped_status,
-                    "ignored_reason": ignored_reason,
-                    "superseded": True,
-                },
+            replacement_state = self._replacement_in_progress_state(item)
+            mismatch_payload = self._binding_mismatch_payload(
+                source="task_owner",
+                expected_downstream_task_id=self._current_downstream_task_id(item),
+                actual_downstream_task_id=self._payload_downstream_task_id(payload),
+                current_downstream_task_id=self._current_downstream_task_id(item),
+                payload_downstream_task_id=self._payload_downstream_task_id(payload),
+                replacement_state=replacement_state,
             )
+            if self._replacement_window_active_for_stale_ignore(item):
+                self._record_event(
+                    db,
+                    task,
+                    "stale_archive_trigger_ignored",
+                    "旧 child 的终态归档触发已忽略",
+                    stage_name=item.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={
+                        **mismatch_payload,
+                        "downstream_service": item.downstream_service,
+                        "mapped_status": mapped_status,
+                        "ignored_reason": ignored_reason,
+                        "superseded": True,
+                    },
+                )
+            else:
+                self._record_binding_mismatch_event(
+                    db,
+                    task,
+                    item,
+                    event_type="downstream_binding_mismatch_detected",
+                    message="归档触发来自非 authoritative child，本次仅记录绑定不匹配观测",
+                    payload={
+                        **mismatch_payload,
+                        "mapped_status": mapped_status,
+                        "ignored_reason": ignored_reason,
+                    },
+                )
             return None
         job = self._ensure_downstream_archive_job(
             db,

@@ -99,9 +99,6 @@ class TaskRuntimeStateServiceMixin:
             .all()
         )
         for operation in operations:
-            lease_expires_at = getattr(operation, "claim_lease_expires_at", None)
-            if lease_expires_at is not None and lease_expires_at < now_value:
-                continue
             return operation
         return None
 

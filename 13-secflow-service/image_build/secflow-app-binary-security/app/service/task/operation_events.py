@@ -225,9 +225,8 @@ class TaskOperationEventServiceMixin:
             request_source=str(operation.request_source or "").strip() or None,
             status=str(operation.status or ""),
             operation_token=str(operation.operation_token or ""),
-            owner_instance_id=str(operation.owner_instance_id or "").strip() or None,
-            claim_lease_expires_at=getattr(operation, "claim_lease_expires_at", None),
-            heartbeat_at=getattr(operation, "heartbeat_at", None),
+            execution_model="task_owner_inbox",
+            owner_model="task_lease_owner",
             request_payload=self._load_operation_request_payload(operation),
             result_payload=self._load_operation_result_payload(operation),
             error_code=str(operation.error_code or "").strip() or None,
@@ -293,7 +292,7 @@ class TaskOperationEventServiceMixin:
             "operation_id": operation.id,
             "operation_type": operation.operation_type,
             "operation_status": operation.status,
-            "owner_instance_id": operation.owner_instance_id,
+            "owner_instance_id": None,
             **dict(payload or {}),
         }
         self._record_event(

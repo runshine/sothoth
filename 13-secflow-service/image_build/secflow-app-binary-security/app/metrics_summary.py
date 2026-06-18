@@ -138,7 +138,7 @@ def build_ai_summary(rows: list[MetricRow], *, coverage_text: str) -> dict[str, 
         row.family_name
         for row in ai_rows
         if row.name.endswith((
-            "_ai_role_count",
+            "_runtime_role_count",
             "_ai_session_total",
             "_ai_round_total",
             "_ai_retry_total",
@@ -157,7 +157,7 @@ def build_ai_summary(rows: list[MetricRow], *, coverage_text: str) -> dict[str, 
         "token_cache_write": match_sum(ai_rows, lambda row: row.name.endswith("_ai_token_usage_total") and row.labels.get("type") == "cache_write"),
         "token_total": match_sum(ai_rows, lambda row: row.name.endswith("_ai_token_usage_total") and row.labels.get("type") == "total") or match_sum(ai_rows, lambda row: "token" in row.name and ("total" in row.name or "usage" in row.name)),
         "cost_total": match_sum(ai_rows, lambda row: row.name.endswith("_ai_token_cost_total") or "token_cost_total" in row.name or "cost_usage" in row.name),
-        "role_total": match_sum(ai_rows, lambda row: row.name.endswith("_ai_role_count")),
+        "role_total": match_sum(ai_rows, lambda row: row.name.endswith("_runtime_role_count")),
         "retry_total": match_sum(ai_rows, lambda row: row.name.endswith("_ai_retry_total") or "retry" in row.name),
         "timeout_total": match_sum(ai_rows, lambda row: row.name.endswith("_ai_timeout_total") or "timeout" in row.name),
         "failure_total": match_sum(ai_rows, lambda row: row.name.endswith("_ai_failure_total") or "error" in row.name or "fail" in row.name),
@@ -165,8 +165,8 @@ def build_ai_summary(rows: list[MetricRow], *, coverage_text: str) -> dict[str, 
         "review_total": match_sum(ai_rows, lambda row: row.name.endswith("_ai_review_total") or "review" in row.name),
     }
     role_chart = []
-    for role in ("worker", "judge", "agent", "plugin", "validator", "advisor"):
-        value = match_sum(ai_rows, lambda row: row.name.endswith("_ai_role_count") and row.labels.get("role") == role)
+    for role in ("task_owner", "lease_auditor"):
+        value = match_sum(ai_rows, lambda row: row.name.endswith("_runtime_role_count") and row.labels.get("role") == role)
         if value > 0:
             role_chart.append({"name": role, "value": value})
     token_chart = [
@@ -199,7 +199,7 @@ def build_ai_summary(rows: list[MetricRow], *, coverage_text: str) -> dict[str, 
             {"label": "AI Token 总量", "value": lookup["token_total"] or (lookup["token_input"] + lookup["token_output"]), "hint": "input/output/cache/total 聚合"},
             {"label": "AI 成本", "value": lookup["cost_total"], "hint": "token cost / cost usage"},
             {"label": "AI 会话数", "value": lookup["session_total"], "hint": "session / conversation / role session"},
-            {"label": "Worker/Judge/Agent 活跃数", "value": lookup["role_total"], "hint": "role_count 聚合"},
+            {"label": "运行角色活跃数", "value": lookup["role_total"], "hint": "runtime_role_count 聚合"},
             {"label": "重试/超时/失败", "value": lookup["retry_total"] + lookup["timeout_total"] + lookup["failure_total"], "hint": "retry + timeout + failure"},
             {"label": "轮次/周期/评审次数", "value": lookup["round_total"] + lookup["review_total"], "hint": "round/cycle/review 聚合"},
         ],

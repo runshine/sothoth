@@ -97,20 +97,6 @@ class _FakeRedisTimeout(_FakeRedis):
         return None
 
 
-class _FakeRedisConnectionError(_FakeRedis):
-    def __init__(self):
-        super().__init__()
-        self.closed = False
-
-    async def blpop(self, key, timeout=0):
-        del key, timeout
-        raise RedisConnectionError("Connection closed by server")
-
-    async def aclose(self):
-        self.closed = True
-        return None
-
-
 class _FakeRedisStatsConnectionError(_FakeRedis):
     def __init__(self):
         super().__init__()
@@ -198,24 +184,6 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual("task-1", popped)
         self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
 
-    def test_pop_operation_removes_duplicate_queue_entries(self):
-        queue = TaskQueue()
-        fake = _FakeRedis()
-        queue._client = fake
-
-        fake.lists[queue.config.operation_queue_key] = ["op-1", "op-1", "op-2"]
-        fake.sets[f"{queue.config.operation_queue_key}:dedupe"] = {"op-1", "op-2"}
-        fake.sorted_sets[f"{queue.config.operation_queue_key}:enqueued_at"] = {
-            "op-1": 1.0,
-            "op-2": 2.0,
-        }
-
-        popped = asyncio.run(queue.pop_operation(timeout_seconds=1))
-
-        self.assertEqual("op-1", popped)
-        self.assertEqual(["op-2"], fake.lists[queue.config.operation_queue_key])
-        self.assertEqual({"op-2"}, fake.sets[f"{queue.config.operation_queue_key}:dedupe"])
-
     def test_pop_task_treats_redis_timeout_as_empty_poll(self):
         queue = TaskQueue()
         fake = _FakeRedisTimeout()
@@ -227,27 +195,28 @@ class TaskQueueTests(unittest.TestCase):
         self.assertTrue(fake.closed)
         self.assertIsNone(queue._client)
 
-    def test_pop_operation_resets_client_after_connection_error(self):
-        queue = TaskQueue()
-        fake = _FakeRedisConnectionError()
-        queue._client = fake
-
-        popped = asyncio.run(queue.pop_operation(timeout_seconds=1))
-
-        self.assertIsNone(popped)
-        self.assertTrue(fake.closed)
-        self.assertIsNone(queue._client)
-
     def test_queue_stats_returns_empty_snapshot_after_connection_error(self):
         queue = TaskQueue()
         fake = _FakeRedisStatsConnectionError()
         queue._client = fake
 
-        stats = asyncio.run(queue.queue_stats(queue.config.operation_queue_key))
+        stats = asyncio.run(queue.queue_stats(queue.config.task_queue_key))
 
         self.assertEqual({"length": 0, "oldest_age_seconds": 0.0}, stats)
         self.assertTrue(fake.closed)
         self.assertIsNone(queue._client)
+
+    def test_snapshot_marks_operation_queue_disabled_under_owner_only_runtime(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+        fake.lists[queue.config.task_queue_key] = ["task-1"]
+
+        snapshot = asyncio.run(queue.snapshot())
+
+        self.assertEqual(1, snapshot["task_queue"]["length"])
+        self.assertEqual(0, snapshot["operation_queue"]["length"])
+        self.assertEqual(0, snapshot["operation_queue"]["enabled"])
 
 
 if __name__ == "__main__":

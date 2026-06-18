@@ -46,7 +46,7 @@ _MAX_METRICS = {
 _SUM_GAUGES = {
     "secflow_binary_security_active_workers",
     "secflow_binary_security_slot_usage",
-    "secflow_binary_security_ai_role_count",
+    "secflow_binary_security_runtime_role_count",
     "secflow_binary_security_auth_token_cache_entries",
 }
 

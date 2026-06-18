@@ -628,7 +628,7 @@ async def sync_downstream_status(
         item_id=payload.item_id if payload else None,
         force=payload.force if payload else False,
         token=token,
-        apply_state=True,
+        apply_state=False,
     )
 
 
