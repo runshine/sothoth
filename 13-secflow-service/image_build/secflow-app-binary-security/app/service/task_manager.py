@@ -2064,6 +2064,8 @@ class TaskManager(
             task.status = "pending"
         elif previous_status == "dispatching":
             task.status = "pending"
+        elif previous_status == TASK_STATUS_CANCELLING:
+            task.status = TASK_STATUS_CANCELLING
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None

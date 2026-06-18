@@ -7542,6 +7542,49 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_row_owner_released_without_local_runtime", events)
         self.assertEqual([("t1", "stale-worker")], cleared_leases)
 
+    def test_requeue_stale_operations_releases_stale_owner_for_cancelling_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status=task_manager_module.TASK_STATUS_CANCELLING,
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="stale-worker",
+            dispatch_started_at=_now() - timedelta(minutes=5),
+            lease_expires_at=_now() - timedelta(minutes=4),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            target_stage="dataflow_vuln_scan",
+            status="running",
+            current_step="cancel_local_execution",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        queued: list[str] = []
+        events: list[str] = []
+        cleared_leases: list[tuple[str, str | None]] = []
+        self.manager.instance_id = "new-worker"
+        self.manager._enqueue_task = queued.append
+        self.manager._record_event = lambda *args, **kwargs: events.append(args[2])
+        self.manager._clear_runtime_lease = lambda db_arg, task_id, owner_instance_id=None: cleared_leases.append((task_id, owner_instance_id))
+
+        changed = self.manager._requeue_stale_operations(db)
+
+        self.assertTrue(changed)
+        self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertEqual(["t1"], queued)
+        self.assertIn("task_row_owner_released_without_local_runtime", events)
+        self.assertEqual([("t1", "stale-worker")], cleared_leases)
+
     def test_task_row_owner_is_runtime_supported_rejects_active_operation_without_owner_support(self):
         task = BinarySecurityTask(
             id="t1",
