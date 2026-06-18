@@ -7390,6 +7390,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             target_stage="entry_analysis",
             status="running",
             current_step="requeue_task",
+            result_payload={"requeue": {"requested": True}},
         )
         operation.resume_cursor = {"current_step": "requeue_task"}
         db = _ModelAwareDb(tasks=[task], operations=[operation])
@@ -7431,6 +7432,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             target_stage="entry_analysis",
             status="running",
             current_step="requeue_task",
+            result_payload={"requeue": {"requested": True}},
         )
         operation.resume_cursor = {"current_step": "requeue_task"}
         db = _ModelAwareDb(tasks=[task], operations=[operation])
@@ -27837,6 +27839,64 @@ def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
     self.assertEqual(["task-op-requeue"], queued)
     self.assertEqual("entry_analysis", applied[0]["next_stage"])
     self.assertEqual(TASK_ACTION_CONTINUE, applied[0]["source"])
+    self.assertEqual("task_requeued", applied[0]["event_type"])
+
+
+def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_state_without_requeue_marker(self):
+    task = BinarySecurityTask(
+        id="task-op-hard-retry",
+        project_id="p1",
+        name="n",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-hard-retry",
+        task_id="task-op-hard-retry",
+        project_id="p1",
+        operation_type=TASK_ACTION_RETRY,
+        target_stage="system_analysis",
+        status="running",
+        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+        result_payload={},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+    original_apply = self.manager._apply_task_resume_decision
+    original_enqueue = self.manager._enqueue_task
+    original_should_auto = self.manager._should_auto_advance_to_stage
+    applied = []
+    queued = []
+
+    def _capture_apply(_db, _task, decision, *, operation=None):
+        applied.append(
+            {
+                "next_stage": decision.next_stage,
+                "source": decision.source,
+                "event_type": decision.event_type,
+                "operation_id": getattr(operation, "id", None),
+            }
+        )
+        return original_apply(_db, _task, decision, operation=operation)
+
+    self.manager._apply_task_resume_decision = _capture_apply
+    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
+    try:
+        asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+    finally:
+        self.manager._apply_task_resume_decision = original_apply
+        self.manager._enqueue_task = original_enqueue
+        self.manager._should_auto_advance_to_stage = original_should_auto
+
+    self.assertEqual(["task-op-hard-retry"], queued)
+    self.assertEqual("system_analysis", applied[0]["next_stage"])
+    self.assertEqual(TASK_ACTION_RETRY, applied[0]["source"])
     self.assertEqual("task_requeued", applied[0]["event_type"])
 
 

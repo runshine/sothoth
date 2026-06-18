@@ -2409,6 +2409,10 @@ class TaskOperationServiceMixin:
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
     ) -> bool:
+        result_payload = dict(self._operation_result_data(operation) or {})
+        requeue_payload = dict(result_payload.get("requeue") or {})
+        if not bool(requeue_payload.get("requested")):
+            return False
         target_stage = str(operation.target_stage or task.current_stage or "").strip() or None
         if str(task.status or "").strip() != "pending":
             return False
