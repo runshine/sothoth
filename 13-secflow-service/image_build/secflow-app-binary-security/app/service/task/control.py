@@ -224,7 +224,7 @@ class TaskControlServiceMixin:
             if not current:
                 continue
             if current not in allowed:
-                raise ValidationError(f"阶段不属于当前任务流程: {current}")
+                continue
             normalized[current] = bool(enabled)
         return normalized
 
