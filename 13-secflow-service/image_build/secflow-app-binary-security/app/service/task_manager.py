@@ -449,6 +449,14 @@ STAGE_METRIC_RESETTERS = {
         "candidate_module_count": 0,
         "selected_module_count": 0,
     },
+    "knowledge_graph_entry_fetch": {
+        "knowledge_graph_raw_entry_count": 0,
+        "knowledge_graph_selected_entry_count": 0,
+        "knowledge_graph_filtered_out_count": 0,
+        "candidate_entry_count": 0,
+        "selected_entry_count": 0,
+        "entry_count": 0,
+    },
     "entry_analysis": {"entry_count": 0},
     "dataflow_vuln_scan": {"vuln_result_count": 0},
 }
@@ -3303,6 +3311,9 @@ class TaskManager(
     def _entry_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         return [dict(item) for item in (task.summary.get("entry_results") or []) if isinstance(item, dict)]
 
+    def _knowledge_graph_entry_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        return [dict(item) for item in (task.summary.get("knowledge_graph_entry_results") or []) if isinstance(item, dict)]
+
     def _entry_candidates(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         snapshot = self._entry_selection_snapshot(task)
         candidate_entries = snapshot.get("candidate_entries")
@@ -6086,13 +6097,15 @@ class TaskManager(
         self._ensure_stage_inputs_available(db, task, stage_name)
         normalized_stage = normalize_stage_name(stage_name)
         handler = self._stage_handler(normalized_stage)
-        if handler is not None and normalized_stage in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan"}:
+        if handler is not None and normalized_stage in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "knowledge_graph_entry_fetch", "dataflow_vuln_scan"}:
             return handler.has_runnable_inputs(self, db, task)
         summary = dict(task.summary or {})
         if normalized_stage == "binary_to_source":
             return bool(list(summary.get("selected_modules") or []))
         if normalized_stage == "entry_analysis":
             return bool(self._entry_analysis_inputs(db, task))
+        if normalized_stage == "knowledge_graph_entry_fetch":
+            return bool(str(summary.get("input_dir") or "").strip())
         if normalized_stage == "dataflow_vuln_scan":
             return bool(self._effective_entry_inputs(task))
         return True
@@ -6207,6 +6220,52 @@ class TaskManager(
         if handler is None:
             return
         handler.refresh_summary_from_items(self, db, task)
+
+    def _refresh_knowledge_graph_entry_fetch_summary(
+        self,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> dict[str, Any]:
+        knowledge_graph_entries = self._knowledge_graph_entry_results(task)
+        entry_results = self._entry_results(task)
+        metrics = dict(task.metrics or {})
+        summary = {
+            "items": self._compact_stage_success_items_for_db("entry_results", entry_results),
+            "failed_items": [],
+            "cancelled_items": [],
+            "success_count": len(knowledge_graph_entries),
+            "failed_count": 0,
+            "cancelled_count": 0,
+            "running_count": 0,
+            "candidate_entry_count": int(metrics.get("candidate_entry_count") or len(knowledge_graph_entries)),
+            "selected_entry_count": int(metrics.get("selected_entry_count") or len(knowledge_graph_entries)),
+            "entry_count": int(metrics.get("entry_count") or len(knowledge_graph_entries)),
+            "knowledge_graph_raw_entry_count": int(metrics.get("knowledge_graph_raw_entry_count") or 0),
+            "knowledge_graph_selected_entry_count": int(metrics.get("knowledge_graph_selected_entry_count") or len(knowledge_graph_entries)),
+            "knowledge_graph_filtered_out_count": int(metrics.get("knowledge_graph_filtered_out_count") or 0),
+            "entries_url": (
+                dict(stage_run.output_summary or {}).get("entries_url")
+                if stage_run is not None and isinstance(stage_run.output_summary, dict)
+                else None
+            ),
+            "duration_ms": (
+                dict(stage_run.output_summary or {}).get("duration_ms")
+                if stage_run is not None and isinstance(stage_run.output_summary, dict)
+                else None
+            ),
+        }
+        if stage_run is not None:
+            self._persist_stage_run_output_summary(
+                task,
+                stage_run,
+                {
+                    **summary,
+                    "status_synced": True,
+                    "sync_status": stage_run.status,
+                    **(stage_run.counts or {}),
+                },
+            )
+        return summary
 
     def _should_skip_readless_reconcile_for_active_task(self, task: BinarySecurityTask) -> bool:
         status = str(task.status or "").strip()
@@ -7712,15 +7771,18 @@ class TaskManager(
     def _ensure_stage_inputs_available(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
         """Rebuild target-stage inputs from the previous successful stage when possible."""
         summary = dict(task.summary or {})
+        if normalize_stage_name(stage_name) == "knowledge_graph_entry_fetch":
+            return
         if stage_name in {"binary_to_source", "entry_analysis"} and not summary.get("selected_modules"):
             self._refresh_system_analysis_stage_from_synced_items(db, task)
             summary = dict(task.summary or {})
         if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and not summary.get("entry_results"):
-            self._refresh_system_analysis_stage_from_synced_items(db, task)
-            summary = dict(task.summary or {})
-            if summary.get("selected_modules") and not self._stage_items(db, task.id, "entry_analysis"):
-                task.current_stage = "entry_analysis"
-                stage_name = "entry_analysis"
+            if self._pipeline_profile(task) != PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+                self._refresh_system_analysis_stage_from_synced_items(db, task)
+                summary = dict(task.summary or {})
+                if summary.get("selected_modules") and not self._stage_items(db, task.id, "entry_analysis"):
+                    task.current_stage = "entry_analysis"
+                    stage_name = "entry_analysis"
         if stage_name == "entry_analysis" and self._task_type(task) != TASK_TYPE_SOURCE and not summary.get("b2s_results"):
             self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
             summary = dict(task.summary or {})
@@ -7729,7 +7791,10 @@ class TaskManager(
             if normalized != list(summary.get("b2s_results") or []):
                 task.summary = {**summary, "b2s_results": normalized}
         if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and not summary.get("entry_results"):
-            self._rebuild_entry_results_from_stage_items(db, task)
+            if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+                self._refresh_knowledge_graph_entry_fetch_summary(task)
+            else:
+                self._rebuild_entry_results_from_stage_items(db, task)
 
     def _rebuild_summary_results_from_stage_items(
         self,
@@ -7816,7 +7881,7 @@ class TaskManager(
     def _continue_stage_input_error(self, db: Session, task: BinarySecurityTask, stage_name: str) -> str | None:
         self._ensure_stage_inputs_available(db, task, stage_name)
         handler = self._stage_handler(stage_name)
-        if handler is not None and normalize_stage_name(stage_name) in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan"}:
+        if handler is not None and normalize_stage_name(stage_name) in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "knowledge_graph_entry_fetch", "dataflow_vuln_scan"}:
             handler_reason = handler.continue_stage_input_error(self, db, task)
             return handler_reason
         summary = dict(task.summary or {})
@@ -7840,9 +7905,16 @@ class TaskManager(
             if not inputs:
                 return "系统分析尚未产出可用模块，不能继续入口分析阶段"
             return None
+        if normalize_stage_name(stage_name) == "knowledge_graph_entry_fetch":
+            source_dir = str(summary.get("input_dir") or "").strip()
+            if not source_dir:
+                return "源码任务缺少输入目录，不能继续知识图谱入口获取阶段"
+            return None
         if normalize_stage_name(stage_name) == "dataflow_vuln_scan":
             inputs = list(summary.get("entry_results") or [])
             if not inputs:
+                if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+                    return "知识图谱入口获取尚未产出可用入口结果，不能继续数据流漏洞挖掘阶段"
                 return "入口分析尚未产出可用入口结果，不能继续数据流漏洞挖掘阶段"
             return None
         return None
@@ -9171,7 +9243,11 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        del db, token, retry_existing
+        del token, retry_existing
+        entries_url = self._knowledge_graph_entries_url(task) or (
+            f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}"
+            f"{self.cfg.services.knowledge_graph_entries.entries_path}"
+        )
         self._record_event(
             db,
             task,
@@ -9180,8 +9256,7 @@ class TaskManager(
             stage_name=stage_run.stage_name,
             payload={
                 "provider": "knowledge_graph",
-                "entries_url": self._knowledge_graph_entries_url(task)
-                or f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}{self.cfg.services.knowledge_graph_entries.entries_path}",
+                "entries_url": entries_url,
             },
         )
         try:
@@ -9196,12 +9271,39 @@ class TaskManager(
                 stage_name=stage_run.stage_name,
                 payload={
                     "provider": "knowledge_graph",
-                    "entries_url": self._knowledge_graph_entries_url(task)
-                    or f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}{self.cfg.services.knowledge_graph_entries.entries_path}",
+                    "entries_url": entries_url,
+                    "raw_entry_count": 0,
+                    "selected_entry_count": 0,
+                    "filtered_out_count": 0,
+                    "duration_ms": 0,
                     "error_message": str(exc),
                 },
             )
-            return "failed", {"error": str(exc)}
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": [],
+                "entry_results": [],
+            }
+            task.metrics = {
+                **(task.metrics or {}),
+                **STAGE_METRIC_RESETTERS["knowledge_graph_entry_fetch"],
+            }
+            failure_summary = {
+                "error": str(exc),
+                "items": [],
+                "success_count": 0,
+                "failed_count": 1,
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                "knowledge_graph_raw_entry_count": 0,
+                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_filtered_out_count": 0,
+                "entries_url": entries_url,
+                "duration_ms": 0,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, failure_summary)
+            return "failed", failure_summary
         if not entries:
             self._record_event(
                 db,
@@ -9229,7 +9331,21 @@ class TaskManager(
                 "selected_entry_count": 0,
                 "entry_count": 0,
             }
-            return "failed", {"error": "知识图谱入口结果为空", **meta}
+            failure_summary = {
+                "error": "知识图谱入口结果为空",
+                "items": [],
+                "success_count": 0,
+                "failed_count": 1,
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **meta,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, failure_summary)
+            return "failed", failure_summary
         compact_entries = [
             {
                 **entry,
@@ -9262,14 +9378,21 @@ class TaskManager(
                 **meta,
             },
         )
-        return "success", {
+        success_summary = {
             "items": compact_entries,
             "success_count": len(entries),
             "failed_count": 0,
             "candidate_entry_count": len(entries),
             "selected_entry_count": len(entries),
+            "entry_count": len(entries),
+            "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+            "knowledge_graph_selected_entry_count": int(meta.get("selected_entry_count") or 0),
+            "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
             "entry_results": compact_entries,
+            **meta,
         }
+        self._persist_stage_run_output_summary(task, stage_run, success_summary)
+        return "success", success_summary
 
     async def _stage_dataflow_vuln_scan(
         self,
