@@ -2055,11 +2055,19 @@ class TaskManager(
         active_operation=None,
         reason: str,
     ) -> bool:
+        previous_dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
+        active_runtime_lease_owner = (
+            str(getattr(lease, "owner_instance_id", "") or "").strip() or None
+            if self._runtime_lease_is_active(lease)
+            else None
+        )
+        if previous_dispatcher_instance_id is None and active_runtime_lease_owner is None:
+            return False
         if self._task_row_owner_is_runtime_supported(db, task, active_operation=active_operation):
             return False
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
-        previous_dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
         if previous_status == "running":
             task.status = "pending"
         elif previous_status == "dispatching":
