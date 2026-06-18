@@ -29,6 +29,13 @@ SEMVER_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
 EVOLVE_STATE_DIR = ".evolve"
 NEXT_VERSION_FILE = "next_version"
 
+_SESSION_ID_CWD_RE = re.compile(r"/data/files/[^/]+/app/[^/]+/([0-9a-f]{8,})")
+
+
+def _session_id_from_pwd() -> str | None:
+    m = _SESSION_ID_CWD_RE.search(os.getcwd())
+    return m.group(1) if m else None
+
 
 def _run(cwd: Path, args: list[str], *, check: bool = True, env: dict = None) -> subprocess.CompletedProcess:
     r = subprocess.run(["git", *args], cwd=str(cwd),
@@ -278,7 +285,7 @@ def cmd_discover(args: argparse.Namespace) -> int:
     import re
     from pathlib import Path
 
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("KILO_SESSION_ID")
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("KILO_SESSION_ID") or _session_id_from_pwd()
     if not session_id:
         print("ERROR: no session ID found in environment", file=sys.stderr)
         return 2
@@ -288,6 +295,8 @@ def cmd_discover(args: argparse.Namespace) -> int:
     if os.environ.get("KILO_SESSION_ID"):
         agent = "kilo"
     elif os.environ.get("OPENCODE_SESSION_ID"):
+        agent = "opencode"
+    elif _session_id_from_pwd():
         agent = "opencode"
 
     # Load trace metadata to get trace_url
@@ -394,7 +403,7 @@ def cmd_auto_evolve(args: argparse.Namespace) -> int:
     import subprocess
     from pathlib import Path
 
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("KILO_SESSION_ID")
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("KILO_SESSION_ID") or _session_id_from_pwd()
     if not session_id:
         print("ERROR: no session ID found in environment", file=sys.stderr)
         return 2
@@ -403,6 +412,8 @@ def cmd_auto_evolve(args: argparse.Namespace) -> int:
     if os.environ.get("KILO_SESSION_ID"):
         agent = "kilo"
     elif os.environ.get("OPENCODE_SESSION_ID"):
+        agent = "opencode"
+    elif _session_id_from_pwd():
         agent = "opencode"
 
     trace_cache = Path.home() / ".cache" / "task-trace"
@@ -688,7 +699,7 @@ def cmd_auto_evolve_llm(args: argparse.Namespace) -> int:
         print("ERROR: --skill and --content or --content-file are required", file=sys.stderr)
         return 2
 
-    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("KILO_SESSION_ID") or "unknown"
+    session_id = os.environ.get("CLAUDE_CODE_SESSION_ID") or os.environ.get("OPENCODE_SESSION_ID") or os.environ.get("KILO_SESSION_ID") or _session_id_from_pwd() or "unknown"
 
     # Find skill dir
     skills_dir = Path(__file__).resolve().parents[2]

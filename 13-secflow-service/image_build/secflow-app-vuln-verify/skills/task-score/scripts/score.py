@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -24,6 +25,13 @@ CACHE_DIR = Path.home() / ".cache" / "task-score"
 DIMENSIONS = ["evidence", "results", "process", "evolution", "consistency"]
 WEIGHTS = [40, 30, 15, 10, 5]
 
+_SESSION_ID_CWD_RE = re.compile(r"/data/files/[^/]+/app/[^/]+/([0-9a-f]{8,})")
+
+
+def _session_id_from_pwd() -> str | None:
+    m = _SESSION_ID_CWD_RE.search(os.getcwd())
+    return m.group(1) if m else None
+
 
 def detect_session_id() -> str:
     sid = os.environ.get("KILO_SESSION_ID")
@@ -35,7 +43,10 @@ def detect_session_id() -> str:
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if sid:
         return sid
-    print("ERROR: no session id (CLAUDE_CODE_SESSION_ID / KILO_SESSION_ID / OPENCODE_SESSION_ID)", file=sys.stderr)
+    sid = _session_id_from_pwd()
+    if sid:
+        return sid
+    print("ERROR: no session id (CLAUDE_CODE_SESSION_ID / KILO_SESSION_ID / OPENCODE_SESSION_ID / cwd)", file=sys.stderr)
     sys.exit(2)
 
 

@@ -32,6 +32,8 @@ tags: [post-task, collect, task-restore, taxonomy]
 
 task-restore 服务地址必须来自环境变量 `TASK_RESTORE_URL`。执行命令时应先加载 `~/.config/secocto/.env`，不要在命令、脚本参数或 payload 中写死服务端地址。
 
+**超时约束**：workflow 中每个步骤（Step 1 ~ Step 5）执行时间不得超过 **1 分钟**。超时则 skip 当前步骤，继续执行下一个步骤，不阻塞整体流程。
+
 ## Workflow
 
 ### Step 1: 生成摘要

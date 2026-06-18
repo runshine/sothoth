@@ -14,6 +14,7 @@ if _env_file.exists():
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,13 @@ from pathlib import Path
 
 VULN_RESTORE_URL = os.environ.get("VULN_RESTORE_URL", "http://localhost:8301")
 TRACE_CACHE_DIR = Path.home() / ".cache" / "task-trace"
+
+_SESSION_ID_CWD_RE = re.compile(r"/data/files/[^/]+/app/[^/]+/([0-9a-f]{8,})")
+
+
+def _session_id_from_pwd() -> str | None:
+    m = _SESSION_ID_CWD_RE.search(os.getcwd())
+    return m.group(1) if m else None
 
 SEVERITY_TO_LEVEL = {
     "critical": "error",
@@ -39,6 +47,9 @@ def detect_agent() -> tuple[str, str]:
     if sid:
         return ("claude", sid)
     sid = os.environ.get("OPENCODE_SESSION_ID")
+    if sid:
+        return ("opencode", sid)
+    sid = _session_id_from_pwd()
     if sid:
         return ("opencode", sid)
     print("ERROR: no session id found in environment", file=sys.stderr)

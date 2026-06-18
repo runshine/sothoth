@@ -5,6 +5,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import sys
 import urllib.request
 import urllib.error
@@ -91,6 +92,14 @@ def parse_manifest(raw: str) -> dict:
     return json.loads(raw)
 
 
+_SESSION_ID_CWD_RE = re.compile(r"/data/files/[^/]+/app/[^/]+/([0-9a-f]{8,})")
+
+
+def _session_id_from_pwd() -> str | None:
+    m = _SESSION_ID_CWD_RE.search(os.getcwd())
+    return m.group(1) if m else None
+
+
 def detect_agent_type() -> str:
     if os.environ.get("KILO_SESSION_ID"):
         return "kilo"
@@ -106,6 +115,7 @@ def detect_session_id() -> str:
         os.environ.get("KILO_SESSION_ID")
         or os.environ.get("OPENCODE_SESSION_ID")
         or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or _session_id_from_pwd()
         or ""
     )
 
@@ -245,7 +255,7 @@ def upload_to_minio(
         headers={"Content-Type": "application/zip"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             if resp.status not in (200, 204):
                 raise RuntimeError(f"MinIO PUT returned {resp.status}")
     except urllib.error.HTTPError as e:

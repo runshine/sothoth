@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -37,6 +38,13 @@ if _env_file.is_file():
             os.environ[_k] = _v
 
 CACHE_DIR = Path.home() / ".cache" / "task-trace"
+
+_SESSION_ID_CWD_RE = re.compile(r"/data/files/[^/]+/app/[^/]+/([0-9a-f]{8,})")
+
+
+def _session_id_from_pwd() -> str | None:
+    m = _SESSION_ID_CWD_RE.search(os.getcwd())
+    return m.group(1) if m else None
 
 
 def env_enabled(name: str, default: str = "0") -> bool:
@@ -281,6 +289,11 @@ def discover_session_id(cli_session_id: str | None, explicit_agent: str | None =
     if env_sid:
         print(f"INFO: session ID 来自 env var (直接): {env_sid}", file=sys.stderr)
         return (agent, env_sid)
+
+    cwd_sid = _session_id_from_pwd()
+    if cwd_sid:
+        print(f"INFO: session ID 来自 cwd 路径解析: {cwd_sid}", file=sys.stderr)
+        return (agent, cwd_sid)
 
     print("ERROR: 无法获取真实 session ID（所有发现机制均失败）", file=sys.stderr)
     print("  - CLI --session-id: 未提供", file=sys.stderr)

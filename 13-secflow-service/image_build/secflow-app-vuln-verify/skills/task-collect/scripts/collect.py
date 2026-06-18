@@ -14,6 +14,7 @@ if _env_file.exists():
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +22,13 @@ from pathlib import Path
 TASK_RESTORE_URL = os.environ.get("TASK_RESTORE_URL", "http://localhost:8300")
 SCORE_CACHE_DIR = Path.home() / ".cache" / "task-score"
 TRACE_CACHE_DIR = Path.home() / ".cache" / "task-trace"
+
+_SESSION_ID_CWD_RE = re.compile(r"/data/files/[^/]+/app/[^/]+/([0-9a-f]{8,})")
+
+
+def _session_id_from_pwd() -> str | None:
+    m = _SESSION_ID_CWD_RE.search(os.getcwd())
+    return m.group(1) if m else None
 
 
 def detect_agent() -> tuple[str, str]:
@@ -33,6 +41,9 @@ def detect_agent() -> tuple[str, str]:
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
     if sid:
         return ("claude", sid)
+    sid = _session_id_from_pwd()
+    if sid:
+        return ("opencode", sid)
     print("ERROR: no session id", file=sys.stderr)
     sys.exit(2)
 
