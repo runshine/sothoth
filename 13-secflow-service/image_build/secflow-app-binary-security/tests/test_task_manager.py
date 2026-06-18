@@ -30149,6 +30149,59 @@ def _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtim
     self.assertEqual("remote-worker", task.dispatcher_instance_id)
 
 
+def _test_task_row_owner_runtime_supported_keeps_recent_remote_dispatch_without_runtime_lease(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-foreign-owner-starting",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        dispatch_started_at=now_value - timedelta(seconds=3),
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], runtime_leases=[])
+
+    supported = manager._task_row_owner_is_runtime_supported(db, task)
+
+    self.assertTrue(supported)
+    self.assertEqual("remote-worker", task.dispatcher_instance_id)
+
+
+def _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-foreign-owner-stale",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        dispatch_started_at=now_value - timedelta(seconds=30),
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], runtime_leases=[])
+
+    supported = manager._task_row_owner_is_runtime_supported(db, task)
+
+    self.assertFalse(supported)
+
+
 def _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -34162,6 +34215,8 @@ TaskManagerTests.test_archive_apply_repaired_stage_refresh_delegates_to_binary_t
 TaskManagerTests.test_compact_stage_success_items_delegates_to_dataflow_handler = _test_compact_stage_success_items_delegates_to_dataflow_handler
 TaskManagerTests.test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets = _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets
 TaskManagerTests.test_get_task_detail_task_key_snapshot_reports_unused_without_keys = _test_get_task_detail_task_key_snapshot_reports_unused_without_keys
+TaskManagerTests.test_task_row_owner_runtime_supported_keeps_recent_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_keeps_recent_remote_dispatch_without_runtime_lease
+TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease
 TaskManagerTests.test_stage_sequence_uses_pipeline_profile_for_source_kg_scan = _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary = _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results = _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results

@@ -2035,6 +2035,18 @@ class TaskManager(
             return not has_active_operation
         if dispatcher_instance_id == str(self.instance_id or "").strip():
             return self._task_owner_runtime_supported_locally(task, active_operation=operation)
+        if current_status in {"dispatching", "running"}:
+            dispatch_started_at = getattr(task, "dispatch_started_at", None)
+            dispatch_age_seconds = _elapsed_seconds_since(dispatch_started_at)
+            lease_remaining_seconds = _seconds_until(getattr(task, "lease_expires_at", None))
+            if (
+                dispatch_started_at is not None
+                and dispatch_age_seconds is not None
+                and dispatch_age_seconds < 15
+                and lease_remaining_seconds is not None
+                and lease_remaining_seconds > 0
+            ):
+                return True
         lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
         if (
             self._runtime_lease_is_active(lease)
