@@ -5801,10 +5801,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             input_dir = workspace / "input"
+            temp_dir = workspace / "run" / "upload-tmp"
             src_file = input_dir / "src" / "main.c"
             header_file = input_dir / "include" / "util.h"
             src_file.parent.mkdir(parents=True, exist_ok=True)
             header_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_dir.mkdir(parents=True, exist_ok=True)
             src_file.write_text("int main(void) { return 0; }\n", encoding="utf-8")
             header_file.write_text("#pragma once\n", encoding="utf-8")
 
@@ -5864,6 +5866,84 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, len(task.summary["input_files"]))
             self.assertEqual(2, task.metrics["uploaded_file_count"])
             self.assertEqual("ready_to_start", detail.status)
+
+    async def test_complete_uploads_accepts_source_tree_files_from_temp_upload_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            input_dir = workspace / "input"
+            temp_dir = workspace / "run" / "upload-tmp"
+            src_file = temp_dir / "src" / "main.c"
+            header_file = temp_dir / "include" / "util.h"
+            src_file.parent.mkdir(parents=True, exist_ok=True)
+            header_file.parent.mkdir(parents=True, exist_ok=True)
+            src_file.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            header_file.write_text("#pragma once\n", encoding="utf-8")
+
+            task = BinarySecurityTask(
+                id="src-temp",
+                project_id="p1",
+                name="source-task",
+                task_type=TASK_TYPE_SOURCE,
+                status="pending_upload",
+                firmware_source="project_filesystem",
+                firmware_path=str(input_dir),
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_dir": str(input_dir),
+                "temp_upload_dir": str(temp_dir),
+                "input_kind": "source_tree_files",
+                "input_files": [
+                    {"filename": "main.c", "relative_path": "src/main.c"},
+                    {"filename": "util.h", "relative_path": "include/util.h"},
+                ],
+            }
+            task.metrics = {}
+            db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
+
+            def _fake_start_task(_db, *, project_id, task_id):
+                self.assertEqual("p1", project_id)
+                self.assertEqual("src-temp", task_id)
+                return self.manager.get_task_detail(_db, project_id=project_id, task_id=task_id)
+
+            original_start_task = self.manager.start_task
+            original_build_queue_info = self.manager._build_queue_info
+            self.manager.start_task = _fake_start_task
+            self.manager._build_queue_info = lambda *_args, **_kwargs: {"pending_positions": {}, "running_count": 0, "queued_count": 0, "max_concurrent_tasks": 0}
+            try:
+                with patch.object(self.manager, "_check_storage_free_space", return_value=None):
+                    detail = await self.manager.complete_uploads(
+                        db,
+                        project_id="p1",
+                        task_id="src-temp",
+                        payload=BinarySecurityUploadCompletePayload(
+                            files=[
+                                BinarySecurityInputFile(filename="main.c", relative_path="src/main.c"),
+                                BinarySecurityInputFile(filename="util.h", relative_path="include/util.h"),
+                            ]
+                        ),
+                        updated_by="tester",
+                        authorization_token="token",
+                    )
+            finally:
+                self.manager.start_task = original_start_task
+                self.manager._build_queue_info = original_build_queue_info
+
+            self.assertEqual("ready_to_start", task.status)
+            self.assertTrue((input_dir / "src" / "main.c").is_file())
+            self.assertTrue((input_dir / "include" / "util.h").is_file())
+            self.assertFalse((temp_dir / "src" / "main.c").exists())
+            self.assertFalse((temp_dir / "include" / "util.h").exists())
+            self.assertEqual("ready_to_start", detail.status)
+
+    async def test_init_workspace_async_creates_source_temp_upload_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "workspace"
+            await self.manager._init_workspace_async(workspace)
+            self.assertTrue((workspace / "input").is_dir())
+            self.assertTrue((workspace / "run").is_dir())
+            self.assertTrue((workspace / "run" / "upload-tmp").is_dir())
 
     def test_build_project_stats_aggregates_task_metrics(self):
         success = BinarySecurityTask(

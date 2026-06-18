@@ -30,6 +30,23 @@ if TYPE_CHECKING:
 
 
 class TaskControlServiceMixin:
+    def _task_workspace_root(self: TaskManager, task) -> Path:
+        return Path(str(task.workspace_root or "")).expanduser()
+
+    def _task_summary_dir(self: TaskManager, task, key: str, fallback: Path) -> Path:
+        summary_value = str((task.summary or {}).get(key) or "").strip()
+        workspace_root = self._task_workspace_root(task)
+        if summary_value:
+            candidate = Path(summary_value).expanduser()
+            try:
+                resolved = candidate.resolve(strict=False)
+                workspace_resolved = workspace_root.resolve(strict=False)
+                if resolved == workspace_resolved or workspace_resolved in resolved.parents:
+                    return resolved
+            except Exception:
+                pass
+        return fallback
+
     def _global_config_defaults(self: TaskManager) -> dict[str, Any]:
         project_defaults = self._project_config_defaults(task_type="binary")
         return {
@@ -65,16 +82,12 @@ class TaskControlServiceMixin:
         return migrated
 
     def _task_input_dir(self: TaskManager, task) -> Path:
-        summary_path = Path(str((task.summary or {}).get("input_dir") or "")).expanduser()
-        if str(summary_path) and summary_path.exists():
-            return summary_path
-        return Path(task.workspace_root) / "input"
+        fallback = self._task_workspace_root(task) / "input"
+        return self._task_summary_dir(task, "input_dir", fallback)
 
     def _task_temp_upload_dir(self: TaskManager, task) -> Path:
-        summary_path = Path(str((task.summary or {}).get("temp_upload_dir") or "")).expanduser()
-        if str(summary_path) and summary_path.exists():
-            return summary_path
-        return Path(task.workspace_root) / "run" / "upload-tmp"
+        fallback = self._task_workspace_root(task) / "run" / "upload-tmp"
+        return self._task_summary_dir(task, "temp_upload_dir", fallback)
 
     def _normalize_input_files(self: TaskManager, files, *, task_type: str) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -174,14 +187,21 @@ class TaskControlServiceMixin:
         declared: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], int]:
         input_dir = self._task_input_dir(task)
+        temp_dir = self._task_temp_upload_dir(task)
+        await asyncio.to_thread(input_dir.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(temp_dir.mkdir, parents=True, exist_ok=True)
         total_bytes = 0
         actual_files: list[dict[str, Any]] = []
         for file_info in declared:
             filename = str(file_info.get("filename") or "").strip()
             relative_path = str(file_info.get("relative_path") or filename).strip().replace("\\", "/")
             local_path = input_dir / relative_path
+            temp_path = temp_dir / relative_path
             if not await asyncio.to_thread(local_path.is_file):
-                raise ValidationError(f"上传文件缺失: {relative_path}")
+                if not await asyncio.to_thread(temp_path.is_file):
+                    raise ValidationError(f"上传文件缺失: {relative_path}")
+                await asyncio.to_thread(local_path.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(temp_path.replace, local_path)
             stat = await asyncio.to_thread(local_path.stat)
             self._check_storage_free_space(required_bytes=stat.st_size)
             total_bytes += int(stat.st_size or 0)
@@ -199,6 +219,7 @@ class TaskControlServiceMixin:
         await asyncio.to_thread(workspace_root.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread((workspace_root / "input").mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread((workspace_root / "run").mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread((workspace_root / "run" / "upload-tmp").mkdir, parents=True, exist_ok=True)
 
     async def _ensure_task_directories(self: TaskManager, project_id: str, task_id: str, authorization_token: str) -> None:
         del project_id, task_id, authorization_token
