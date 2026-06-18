@@ -34,6 +34,15 @@ if TYPE_CHECKING:
 
 
 class TaskReducerServiceMixin:
+    def _bootstrap_reducer_metrics_snapshot_payload(self: TaskManager) -> str:
+        return "\n".join(
+            [
+                "# HELP secflow_binary_security_reducer_bootstrap_snapshot Reducer bootstrap snapshot placeholder.",
+                "# TYPE secflow_binary_security_reducer_bootstrap_snapshot gauge",
+                "secflow_binary_security_reducer_bootstrap_snapshot 1",
+            ]
+        )
+
     def _apply_stage_worker_start_requested_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
         from app.service import task_manager as task_manager_module
 
@@ -134,18 +143,21 @@ class TaskReducerServiceMixin:
     async def _reducer_metrics_snapshot_loop(self: TaskManager) -> None:
         interval_seconds = max(5, int(self.cfg.scheduler.poll_interval_seconds or 5))
         self._mark_loop_heartbeat("reducer_metrics_snapshot")
-        await self._publish_reducer_metrics_snapshot()
+        await self._publish_reducer_metrics_snapshot(lightweight=True)
         self._mark_loop_heartbeat("reducer_metrics_snapshot")
         while self._running:
             await asyncio.sleep(interval_seconds)
             await self._publish_reducer_metrics_snapshot()
             self._mark_loop_heartbeat("reducer_metrics_snapshot")
 
-    async def _publish_reducer_metrics_snapshot(self: TaskManager) -> None:
+    async def _publish_reducer_metrics_snapshot(self: TaskManager, *, lightweight: bool = False) -> None:
         from app.service import task_manager as task_manager_module
 
         try:
-            payload, _ = await asyncio.to_thread(task_manager_module.render_metrics)
+            if lightweight:
+                payload = self._bootstrap_reducer_metrics_snapshot_payload().encode("utf-8")
+            else:
+                payload, _ = await asyncio.to_thread(task_manager_module.render_metrics)
             await task_manager_module.get_reducer_metrics_snapshot_store().write_snapshot(
                 metrics_payload=payload.decode("utf-8", errors="ignore"),
                 source_pod=self.instance_id,

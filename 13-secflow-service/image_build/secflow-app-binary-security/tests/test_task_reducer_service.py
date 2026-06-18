@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from app.model import BinarySecurityStateEvent, BinarySecurityTask
 from app.service.task.reducer import TaskReducerServiceMixin
@@ -53,6 +54,20 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(1, len(db.stage_runs))
         self.assertEqual("running", db.stage_runs[0].status)
         self.assertIn("stage_started", [row.event_type for row in db.events])
+
+    def test_publish_reducer_metrics_snapshot_lightweight_skips_full_render(self):
+        store = AsyncMock()
+        with (
+            patch("app.service.task_manager.render_metrics", side_effect=AssertionError("full render should be skipped")),
+            patch("app.service.task_manager.get_reducer_metrics_snapshot_store", return_value=store),
+        ):
+            import asyncio
+
+            asyncio.run(self.manager._publish_reducer_metrics_snapshot(lightweight=True))
+
+        store.write_snapshot.assert_awaited_once()
+        payload = store.write_snapshot.await_args.kwargs["metrics_payload"]
+        self.assertIn("secflow_binary_security_reducer_bootstrap_snapshot", payload)
 
 
 if __name__ == "__main__":
