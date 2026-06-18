@@ -11,6 +11,7 @@ from app.model import (
     BinarySecurityTask,
     BinarySecurityTaskOperation,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_TYPE_SOURCE,
     normalize_stage_name,
 )
 
@@ -594,8 +595,10 @@ class TaskStateMachineMixin:
     ) -> bool:
         normalized_stage = normalize_stage_name(stage_name)
         if normalized_stage == "entry_analysis":
-            return not bool(self._effective_entry_inputs(task))
+            return not bool(self._entry_analysis_inputs(db, task))
         if normalized_stage == "dataflow_vuln_scan":
+            if self._task_type(task) == TASK_TYPE_SOURCE and not bool(self._effective_entry_inputs(task)):
+                return True
             return not bool(self._entry_results(task))
         return False
 

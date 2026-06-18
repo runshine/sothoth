@@ -3599,7 +3599,14 @@ class TaskManager(
 
     def _filter_candidate_modules(self, modules: list[dict[str, Any]], risk_levels: list[str]) -> list[dict[str, Any]]:
         allowed = set(_normalize_module_risk_levels(risk_levels))
-        return [dict(module) for module in modules if str(module.get("risk_level") or "").strip() in allowed]
+        candidates = [dict(module) for module in modules if str(module.get("risk_level") or "").strip() in allowed]
+        if candidates:
+            return candidates
+        if not modules:
+            return []
+        if allowed and all(not str(module.get("risk_level") or "").strip() for module in modules):
+            return [dict(module) for module in modules]
+        return candidates
 
     def _module_metrics(self, modules: list[dict[str, Any]], candidate_modules: list[dict[str, Any]], selected_modules: list[dict[str, Any]]) -> dict[str, int]:
         return {
