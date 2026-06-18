@@ -7,6 +7,7 @@ from app.service.stages.binary_to_source import BinaryToSourceStageHandler
 from app.service.stages.dataflow_vuln_scan import DataflowVulnScanStageHandler
 from app.service.stages.entry_analysis import EntryAnalysisStageHandler
 from app.service.stages.firmware_unpack import FirmwareUnpackStageHandler
+from app.service.stages.knowledge_graph_entry_fetch import KnowledgeGraphEntryFetchStageHandler
 from app.service.stages.system_analysis import SystemAnalysisStageHandler
 
 
@@ -22,6 +23,7 @@ class BinarySecurityStageRegistry:
             "system_analysis": SystemAnalysisStageHandler(),
             "binary_to_source": BinaryToSourceStageHandler(),
             "entry_analysis": EntryAnalysisStageHandler(),
+            "knowledge_graph_entry_fetch": KnowledgeGraphEntryFetchStageHandler(),
             "dataflow_vuln_scan": DataflowVulnScanStageHandler(),
         }
 

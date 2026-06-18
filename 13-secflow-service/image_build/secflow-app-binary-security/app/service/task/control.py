@@ -239,6 +239,7 @@ class TaskControlServiceMixin:
     def _project_config_defaults(self: TaskManager, *, task_type: str) -> dict[str, Any]:
         stage_names = self._stage_sequence_for_task(task_type)
         defaults = {
+            "pipeline_profile": "default",
             "pipeline_mode": "barrier",
             "max_stage_parallelism": 4,
             "max_retries_per_item": 2,
@@ -276,6 +277,10 @@ class TaskControlServiceMixin:
                 },
             }
         override_payload = dict(overrides or {})
+        if "pipeline_profile" in override_payload:
+            policy["pipeline_profile"] = self._validate_pipeline_profile(task_type, override_payload.get("pipeline_profile"))
+        else:
+            policy["pipeline_profile"] = self._validate_pipeline_profile(task_type, policy.get("pipeline_profile"))
         if "pipeline_mode" in override_payload:
             policy["pipeline_mode"] = task_manager_module._normalize_pipeline_mode(override_payload.get("pipeline_mode"))
         else:
@@ -301,6 +306,11 @@ class TaskControlServiceMixin:
                 policy[key] = override_payload.get(key)
         if override_payload.get("module_risk_levels") is not None:
             policy["module_risk_levels"] = task_manager_module._normalize_module_risk_levels(override_payload.get("module_risk_levels"))
+        if "knowledge_graph_entries_url" in override_payload:
+            value = str(override_payload.get("knowledge_graph_entries_url") or "").strip()
+            policy["knowledge_graph_entries_url"] = value or None
+        if policy.get("pipeline_profile") == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            policy["entry_selection_mode"] = "auto"
         return policy
 
     def save_project_config(
@@ -650,6 +660,10 @@ class TaskControlServiceMixin:
             else self.prepare_task_id(db, project_id)
         )
         task_type = self._validate_task_type(payload.task_type)
+        pipeline_profile = self._validate_pipeline_profile(
+            task_type,
+            payload.policy_overrides.pipeline_profile,
+        )
         if db.query(task_manager_module.BinarySecurityTask.id).filter(
             task_manager_module.BinarySecurityTask.project_id == project_id,
             task_manager_module.BinarySecurityTask.id == task_id,
@@ -672,6 +686,7 @@ class TaskControlServiceMixin:
         metadata_path = input_dir / "task-metadata.json"
         policy_overrides = payload.policy_overrides.model_dump(exclude_none=True)
         policy_overrides["task_type"] = task_type
+        policy_overrides["pipeline_profile"] = pipeline_profile
         policy = self._merge_policy(db, project_id, policy_overrides, payload.stage_options)
 
         task = task_manager_module.BinarySecurityTask(
@@ -728,6 +743,7 @@ class TaskControlServiceMixin:
                 "root_task_key_prefix": str(payload.root_task_key_prefix or "").strip() or None,
                 "task_key_source": str(payload.task_key_source or "").strip() or None,
             },
+            "pipeline_profile": pipeline_profile,
         }
         task.metrics = {
             "high_risk_module_count": 0,

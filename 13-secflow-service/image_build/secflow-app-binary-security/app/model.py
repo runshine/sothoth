@@ -31,9 +31,15 @@ STAGE_SEQUENCE = [
     "entry_analysis",
     "dataflow_vuln_scan",
 ]
+KG_SOURCE_VULN_SCAN_STAGE_SEQUENCE = [
+    "knowledge_graph_entry_fetch",
+    "dataflow_vuln_scan",
+]
 TASK_TYPE_BINARY = "binary"
 TASK_TYPE_SOURCE = "source"
 TASK_TYPE_BINARY_MODULE = "binary_module"
+PIPELINE_PROFILE_DEFAULT = "default"
+PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN = "kg_source_vuln_scan"
 TASK_RUNTIME_PHASE_OWNED_EXECUTION = "owned_execution"
 TASK_RUNTIME_PHASE_TAIL_RECONCILIATION = "tail_reconciliation"
 TASK_RUNTIME_PHASE_TERMINAL = "terminal"
@@ -49,6 +55,9 @@ TASK_STAGE_SEQUENCES = {
         "entry_analysis",
         "dataflow_vuln_scan",
     ],
+}
+TASK_PIPELINE_PROFILE_SEQUENCES = {
+    (TASK_TYPE_SOURCE, PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN): KG_SOURCE_VULN_SCAN_STAGE_SEQUENCE,
 }
 
 LEGACY_STAGE_NAME_ALIASES = {

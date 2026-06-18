@@ -183,6 +183,12 @@ class VulnerabilityServiceConfig(BaseModel):
     timeout: int = 60
 
 
+class KnowledgeGraphEntriesConfig(BaseModel):
+    base_url: str = "http://172.31.30.88:10001"
+    entries_path: str = "/api/v1/sources/entries"
+    timeout_seconds: int = 60
+
+
 class ServicesConfig(BaseModel):
     firmware_unpacker: SimpleServiceConfig = Field(
         default_factory=lambda: SimpleServiceConfig(base_url="http://secflow-app-firmware-unpacker")
@@ -198,6 +204,9 @@ class ServicesConfig(BaseModel):
     )
     dataflow_vuln_scan: VulnerabilityServiceConfig = Field(
         default_factory=VulnerabilityServiceConfig
+    )
+    knowledge_graph_entries: KnowledgeGraphEntriesConfig = Field(
+        default_factory=KnowledgeGraphEntriesConfig
     )
     fileserver: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
 
