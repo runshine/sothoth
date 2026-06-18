@@ -2384,6 +2384,14 @@ class TaskOperationServiceMixin:
             )
             task_manager_module.observe_control_operation(operation_type, "succeeded")
             return True
+        except task_manager_module.StaleTaskExecution:
+            task_manager_module.logger.warning(
+                "binary-security task owner stopped operation consumption because task ownership became stale: "
+                "task_id=%s current_operation_id=%s",
+                task_id,
+                str(current_operation_id if "current_operation_id" in locals() else "") or None,
+            )
+            return False
         except Exception as exc:
             db.rollback()
             task_manager_module.logger.exception(

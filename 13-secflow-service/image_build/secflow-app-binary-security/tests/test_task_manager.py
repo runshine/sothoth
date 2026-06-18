@@ -29763,6 +29763,41 @@ def _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run(
     self.assertEqual("dispatching", task.status)
 
 
+def _test_run_current_task_operation_stops_on_stale_task_ownership(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-stale-operation-owner",
+        project_id="p1",
+        name="source",
+        status="running",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[])
+    manager.instance_id = "local-worker"
+
+    def _boom(*args, **kwargs):
+        raise task_manager_module.StaleTaskExecution("owner lost")
+
+    original_factory = task_manager_module.get_session_factory
+    original_ensure = manager._ensure_task_write_ownership
+    task_manager_module.get_session_factory = lambda: (lambda: db)
+    manager._ensure_task_write_ownership = _boom
+    try:
+        result = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._ensure_task_write_ownership = original_ensure
+
+    self.assertFalse(result)
+
+
 def _test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count(self):
     manager = TaskManager()
     stale_success = BinarySecurityStageItem(
@@ -32679,6 +32714,7 @@ TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _
 TaskManagerTests.test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation = _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
+TaskManagerTests.test_run_current_task_operation_stops_on_stale_task_ownership = _test_run_current_task_operation_stops_on_stale_task_ownership
 TaskManagerTests.test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child = _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child
 TaskManagerTests.test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child = _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task
