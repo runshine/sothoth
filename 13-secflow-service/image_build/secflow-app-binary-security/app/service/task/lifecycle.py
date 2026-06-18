@@ -262,9 +262,9 @@ class TaskLifecycleServiceMixin:
         queue_snapshot = await task_manager_module.get_task_queue().snapshot()
         runtime_snapshot = await asyncio.to_thread(self._collect_runtime_metrics_snapshot_sync)
         task_manager_module.observe_queue_depths(
-            task_queue_length=int(dict(queue_snapshot.get("task_queue") or {}).get("length") or 0),
+            redis_task_queue=int(dict(queue_snapshot.get("task_queue") or {}).get("length") or 0),
             task_queue_oldest_age_seconds=dict(queue_snapshot.get("task_queue") or {}).get("oldest_age_seconds"),
-            operation_queue_length=int(dict(queue_snapshot.get("operation_queue") or {}).get("length") or 0),
+            redis_operation_queue=int(dict(queue_snapshot.get("operation_queue") or {}).get("length") or 0),
             operation_queue_oldest_age_seconds=dict(queue_snapshot.get("operation_queue") or {}).get("oldest_age_seconds"),
             pending_tasks=int(runtime_snapshot.get("pending_tasks") or 0),
             running_tasks=int(runtime_snapshot.get("running_tasks") or 0),
@@ -278,6 +278,7 @@ class TaskLifecycleServiceMixin:
             task_capacity=int(runtime_snapshot.get("task_capacity") or 0),
             task_active=len([task for task in self._workers.values() if not task.done()]),
             action_active=len([task for task in self._operation_workers.values() if not task.done()]),
+            action_capacity=max(1, int(getattr(self.cfg.scheduler, "downstream_action_concurrency", 1) or 1)),
         )
 
     async def _operation_dispatch_loop(self: TaskManager) -> None:

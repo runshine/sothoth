@@ -973,6 +973,8 @@ class TaskRuntimeServiceMixin:
         except task_manager_module.StaleTaskExecution:
             return
         except Exception as exc:
+            with suppress(Exception):
+                db.rollback()
             task = db.query(task_manager_module.BinarySecurityTask).filter(
                 task_manager_module.BinarySecurityTask.id == task_id
             ).first()
