@@ -30202,6 +30202,58 @@ def _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without
     self.assertFalse(supported)
 
 
+def _test_upsert_runtime_lease_recovers_from_duplicate_insert_race(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    existing_lease = BinarySecurityTaskRuntimeLease(
+        task_id="task-lease-race",
+        execution_epoch=2,
+        owner_instance_id="local-worker",
+        owner_pod_uid=manager.owner_pod_uid,
+        owner_boot_id=manager.owner_boot_id,
+        generation=1,
+        owner_started_at=manager.owner_started_at,
+        heartbeat_at=_now() - timedelta(seconds=5),
+        last_renewed_at=_now() - timedelta(seconds=5),
+        lease_expires_at=_now() + timedelta(seconds=60),
+    )
+    task = BinarySecurityTask(
+        id="task-lease-race",
+        project_id="p1",
+        name="source",
+        status="running",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        execution_epoch=2,
+    )
+
+    class _RuntimeLeaseRaceDb(_AppendingModelAwareDb):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._flush_calls = 0
+
+        def flush(self):
+            self._flush_calls += 1
+            if self._flush_calls == 1:
+                raise IntegrityError("insert", None, Exception("duplicate"))
+
+        def rollback(self):
+            return None
+
+    db = _RuntimeLeaseRaceDb(tasks=[task], runtime_leases=[existing_lease])
+
+    lease = manager._upsert_runtime_lease(db, task, now_value=_now())
+
+    self.assertIs(lease, existing_lease)
+    self.assertEqual("local-worker", lease.owner_instance_id)
+    self.assertGreater(lease.lease_expires_at, _now())
+
+
 def _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -34217,6 +34269,7 @@ TaskManagerTests.test_get_task_detail_includes_task_key_snapshot_and_redacts_sec
 TaskManagerTests.test_get_task_detail_task_key_snapshot_reports_unused_without_keys = _test_get_task_detail_task_key_snapshot_reports_unused_without_keys
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_recent_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_keeps_recent_remote_dispatch_without_runtime_lease
 TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease
+TaskManagerTests.test_upsert_runtime_lease_recovers_from_duplicate_insert_race = _test_upsert_runtime_lease_recovers_from_duplicate_insert_race
 TaskManagerTests.test_stage_sequence_uses_pipeline_profile_for_source_kg_scan = _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary = _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results = _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results

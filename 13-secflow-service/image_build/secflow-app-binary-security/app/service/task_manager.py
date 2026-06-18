@@ -1779,7 +1779,24 @@ class TaskManager(
                 last_renewed_at=now_value,
                 lease_expires_at=self._next_runtime_lease_expiry(now_value=now_value),
             )
+            begin_nested = getattr(db, "begin_nested", None)
+            nested = begin_nested() if callable(begin_nested) else None
             db.add(lease)
+            try:
+                db.flush()
+            except IntegrityError:
+                if nested is not None:
+                    with suppress(Exception):
+                        nested.rollback()
+                else:
+                    db.rollback()
+                lease = self._runtime_lease_for_task(db, task.id)
+                if lease is None:
+                    raise
+            else:
+                if nested is not None:
+                    with suppress(Exception):
+                        nested.commit()
         else:
             current_owner = str(lease.owner_instance_id or "").strip() or None
             lease_active = self._runtime_lease_is_active(lease)
