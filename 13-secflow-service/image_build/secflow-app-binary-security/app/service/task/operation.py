@@ -160,8 +160,12 @@ class TaskOperationServiceMixin:
             handle = self._workers.get(task_id)
         if handle is None or handle.done():
             return
-        handle.cancel()
         current_task = asyncio.current_task()
+        handle.cancel_requested = True
+        if handle.heartbeat_task is not None and handle.heartbeat_task is not current_task and not handle.heartbeat_task.done():
+            handle.heartbeat_task.cancel()
+        if handle.runner_task is not current_task and not handle.runner_task.done():
+            handle.runner_task.cancel()
         tasks: list[asyncio.Task] = []
         if wait_for_runner and handle.runner_task is not current_task:
             tasks.append(handle.runner_task)

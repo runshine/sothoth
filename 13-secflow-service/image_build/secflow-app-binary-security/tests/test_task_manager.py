@@ -9389,8 +9389,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             del args, kwargs
             order.append("write_metadata")
 
-        async def fake_cancel_local_worker(task_id: str):
+        async def fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
             self.assertEqual("t1", task_id)
+            self.assertFalse(wait_for_runner)
             order.append("cancel_worker")
 
         async def fake_cancel_downstream(downstream_item, token):
@@ -9399,7 +9400,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             order.append("cancel_downstream")
 
         self.manager._write_task_metadata_async = fake_write_task_metadata_async
-        self.manager._cancel_local_worker = fake_cancel_local_worker
+        self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
         self.manager._cancel_downstream = fake_cancel_downstream
 
         self.assertEqual([], order)
@@ -9438,8 +9439,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         async def fake_write_task_metadata_async(*args, **kwargs):
             return None
 
-        async def fake_cancel_local_worker(task_id: str):
+        async def fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
             self.assertEqual("t1", task_id)
+            self.assertFalse(wait_for_runner)
 
         async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
             calls.append(
@@ -9454,7 +9456,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         original_discover = self.manager._discover_parent_linked_downstream_refs
         self.manager._write_task_metadata_async = fake_write_task_metadata_async
-        self.manager._cancel_local_worker = fake_cancel_local_worker
+        self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
         self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
         self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
             {"service": "dataflow_vuln_scan", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_vuln_scan"},
@@ -9972,6 +9974,34 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 self.manager._workers.pop("t1", None)
                 heartbeat.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await heartbeat
+
+    def test_request_local_worker_cancel_does_not_cancel_current_runner_task(self):
+        async def _run():
+            current = asyncio.current_task()
+            heartbeat = asyncio.create_task(asyncio.sleep(3600), name="hb")
+            try:
+                handle = task_manager_module.TaskRuntimeHandle(
+                    task_id="t1",
+                    runner_task=current,
+                    heartbeat_task=heartbeat,
+                    claimed_at=_now(),
+                    execution_token="tok",
+                    lease_owner_instance_id="worker-1",
+                )
+                self.manager._workers["t1"] = handle
+                await asyncio.wait_for(
+                    self.manager._request_local_worker_cancel("t1", wait_for_runner=False),
+                    timeout=1,
+                )
+                self.assertTrue(handle.cancel_requested)
+                self.assertFalse(current.cancelled())
+                self.assertTrue(heartbeat.cancelled())
+            finally:
+                self.manager._workers.pop("t1", None)
+                if not heartbeat.done():
+                    heartbeat.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await heartbeat
 
@@ -25925,8 +25955,9 @@ def _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
     async def fake_write_task_metadata_async(*args, **kwargs):
         return None
 
-    async def fake_cancel_local_worker(task_id: str):
+    async def fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
         self.assertEqual("t1", task_id)
+        self.assertFalse(wait_for_runner)
 
     async def fake_cancel_downstream_refs(db_arg, task_arg, refs_arg, token_arg):
         calls.append(
@@ -25941,7 +25972,7 @@ def _test_manual_cancel_collects_dispatching_and_orphan_downstream_refs(self):
 
     original_discover = self.manager._discover_parent_linked_downstream_refs
     self.manager._write_task_metadata_async = fake_write_task_metadata_async
-    self.manager._cancel_local_worker = fake_cancel_local_worker
+    self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
     self.manager._cancel_downstream_refs = fake_cancel_downstream_refs
     self.manager._discover_parent_linked_downstream_refs = lambda _db, _task: [
         {"service": "dataflow_vuln_scan", "task_id": "dfa_orphan", "project_id": "p1", "stage_name": "dataflow_vuln_scan"},
