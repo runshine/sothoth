@@ -15,17 +15,19 @@ def _validate_args(args: argparse.Namespace) -> list[str]:
     errors: list[str] = []
     reports = Path(args.reports).expanduser()
     source_root = Path(args.source_root).expanduser()
-    binary_root = Path(args.binary_root).expanduser()
-    threat = Path(args.threat).expanduser()
 
     if not reports.is_dir():
         errors.append(f"--reports must be an existing directory: {reports}")
     if not source_root.is_dir():
         errors.append(f"--source-root must be an existing directory: {source_root}")
-    if not binary_root.is_dir():
-        errors.append(f"--binary-root must be an existing directory: {binary_root}")
-    if not threat.is_file():
-        errors.append(f"--threat must be an existing file: {threat}")
+    if args.binary_root:
+        binary_root = Path(args.binary_root).expanduser()
+        if not binary_root.is_dir():
+            errors.append(f"--binary-root must be an existing directory: {binary_root}")
+    if args.threat:
+        threat = Path(args.threat).expanduser()
+        if not threat.is_file():
+            errors.append(f"--threat must be an existing file: {threat}")
     if args.concurrency < 1:
         errors.append(f"--concurrency must be >= 1, got {args.concurrency}")
 
@@ -42,23 +44,26 @@ def _log_level(verbose: int) -> int:
 
 def _run_pipeline(args: argparse.Namespace, output_dir: Path, logfile: Path) -> int:
     """Router → assemble → Verifier."""
+    threat_path = Path(args.threat).expanduser() if args.threat else None
+    binary_root = Path(args.binary_root).expanduser() if args.binary_root else None
+    source_root = Path(args.source_root).expanduser()
     output_data = run(
         reports_dir=Path(args.reports).expanduser(),
-        threat_model_path=Path(args.threat).expanduser(),
-        source_root=Path(args.source_root).expanduser(),
-        binary_root=Path(args.binary_root).expanduser(),
+        threat_model_path=threat_path,
+        source_root=source_root,
+        binary_root=binary_root,
     )
     assemble(
         output_data=output_data,
         output_dir=output_dir,
         logfile=logfile,
-        threat_model_path=Path(args.threat).expanduser(),
-        source_root=Path(args.source_root).expanduser(),
-        binary_root=Path(args.binary_root).expanduser(),
+        threat_model_path=threat_path,
+        source_root=source_root,
+        binary_root=binary_root,
     )
     session_dir = Path(args.session_dir).expanduser().resolve() if args.session_dir else output_dir.parent / "run"
     session_dir.mkdir(parents=True, exist_ok=True)
-    launch(output_dir, str(Path(args.threat).expanduser()), model=args.model,
+    launch(output_dir, str(threat_path) if threat_path else None, model=args.model,
            concurrency=args.concurrency, resume=args.resume, session_dir=session_dir)
     return 0
 
@@ -69,8 +74,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--reports", required=True, help="directory containing scan findings (Markdown)")
     parser.add_argument("--source-root", required=True, help="root directory of source files")
-    parser.add_argument("--binary-root", required=True, help="root directory of binary artifacts")
-    parser.add_argument("--threat", required=True, help="threat model file")
+    parser.add_argument("--binary-root", help="root directory of binary artifacts (optional)")
+    parser.add_argument("--threat", help="threat model file (optional)")
     parser.add_argument("--output", required=True, help="output directory")
     parser.add_argument("--logfile", help="routing summary path; defaults to {output}/verify.log")
     parser.add_argument("--model", help="LLM model for assessment engine. Uses pi default if omitted.")

@@ -82,7 +82,7 @@ def _verify_one(
     return (group_dir.name, returncode)
 
 
-def launch(assembled_dir: Path, threat_path: str, model: str | None = None,
+def launch(assembled_dir: Path, threat_path: str | None = None, model: str | None = None,
            concurrency: int = 4, resume: bool = False, session_dir: Path | None = None) -> None:
     log = get_logger("vuln_verify.launcher")
     """

@@ -166,10 +166,6 @@ class VulnVerifyWorker:
                     task.reports_dir,
                     "--source-root",
                     task.source_root,
-                    "--binary-root",
-                    task.binary_root,
-                    "--threat",
-                    task.threat_path,
                     "--output",
                     task.output_dir,
                     "--session-dir",
@@ -178,6 +174,10 @@ class VulnVerifyWorker:
                     str(int(task.concurrency or 1)),
                     "-v",
                 ]
+                if task.binary_root:
+                    cmd.extend(["--binary-root", task.binary_root])
+                if task.threat_path:
+                    cmd.extend(["--threat", task.threat_path])
                 if task.model:
                     cmd.extend(["--model", task.model])
                 if task.resume:

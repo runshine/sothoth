@@ -18,16 +18,16 @@ def _safe_copy2(src: str | Path, dst: str | Path, *, follow_symlinks: bool = Tru
 
 
 def _write_manifest(
-    manifest_path: Path, group: VerifierGroup, source_root: Path, binary_root: Path
+    manifest_path: Path, group: VerifierGroup, source_root: Path | None, binary_root: Path | None
 ) -> None:
     manifest = {
         "group_id": group.group_id,
         "file": group.file,
-        "binary_root": str(binary_root.resolve()),
+        "binary_root": str(binary_root.resolve()) if binary_root else None,
         "function": group.function,
         "report_ids": [report.report_id for report in group.reports],
     }
-    if group.file != "file_unknown":
+    if source_root and group.file != "file_unknown":
         manifest["file_path"] = str(source_root.resolve() / group.file)
 
     with manifest_path.open("w", encoding="utf-8") as handle:
@@ -66,21 +66,22 @@ def assemble(
     output_data: RouterOutput,
     output_dir: str | Path,
     logfile: str | Path,
-    threat_model_path: str | Path,
-    source_root: str | Path,
-    binary_root: str | Path,
+    threat_model_path: str | Path | None = None,
+    source_root: str | Path | None = None,
+    binary_root: str | Path | None = None,
 ) -> dict:
     output_path = Path(output_dir)
     groups_path = output_path / "groups"
     unrouteable_path = output_path / "unrouteable"
-    threat_path = Path(threat_model_path)
-    source_root_path = Path(source_root)
-    binary_root_path = Path(binary_root)
+    source_root_path = Path(source_root) if source_root else None
+    binary_root_path = Path(binary_root) if binary_root else None
 
     groups_path.mkdir(parents=True, exist_ok=True)
     unrouteable_path.mkdir(parents=True, exist_ok=True)
 
-    _safe_copy2(threat_path, output_path / "threat_model.md")
+    if threat_model_path:
+        threat_path = Path(threat_model_path)
+        _safe_copy2(threat_path, output_path / "threat_model.md")
 
     for group in output_data.groups:
         group_path = groups_path / group.group_id

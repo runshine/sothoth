@@ -14,9 +14,9 @@ log = get_logger("vuln_dispatch.pipeline")
 @logged
 def run(
     reports_dir: str | Path,
-    threat_model_path: str | Path,
-    source_root: str | Path,
-    binary_root: str | Path,
+    threat_model_path: str | Path | None = None,
+    source_root: str | Path | None = None,
+    binary_root: str | Path | None = None,
 ) -> RouterOutput:
     del threat_model_path, source_root, binary_root
 
