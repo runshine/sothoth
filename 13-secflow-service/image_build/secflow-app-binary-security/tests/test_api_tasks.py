@@ -13,9 +13,13 @@ from app.exception import UpstreamError, setup_exception_handlers
 from app.model import get_db
 from app.service.project import ProjectService
 from app.schemas import (
+    BinarySecurityActionResponse,
     BinarySecurityAbnormalReasonHistoryResponse,
     BinarySecurityArchiveJobPageResponse,
     BinarySecurityEntrySelectionResponse,
+    BinarySecurityGlobalConfigPayload,
+    BinarySecurityGlobalConfigResponse,
+    BinarySecurityModuleSelectionResponse,
     BinarySecurityOverviewResponse,
     BinarySecurityProjectStats,
     BinarySecurityProjectConfigPayload,
@@ -35,6 +39,17 @@ from app.schemas import (
 class _RouteManagerStub:
     def __init__(self):
         self.calls = []
+
+    async def delete_task(self, db, project_id, task_id, force=False):
+        self.calls.append(("delete_task", db, project_id, task_id, force))
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id="op-delete-1",
+            accepted=True,
+            action="delete",
+            status="accepted",
+            message="任务删除已受理，后台正在清理任务及下游资源",
+        )
 
     def get_task_detail(self, db, project_id, task_id):
         self.calls.append(("get_task_detail", db, project_id, task_id))
@@ -143,6 +158,21 @@ class _RouteManagerStub:
             ),
         )
 
+    def get_config(self, db):
+        self.calls.append(("get_config", db))
+        return BinarySecurityGlobalConfigResponse(
+            config=BinarySecurityGlobalConfigPayload(
+                max_concurrent_tasks=12,
+                dispatch_timeout_seconds=60,
+                lease_timeout_seconds=90,
+                pipeline_mode="mixed_streaming",
+            )
+        )
+
+    def save_config(self, db, payload):
+        self.calls.append(("save_config", db, payload))
+        return BinarySecurityGlobalConfigResponse(config=payload)
+
     def get_orchestration_observability(self, db, project_id, task_id):
         self.calls.append(("get_orchestration_observability", db, project_id, task_id))
         return {
@@ -194,6 +224,19 @@ class _RouteManagerStub:
     def get_task_abnormal_reason_history(self, db, project_id, task_id):
         self.calls.append(("get_task_abnormal_reason_history", db, project_id, task_id))
         return BinarySecurityAbnormalReasonHistoryResponse(task_id=task_id, items=[])
+
+    def get_module_selection(self, db, project_id, task_id):
+        self.calls.append(("get_module_selection", db, project_id, task_id))
+        return BinarySecurityModuleSelectionResponse(
+            task_id=task_id,
+            status="pending_module_confirmation",
+            selection_mode="manual_confirm",
+            risk_levels=["高", "中"],
+            requires_confirmation=True,
+            system_analysis_modules=[{"module_key": "m1", "module_name": "module1"}],
+            candidate_modules=[{"module_key": "m1", "module_name": "module1"}],
+            selected_modules=[],
+        )
 
     def get_entry_selection(self, db, project_id, task_id):
         self.calls.append(("get_entry_selection", db, project_id, task_id))
@@ -504,6 +547,41 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertEqual(("get_task_overview", fake_db, "p1", "t1"), manager.calls[0])
 
+    def test_delete_task_route_delegates_force_flag_to_manager(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.delete(
+                    "/api/app/binary-security/projects/p1/tasks/t1",
+                    params={"force": "true"},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("delete", payload["action"])
+        self.assertTrue(payload["accepted"])
+        self.assertEqual(("delete_task", fake_db, "p1", "t1", True), manager.calls[0])
+
+    def test_get_module_selection_route_delegates_to_manager(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1/module-selection",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("manual_confirm", payload["selection_mode"])
+        self.assertTrue(payload["requires_confirmation"])
+        self.assertEqual(("get_module_selection", fake_db, "p1", "t1"), manager.calls[0])
+
     def test_get_task_archive_jobs_route_preserves_filters(self):
         app, fake_db = self._build_client()
         manager = _RouteManagerStub()
@@ -591,6 +669,41 @@ class TaskApiRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(12, payload["config"]["max_concurrent_tasks"])
         self.assertEqual(("get_service_config", fake_db), manager.calls[0])
+
+    def test_get_global_config_route_delegates_to_manager(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/config",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
+        self.assertEqual(("get_config", fake_db), manager.calls[0])
+
+    def test_put_global_config_route_delegates_to_manager(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.put(
+                    "/api/app/binary-security/config",
+                    json={"pipeline_mode": "mixed_streaming"},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
+        self.assertEqual("save_config", manager.calls[0][0])
+        self.assertIs(fake_db, manager.calls[0][1])
+        self.assertEqual("mixed_streaming", manager.calls[0][2].pipeline_mode)
 
     def test_get_task_detail_route_returns_502_when_project_service_disconnects(self):
         app = FastAPI()

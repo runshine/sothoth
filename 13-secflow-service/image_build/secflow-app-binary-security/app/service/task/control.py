@@ -10,10 +10,13 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy.orm import Session
 
 from app.exception import NotFoundError, ValidationError
-from app.model import BinarySecurityProjectConfig, BinarySecurityTaskOperation
+from app.model import BinarySecurityProjectConfig, BinarySecurityServiceConfig, BinarySecurityTaskOperation
 from app.schemas import (
     BinarySecurityActionResponse,
+    BinarySecurityGlobalConfigPayload,
+    BinarySecurityGlobalConfigResponse,
     BinarySecurityInputFile,
+    BinarySecurityModuleSelectionResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityTaskCreate,
@@ -27,6 +30,40 @@ if TYPE_CHECKING:
 
 
 class TaskControlServiceMixin:
+    def _global_config_defaults(self: TaskManager) -> dict[str, Any]:
+        project_defaults = self._project_config_defaults(task_type="binary")
+        return {
+            "max_concurrent_tasks": 20,
+            "dispatch_timeout_seconds": 60,
+            "lease_timeout_seconds": 90,
+            **project_defaults,
+        }
+
+    def _latest_project_config_row(self: TaskManager, db: Session) -> BinarySecurityProjectConfig | None:
+        return (
+            db.query(BinarySecurityProjectConfig)
+            .order_by(BinarySecurityProjectConfig.updated_at.desc(), BinarySecurityProjectConfig.id.desc())
+            .first()
+        )
+
+    def _ensure_global_service_config_row(self: TaskManager, db: Session) -> BinarySecurityServiceConfig | None:
+        row = (
+            db.query(BinarySecurityServiceConfig)
+            .filter(BinarySecurityServiceConfig.config_key == "global")
+            .first()
+        )
+        if row is not None:
+            return row
+        legacy_row = self._latest_project_config_row(db)
+        if legacy_row is None:
+            return None
+        migrated = BinarySecurityServiceConfig(config_key="global")
+        migrated.config = dict(legacy_row.config or {})
+        db.add(migrated)
+        db.commit()
+        db.refresh(migrated)
+        return migrated
+
     def _task_input_dir(self: TaskManager, task) -> Path:
         summary_path = Path(str((task.summary or {}).get("input_dir") or "")).expanduser()
         if str(summary_path) and summary_path.exists():
@@ -300,6 +337,68 @@ class TaskControlServiceMixin:
             }
         payload = BinarySecurityProjectConfigPayload(**{**BinarySecurityProjectConfigPayload().model_dump(), **config})
         return BinarySecurityProjectConfigResponse(project_id=project_id, config=payload)
+
+    def get_config(self: TaskManager, db: Session) -> BinarySecurityGlobalConfigResponse:
+        row = self._ensure_global_service_config_row(db)
+        config = {**self._global_config_defaults()}
+        if row is not None and row.config:
+            config.update(dict(row.config or {}))
+        config["pipeline_mode"] = self._normalize_policy_update_payload(
+            type("TaskLike", (), {"policy": {}, "task_type": "binary"})(),
+            BinarySecurityTaskPolicyUpdatePayload(pipeline_mode=config.get("pipeline_mode")),
+        ).get("pipeline_mode", "barrier")
+        if "partial_success_stage_advancement" in config:
+            defaults = self._project_config_defaults(task_type="binary")["partial_success_stage_advancement"]
+            current = dict(config.get("partial_success_stage_advancement") or {})
+            config["partial_success_stage_advancement"] = {
+                stage_name: bool(current.get(stage_name, default_value))
+                for stage_name, default_value in defaults.items()
+            }
+        payload = BinarySecurityGlobalConfigPayload(**{**BinarySecurityGlobalConfigPayload().model_dump(), **config})
+        return BinarySecurityGlobalConfigResponse(config=payload)
+
+    def save_config(self: TaskManager, db: Session, payload: BinarySecurityGlobalConfigPayload) -> BinarySecurityGlobalConfigResponse:
+        row = (
+            db.query(BinarySecurityServiceConfig)
+            .filter(BinarySecurityServiceConfig.config_key == "global")
+            .first()
+        )
+        if row is None:
+            row = BinarySecurityServiceConfig(config_key="global")
+            db.add(row)
+        config = payload.model_dump()
+        config["pipeline_mode"] = self._normalize_policy_update_payload(
+            type("TaskLike", (), {"policy": {}, "task_type": "binary"})(),
+            BinarySecurityTaskPolicyUpdatePayload(pipeline_mode=config.get("pipeline_mode")),
+        )["pipeline_mode"]
+        row.config = config
+        db.commit()
+        db.refresh(row)
+        return BinarySecurityGlobalConfigResponse(
+            config=BinarySecurityGlobalConfigPayload(**{**BinarySecurityGlobalConfigPayload().model_dump(), **config})
+        )
+
+    def get_module_selection(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+    ) -> BinarySecurityModuleSelectionResponse:
+        from app.service import task_manager as task_manager_module
+
+        task = self._task_or_404(db, project_id, task_id)
+        summary = task.summary if isinstance(task.summary, dict) else {}
+        return task_manager_module.BinarySecurityModuleSelectionResponse(
+            task_id=task.id,
+            status=task.status,
+            selection_mode=self._module_selection_mode(task),
+            risk_levels=self._module_selection_candidate_levels(task),
+            requires_confirmation=task.status == task_manager_module.TASK_STATUS_PENDING_MODULE_CONFIRMATION,
+            system_analysis_modules=list(summary.get("system_analysis_modules") or []),
+            candidate_modules=list(summary.get("candidate_modules") or []),
+            selected_modules=list(summary.get("selected_modules") or []),
+        )
 
     def _policy_stage_names(self: TaskManager, task) -> set[str]:
         return set(self._stage_sequence_for_task(task))
@@ -708,6 +807,55 @@ class TaskControlServiceMixin:
             status="accepted",
             message="任务取消已受理，后台正在停止执行并清理下游任务",
             task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
+        )
+
+    async def delete_task(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        force: bool = False,
+    ) -> BinarySecurityActionResponse:
+        from app.service import task_manager as task_manager_module
+
+        task = self._task_or_404(db, project_id, task_id)
+        active_delete_operation = self._active_operation(db, task.id)
+        if active_delete_operation is not None and str(active_delete_operation.operation_type or "").strip() == task_manager_module.TASK_ACTION_DELETE:
+            task_manager_module.observe_task_operation("delete", "already_queued")
+            return BinarySecurityActionResponse(
+                task_id=task_id,
+                operation_id=active_delete_operation.id,
+                accepted=True,
+                action="delete",
+                status="accepted",
+                message="任务删除已受理，后台正在清理任务及下游资源",
+                task_status_after_accept=task.status,
+            )
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            target_stage=task.current_stage,
+            requested_by=task.created_by,
+            request_payload={
+                "current_stage": task.current_stage,
+                "force": bool(force),
+            },
+            accepted_event_type="task_delete_accepted",
+            accepted_message="任务删除已受理，后台正在清理任务及下游资源",
+        )
+        task.current_operation_id = operation.id
+        db.commit()
+        task_manager_module.observe_task_operation("delete", "accepted")
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id=operation.id,
+            accepted=True,
+            action="delete",
+            status="accepted",
+            message="任务删除已受理，后台正在清理任务及下游资源",
+            task_status_after_accept=task.status,
         )
 
     async def continue_task(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
