@@ -25703,7 +25703,7 @@ def _test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope(self):
     asyncio.run(_run())
 
 
-def _test_delete_operation_payload_root_uses_fallback_outside_workspace(self):
+def _test_delete_operation_payload_root_externalizes_under_workspace(self):
     operation = BinarySecurityTaskOperation(
         id="op-delete-payload",
         task_id="t-delete-payload",
@@ -25717,14 +25717,17 @@ def _test_delete_operation_payload_root_uses_fallback_outside_workspace(self):
         workspace_root="/tmp/ws-delete-payload",
     )
 
-    self.assertIsNone(payload_root)
+    self.assertEqual(
+        Path("/tmp/ws-delete-payload/run/task-operations/op-delete-payload"),
+        payload_root,
+    )
 
 
 TaskManagerTests.test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success = _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_success
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists = _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active = _test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active
 TaskManagerTests.test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope = _test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope
-TaskManagerTests.test_delete_operation_payload_root_uses_fallback_outside_workspace = _test_delete_operation_payload_root_uses_fallback_outside_workspace
+TaskManagerTests.test_delete_operation_payload_root_externalizes_under_workspace = _test_delete_operation_payload_root_externalizes_under_workspace
 
 
 def _test_task_manager_does_not_access_downstream_clients_directly(self):
