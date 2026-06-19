@@ -581,7 +581,7 @@ class TaskArchiveServiceMixin:
                 payload_downstream_task_id=self._payload_downstream_task_id(payload),
                 replacement_state=replacement_state,
             )
-            if self._replacement_window_active_for_stale_ignore(item):
+            if self._replacement_window_active_for_stale_ignore(item) and self._is_destructive_rebuild_transition(replacement_state):
                 self._record_event(
                     db,
                     task,

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.model import BinarySecurityStageItem, BinarySecurityTask, TASK_TYPE_BINARY, TASK_TYPE_SOURCE
 from app.service.task.contracts import TaskContractServiceMixin
+from app.service.task.shared import _normalize_module_risk_level, _normalize_module_risk_levels
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb
 
@@ -83,7 +84,19 @@ class TaskContractServiceBehaviorTests(unittest.TestCase):
 
             self.assertEqual(1, len(rows))
             self.assertEqual("mod-a", rows[0]["module_name"])
-            self.assertEqual("high", rows[0]["risk_level"])
+            self.assertEqual("高", rows[0]["risk_level"])
+
+    def test_normalize_module_risk_level_maps_common_aliases(self):
+        self.assertEqual("高", _normalize_module_risk_level("致命"))
+        self.assertEqual("高", _normalize_module_risk_level("critical"))
+        self.assertEqual("高", _normalize_module_risk_level("high"))
+        self.assertEqual("中", _normalize_module_risk_level("一般"))
+        self.assertEqual("中", _normalize_module_risk_level("warning"))
+        self.assertEqual("低", _normalize_module_risk_level("提示"))
+        self.assertEqual("低", _normalize_module_risk_level("info"))
+
+    def test_normalize_module_risk_levels_maps_policy_aliases(self):
+        self.assertEqual(["高", "中", "低"], _normalize_module_risk_levels(["严重", "一般", "提示", "critical"]))
 
     def test_entry_analysis_inputs_for_source_reuses_selected_modules(self):
         task = BinarySecurityTask(

@@ -1469,6 +1469,7 @@ class TaskOperationServiceMixin:
                     old_downstream_task_id=None,
                     binding_cleared=True,
                     verification_status="pending",
+                    transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                 )
                 self._update_retry_item_action(
                     task,
@@ -1501,6 +1502,7 @@ class TaskOperationServiceMixin:
                     old_downstream_task_id=old_task_id,
                     binding_cleared=True,
                     verification_status="pending",
+                    transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                 )
                 updated = {
                     "cleanup_performed": True,
@@ -1679,6 +1681,7 @@ class TaskOperationServiceMixin:
                             old_downstream_task_id=old_task_id,
                             binding_cleared=True,
                             verification_status="pending",
+                            transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                         )
                         created = await self._downstream_create_task(
                             db,
@@ -2190,27 +2193,53 @@ class TaskOperationServiceMixin:
                 changed = True
                 continue
             if current_task_id and old_task_id and current_task_id == old_task_id and not replacement_state["binding_cleared"]:
-                self._mark_replacement_in_progress(
-                    item,
-                    old_downstream_task_id=old_task_id,
-                    binding_cleared=True,
-                    verification_status="pending",
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "replacement_binding_repaired",
-                    "任务 owner 已清理 replacement 残留，旧 child 绑定已标记为可重建",
-                    stage_name=item.stage_name,
-                    item=item,
-                    payload={
-                        "source": "task_owner",
-                        "old_downstream_task_id": old_task_id,
-                        "current_downstream_task_id": current_task_id,
-                        "repair_action": "mark_binding_cleared",
-                    },
-                )
-                changed = True
+                explicit_transition_type = str(replacement_state.get("transition_type") or "").strip().lower()
+                if explicit_transition_type == self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD:
+                    self._mark_replacement_in_progress(
+                        item,
+                        old_downstream_task_id=old_task_id,
+                        binding_cleared=True,
+                        verification_status="pending",
+                        transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
+                    )
+                    self._record_event(
+                        db,
+                        task,
+                        "replacement_binding_repaired",
+                        "任务 owner 已清理 replacement 残留，旧 child 绑定已标记为可重建",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "source": "task_owner",
+                            "old_downstream_task_id": old_task_id,
+                            "current_downstream_task_id": current_task_id,
+                            "repair_action": "mark_binding_cleared",
+                            "transition_type": self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
+                        },
+                    )
+                    changed = True
+                else:
+                    self._mark_in_place_child_restart(
+                        item,
+                        downstream_task_id=old_task_id,
+                        verification_status=replacement_state["verification_status"] or "pending",
+                    )
+                    self._record_event(
+                        db,
+                        task,
+                        "replacement_binding_repaired",
+                        "任务 owner 已确认当前 child 为原地重启中的 authoritative child",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "source": "task_owner",
+                            "old_downstream_task_id": old_task_id,
+                            "current_downstream_task_id": current_task_id,
+                            "repair_action": "preserve_in_place_binding",
+                            "transition_type": self.CHILD_TRANSITION_IN_PLACE_RESTART,
+                        },
+                    )
+                    changed = True
         return changed
 
     async def _run_task_runtime_signals(self: TaskManager, task_id: str) -> bool:

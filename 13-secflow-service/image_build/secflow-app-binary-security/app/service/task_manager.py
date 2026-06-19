@@ -210,6 +210,7 @@ from app.service.task.shared import (
     _no_candidate_modules_failure,
     _normalize_entry_function_name,
     _normalize_entry_taint_details,
+    _normalize_module_risk_level,
     _normalize_module_risk_levels,
     _normalize_parameter_name,
     _normalize_pipeline_mode,
@@ -3499,6 +3500,9 @@ class TaskManager(
     def _module_risk_levels(self, task: BinarySecurityTask) -> list[str]:
         return _normalize_module_risk_levels((task.policy or {}).get("module_risk_levels"))
 
+    def _normalize_module_risk_level(self, value: Any, risk_score: Any = None) -> str:
+        return _normalize_module_risk_level(value, risk_score)
+
     def _module_selection_candidate_levels(self, task: BinarySecurityTask) -> list[str]:
         if self._module_selection_mode(task) == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
             return list(ALLOWED_MODULE_RISK_LEVELS)
@@ -3670,7 +3674,11 @@ class TaskManager(
 
     def _filter_candidate_modules(self, modules: list[dict[str, Any]], risk_levels: list[str]) -> list[dict[str, Any]]:
         allowed = set(_normalize_module_risk_levels(risk_levels))
-        candidates = [dict(module) for module in modules if str(module.get("risk_level") or "").strip() in allowed]
+        candidates = [
+            dict(module)
+            for module in modules
+            if self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")) in allowed
+        ]
         if candidates:
             return candidates
         if not modules:
@@ -3679,9 +3687,9 @@ class TaskManager(
 
     def _module_metrics(self, modules: list[dict[str, Any]], candidate_modules: list[dict[str, Any]], selected_modules: list[dict[str, Any]]) -> dict[str, int]:
         return {
-            "high_risk_module_count": sum(1 for module in modules if str(module.get("risk_level") or "").strip() == "高"),
-            "medium_risk_module_count": sum(1 for module in modules if str(module.get("risk_level") or "").strip() == "中"),
-            "low_risk_module_count": sum(1 for module in modules if str(module.get("risk_level") or "").strip() == "低"),
+            "high_risk_module_count": sum(1 for module in modules if self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")) == "高"),
+            "medium_risk_module_count": sum(1 for module in modules if self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")) == "中"),
+            "low_risk_module_count": sum(1 for module in modules if self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")) == "低"),
             "candidate_module_count": len(candidate_modules),
             "selected_module_count": len(selected_modules),
         }
@@ -9238,6 +9246,7 @@ class TaskManager(
         for result in success:
             all_modules.extend(result.get("modules", []))
         candidate_modules = self._filter_candidate_modules(all_modules, self._module_selection_candidate_levels(task))
+        module_metrics = self._module_metrics(all_modules, candidate_modules, [])
         if status in {"success", "partial_success"} and success and not failed_like and not candidate_modules:
             failure = _no_candidate_modules_failure()
             task.summary = {
@@ -9271,15 +9280,16 @@ class TaskManager(
                 "success_count": len(success),
                 "failed_count": int(aggregate_summary.get("failed_count") or 0),
                 "module_count": len(all_modules),
-                "high_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "高"),
-                "medium_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "中"),
-                "low_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "低"),
+                "high_risk_module_count": module_metrics["high_risk_module_count"],
+                "medium_risk_module_count": module_metrics["medium_risk_module_count"],
+                "low_risk_module_count": module_metrics["low_risk_module_count"],
                 "candidate_module_count": 0,
                 "selected_module_count": 0,
                 **failure,
             }
         selection_mode = self._module_selection_mode(task)
         selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if selection_mode == MODULE_SELECTION_MODE_AUTO else []
+        module_metrics = self._module_metrics(all_modules, candidate_modules, selected_modules)
         task.summary = {
             **self._clear_failure_fields_from_summary(task.summary),
             "system_analysis_results": self._lightweight_system_analysis_items(success),
@@ -9317,9 +9327,9 @@ class TaskManager(
             "pending_count": int(aggregate_summary.get("pending_count") or 0),
             "downstream_missing_count": int(aggregate_summary.get("downstream_missing_count") or 0),
             "module_count": len(all_modules),
-            "high_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "高"),
-            "medium_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "中"),
-            "low_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "低"),
+            "high_risk_module_count": module_metrics["high_risk_module_count"],
+            "medium_risk_module_count": module_metrics["medium_risk_module_count"],
+            "low_risk_module_count": module_metrics["low_risk_module_count"],
             "candidate_module_count": len(candidate_modules),
             "selected_module_count": len(selected_modules),
             "requires_confirmation": selection_mode == MODULE_SELECTION_MODE_MANUAL_CONFIRM,

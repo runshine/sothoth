@@ -128,6 +128,7 @@ class TaskDownstreamServiceBehaviorTests(unittest.TestCase):
                 new_downstream_task_id="child-new",
                 token=None,
                 reason="test",
+                transition_type=self.manager.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
             )
 
         self.manager._downstream_cancel_refs = unittest.mock.AsyncMock(return_value=0)
@@ -137,6 +138,41 @@ class TaskDownstreamServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("child-old", result)
         self.assertEqual("child-new", item.downstream_task_id)
         self.assertEqual("superseded", job.archive_status)
+
+    def test_replace_active_child_binding_same_task_id_marks_in_place_restart(self):
+        task = self._task()
+        item = BinarySecurityStageItem(
+            id="item-2",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            item_key="fw-1",
+            item_name="fw-1",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="child-same",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[])
+
+        async def _run():
+            return await self.manager._replace_active_child_binding(
+                db,
+                task,
+                item,
+                new_downstream_task_id="child-same",
+                token=None,
+                reason="test-in-place",
+                transition_type=self.manager.CHILD_TRANSITION_IN_PLACE_RESTART,
+            )
+
+        result = __import__("asyncio").run(_run())
+
+        self.assertEqual("child-same", result)
+        self.assertEqual("child-same", item.downstream_task_id)
+        state = self.manager._replacement_in_progress_state(item)
+        self.assertTrue(state["replacement_in_progress"])
+        self.assertFalse(state["binding_cleared"])
+        self.assertEqual(self.manager.CHILD_TRANSITION_IN_PLACE_RESTART, state["transition_type"])
 
     def test_may_queue_archive_for_current_binding_rejects_stale_payload(self):
         item = BinarySecurityStageItem(
@@ -158,6 +194,36 @@ class TaskDownstreamServiceBehaviorTests(unittest.TestCase):
 
         self.assertFalse(allowed)
         self.assertEqual("stale_child_payload", reason)
+
+    def test_may_queue_archive_for_current_binding_allows_in_place_restart_same_child(self):
+        item = BinarySecurityStageItem(
+            id="item-2",
+            task_id="task-1",
+            project_id="project-1",
+            stage_name="entry_analysis",
+            item_key="module-2",
+            item_name="module-2",
+            status="running",
+            downstream_task_id="child-current",
+            result={
+                "sync_observation": {
+                    "replacement_in_progress": True,
+                    "binding_cleared": False,
+                    "verification_status": "pending",
+                    "old_downstream_task_id": "child-current",
+                    "transition_type": "in_place_restart",
+                }
+            },
+        )
+
+        allowed, reason = self.manager._may_queue_archive_for_current_binding(
+            item,
+            payload={"task_id": "child-current"},
+            mapped_status="success",
+        )
+
+        self.assertTrue(allowed)
+        self.assertIsNone(reason)
 
     def test_downstream_create_task_rejects_when_delete_operation_is_active(self):
         task = self._task()

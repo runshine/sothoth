@@ -1903,6 +1903,7 @@ class TaskRuntimeServiceMixin:
                     new_downstream_task_id=created.get("task_id") or created.get("id"),
                     token=token,
                     reason="firmware_unpack_child_create",
+                    transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                 )
                 item.started_at = _now()
                 self._merge_stage_item_result_fields(
@@ -2217,6 +2218,7 @@ class TaskRuntimeServiceMixin:
                         new_downstream_task_id=created.get("task_id") or created.get("id"),
                         token=self._resolve_downstream_token(),
                         reason="system_analysis_child_create",
+                        transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                     )
                     item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                     item.started_at = item.started_at or _now()
@@ -2557,6 +2559,7 @@ class TaskRuntimeServiceMixin:
                         new_downstream_task_id=created.get("task_id") or created.get("id"),
                         token=token,
                         reason="binary_to_source_child_create",
+                        transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                     )
                     self._merge_stage_item_result_fields(
                         task,
@@ -3430,6 +3433,7 @@ class TaskRuntimeServiceMixin:
                         new_downstream_task_id=created.get("task_id") or created.get("id"),
                         token=self._resolve_downstream_token(token),
                         reason="dataflow_vuln_scan_child_create",
+                        transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                     )
                     self._record_downstream_item_disposition(
                         session,
@@ -3678,6 +3682,7 @@ class TaskRuntimeServiceMixin:
                             new_downstream_task_id=created.get("task_id") or created.get("id"),
                             token=token,
                             reason="dataflow_vuln_scan_recreate_child_create",
+                            transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                         )
                         item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                         self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
@@ -3926,6 +3931,7 @@ class TaskRuntimeServiceMixin:
                     new_downstream_task_id=created.get("task_id") or created.get("id"),
                     token=token,
                     reason=f"{stage_run.stage_name}_child_create",
+                    transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                 )
                 item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                 self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")

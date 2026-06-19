@@ -116,6 +116,12 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
             all_modules,
             manager._module_selection_candidate_levels(task),
         )
+        if (
+            not candidate_modules
+            and manager._task_type(task) == "source"
+            and any(not manager._normalize_module_risk_level(module.get("risk_level")) for module in all_modules)
+        ):
+            candidate_modules = [dict(module) for module in all_modules]
         summary = dict(task.summary or {})
         existing_selected_modules = [
             dict(module)
@@ -193,9 +199,10 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
             }
         )
         task.summary = summary
+        module_metrics = manager._module_metrics(all_modules, candidate_modules, selected_modules)
         task.metrics = {
             **(task.metrics or {}),
-            **manager._module_metrics(all_modules, candidate_modules, selected_modules),
+            **module_metrics,
         }
         stage_run.status = "waiting_confirmation" if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION else status
         stage_run.finished_at = None if stage_run.status in {"running", "pending", "queued"} else (stage_run.finished_at or now_local())
@@ -224,9 +231,9 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
                 "success_count": len(success),
                 "failed_count": len(failed),
                 "module_count": len(all_modules),
-                "high_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "高"),
-                "medium_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "中"),
-                "low_risk_module_count": sum(1 for module in all_modules if str(module.get("risk_level") or "").strip() == "低"),
+                "high_risk_module_count": module_metrics["high_risk_module_count"],
+                "medium_risk_module_count": module_metrics["medium_risk_module_count"],
+                "low_risk_module_count": module_metrics["low_risk_module_count"],
                 "candidate_module_count": len(candidate_modules),
                 "selected_module_count": len(selected_modules),
                 "status_synced": True,

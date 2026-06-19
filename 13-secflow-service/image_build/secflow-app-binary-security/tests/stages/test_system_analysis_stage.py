@@ -187,6 +187,73 @@ class SystemAnalysisStageHandlerTests(unittest.TestCase):
             self.assertEqual(["m-high"], [row["module_key"] for row in task.summary["selected_modules"]])
             self.assertEqual(2, task.summary["system_analysis_module_count"])
 
+    def test_refresh_summary_from_items_accepts_risk_aliases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_root = workspace / "output"
+            artifact_root = output_root / "system-analyse" / "fw1__sat1"
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            task = BinarySecurityTask(
+                id="task-1",
+                project_id="project-1",
+                name="task",
+                status="running",
+                task_type=TASK_TYPE_BINARY,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/fw.bin",
+                workspace_root=str(workspace),
+                output_root=str(output_root),
+            )
+            task.policy = {"module_selection_mode": "auto", "module_risk_levels": ["严重", "一般"]}
+            stage_run = BinarySecurityStageRun(
+                id="run-1",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            item = BinarySecurityStageItem(
+                id="item-1",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_run_id=stage_run.id,
+                stage_name="system_analysis",
+                item_key="fw1",
+                item_name="fw1",
+                status="success",
+                downstream_service="system_analyse",
+                downstream_task_id="sat1",
+            )
+            item.result = {
+                "firmware_key": "fw1",
+                "firmware_name": "fw1",
+                "filename": "fw1.bin",
+                "unpacked_root": str(workspace / "input"),
+                "source_root": str(workspace / "input"),
+                "task_type": TASK_TYPE_BINARY,
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+                "modules": [
+                    {"module_key": "m-critical", "module_name": "critical", "risk_level": "严重", "risk_score": 95},
+                    {"module_key": "m-normal", "module_name": "normal", "risk_level": "一般", "risk_score": 50},
+                    {"module_key": "m-info", "module_name": "info", "risk_level": "提示", "risk_score": 5},
+                ],
+            }
+            item.output_ref = {"archive_root": str(artifact_root)}
+            db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+            self.handler.refresh_summary_from_items(self.manager, db, task)
+
+            self.assertEqual(
+                ["m-critical", "m-normal"],
+                [row["module_key"] for row in task.summary["selected_modules"]],
+            )
+            self.assertEqual(1, task.metrics["high_risk_module_count"])
+            self.assertEqual(1, task.metrics["medium_risk_module_count"])
+            self.assertEqual(1, task.metrics["low_risk_module_count"])
+
     def test_refresh_summary_from_items_selects_source_modules_when_risk_level_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

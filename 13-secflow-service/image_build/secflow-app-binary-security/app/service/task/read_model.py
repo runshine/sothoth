@@ -1329,7 +1329,7 @@ class TaskReadModelServiceMixin:
             "module_name": module_name,
             "module_dir": module_dir or None,
             "module_report_path": report_path or None,
-            "risk_level": module.get("risk_level"),
+            "risk_level": task_shared._normalize_module_risk_level(module.get("risk_level")) or module.get("risk_level"),
             "risk_score": module.get("risk_score"),
             "file_count": module.get("file_count"),
             "files_list_path": str(module.get("files_list") or module.get("files_list_path") or "").strip() or None,

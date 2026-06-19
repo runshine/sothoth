@@ -28,6 +28,9 @@ task_manager_module = _TaskManagerModuleProxy()
 
 
 class TaskDownstreamServiceMixin:
+    CHILD_TRANSITION_IN_PLACE_RESTART = "in_place_restart"
+    CHILD_TRANSITION_DESTRUCTIVE_REBUILD = "destructive_rebuild"
+
     # Downstream orchestration relies on shared task-manager constants/helpers.
     @staticmethod
     def _entry_contract_fields(entry: dict[str, Any] | None) -> dict[str, Any]:
@@ -1226,6 +1229,7 @@ class TaskDownstreamServiceMixin:
         old_downstream_task_id: str | None,
         binding_cleared: bool,
         verification_status: str = "pending",
+        transition_type: str | None = None,
     ) -> None:
         result = dict(item.result or {})
         sync_observation = dict(result.get("sync_observation") or {})
@@ -1233,6 +1237,13 @@ class TaskDownstreamServiceMixin:
         sync_observation["old_downstream_task_id"] = str(old_downstream_task_id or "").strip() or None
         sync_observation["binding_cleared"] = bool(binding_cleared)
         sync_observation["verification_status"] = str(verification_status or "pending")
+        normalized_transition_type = str(transition_type or self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD).strip().lower()
+        if normalized_transition_type not in {
+            self.CHILD_TRANSITION_IN_PLACE_RESTART,
+            self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
+        }:
+            normalized_transition_type = self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD
+        sync_observation["transition_type"] = normalized_transition_type
         result["sync_observation"] = sync_observation
         item.result = result
 
@@ -1258,24 +1269,57 @@ class TaskDownstreamServiceMixin:
     def _replacement_in_progress_state(self, item: BinarySecurityStageItem) -> dict[str, Any]:
         result = dict(item.result or {})
         sync_observation = dict(result.get("sync_observation") or {})
+        transition_type = str(sync_observation.get("transition_type") or "").strip().lower() or None
+        if transition_type not in {
+            self.CHILD_TRANSITION_IN_PLACE_RESTART,
+            self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
+        }:
+            transition_type = (
+                self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD
+                if bool(sync_observation.get("replacement_in_progress")) or bool(sync_observation.get("binding_cleared"))
+                else None
+            )
         return {
             "replacement_in_progress": bool(sync_observation.get("replacement_in_progress")),
             "binding_cleared": bool(sync_observation.get("binding_cleared")),
             "verification_status": str(sync_observation.get("verification_status") or "").strip().lower() or None,
             "old_downstream_task_id": str(sync_observation.get("old_downstream_task_id") or "").strip() or None,
+            "transition_type": transition_type,
         }
 
     def _clear_replacement_in_progress(self, item: BinarySecurityStageItem) -> None:
         result = dict(item.result or {})
         sync_observation = dict(result.get("sync_observation") or {})
         changed = False
-        for key in ("replacement_in_progress", "binding_cleared", "verification_status", "old_downstream_task_id"):
+        for key in ("replacement_in_progress", "binding_cleared", "verification_status", "old_downstream_task_id", "transition_type"):
             if key in sync_observation:
                 sync_observation.pop(key, None)
                 changed = True
         if changed:
             result["sync_observation"] = sync_observation
             item.result = result
+
+    def _is_destructive_rebuild_transition(self, replacement_state: dict[str, Any] | None) -> bool:
+        state = dict(replacement_state or {})
+        if not (state.get("replacement_in_progress") or state.get("binding_cleared")):
+            return False
+        transition_type = str(state.get("transition_type") or "").strip().lower()
+        return transition_type != self.CHILD_TRANSITION_IN_PLACE_RESTART
+
+    def _mark_in_place_child_restart(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        downstream_task_id: str | None,
+        verification_status: str = "pending",
+    ) -> None:
+        self._mark_replacement_in_progress(
+            item,
+            old_downstream_task_id=downstream_task_id,
+            binding_cleared=False,
+            verification_status=verification_status,
+            transition_type=self.CHILD_TRANSITION_IN_PLACE_RESTART,
+        )
 
     def _archive_job_is_active(self, archive_status: str | None) -> bool:
         return str(archive_status or "").strip() in {"pending", "running", "archived", "applying", "success"}
@@ -1354,15 +1398,29 @@ class TaskDownstreamServiceMixin:
         new_downstream_task_id: str | None,
         token: str | None,
         reason: str,
+        transition_type: str | None = None,
     ) -> str | None:
         new_task_id = str(new_downstream_task_id or "").strip() or None
         old_task_id = str(item.downstream_task_id or "").strip() or None
+        normalized_transition_type = str(transition_type or self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD).strip().lower()
+        if normalized_transition_type not in {
+            self.CHILD_TRANSITION_IN_PLACE_RESTART,
+            self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
+        }:
+            normalized_transition_type = self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD
         if not old_task_id:
             item.downstream_task_id = new_task_id or item.downstream_task_id
             self._clear_replacement_in_progress(item)
             return None
         if new_task_id and new_task_id == old_task_id:
-            self._clear_replacement_in_progress(item)
+            if normalized_transition_type == self.CHILD_TRANSITION_IN_PLACE_RESTART:
+                self._mark_in_place_child_restart(
+                    item,
+                    downstream_task_id=old_task_id,
+                    verification_status="pending",
+                )
+            else:
+                self._clear_replacement_in_progress(item)
             return old_task_id
 
         task_manager_module.logger.warning(
@@ -1381,6 +1439,7 @@ class TaskDownstreamServiceMixin:
             old_downstream_task_id=old_task_id,
             binding_cleared=False,
             verification_status="pending",
+            transition_type=normalized_transition_type,
         )
         self._supersede_archive_jobs_for_downstream_task(
             db,
@@ -1471,7 +1530,7 @@ class TaskDownstreamServiceMixin:
         if mapped_status not in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES:
             return False, "non_success_status"
         replacement_state = self._replacement_in_progress_state(item)
-        if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]:
+        if self._is_destructive_rebuild_transition(replacement_state):
             return False, "replacement_in_progress"
         current_downstream_task_id = self._current_downstream_task_id(item)
         payload_downstream_task_id = self._payload_downstream_task_id(payload)
@@ -1490,7 +1549,7 @@ class TaskDownstreamServiceMixin:
         if not mapped_status or not current_item_status or current_item_status == mapped_status:
             return False
         replacement_state = self._replacement_in_progress_state(item)
-        if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"] or replacement_state["verification_status"] == "pending":
+        if self._is_destructive_rebuild_transition(replacement_state) or replacement_state["verification_status"] == "pending":
             return normalize_stage_name(item.stage_name) != "dataflow_vuln_scan"
         observed_task_id = str(payload.get("task_id") or payload.get("id") or "").strip() or None
         current_task_id = str(item.downstream_task_id or "").strip() or None

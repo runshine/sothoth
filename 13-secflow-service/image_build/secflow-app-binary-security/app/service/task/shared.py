@@ -113,6 +113,85 @@ def _normalize_pipeline_mode(value: Any) -> str:
     return PIPELINE_MODE_BARRIER
 
 
+_HIGH_RISK_ALIASES = {
+    "高",
+    "高危",
+    "高风险",
+    "严重",
+    "严重风险",
+    "致命",
+    "致命风险",
+    "critical",
+    "crit",
+    "severe",
+    "high",
+    "urgent",
+    "fatal",
+    "blocker",
+}
+
+_MEDIUM_RISK_ALIASES = {
+    "中",
+    "中危",
+    "中风险",
+    "一般",
+    "普通",
+    "中等",
+    "中等级",
+    "moderate",
+    "medium",
+    "warning",
+    "warn",
+    "normal",
+    "average",
+}
+
+_LOW_RISK_ALIASES = {
+    "低",
+    "低危",
+    "低风险",
+    "提示",
+    "信息",
+    "通知",
+    "轻微",
+    "轻度",
+    "建议",
+    "notice",
+    "info",
+    "information",
+    "low",
+    "minor",
+    "trivial",
+    "hint",
+}
+
+
+def _normalize_module_risk_level(value: Any, risk_score: Any = None) -> str:
+    normalized = str(value or "").strip()
+    if not normalized:
+        normalized = ""
+    lowered = normalized.lower()
+    if normalized in _HIGH_RISK_ALIASES or lowered in _HIGH_RISK_ALIASES:
+        return "高"
+    if normalized in _MEDIUM_RISK_ALIASES or lowered in _MEDIUM_RISK_ALIASES:
+        return "中"
+    if normalized in _LOW_RISK_ALIASES or lowered in _LOW_RISK_ALIASES:
+        return "低"
+    if normalized in ALLOWED_MODULE_RISK_LEVELS:
+        return normalized
+    try:
+        score = int(risk_score)
+    except (TypeError, ValueError):
+        return ""
+    if score >= 70:
+        return "高"
+    if score >= 40:
+        return "中"
+    if score >= 0:
+        return "低"
+    return ""
+
+
 def _normalize_entry_function_name(value: Any) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -551,7 +630,7 @@ def _downstream_origin_payload(task: BinarySecurityTask, item: BinarySecuritySta
 def _normalize_module_risk_levels(values: list[str] | None) -> list[str]:
     ordered: list[str] = []
     for value in values or []:
-        normalized = str(value or "").strip()
+        normalized = _normalize_module_risk_level(value)
         if normalized in ALLOWED_MODULE_RISK_LEVELS and normalized not in ordered:
             ordered.append(normalized)
     return ordered or ["高"]

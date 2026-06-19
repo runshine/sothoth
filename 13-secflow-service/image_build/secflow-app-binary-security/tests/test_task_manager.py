@@ -641,6 +641,7 @@ class ArchiveReclaimTests(unittest.TestCase):
                 "binding_cleared": False,
                 "verification_status": "pending",
                 "old_downstream_task_id": "child-old",
+                "transition_type": "destructive_rebuild",
             }
         }
         db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[], events=[])
@@ -11305,6 +11306,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ]
             db = _ModelAwareDb(tasks=[task], stage_items=items)
             calls = []
+            remaining_refs = [
+                {"service": "system_analyse", "task_id": "sa-1", "project_id": "p1", "stage_name": "system_analysis"},
+                {"service": "system_analyse", "task_id": "sa-orphan", "project_id": "p1", "stage_name": "system_analysis"},
+                {"service": "dataflow_vuln_scan", "task_id": "dfa-other", "project_id": "p1", "stage_name": "dataflow_vuln_scan"},
+            ]
 
             async def fake_cleanup(db_arg, task_arg, refs_arg, token_arg):
                 calls.append(
@@ -11315,16 +11321,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                         "token": token_arg,
                     }
                 )
+                remaining_refs.clear()
 
             original_cleanup = self.manager._cleanup_downstream_refs
             original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
             self.manager._cleanup_downstream_refs = fake_cleanup
             self.manager._discover_parent_linked_downstream_refs_detailed = lambda _db, _task: (
-                [
-                    {"service": "system_analyse", "task_id": "sa-1", "project_id": "p1", "stage_name": "system_analysis"},
-                    {"service": "system_analyse", "task_id": "sa-orphan", "project_id": "p1", "stage_name": "system_analysis"},
-                    {"service": "dataflow_vuln_scan", "task_id": "dfa-other", "project_id": "p1", "stage_name": "dataflow_vuln_scan"},
-                ],
+                list(remaining_refs),
                 [],
             )
             try:

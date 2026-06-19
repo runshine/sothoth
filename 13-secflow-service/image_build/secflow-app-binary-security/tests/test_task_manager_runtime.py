@@ -458,7 +458,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, db.commits)
         self.assertEqual("running", operation.step_payload["prepare"]["status"])
 
-    async def test_run_task_runtime_signals_repairs_replacement_binding_by_marking_binding_cleared(self):
+    async def test_repair_replacement_binding_state_preserves_in_place_restart_binding_for_same_child_id(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         task = BinarySecurityTask(
@@ -475,15 +475,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             dispatcher_instance_id="worker-a",
             lease_expires_at=_now() + timedelta(minutes=5),
         )
-        task.summary = {
-            "runtime_workset": {
-                "pending_binding_repair": {
-                    "requested_at": _now().isoformat(),
-                    "source": "lease_auditor_signal",
-                    "reason": "replacement_repair",
-                }
-            }
-        }
         item = BinarySecurityStageItem(
             id="item-bind",
             task_id=task.id,
@@ -498,20 +489,20 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                     "binding_cleared": False,
                     "verification_status": "pending",
                     "old_downstream_task_id": "child-old",
+                    "transition_type": "in_place_restart",
                 }
             },
         )
         db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[])
 
-        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
-            changed = await manager._run_task_runtime_signals(task.id)
+        changed = manager._repair_replacement_binding_state_for_task(db, task)
 
         self.assertTrue(changed)
         state = manager._replacement_in_progress_state(item)
         self.assertTrue(state["replacement_in_progress"])
-        self.assertTrue(state["binding_cleared"])
+        self.assertFalse(state["binding_cleared"])
         self.assertEqual("pending", state["verification_status"])
-        self.assertEqual({}, task.summary.get("runtime_workset") or {})
+        self.assertEqual(manager.CHILD_TRANSITION_IN_PLACE_RESTART, state["transition_type"])
 
     async def test_run_task_runtime_signals_repairs_replacement_binding_by_clearing_stale_flag_after_new_child_bound(self):
         manager = TaskManager()
