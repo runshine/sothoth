@@ -254,7 +254,7 @@ class SystemAnalysisStageHandlerTests(unittest.TestCase):
             self.assertEqual(1, task.metrics["medium_risk_module_count"])
             self.assertEqual(1, task.metrics["low_risk_module_count"])
 
-    def test_refresh_summary_from_items_selects_source_modules_when_risk_level_is_missing(self):
+    def test_refresh_summary_from_items_uses_score_fallback_when_source_risk_level_is_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             output_root = workspace / "output"
@@ -311,10 +311,71 @@ class SystemAnalysisStageHandlerTests(unittest.TestCase):
 
             self.handler.refresh_summary_from_items(self.manager, db, task)
 
+            self.assertEqual([], [row["module_key"] for row in task.summary["selected_modules"]])
+            self.assertEqual(1, task.metrics["low_risk_module_count"])
+
+    def test_refresh_summary_from_items_uses_score_fallback_for_source_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            output_root = workspace / "output"
+            artifact_root = output_root / "system-analyse" / "source_project__sat1"
+            artifact_root.mkdir(parents=True, exist_ok=True)
+            task = BinarySecurityTask(
+                id="task-source-1",
+                project_id="project-1",
+                name="source-task",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path=str(workspace / "input"),
+                workspace_root=str(workspace),
+                output_root=str(output_root),
+            )
+            task.policy = {"module_selection_mode": "auto", "module_risk_levels": ["高"]}
+            stage_run = BinarySecurityStageRun(
+                id="run-source-1",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            item = BinarySecurityStageItem(
+                id="item-source-1",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_run_id=stage_run.id,
+                stage_name="system_analysis",
+                item_key="source_project",
+                item_name="source-project",
+                status="success",
+                downstream_service="system_analyse",
+                downstream_task_id="sat1",
+            )
+            item.result = {
+                "firmware_key": "source_project",
+                "firmware_name": "source-task",
+                "filename": "source-project",
+                "unpacked_root": str(workspace / "input"),
+                "source_root": str(workspace / "input"),
+                "task_type": TASK_TYPE_SOURCE,
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+                "modules": [
+                    {"module_key": "source_project-source-project", "module_name": "source-project", "risk_level": "", "risk_score": 78}
+                ],
+            }
+            item.output_ref = {"archive_root": str(artifact_root)}
+            db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+
+            self.handler.refresh_summary_from_items(self.manager, db, task)
+
             self.assertEqual(
                 ["source_project-source-project"],
                 [row["module_key"] for row in task.summary["selected_modules"]],
             )
+            self.assertEqual(1, task.metrics["high_risk_module_count"])
 
 
 if __name__ == "__main__":

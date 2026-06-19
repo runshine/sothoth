@@ -151,7 +151,7 @@ class TaskContractServiceMixin:
                     "module_key": module.get("module_key"),
                     "module_name": module.get("module_name"),
                     "rank": module.get("rank"),
-                    "risk_level": self._normalize_module_risk_level(module.get("risk_level")),
+                    "risk_level": self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")),
                     "risk_score": module.get("risk_score"),
                     "file_count": module.get("file_count"),
                 }
@@ -386,7 +386,7 @@ class TaskContractServiceMixin:
                         "source_dir": str(source_dir),
                         "module_report": str(module_report),
                         "files_list": str(files_list),
-                        "risk_level": task_manager_module._normalize_module_risk_level(module.get("risk_level")),
+                        "risk_level": task_manager_module._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")),
                         "risk_score": int(module.get("risk_score") or 0),
                         "rank": int(module.get("rank") or 0),
                         "selected_by": None,

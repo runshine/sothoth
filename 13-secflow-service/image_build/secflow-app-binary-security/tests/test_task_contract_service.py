@@ -94,6 +94,11 @@ class TaskContractServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("中", _normalize_module_risk_level("warning"))
         self.assertEqual("低", _normalize_module_risk_level("提示"))
         self.assertEqual("低", _normalize_module_risk_level("info"))
+        self.assertEqual("高", _normalize_module_risk_level("mystery", 85))
+        self.assertEqual("高", _normalize_module_risk_level("", 78))
+        self.assertEqual("中", _normalize_module_risk_level("unknown", 50))
+        self.assertEqual("低", _normalize_module_risk_level("other", 5))
+        self.assertEqual("低", _normalize_module_risk_level(None, 0))
 
     def test_normalize_module_risk_levels_maps_policy_aliases(self):
         self.assertEqual(["高", "中", "低"], _normalize_module_risk_levels(["严重", "一般", "提示", "critical"]))

@@ -119,7 +119,7 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
         if (
             not candidate_modules
             and manager._task_type(task) == "source"
-            and any(not manager._normalize_module_risk_level(module.get("risk_level")) for module in all_modules)
+            and any(not manager._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")) for module in all_modules)
         ):
             candidate_modules = [dict(module) for module in all_modules]
         summary = dict(task.summary or {})
