@@ -2765,6 +2765,12 @@ class TaskManager(
             ("dataflow_vuln_scan", "secflow_dataflow_vuln_scanner_run_index", "id", "linked_task_id", None),
         ]
 
+    def _parent_linked_downstream_soft_delete_column(self, service: str) -> str | None:
+        normalized_service = str(service or "").strip()
+        if normalized_service in {"system_analyse", "entry_analyse", "dataflow_vuln_scan"}:
+            return "is_deleted"
+        return None
+
     def _discover_parent_linked_downstream_refs_detailed(
         self,
         db: Session,
@@ -2774,6 +2780,7 @@ class TaskManager(
         scan_errors: list[dict[str, Any]] = []
         for service, table_name, task_id_column, parent_column, stage_column in self._parent_linked_downstream_candidates():
             try:
+                soft_delete_column = self._parent_linked_downstream_soft_delete_column(service)
                 column_rows = db.execute(
                     text(
                         """
@@ -2785,6 +2792,7 @@ class TaskManager(
                             column_name = :task_id_column
                             OR column_name = :parent_column
                             OR column_name = :stage_column
+                            OR column_name = :soft_delete_column
                           )
                         """
                     ),
@@ -2793,6 +2801,7 @@ class TaskManager(
                         "task_id_column": task_id_column,
                         "parent_column": parent_column,
                         "stage_column": stage_column or "",
+                        "soft_delete_column": soft_delete_column or "",
                     },
                 ).fetchall()
                 available_columns = {str(row[0]) for row in column_rows}
@@ -2814,12 +2823,16 @@ class TaskManager(
                     )
                     continue
                 select_stage = f"`{stage_column}`" if stage_column and stage_column in available_columns else "NULL"
+                soft_delete_filter = ""
+                if soft_delete_column and soft_delete_column in available_columns:
+                    soft_delete_filter = f" AND COALESCE(`{soft_delete_column}`, 0) = 0"
                 rows = db.execute(
                     text(
                         f"""
                         SELECT `{task_id_column}` AS task_id, {select_stage} AS stage_name
                         FROM `{table_name}`
                         WHERE `{parent_column}` = :parent_task_id
+                        {soft_delete_filter}
                         """
                     ),
                     {"parent_task_id": task.id},

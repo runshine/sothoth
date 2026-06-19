@@ -3053,12 +3053,14 @@ class TaskReadModelServiceMixin:
         deferred_refs = [dict(ref) for ref in list(snapshot.get("deferred_downstream_refs") or []) if isinstance(ref, dict)]
         blocking_refs = [dict(ref) for ref in list(snapshot.get("downstream_cleanup_blocking_refs") or []) if isinstance(ref, dict)]
         partial_failed = bool(snapshot.get("cleanup_partial_failed")) or bool(deferred_refs)
-        status = str(snapshot.get("deferred_cleanup_status") or "").strip() or ("partial_failed" if partial_failed else "succeeded")
+        raw_status = str(snapshot.get("deferred_cleanup_status") or "").strip()
+        status = raw_status or ("legacy_recovery_pending" if partial_failed else "succeeded")
         last_attempt_at = task_shared._parse_iso_datetime(snapshot.get("deferred_cleanup_last_attempt_at"))
         next_retry_at = task_shared._parse_iso_datetime(snapshot.get("deferred_cleanup_next_retry_at"))
         return {
             "status": status,
             "partial_failed": partial_failed,
+            "legacy_recovery": partial_failed,
             "deferred_ref_count": len(deferred_refs),
             "blocking_ref_count": len(blocking_refs),
             "last_error": self._string_or_none(snapshot.get("deferred_cleanup_last_error")),
@@ -3085,6 +3087,9 @@ class TaskReadModelServiceMixin:
         if active_operation is not None:
             blocking_reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
             task_owner = str(task.dispatcher_instance_id or "").strip() or None
+            request_payload = dict(active_operation.request_payload or {})
+            fallback_from = self._string_or_none(request_payload.get("fallback_from"))
+            requested_stage = self._string_or_none(request_payload.get("requested_stage"))
             result_payload = dict(active_operation.result_payload or {})
             item_actions = [dict(row) for row in list(result_payload.get("item_actions") or []) if isinstance(row, dict)]
             validation = dict(result_payload.get("validation") or {})
@@ -3114,12 +3119,15 @@ class TaskReadModelServiceMixin:
                 "operation_in_progress": True,
                 "operation_id": active_operation.id,
                 "operation_type": active_operation.operation_type,
+                "requested_operation_type": fallback_from or active_operation.operation_type,
                 "operation_status": active_operation.status,
                 "operation_owner": task_owner,
                 "operation_owner_model": "task_lease_owner" if task_owner else "owner_unknown",
                 "operation_started_at": task_shared._isoformat_or_none(active_operation.started_at),
                 "current_step": active_operation.current_step,
                 "target_stage": active_operation.target_stage,
+                "requested_stage": requested_stage or active_operation.target_stage,
+                "fallback_from": fallback_from,
                 "item_actions": item_actions,
                 "item_actions_count": len(item_actions),
                 "validation": validation,
@@ -3135,7 +3143,7 @@ class TaskReadModelServiceMixin:
                 "downstream_cleanup_deferred_count": len(downstream_cleanup_deferred_refs),
                 "cleanup_partial_failed": cleanup_partial_failed,
                 "downstream_cleanup_warning_summary": (
-                    f"下游清理仍有 {len(downstream_cleanup_deferred_refs)} 个任务待后台补偿"
+                    f"检测到 {len(downstream_cleanup_deferred_refs)} 个历史删除遗留引用，系统正在尝试恢复清理"
                     if downstream_cleanup_deferred_refs else None
                 ),
                 "can_cancel": False,
@@ -3206,7 +3214,7 @@ class TaskReadModelServiceMixin:
         cleanup_state = self._build_cleanup_state(task)
         deferred_count = int(cleanup_state.get("deferred_ref_count") or 0)
         cleanup_warning_summary = (
-            f"下游清理仍有 {deferred_count} 个任务待后台补偿"
+            f"检测到 {deferred_count} 个历史删除遗留引用，系统正在尝试恢复清理"
             if bool(cleanup_state.get("partial_failed")) and deferred_count > 0
             else None
         )

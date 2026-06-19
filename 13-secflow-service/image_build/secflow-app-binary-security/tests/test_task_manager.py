@@ -7690,10 +7690,23 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             prepare_calls.append("prepare")
             return ["entry_analysis"]
 
+        original_decide = self.manager._decide_task_resume_after_stage_reset
         self.manager._prepare_retry_stage_full = fake_prepare_retry_stage_full
         self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        self.manager._decide_task_resume_after_stage_reset = lambda *args, **kwargs: task_manager_module._TaskResumeDecision(
+            should_resume=True,
+            next_stage="entry_analysis",
+            resume_reason="task_operation_requeue",
+            source="retry_stage_full",
+            message="ok",
+            event_type="task_requeued",
+            payload={"next_stage": "entry_analysis"},
+        )
 
-        asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        try:
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager._decide_task_resume_after_stage_reset = original_decide
 
         self.assertEqual([], prepare_calls)
         self.assertEqual(["t1"], queued)
@@ -7731,6 +7744,57 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], queued)
         self.assertEqual("pending", task.status)
+
+    def test_run_task_operation_steps_retry_stage_full_requeue_fails_when_resume_blocked(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="failed",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="retry_stage_full",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="requeue_task",
+            result_payload={"requeue": {"requested": False}},
+        )
+        operation.resume_cursor = {"current_step": "requeue_task"}
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+        queued: list[str] = []
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+
+        original_decide = self.manager._decide_task_resume_after_stage_reset
+        try:
+            def fake_decide(*args, **kwargs):
+                del args, kwargs
+                return task_manager_module._TaskResumeDecision(
+                    resume_reason="task_operation_requeue",
+                    source="retry_stage_full",
+                    message="blocked",
+                    event_type="task_resume_blocked",
+                    payload={"blocked_reason": "missing_input"},
+                )
+
+            self.manager._decide_task_resume_after_stage_reset = fake_decide
+            with self.assertRaises(ValidationError):
+                asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager._decide_task_resume_after_stage_reset = original_decide
+
+        self.assertEqual([], queued)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("task_resume_blocked", event_types)
 
     def test_mark_task_waiting_for_archive_retry_clears_latest_abnormal_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -10495,6 +10559,42 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(3, json.loads((workspace / "task-summary.json").read_text(encoding="utf-8")).get("execution_epoch"))
             self.assertFalse((workspace / "output" / "entry-analyse").exists())
 
+    def test_allow_reusable_downstream_payload_blocks_fresh_hard_restart_epoch(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.execution_epoch = 4
+        task.cleanup_snapshot = {"previous_epoch": 3}
+
+        self.assertFalse(self.manager._allow_reusable_downstream_payload(task, retrying=False))
+        self.assertFalse(self.manager._allow_reusable_downstream_payload(task, retrying=True))
+
+    def test_allow_reusable_downstream_payload_allows_normal_execution_without_hard_restart_snapshot(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.execution_epoch = 2
+        task.cleanup_snapshot = {}
+
+        self.assertTrue(self.manager._allow_reusable_downstream_payload(task, retrying=False))
+        self.assertFalse(self.manager._allow_reusable_downstream_payload(task, retrying=True))
+
     def test_prepare_retry_task_rejects_when_cleanup_leaves_state_event_residue(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -11193,6 +11293,52 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["fw-orphan"], [ref["task_id"] for ref in calls[0]["refs"]])
             self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
 
+    def test_parent_linked_scan_ignores_soft_deleted_downstream_rows(self):
+        outer = self
+
+        class _InfoSchemaDb:
+            def execute(self, statement, params=None):
+                sql = str(statement)
+                params = params or {}
+                table_name = params.get("table_name")
+                if "information_schema.columns" in sql and table_name == "secflow_app_ea_tasks":
+                    return SimpleNamespace(fetchall=lambda: [("task_id",), ("parent_task_id",), ("parent_stage_name",), ("is_deleted",)])
+                if "information_schema.columns" in sql:
+                    return SimpleNamespace(fetchall=lambda: [])
+                if "FROM `secflow_app_ea_tasks`" in sql:
+                    expected = params.get("parent_task_id")
+                    outer.assertEqual("task-1", expected)
+                    outer.assertIn("COALESCE(`is_deleted`, 0) = 0", sql)
+                    return SimpleNamespace(fetchall=lambda: [])
+                raise AssertionError(sql)
+
+        task = BinarySecurityTask(id="task-1", project_id="p1")
+
+        refs, errors = self.manager._discover_parent_linked_downstream_refs_detailed(_InfoSchemaDb(), task)
+
+        self.assertEqual([], refs)
+        self.assertEqual(4, len(errors))
+
+    def test_verify_child_ref_deleted_requires_explicit_deleted_or_not_found_status(self):
+        controller = downstream_tasks_module.DownstreamTaskController(self.manager)
+        ref = {
+            "service": "entry_analyse",
+            "task_id": "eat-1",
+            "project_id": "p1",
+        }
+
+        async def fake_get_child_task(*, service, project_id, task_id, token):
+            del service, project_id, task_id, token
+            return {"task_id": "eat-1", "status": "failed"}
+
+        with (
+            patch.object(controller, "get_child_task", side_effect=fake_get_child_task),
+        ):
+            verified, payload = asyncio.run(controller.verify_child_ref_deleted(ref, token="tok"))
+
+        self.assertFalse(verified)
+        self.assertFalse(bool(payload.get("verified_deleted")))
+
     def test_prepare_hard_restart_marks_remaining_parent_linked_ref_as_partial_failed(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -11244,7 +11390,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._discover_parent_linked_downstream_refs_detailed = fake_discover
             try:
                 self.manager.retry_task(db, project_id="p1", task_id="task1")
-                self._finish_retry_prepare(db, task)
+                with self.assertRaises(ValidationError):
+                    self._finish_retry_prepare(db, task)
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
                 self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
@@ -11252,6 +11399,66 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
             self.assertEqual(1, task.cleanup_snapshot.get("remaining_downstream_count"))
             self.assertEqual("fw-leftover", task.cleanup_snapshot.get("remaining_downstream_refs")[0]["task_id"])
+
+    def test_prepare_retry_task_hard_restart_rejects_partial_cleanup_before_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            (workspace / "input").mkdir(parents=True, exist_ok=True)
+            task = BinarySecurityTask(
+                id="task1",
+                project_id="p1",
+                name="n",
+                status="failed",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+                execution_epoch=2,
+            )
+            task.summary = {
+                "input_files": [{"filename": "src.tar.gz", "size": 8}],
+                "selected_modules": [{"module_key": "m1"}],
+            }
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[], stage_runs=[], archive_jobs=[], events=[], state_events=[])
+
+            async def fake_cleanup(*args, **kwargs):
+                del args, kwargs
+                setattr(self.manager, "_last_downstream_cleanup_results", [])
+                return None
+
+            original_cleanup = self.manager._cleanup_downstream_refs
+            original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
+            self.manager._cleanup_downstream_refs = fake_cleanup
+
+            def fake_discover(_db, _task):
+                ref = {
+                    "service": "system_analyse",
+                    "task_id": "sat-leftover",
+                    "project_id": "p1",
+                    "stage_name": "system_analysis",
+                    "parent_stage_name": None,
+                    "stage_name_inferred": True,
+                    "inferred_stage_name": "system_analysis",
+                    "collect_source": "parent_linked_scan",
+                }
+                return ([ref], [])
+
+            self.manager._discover_parent_linked_downstream_refs_detailed = fake_discover
+            try:
+                with self.assertRaises(ValidationError):
+                    asyncio.run(self.manager._prepare_retry_task(db, task))
+            finally:
+                self.manager._cleanup_downstream_refs = original_cleanup
+                self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
+
+            self.assertEqual("failed", task.status)
+            self.assertEqual("system_analysis", task.current_stage)
+            self.assertEqual(2, task.execution_epoch)
+            self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
+            self.assertEqual(1, task.cleanup_snapshot.get("remaining_downstream_count"))
+            self.assertEqual("sat-leftover", task.cleanup_snapshot.get("remaining_downstream_refs")[0]["task_id"])
 
     def test_prepare_hard_restart_records_service_scan_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -11890,6 +12097,100 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["validation"]["validated"])
         self.assertEqual([], state["issues"])
         self.assertTrue(state["requeue"]["requested"])
+
+    def test_build_manual_operation_state_exposes_retry_failed_items_continue_fallback(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="failed",
+            current_operation_id="op1",
+            dispatcher_instance_id="worker-a",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="continue",
+            target_stage="dataflow_vuln_scan",
+            status="running",
+            current_step="collect_cleanup_plan",
+            request_payload={
+                "target_stage": "dataflow_vuln_scan",
+                "fallback_from": "retry_failed_items",
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        state = self.manager._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=False,
+            task_retry_reason=None,
+            task_retry_failed_supported=False,
+            task_retry_failed_reason=None,
+            task_continue_supported=False,
+            task_continue_reason=None,
+            stage_summaries=[BinarySecurityStageSummary(stage_name="dataflow_vuln_scan", sequence_no=3, status="failed")],
+        )
+
+        self.assertTrue(state["operation_in_progress"])
+        self.assertEqual("continue", state["operation_type"])
+        self.assertEqual("retry_failed_items", state["requested_operation_type"])
+        self.assertEqual("retry_failed_items", state["fallback_from"])
+        self.assertEqual("dataflow_vuln_scan", state["requested_stage"])
+
+    def test_build_manual_operation_state_exposes_retry_stage_failed_items_continue_fallback(self):
+        task = BinarySecurityTask(
+            id="t2",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="failed",
+            current_operation_id="op2",
+            dispatcher_instance_id="worker-b",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op2",
+            task_id="t2",
+            project_id="p1",
+            operation_type="continue",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="collect_cleanup_plan",
+            request_payload={
+                "target_stage": "entry_analysis",
+                "requested_stage": "system_analysis",
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        state = self.manager._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=False,
+            task_retry_reason=None,
+            task_retry_failed_supported=False,
+            task_retry_failed_reason=None,
+            task_continue_supported=False,
+            task_continue_reason=None,
+            stage_summaries=[BinarySecurityStageSummary(stage_name="entry_analysis", sequence_no=2, status="failed")],
+        )
+
+        self.assertTrue(state["operation_in_progress"])
+        self.assertEqual("continue", state["operation_type"])
+        self.assertEqual("continue", state["requested_operation_type"])
+        self.assertIsNone(state["fallback_from"])
+        self.assertEqual("system_analysis", state["requested_stage"])
 
     def test_task_response_exposes_stage_full_retry_for_binary_module_when_upstreams_succeed(self):
         task = BinarySecurityTask(
@@ -13863,6 +14164,68 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("failure_message", persisted)
             self.assertNotIn("error", persisted)
 
+    def test_operation_execute_retry_stage_full_cleanup_rejects_partial_downstream_cleanup(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry_stage_full",
+            target_stage="entry_analysis",
+            status="running",
+        )
+        operation.result_payload = {
+            "cleanup_plan": {
+                "target_stage": "entry_analysis",
+                "affected_stages": ["entry_analysis", "dataflow_vuln_scan"],
+                "downstream_refs": [
+                    {"service": "entry_analyse", "task_id": "eat-leftover", "stage_name": "entry_analysis"}
+                ],
+            }
+        }
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], stage_runs=[], stage_items=[], archive_jobs=[], state_events=[], events=[])
+
+        async def _partial_cleanup(*args, **kwargs):
+            del args, kwargs
+            setattr(
+                self.manager,
+                "_last_downstream_cleanup_results",
+                [
+                    {
+                        "service": "entry_analyse",
+                        "task_id": "eat-leftover",
+                        "stage_name": "entry_analysis",
+                        "delete_status": "failed",
+                        "deferred": True,
+                        "deferred_reason": "transport_error",
+                    }
+                ],
+            )
+            return None
+
+        original_cleanup = self.manager._cleanup_downstream_refs
+        self.manager._cleanup_downstream_refs = _partial_cleanup
+        try:
+            with self.assertRaises(ValidationError):
+                asyncio.run(self.manager._operation_execute_retry_stage_full_cleanup(db, task, operation))
+        finally:
+            self.manager._cleanup_downstream_refs = original_cleanup
+
+        cleanup_result = dict(operation.result_payload or {}).get("cleanup_result") or {}
+        self.assertTrue(cleanup_result.get("cleanup_partial_failed"))
+        self.assertEqual(1, len(cleanup_result.get("downstream_cleanup_deferred_refs") or []))
+
     def test_run_task_operation_steps_retry_stage_full_executes_cleanup_before_requeue(self):
         task = BinarySecurityTask(
             id="task1",
@@ -13910,14 +14273,25 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         original_collect = self.manager._operation_collect_retry_stage_full_plan
         original_cleanup = self.manager._operation_execute_retry_stage_full_cleanup
+        original_decide = self.manager._decide_task_resume_after_stage_reset
         try:
             self.manager._operation_collect_retry_stage_full_plan = fake_collect
             self.manager._operation_execute_retry_stage_full_cleanup = fake_cleanup
             self.manager._enqueue_task = lambda task_id: calls.append(("requeue", task_id))
+            self.manager._decide_task_resume_after_stage_reset = lambda *args, **kwargs: task_manager_module._TaskResumeDecision(
+                should_resume=True,
+                next_stage="entry_analysis",
+                resume_reason="task_operation_requeue",
+                source="retry_stage_full",
+                message="ok",
+                event_type="task_requeued",
+                payload={"next_stage": "entry_analysis"},
+            )
             asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
         finally:
             self.manager._operation_collect_retry_stage_full_plan = original_collect
             self.manager._operation_execute_retry_stage_full_cleanup = original_cleanup
+            self.manager._decide_task_resume_after_stage_reset = original_decide
 
         self.assertEqual(
             [("collect", "task1"), ("cleanup", "task1"), ("requeue", "task1")],
@@ -24071,6 +24445,71 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("ea-live", item.downstream_task_id)
         self.assertEqual("success", item.status)
 
+    def test_run_entry_item_full_retry_fresh_start_does_not_reuse_duplicate_downstream_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        task.execution_epoch = 5
+        task.cleanup_snapshot = {"previous_epoch": 4}
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod",
+            parent_key="fw-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-old",
+            status="failed",
+            output_ref={},
+        )
+        module = {
+            "module_key": "module-1",
+            "module_name": "mod",
+            "firmware_key": "fw-1",
+            "source_dir": "/tmp/src",
+        }
+        fake_session = _ModelAwareDb()
+        client = _AsyncEntryAnalyseClientStub(fail_on_create=False, create_payload={"task_id": "ea-new", "status": "queued"})
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "ea-new", "status": "passed"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(self.manager, "_find_reusable_entry_payload", return_value={"task_id": "ea-live", "status": "running"}) as reuse_mock,
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_parse_entries", return_value=[]),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=False))
+
+        reuse_mock.assert_not_called()
+        self.assertEqual("success", result["status"])
+        self.assertEqual("ea-new", item.downstream_task_id)
+        self.assertEqual("success", item.status)
+
 
     def test_classify_retry_downstream_strategy_reuses_success(self):
         item = BinarySecurityStageItem(
@@ -25715,7 +26154,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertIn("task_force_delete_requested", event_types)
         self.assertIn("task_force_delete_completed", event_types)
 
-    def test_manual_delete_deferred_cleanup_keeps_parent_and_records_cleanup_state(self):
+    def test_manual_delete_rejects_partial_downstream_cleanup(self):
         task = BinarySecurityTask(
             id="t-delete-deferred",
             project_id="p1",
@@ -25782,24 +26221,22 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                         }
                     ],
                 )
-                await self.manager._prepare_delete_task(db, task)
+                with self.assertRaises(ValidationError):
+                    await self.manager._prepare_delete_task(db, task)
                 cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
 
         asyncio.run(_run())
 
         self.assertEqual(1, len(db.tasks))
-        self.assertEqual("cancelled", task.status)
-        self.assertIsNone(task.last_error)
-        self.assertIsNone(task.current_operation_id)
-        self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
-        self.assertEqual("partial_failed", task.cleanup_snapshot.get("deferred_cleanup_status"))
-        self.assertEqual(1, len(task.cleanup_snapshot.get("deferred_downstream_refs") or []))
-        self.assertEqual(1, task.cleanup_snapshot.get("cleanup_counts", {}).get("stage_items_deleted"))
+        self.assertEqual("delete_failed", task.status)
+        self.assertIn("无法连接下游服务", str(task.last_error or ""))
+        self.assertEqual("op-delete-deferred", task.current_operation_id)
+        self.assertFalse(bool(task.cleanup_snapshot))
         cleanup_result = dict(operation.result_payload or {}).get("cleanup_result") or {}
         self.assertTrue(cleanup_result.get("cleanup_partial_failed"))
         self.assertEqual(1, len(cleanup_result.get("downstream_cleanup_deferred_refs") or []))
         event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
-        self.assertIn("task_delete_cleanup_deferred", event_types)
+        self.assertIn("task_delete_failed", event_types)
 
     def test_build_manual_operation_state_exposes_cleanup_warning(self):
         task = BinarySecurityTask(
@@ -25837,8 +26274,32 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertTrue(state["cleanup_partial_failed"])
         self.assertEqual(1, state["downstream_cleanup_deferred_count"])
-        self.assertIn("后台补偿", str(state["downstream_cleanup_warning_summary"]))
+        self.assertIn("历史删除遗留引用", str(state["downstream_cleanup_warning_summary"]))
         self.assertEqual("eat-1", state["downstream_cleanup_deferred_refs"][0]["task_id"])
+
+    def test_build_cleanup_state_marks_deferred_cleanup_as_legacy_recovery(self):
+        task = BinarySecurityTask(
+            id="t-cleanup-state-legacy",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="cancelled",
+        )
+        task.cleanup_snapshot = {
+            "cleanup_partial_failed": True,
+            "deferred_downstream_refs": [
+                {"service": "entry_analyse", "task_id": "eat-1"}
+            ],
+        }
+
+        cleanup_state = self.manager._build_cleanup_state(task)
+
+        self.assertEqual("legacy_recovery_pending", cleanup_state["status"])
+        self.assertTrue(cleanup_state["legacy_recovery"])
 
     def test_reconcile_deferred_cleanup_task_ref_updates_snapshot_after_success(self):
         task = BinarySecurityTask(

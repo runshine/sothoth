@@ -491,6 +491,42 @@ class DownstreamTaskController:
     async def list_child_tasks(self, *, service: str, project_id: str, token: str | None, **kwargs: Any) -> dict[str, Any]:
         return await self.gateway.list_tasks(service, project_id=project_id, token=token, **kwargs)
 
+    async def verify_child_ref_deleted(
+        self,
+        ref: dict[str, str],
+        *,
+        token: str | None,
+    ) -> tuple[bool, dict[str, object]]:
+        verification: dict[str, object] = {
+            "verified_absent": False,
+            "verified_deleted": False,
+            "observed_status": None,
+            "observed_active": False,
+            "verification_error": None,
+        }
+        service = str(ref.get("service") or "").strip()
+        task_id = str(ref.get("task_id") or "").strip()
+        project_id = str(ref.get("project_id") or "").strip()
+        if not service or not task_id or not project_id:
+            verification["verification_error"] = "missing_ref_identity"
+            return False, verification
+        try:
+            payload = await self.get_child_task(service=service, project_id=project_id, task_id=task_id, token=token)
+        except NotFoundError:
+            verification["verified_absent"] = True
+            return True, verification
+        except Exception as verify_exc:
+            verification["verification_error"] = str(verify_exc)
+            return False, verification
+        payload_status = str((payload or {}).get("status") or "").strip().lower()
+        mapped_status = self.manager._map_downstream_status(payload_status) or payload_status
+        verification["observed_status"] = mapped_status
+        verification["observed_active"] = mapped_status in DOWNSTREAM_REF_ACTIVE_STATUSES
+        if bool((payload or {}).get("is_deleted")) or mapped_status in DOWNSTREAM_REF_DELETED_STATUSES:
+            verification["verified_deleted"] = True
+            return True, verification
+        return False, verification
+
     async def create_child_task(
         self,
         db: Session,
@@ -854,36 +890,6 @@ class DownstreamTaskController:
                 payload={**ref, "operation": "delete"},
             )
 
-        async def verify_deleted(ref: dict[str, str]) -> tuple[bool, dict[str, object]]:
-            verification: dict[str, object] = {
-                "verified_absent": False,
-                "verified_deleted": False,
-                "observed_status": None,
-                "observed_active": False,
-                "verification_error": None,
-            }
-            service = str(ref.get("service") or "").strip()
-            task_id = str(ref.get("task_id") or "").strip()
-            if not task_id:
-                return False, verification
-            try:
-                project_id = str(ref.get("project_id") or "") or None
-                payload = await self.get_child_task(service=service, project_id=project_id, task_id=task_id, token=token)
-            except NotFoundError:
-                verification["verified_absent"] = True
-                return True, verification
-            except Exception as verify_exc:
-                verification["verification_error"] = str(verify_exc)
-                return False, verification
-            payload_status = str((payload or {}).get("status") or "").strip().lower()
-            mapped_status = self.manager._map_downstream_status(payload_status) or payload_status
-            verification["observed_status"] = mapped_status
-            verification["observed_active"] = mapped_status in DOWNSTREAM_REF_ACTIVE_STATUSES
-            if bool((payload or {}).get("is_deleted")) or mapped_status in DOWNSTREAM_REF_DELETED_STATUSES:
-                verification["verified_deleted"] = True
-                return True, verification
-            return False, verification
-
         async def do_delete(ref: dict[str, str]) -> dict[str, Any]:
             result: dict[str, Any] = {
                 **ref,
@@ -916,7 +922,7 @@ class DownstreamTaskController:
             except Exception as exc:
                 result["delete_status"] = "failed"
                 result["error"] = str(exc)
-            verified_ok, verification = await verify_deleted(ref)
+            verified_ok, verification = await self.verify_child_ref_deleted(ref, token=token)
             result.update(verification)
             result["verify_status"] = "succeeded" if verified_ok else "failed"
             if verified_ok:

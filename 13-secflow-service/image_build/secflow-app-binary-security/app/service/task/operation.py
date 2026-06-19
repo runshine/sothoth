@@ -556,6 +556,26 @@ class TaskOperationServiceMixin:
     def _run_sync(self: TaskManager, coro):
         return asyncio.run(coro)
 
+    def _raise_if_restart_cleanup_incomplete(
+        self: TaskManager,
+        *,
+        cleanup_partial_failed: bool,
+        remaining_refs: list[dict[str, Any]] | None = None,
+        deferred_refs: list[dict[str, Any]] | None = None,
+        blocking_refs: list[dict[str, Any]] | None = None,
+        context: str,
+    ) -> None:
+        if not cleanup_partial_failed:
+            return
+        remaining_count = len([row for row in list(remaining_refs or []) if isinstance(row, dict)])
+        deferred_count = len([row for row in list(deferred_refs or []) if isinstance(row, dict)])
+        blocking_count = len([row for row in list(blocking_refs or []) if isinstance(row, dict)])
+        raise ValidationError(
+            f"{context} cleanup left downstream bindings behind; "
+            f"remaining_downstream_count={remaining_count} deferred_cleanup_count={deferred_count} "
+            f"blocking_cleanup_count={blocking_count}"
+        )
+
     async def _prepare_hard_restart_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
         from app.service import task_manager as task_manager_module
 
@@ -594,6 +614,15 @@ class TaskOperationServiceMixin:
         cleanup_snapshot["cleanup_counts"]["state_events_deleted"] = self._delete_task_state_event_rows(db, task.id)
         task.cleanup_snapshot = cleanup_snapshot
         self._validate_hard_restart_cleanup(db, task)
+        self._raise_if_restart_cleanup_incomplete(
+            cleanup_partial_failed=bool(cleanup_snapshot.get("cleanup_partial_failed")),
+            remaining_refs=[
+                dict(row)
+                for row in list(cleanup_snapshot.get("remaining_downstream_refs") or [])
+                if isinstance(row, dict)
+            ],
+            context="full retry hard restart",
+        )
         self._reset_task_for_hard_restart(task)
         task.cleanup_snapshot = cleanup_snapshot
         return cleanup_snapshot
@@ -945,19 +974,6 @@ class TaskOperationServiceMixin:
             "cleanup_partial_failed": bool(downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs),
             "reconciled_stages": reconciled_stages,
         }
-        self._record_event(
-            db,
-            task,
-            "stage_retry_full_cleanup_finished",
-            f"阶段完全重试清理完成: {target_stage}",
-            stage_name=target_stage,
-            payload={
-                **cleanup_summary,
-                "old_retry_mode": task.execution_mode,
-                "new_retry_mode": task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
-            },
-            operation_id=operation.id,
-        )
         self._update_operation_result_payload(
             operation,
             {
@@ -970,6 +986,25 @@ class TaskOperationServiceMixin:
                 "cleanup_result": cleanup_summary,
             },
             workspace_root=task.workspace_root,
+        )
+        self._raise_if_restart_cleanup_incomplete(
+            cleanup_partial_failed=bool(cleanup_summary.get("cleanup_partial_failed")),
+            deferred_refs=downstream_cleanup_deferred_refs,
+            blocking_refs=downstream_cleanup_blocking_refs,
+            context="retry_stage_full",
+        )
+        self._record_event(
+            db,
+            task,
+            "stage_retry_full_cleanup_finished",
+            f"阶段完全重试清理完成: {target_stage}",
+            stage_name=target_stage,
+            payload={
+                **cleanup_summary,
+                "old_retry_mode": task.execution_mode,
+                "new_retry_mode": task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
+            },
+            operation_id=operation.id,
         )
         return cleanup_summary
 
@@ -2007,49 +2042,28 @@ class TaskOperationServiceMixin:
             )
 
         if downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs:
-            snapshot = {
-                "cleanup_partial_failed": True,
-                "deleted_downstream_count": deleted_downstream_count,
-                "deferred_cleanup_attempts": 1,
-                "deferred_cleanup_status": "partial_failed",
-                "deferred_cleanup_last_error": next(
-                    (
-                        str(row.get("error") or row.get("deferred_reason") or "").strip()
-                        for row in downstream_cleanup_deferred_refs + downstream_cleanup_blocking_refs
-                        if str(row.get("error") or row.get("deferred_reason") or "").strip()
-                    ),
-                    None,
+            cleanup_error = next(
+                (
+                    str(row.get("error") or row.get("deferred_reason") or "").strip()
+                    for row in downstream_cleanup_deferred_refs + downstream_cleanup_blocking_refs
+                    if str(row.get("error") or row.get("deferred_reason") or "").strip()
                 ),
-                "deferred_cleanup_last_attempt_at": task_manager_module._isoformat_or_none(task_manager_module._now()),
-                "deferred_cleanup_next_retry_at": task_manager_module._isoformat_or_none(
-                    task_manager_module._now()
-                    + timedelta(seconds=max(30, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30)))
-                ),
-                "deferred_downstream_refs": downstream_cleanup_deferred_refs,
-                "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
-                "cleanup_counts": cleanup_counts,
-            }
-            task.cleanup_snapshot = snapshot
-            task.status = "cancelled"
+                None,
+            ) or "下游删除未完成"
+            task.status = task_manager_module.TASK_STATUS_DELETE_FAILED
             task.finished_at = task_manager_module._now()
-            task.current_operation_id = None
-            task.last_error = None
+            task.last_error = cleanup_error
             self._record_event(
                 db,
                 task,
-                "task_delete_cleanup_deferred",
-                "删除已完成本地清理，但仍有下游子任务等待后台补偿",
+                "task_delete_failed",
+                "删除失败，下游子任务尚未完成删除确认",
                 stage_name=task.current_stage,
-                level="warning",
+                level="error",
                 payload=cleanup_result,
             )
-            await self._write_task_metadata_async(
-                task,
-                Path(task.workspace_root) / "input" / "task-metadata.json",
-                status=task.status,
-            )
             db.commit()
-            return
+            raise ValidationError("删除失败，下游子任务尚未完成删除确认")
 
         db.delete(task)
         self._record_event(
@@ -2691,17 +2705,6 @@ class TaskOperationServiceMixin:
             message=f"后台操作完成，任务已重新排队: {operation.operation_type}",
             payload={"operation_type": operation.operation_type},
         )
-        if not decision.should_resume and str(operation.operation_type or "").strip() == task_manager_module.TASK_ACTION_RETRY_STAGE_FULL:
-            decision.should_resume = bool(operation.target_stage or task.current_stage)
-            decision.next_stage = operation.target_stage or task.current_stage
-            decision.event_type = "task_requeued"
-            decision.payload = {
-                **dict(decision.payload or {}),
-                "next_stage": decision.next_stage,
-                "resume_reason": decision.resume_reason,
-                "source": decision.source,
-                "forced_resume": True,
-            }
         if not decision.should_resume:
             self._record_operation_event(
                 db,
@@ -2713,8 +2716,8 @@ class TaskOperationServiceMixin:
                 stage_name=operation.target_stage or task.current_stage,
                 payload=dict(decision.payload or {}),
             )
-        else:
-            self._apply_task_resume_decision(db, task, decision, operation=operation)
+            raise ValidationError("后台操作完成，但当前仍不满足重新排队条件")
+        self._apply_task_resume_decision(db, task, decision, operation=operation)
         self._record_operation_step_finished(
             db,
             task,

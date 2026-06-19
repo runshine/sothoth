@@ -355,7 +355,7 @@ class TaskLifecycleServiceMixin:
                 task,
                 "pending_cleanup_retry",
                 source="lease_auditor_signal",
-                reason="deferred_cleanup_retry_requested",
+                reason="legacy_delete_cleanup_retry_requested",
                 extra={
                     "deferred_ref_count": len(deferred_refs),
                     "requested_by_token_present": bool(str(token or "").strip()),
@@ -365,13 +365,14 @@ class TaskLifecycleServiceMixin:
                 db,
                 task,
                 "task_delete_cleanup_retry_deferred",
-                "检测到待补偿删除下游引用，已通知任务 owner 串行处理",
+                "检测到历史删除遗留引用，已通知任务 owner 串行恢复清理",
                 level="warning",
                 payload={
                     "task_id": task.id,
                     "project_id": task.project_id,
                     "remaining_deferred_count": len(deferred_refs),
                     "source": "lease_auditor_signal",
+                    "legacy_recovery": True,
                 },
             )
             db.commit()
@@ -554,7 +555,7 @@ class TaskLifecycleServiceMixin:
                                 db,
                                 task,
                                 "task_delete_cleanup_reconcile_failed",
-                                f"后台补偿下游删除失败: {exc}",
+                                f"历史删除遗留恢复失败: {exc}",
                                 level="warning",
                                 payload={
                                     "task_id": ref["task_id"],

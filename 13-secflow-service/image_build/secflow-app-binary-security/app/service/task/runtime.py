@@ -33,6 +33,23 @@ class TaskRuntimeServiceMixin:
             return True, mapped_status
         return False, mapped_status
 
+    def _allow_reusable_downstream_payload(
+        self: TaskManager,
+        task,
+        *,
+        retrying: bool,
+    ) -> bool:
+        if retrying:
+            return False
+        cleanup_snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
+        if not cleanup_snapshot:
+            return True
+        previous_epoch = int(cleanup_snapshot.get("previous_epoch") or 0)
+        current_epoch = int(getattr(task, "execution_epoch", 0) or 0)
+        if current_epoch > previous_epoch:
+            return False
+        return True
+
     async def _sync_streaming_task_tail_state(self: TaskManager, task_id: str) -> None:
         from pathlib import Path
 
@@ -1728,7 +1745,7 @@ class TaskRuntimeServiceMixin:
                 )
                 created = None
             else:
-                reusable_payload = None if retrying else await self._find_reusable_firmware_unpack_payload(
+                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_firmware_unpack_payload(
                     task,
                     item,
                     token,
@@ -2053,7 +2070,7 @@ class TaskRuntimeServiceMixin:
                     item=item,
                 )
             else:
-                reusable_payload = None if retrying else await self._find_reusable_system_analysis_payload(
+                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_system_analysis_payload(
                     task,
                     item,
                     self._resolve_downstream_token(),
@@ -2396,7 +2413,7 @@ class TaskRuntimeServiceMixin:
                     item=item,
                 )
             else:
-                reusable_payload = None if retrying else await self._find_reusable_b2s_payload(task, item, token)
+                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_b2s_payload(task, item, token)
                 if reusable_payload is not None:
                     downstream_status = str(reusable_payload.get("status") or "").lower()
                     mapped_reusable_status = self._map_downstream_status(downstream_status)
@@ -2763,7 +2780,7 @@ class TaskRuntimeServiceMixin:
                 )
                 created = None
             else:
-                reusable_payload = None if retrying else await self._find_reusable_entry_payload(task, item, token)
+                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_entry_payload(task, item, token)
                 if reusable_payload is not None:
                     downstream_status = str(reusable_payload.get("status") or "").lower()
                     mapped_reusable_status = self._map_downstream_status(downstream_status)
@@ -3248,7 +3265,7 @@ class TaskRuntimeServiceMixin:
                     item=item,
                 )
             else:
-                reusable_payload = None if retrying else await self._find_reusable_dataflow_payload(
+                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_dataflow_payload(
                     task,
                     item,
                     allow_rebind=allow_rebind,
@@ -3728,7 +3745,7 @@ class TaskRuntimeServiceMixin:
                 )
                 created = None
             else:
-                reusable_payload = None if retrying else await self._find_reusable_vuln_payload(task, item, token)
+                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_vuln_payload(task, item, token)
                 if reusable_payload is not None:
                     downstream_status = str(reusable_payload.get("status") or "").lower()
                     mapped_reusable_status = self._map_downstream_status(downstream_status)
