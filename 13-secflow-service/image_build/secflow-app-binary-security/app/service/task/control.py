@@ -269,34 +269,39 @@ class TaskControlServiceMixin:
         stage_names = self._stage_sequence_for_task(task_type)
         defaults = {
             "pipeline_profile": "default",
-            "pipeline_mode": "barrier",
-            "max_stage_parallelism": 4,
+            "pipeline_mode": "mixed_streaming",
+            "max_stage_parallelism": 5,
             "max_retries_per_item": 2,
             "continue_on_item_failure": True,
-            "stage_parallelism": {stage_name: 4 for stage_name in stage_names},
+            "stage_parallelism": {stage_name: 5 for stage_name in stage_names},
             "stage_options": {},
             "module_selection_mode": "auto",
             "module_risk_levels": ["高"],
         }
         defaults["partial_success_stage_advancement"] = {
-            stage_name: False for stage_name in stage_names if stage_name in {"binary_to_source", "entry_analysis", "dataflow_vuln_scan"}
+            stage_name: True for stage_name in stage_names if stage_name in {"binary_to_source", "entry_analysis", "dataflow_vuln_scan"}
         }
         return defaults
+
+    def _global_task_policy_config(self: TaskManager, db: Session, *, task_type: str) -> dict[str, Any]:
+        policy = self._project_config_defaults(task_type=task_type)
+        row = self._ensure_global_service_config_row(db)
+        config = dict(getattr(row, "config", {}) or {}) if row is not None else {}
+        if config:
+            policy.update({k: v for k, v in config.items() if k != "partial_success_stage_advancement"})
+            if "partial_success_stage_advancement" in config:
+                policy["partial_success_stage_advancement"] = self._normalize_partial_success_stage_advancement_for_task_type(
+                    config.get("partial_success_stage_advancement"),
+                    task_type=task_type,
+                )
+        return policy
 
     def _merge_policy(self: TaskManager, db: Session, project_id: str, overrides: dict[str, Any], stage_options: dict[str, Any]) -> dict[str, Any]:
         from app.service import task_manager as task_manager_module
 
+        del project_id
         task_type = self._validate_task_type(overrides.get("task_type"))
-        policy = self._project_config_defaults(task_type=task_type)
-        row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
-        project_config = dict(getattr(row, "config", {}) or {})
-        if project_config:
-            policy.update({k: v for k, v in project_config.items() if k != "partial_success_stage_advancement"})
-            if "partial_success_stage_advancement" in project_config:
-                policy["partial_success_stage_advancement"] = self._normalize_partial_success_stage_advancement_for_task_type(
-                    project_config.get("partial_success_stage_advancement"),
-                    task_type=task_type,
-                )
+        policy = self._global_task_policy_config(db, task_type=task_type)
         if stage_options:
             policy["stage_options"] = {
                 **dict(policy.get("stage_options") or {}),
@@ -348,34 +353,18 @@ class TaskControlServiceMixin:
         project_id: str,
         payload: BinarySecurityProjectConfigPayload,
     ) -> BinarySecurityProjectConfigResponse:
-        row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
-        if row is None:
-            row = BinarySecurityProjectConfig(project_id=project_id)
-            db.add(row)
-        config = payload.model_dump()
-        config["pipeline_mode"] = self._normalize_policy_update_payload(
-            type("TaskLike", (), {"policy": {}, "task_type": "binary"})(),
-            BinarySecurityTaskPolicyUpdatePayload(pipeline_mode=config.get("pipeline_mode")),
-        )["pipeline_mode"]
-        row.config = config
-        return BinarySecurityProjectConfigResponse(project_id=project_id, config=BinarySecurityProjectConfigPayload(**config))
+        response = self.save_config(db, BinarySecurityGlobalConfigPayload(**payload.model_dump()))
+        return BinarySecurityProjectConfigResponse(
+            project_id=project_id,
+            config=BinarySecurityProjectConfigPayload(**response.config.model_dump()),
+        )
 
     def get_project_config(self: TaskManager, db: Session, project_id: str) -> BinarySecurityProjectConfigResponse:
-        row = db.query(BinarySecurityProjectConfig).filter(BinarySecurityProjectConfig.project_id == project_id).first()
-        config = dict(getattr(row, "config", {}) or {})
-        config["pipeline_mode"] = self._normalize_policy_update_payload(
-            type("TaskLike", (), {"policy": {}, "task_type": "binary"})(),
-            BinarySecurityTaskPolicyUpdatePayload(pipeline_mode=config.get("pipeline_mode")),
-        ).get("pipeline_mode", "barrier")
-        if "partial_success_stage_advancement" in config:
-            defaults = self._project_config_defaults(task_type="binary")["partial_success_stage_advancement"]
-            current = dict(config.get("partial_success_stage_advancement") or {})
-            config["partial_success_stage_advancement"] = {
-                stage_name: bool(current.get(stage_name, default_value))
-                for stage_name, default_value in defaults.items()
-            }
-        payload = BinarySecurityProjectConfigPayload(**{**BinarySecurityProjectConfigPayload().model_dump(), **config})
-        return BinarySecurityProjectConfigResponse(project_id=project_id, config=payload)
+        response = self.get_config(db)
+        return BinarySecurityProjectConfigResponse(
+            project_id=project_id,
+            config=BinarySecurityProjectConfigPayload(**response.config.model_dump()),
+        )
 
     def get_config(self: TaskManager, db: Session) -> BinarySecurityGlobalConfigResponse:
         row = self._ensure_global_service_config_row(db)

@@ -181,6 +181,7 @@ async def create_task(
     )
 
 
+# Backward-compatible alias for the global task policy config endpoint.
 @router.get("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
 def get_project_config(
     project_id: str,
@@ -190,6 +191,7 @@ def get_project_config(
     return get_task_manager().get_project_config(db, project_id=project_id)
 
 
+# Backward-compatible alias for the global task policy config endpoint.
 @router.put("/projects/{project_id}/config", response_model=BinarySecurityProjectConfigResponse)
 def save_project_config(
     project_id: str,

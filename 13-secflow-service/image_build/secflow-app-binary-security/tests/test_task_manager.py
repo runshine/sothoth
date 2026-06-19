@@ -20,6 +20,7 @@ from app.model import (
     BinarySecurityArchiveJob,
     BinarySecurityEvent,
     BinarySecurityProjectConfig,
+    BinarySecurityServiceConfig,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityStateEvent,
@@ -5590,16 +5591,16 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 authorization_token="token",
             )
 
-    async def test_create_task_uses_project_pipeline_mode_when_no_override(self):
+    async def test_create_task_uses_global_pipeline_mode_when_no_override(self):
         payload = BinarySecurityTaskCreate(
             task_id="t1",
             task_type=TASK_TYPE_SOURCE,
             name="source-task",
             input_files=[BinarySecurityInputFile(filename="src.zip", size=12)],
         )
-        row = BinarySecurityProjectConfig(project_id="p1")
+        row = BinarySecurityServiceConfig(config_key="global")
         row.config = {"pipeline_mode": "mixed_streaming"}
-        db = _AppendingModelAwareDb(project_configs=[row])
+        db = _AppendingModelAwareDb(service_configs=[row])
 
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "task-root"
@@ -5637,9 +5638,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             input_files=[BinarySecurityInputFile(filename="src.zip", size=12)],
             policy_overrides={"pipeline_mode": "unexpected-mode"},
         )
-        row = BinarySecurityProjectConfig(project_id="p1")
+        row = BinarySecurityServiceConfig(config_key="global")
         row.config = {"pipeline_mode": "mixed_streaming"}
-        db = _AppendingModelAwareDb(project_configs=[row])
+        db = _AppendingModelAwareDb(service_configs=[row])
 
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp) / "task-root"
@@ -23252,18 +23253,20 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
     def test_project_config_includes_partial_success_stage_advancement_defaults(self):
         payload = BinarySecurityProjectConfigPayload()
+        self.assertEqual("mixed_streaming", payload.pipeline_mode)
+        self.assertEqual(5, payload.max_stage_parallelism)
         self.assertEqual(
             {
-                "binary_to_source": False,
-                "entry_analysis": False,
-                "dataflow_vuln_scan": False,
+                "binary_to_source": True,
+                "entry_analysis": True,
+                "dataflow_vuln_scan": True,
             },
             payload.partial_success_stage_advancement,
         )
+        self.assertTrue(all(value == 5 for value in payload.stage_parallelism.values()))
 
     def test_save_project_config_normalizes_pipeline_mode(self):
-        row = BinarySecurityProjectConfig(project_id="p1")
-        db = _FakeDb(rows=[row])
+        db = _AppendingModelAwareDb()
 
         response = self.manager.save_project_config(
             db,
@@ -23272,10 +23275,11 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         )
 
         self.assertEqual("mixed_streaming", response.config.pipeline_mode)
-        self.assertEqual("mixed_streaming", row.config["pipeline_mode"])
+        self.assertEqual(1, len(db.service_configs))
+        self.assertEqual("mixed_streaming", db.service_configs[0].config["pipeline_mode"])
 
     def test_get_project_config_normalizes_legacy_pipeline_mode(self):
-        row = BinarySecurityProjectConfig(project_id="p1")
+        row = BinarySecurityServiceConfig(config_key="global")
         row.config = {
             "pipeline_mode": "legacy-mode",
             "partial_success_stage_advancement": {
@@ -23284,7 +23288,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 "dataflow_vuln_scan": False,
             },
         }
-        db = _FakeDb(rows=[row])
+        db = _ModelAwareDb(service_configs=[row])
 
         response = self.manager.get_project_config(db, "p1")
 
@@ -23299,7 +23303,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         )
 
     def test_merge_policy_merges_partial_success_stage_advancement(self):
-        row = BinarySecurityProjectConfig(project_id="p1")
+        row = BinarySecurityServiceConfig(config_key="global")
         row.config = {
             "partial_success_stage_advancement": {
                 "binary_to_source": False,
@@ -23308,7 +23312,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             }
         }
         policy = self.manager._merge_policy(
-            _FakeDb(rows=[row]),
+            _ModelAwareDb(service_configs=[row]),
             "p1",
             {
                 "task_type": TASK_TYPE_BINARY,
@@ -23329,7 +23333,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         )
 
     def test_merge_policy_prunes_binary_to_source_partial_success_advancement_for_source_tasks(self):
-        row = BinarySecurityProjectConfig(project_id="p1")
+        row = BinarySecurityServiceConfig(config_key="global")
         row.config = {
             "partial_success_stage_advancement": {
                 "binary_to_source": False,
@@ -23338,7 +23342,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             }
         }
         policy = self.manager._merge_policy(
-            _FakeDb(rows=[row]),
+            _ModelAwareDb(service_configs=[row]),
             "p1",
             {
                 "task_type": TASK_TYPE_SOURCE,
@@ -23354,13 +23358,13 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             policy["partial_success_stage_advancement"],
         )
 
-    def test_merge_policy_normalizes_legacy_project_pipeline_mode(self):
+    def test_merge_policy_normalizes_legacy_global_pipeline_mode(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
-        row = BinarySecurityProjectConfig(project_id="p1")
+        row = BinarySecurityServiceConfig(config_key="global")
         row.config = {"pipeline_mode": "legacy-mode"}
 
         policy = self.manager._merge_policy(
-            _FakeDb(rows=[row]),
+            _ModelAwareDb(service_configs=[row]),
             "p1",
             {"task_type": TASK_TYPE_SOURCE},
             {},
@@ -23368,18 +23372,43 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertEqual("barrier", policy["pipeline_mode"])
 
-    def test_merge_policy_pipeline_override_wins_over_project_config(self):
-        row = BinarySecurityProjectConfig(project_id="p1")
+    def test_merge_policy_pipeline_override_wins_over_global_config(self):
+        row = BinarySecurityServiceConfig(config_key="global")
         row.config = {"pipeline_mode": "barrier"}
 
         policy = self.manager._merge_policy(
-            _FakeDb(rows=[row]),
+            _ModelAwareDb(service_configs=[row]),
             "p1",
             {"task_type": TASK_TYPE_SOURCE, "pipeline_mode": " Mixed_Streaming "},
             {},
         )
 
         self.assertEqual("mixed_streaming", policy["pipeline_mode"])
+
+    def test_merge_policy_uses_global_config_when_create_payload_omits_overrides(self):
+        row = BinarySecurityServiceConfig(config_key="global")
+        row.config = {
+            "pipeline_mode": "barrier",
+            "max_stage_parallelism": 7,
+            "stage_parallelism": {
+                "system_analysis": 7,
+                "entry_analysis": 6,
+                "dataflow_vuln_scan": 5,
+            },
+            "continue_on_item_failure": False,
+        }
+
+        policy = self.manager._merge_policy(
+            _ModelAwareDb(service_configs=[row]),
+            "p1",
+            {"task_type": TASK_TYPE_SOURCE},
+            {},
+        )
+
+        self.assertEqual("barrier", policy["pipeline_mode"])
+        self.assertEqual(7, policy["max_stage_parallelism"])
+        self.assertEqual(6, policy["stage_parallelism"]["entry_analysis"])
+        self.assertFalse(policy["continue_on_item_failure"])
 
     def test_claim_pending_tasks_reclaims_expired_lease(self):
         task = BinarySecurityTask(
@@ -33844,7 +33873,7 @@ def _test_cleanup_task_workspace_retries_transient_residual_directory(self):
 
 
 def _test_get_project_config_normalizes_legacy_partial_success_stage_names(self):
-    row = BinarySecurityProjectConfig(project_id="p1")
+    row = BinarySecurityServiceConfig(config_key="global")
     row.config = {
         "partial_success_stage_advancement": {
             "binary_to_source": False,
@@ -33852,15 +33881,15 @@ def _test_get_project_config_normalizes_legacy_partial_success_stage_names(self)
             "vuln_scan": False,
         },
     }
-    db = _FakeDb(rows=[row])
+    db = _ModelAwareDb(service_configs=[row])
 
     response = self.manager.get_project_config(db, "p1")
 
     self.assertEqual(
         {
             "binary_to_source": False,
-            "entry_analysis": False,
-            "dataflow_vuln_scan": False,
+            "entry_analysis": True,
+            "dataflow_vuln_scan": True,
         },
         response.config.partial_success_stage_advancement,
     )
