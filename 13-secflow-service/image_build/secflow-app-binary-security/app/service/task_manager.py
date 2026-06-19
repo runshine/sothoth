@@ -683,21 +683,13 @@ class TaskManager(
             return _derive_downstream_work_key
         if item == "_rebuild_archive_jobs_for_stage":
             def _rebuild_archive_jobs_for_stage(db, task, target_stage, stage_items):
-                rebuilt = 0
-                for stage_item in list(stage_items or []):
-                    payload = dict(self._load_stage_item_result_payload(stage_item).get("downstream") or {})
-                    mapped_status = str(payload.get("status") or getattr(stage_item, "status", "") or "").strip().lower() or None
-                    job = self._queue_downstream_archive_job(
-                        db,
-                        task,
-                        stage_item,
-                        payload=payload,
-                        mapped_status=mapped_status,
-                        before_status=str(getattr(stage_item, "status", "") or "").strip() or None,
-                    )
-                    if job is not None:
-                        rebuilt += 1
-                return rebuilt
+                return self._rebuild_authoritative_archive_jobs_for_stage(
+                    db,
+                    task,
+                    target_stage,
+                    stage_items,
+                    archive_jobs=self._archive_jobs_for_stages(db, task.id, [target_stage]),
+                )
             return _rebuild_archive_jobs_for_stage
         if item == "_wait_archive_job_completion":
             async def _wait_archive_job_completion(job_id, task_id, timeout_seconds: int = 120):

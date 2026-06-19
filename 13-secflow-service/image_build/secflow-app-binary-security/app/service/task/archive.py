@@ -18,6 +18,168 @@ if TYPE_CHECKING:
 
 
 class TaskArchiveServiceMixin:
+    def _archive_stage_full_retry_failure_reason(self: TaskManager, stage_name: str) -> str:
+        return f"{stage_name} has no authoritative successful result for archive rebuild"
+
+    def _archive_stage_full_retry_reason_payload(self: TaskManager, stage_name: str) -> dict[str, Any]:
+        normalized_stage = str(stage_name or "").strip() or "unknown_stage"
+        return {
+            "reason_code": f"{normalized_stage}_archive_authoritative_success_missing",
+            "reason_category": "authoritative_state",
+        }
+
+    def _archive_stage_full_retry_success_candidates(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        stage_name: str,
+    ) -> tuple[list[Any], list[Any]]:
+        from app.service import task_manager as task_manager_module
+
+        jobs = self._archive_jobs_for_stages(db, task.id, [stage_name])
+        stage_items = list(self._stage_items(db, task.id, stage_name))
+        if not stage_items and not jobs:
+            return [], []
+
+        authoritative_items = [
+            item
+            for item in stage_items
+            if (self._normalize_downstream_status(getattr(item, "status", None)) or str(getattr(item, "status", "") or "").strip().lower())
+            in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES
+        ]
+        if authoritative_items:
+            return jobs, authoritative_items
+
+        authoritative_job_item_ids = {
+            str(getattr(job, "item_id", "") or "").strip()
+            for job in jobs
+            if str((getattr(job, "payload", None) or {}).get("mapped_status") or "").strip().lower()
+            in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES
+        }
+        if authoritative_job_item_ids:
+            filtered_items = [
+                item for item in stage_items
+                if str(getattr(item, "id", "") or "").strip() in authoritative_job_item_ids
+            ]
+            if filtered_items:
+                return jobs, filtered_items
+
+        if self._archive_apply_stage_has_authoritative_success_payload(db, task, stage_name):
+            return jobs, stage_items
+        return jobs, []
+
+    def _rebuild_authoritative_archive_jobs_for_stage(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        stage_name: str,
+        stage_items: list[Any],
+        *,
+        archive_jobs: list[Any] | None = None,
+    ) -> int:
+        from app.service import task_manager as task_manager_module
+
+        archive_jobs = list(archive_jobs or [])
+        jobs_by_item_id = {
+            str(getattr(job, "item_id", "") or "").strip(): job
+            for job in archive_jobs
+            if str(getattr(job, "item_id", "") or "").strip()
+        }
+        rebuilt = 0
+        for stage_item in list(stage_items or []):
+            payload = dict(self._load_stage_item_result_payload(stage_item).get("downstream") or {})
+            normalized_item_status = (
+                self._normalize_downstream_status(getattr(stage_item, "status", None))
+                or str(getattr(stage_item, "status", "") or "").strip().lower()
+                or None
+            )
+            mapped_status = (
+                normalized_item_status
+                if normalized_item_status in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES
+                else None
+            )
+            if mapped_status is None:
+                existing_job = jobs_by_item_id.get(str(getattr(stage_item, "id", "") or "").strip())
+                existing_job_status = str((getattr(existing_job, "payload", None) or {}).get("mapped_status") or "").strip().lower()
+                if existing_job_status in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES:
+                    mapped_status = existing_job_status
+            if mapped_status is None:
+                raise ValidationError(self._archive_stage_full_retry_failure_reason(stage_name))
+            job = self._queue_downstream_archive_job(
+                db,
+                task,
+                stage_item,
+                payload=payload,
+                mapped_status=mapped_status,
+                before_status=str(getattr(stage_item, "status", "") or "").strip() or None,
+            )
+            if job is not None:
+                rebuilt += 1
+        return rebuilt
+
+    async def _prepare_authoritative_archive_retry_full(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        target_stage: str,
+        *,
+        jobs: list[Any],
+        stage_items: list[Any],
+    ) -> list[str]:
+        from app.service import task_manager as task_manager_module
+
+        stage_sequence = self._stage_sequence_for_task(task)
+        if target_stage not in stage_sequence:
+            raise ValidationError(f"{target_stage} is not present in current stage sequence")
+        target_index = stage_sequence.index(target_stage)
+        descendant_stages = list(stage_sequence[target_index + 1 :])
+        downstream_refs = self._retry_downstream_refs_for_stages(db, task, descendant_stages)
+
+        if jobs:
+            self._delete_archive_roots_for_jobs(task, jobs)
+        self._clear_archive_jobs_for_stages(db, task.id, [target_stage])
+        rebuilt = self._rebuild_authoritative_archive_jobs_for_stage(
+            db,
+            task,
+            target_stage,
+            stage_items,
+            archive_jobs=jobs,
+        )
+
+        if downstream_refs:
+            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
+        if descendant_stages:
+            self._clear_stage_outputs_from(task, descendant_stages[0], mark_stale=False)
+            self._delete_archive_children_for_stages(db, task, descendant_stages)
+            self._delete_stage_items_for_stages(db, task.id, descendant_stages)
+            self._delete_state_event_rows_for_stages(db, task.id, descendant_stages)
+            self._delete_timeline_rows_for_stages(db, task.id, descendant_stages)
+            for stage_name in descendant_stages:
+                stage_run = db.query(task_manager_module.BinarySecurityStageRun).filter(
+                    task_manager_module.BinarySecurityStageRun.task_id == task.id,
+                    task_manager_module.BinarySecurityStageRun.stage_name == stage_name,
+                ).first()
+                if stage_run is not None:
+                    self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
+
+        self._mark_task_waiting_for_archive_retry(db, task, target_stage)
+        self._record_event(
+            db,
+            task,
+            "archive_stage_full_retry_requested",
+            "阶段归档任务已清空并重建",
+            stage_name=target_stage,
+            payload={
+                "stage_name": target_stage,
+                "rebuild_count": rebuilt,
+                "retry_semantics": "archive_full",
+                "archive_rebuild_mode": "authoritative_stage_only",
+                "cleared_business_stages": list(descendant_stages),
+                "cleared_archive_stages": [target_stage, *descendant_stages],
+            },
+        )
+        return [target_stage]
+
     def _expand_stage_name_aliases(self: TaskManager, stage_names: list[str]) -> list[str]:
         normalized: list[str] = []
         seen: set[str] = set()
@@ -246,33 +408,12 @@ class TaskArchiveServiceMixin:
         stage_sequence = self._stage_sequence_for_task(task)
         if normalized_stage not in stage_sequence and str(stage_name or "").strip() not in stage_sequence:
             return False, f"无效阶段: {stage_name}", [], []
-        jobs = self._archive_jobs_for_stages(db, task.id, list(allowed_stage_names))
-        stage_items: list[Any] = []
-        for candidate_stage in allowed_stage_names:
-            try:
-                stage_items.extend(self._stage_items(db, task.id, candidate_stage))
-            except Exception:
-                continue
-        seen_item_ids: set[str] = set()
-        deduped_stage_items: list[Any] = []
-        for item in stage_items:
-            item_id = str(getattr(item, "id", "") or "").strip()
-            if item_id and item_id in seen_item_ids:
-                continue
-            if item_id:
-                seen_item_ids.add(item_id)
-            deduped_stage_items.append(item)
-        stage_items = deduped_stage_items
-        if not jobs and not stage_items:
-            return False, "当前阶段暂无归档任务", [], []
-        retryable_items = [
-            item
-            for item in stage_items
-            if str(getattr(item, "status", "") or "").strip() in {"success", "partial_success", "failed", "downstream_missing"}
-        ]
+        jobs, retryable_items = self._archive_stage_full_retry_success_candidates(db, task, normalized_stage)
         if not jobs and not retryable_items:
-            return False, "当前阶段暂无可完全重试的归档任务", [], []
-        return True, None, jobs, retryable_items or stage_items
+            return False, "当前阶段暂无归档任务", [], []
+        if not retryable_items:
+            return False, self._archive_stage_full_retry_failure_reason(normalized_stage), jobs, []
+        return True, None, jobs, retryable_items
 
     def _mark_task_waiting_for_archive_retry(self: TaskManager, db: Session, task: Any, stage_name: str) -> None:
         task.status = "running"
@@ -322,6 +463,7 @@ class TaskArchiveServiceMixin:
         task: Any,
         target_stage: str,
     ) -> list[str]:
+        normalized_target_stage = str(target_stage or "").strip()
         supported, reason, jobs, stage_items = self._archive_full_retry_support(
             db,
             task,
@@ -329,25 +471,14 @@ class TaskArchiveServiceMixin:
             ignore_operation_lock=True,
         )
         if not supported:
-            raise ValidationError(reason or f"阶段 {target_stage} 暂无可完全重试的归档任务")
-        if jobs:
-            self._delete_archive_roots_for_jobs(task, jobs)
-            self._clear_archive_jobs_for_stages(db, task.id, [target_stage])
-        rebuilt = self._rebuild_archive_jobs_for_stage(db, task, target_stage, stage_items)
-        self._mark_task_waiting_for_archive_retry(db, task, target_stage)
-        self._record_event(
+            raise ValidationError(reason or self._archive_stage_full_retry_failure_reason(normalized_target_stage))
+        return await self._prepare_authoritative_archive_retry_full(
             db,
             task,
-            "archive_stage_full_retry_requested",
-            "阶段归档任务已清空并重建",
-            stage_name=target_stage,
-            payload={
-                "stage_name": target_stage,
-                "rebuild_count": rebuilt,
-                "retry_semantics": "archive_full",
-            },
+            normalized_target_stage,
+            jobs=jobs,
+            stage_items=stage_items,
         )
-        return [target_stage]
 
     def _requeue_archive_jobs(
         self: TaskManager,
