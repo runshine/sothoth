@@ -130,6 +130,27 @@ class TaskRuntimeServiceMixin:
                 or authoritative_tail_run_present
                 or current_stage_before_sync == "dataflow_vuln_scan"
             )
+            missing_entry_results_failure = self._missing_entry_results_failure_context(
+                db,
+                task,
+                stage_name="dataflow_vuln_scan",
+                reason="tail_state_sync_missing_entry_results",
+            )
+            if missing_entry_results_failure is not None and authoritative_tail_progress:
+                self._finalize_task_after_authoritative_failure(
+                    db,
+                    task,
+                    failure_ctx=missing_entry_results_failure,
+                    previous_status=str(task.status or "").strip() or None,
+                    event_type="missing_entry_results_terminalized",
+                )
+                await self._write_task_metadata_async(
+                    task,
+                    Path(task.workspace_root) / "input" / "task-metadata.json",
+                    status=task.status,
+                )
+                db.commit()
+                return
             if self._entry_results(task) and authoritative_tail_progress:
                 task.current_stage = "dataflow_vuln_scan"
                 if active_tail_item:
@@ -1282,6 +1303,22 @@ class TaskRuntimeServiceMixin:
                     continue
                 db.refresh(task)
                 if task.status == "cancelled":
+                    return
+                missing_entry_results_failure = self._missing_entry_results_failure_context(
+                    db,
+                    task,
+                    stage_name=stage_name,
+                    reason="execute_task_missing_entry_results",
+                )
+                if missing_entry_results_failure is not None:
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx=missing_entry_results_failure,
+                        previous_status=str(task.status or "").strip() or None,
+                        event_type="missing_entry_results_terminalized",
+                    )
+                    db.commit()
                     return
                 if not self._stage_enabled(task, stage_name):
                     stage_run = self._ensure_stage_run(db, task, stage_name)

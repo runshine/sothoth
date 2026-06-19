@@ -20,6 +20,38 @@ if TYPE_CHECKING:
 
 
 class TaskStateMachineMixin:
+    def _missing_entry_results_failure_context(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str = "dataflow_vuln_scan",
+        reason: str,
+    ) -> dict[str, Any] | None:
+        from app.service import task_manager as task_manager_module
+
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage != "dataflow_vuln_scan":
+            return None
+        if self._task_type(task) != TASK_TYPE_SOURCE:
+            return None
+        if self._entry_results(task):
+            return None
+        stage_run = self._ensure_stage_run(db, task, stage_name)
+        failure_message = "entry_analysis 未产出 entry_results，无法继续进入 dataflow_vuln_scan"
+        stage_run.status = "failed"
+        stage_run.finished_at = stage_run.finished_at or task_manager_module._now()
+        stage_run.last_error = failure_message
+        stage_run.counts = self._stage_counts(db, stage_run)
+        return {
+            "stage_name": stage_name,
+            "stage_run": stage_run,
+            "failure_code": "missing_entry_results",
+            "failure_category": "business",
+            "failure_message": failure_message,
+            "reason": reason,
+        }
+
     def _partial_success_advancement_enabled(
         self: TaskManager,
         task: BinarySecurityTask,

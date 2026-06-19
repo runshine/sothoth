@@ -6644,6 +6644,86 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("/tmp/archive/openssl", stored["dataflow_dir"])
         self.assertNotIn("downstream", stored)
 
+    def test_execute_task_terminalizes_source_dataflow_stage_when_entry_results_missing(self):
+        task = BinarySecurityTask(
+            id="task-missing-entry-results",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        stage_run = BinarySecurityStageRun(
+            id="sr-dataflow",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(self.manager, "_service_token", return_value=None),
+            patch.object(self.manager, "_bind_execution_token"),
+            patch.object(self.manager, "_stage_sequence_for_task", return_value=["dataflow_vuln_scan"]),
+            patch.object(self.manager, "_record_event"),
+            patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
+        ):
+            asyncio.run(self.manager._execute_task(task.id))
+
+        self.assertEqual("failed", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+        self.assertEqual("dataflow_vuln_scan", task.current_stage)
+        self.assertIn("entry_results", str(task.last_error or ""))
+
+    def test_sync_streaming_tail_state_terminalizes_source_dataflow_stage_when_entry_results_missing(self):
+        task = BinarySecurityTask(
+            id="task-tail-missing-entry-results",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        stage_run = BinarySecurityStageRun(
+            id="sr-dataflow-tail",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(self.manager, "_record_event"),
+            patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
+        ):
+            asyncio.run(self.manager._sync_streaming_task_tail_state(task.id))
+
+        self.assertEqual("failed", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+        self.assertIn("entry_results", str(task.last_error or ""))
+
     def test_vuln_results_store_only_archive_summary(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         task.summary = {}
@@ -28235,6 +28315,95 @@ def _test_requeue_orphaned_owned_execution_locked_recovers_orphan(self):
     self.assertTrue(requeue_events)
 
 
+def _test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-owner-drift-restart",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="stale-worker",
+        current_operation_id="op-old",
+        lease_expires_at=_now() - timedelta(seconds=1),
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr-owner-drift-restart",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="binary_to_source",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-owner-drift-restart",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=stage_run.id,
+        stage_name="binary_to_source",
+        item_key="module1",
+        parent_key="module1",
+        status="running",
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s-owner-drift",
+    )
+    older = BinarySecurityTaskOperation(
+        id="op-old",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="continue",
+        target_stage="binary_to_source",
+        status="accepted",
+        created_at=_now() - timedelta(minutes=2),
+        updated_at=_now() - timedelta(minutes=2),
+    )
+    newer = BinarySecurityTaskOperation(
+        id="op-new",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry_stage_full",
+        target_stage="binary_to_source",
+        status="queued",
+        created_at=_now() - timedelta(minutes=1),
+        updated_at=_now() - timedelta(minutes=1),
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[stage_run],
+        stage_items=[item],
+        operations=[older, newer],
+        runtime_leases=[],
+        events=[],
+    )
+
+    released = manager._release_unsupported_task_row_owner(
+        db,
+        task,
+        active_operation=older,
+        reason="unit_test_owner_drift_runtime_restart",
+    )
+
+    self.assertTrue(released)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("op-new", task.current_operation_id)
+    self.assertEqual("superseded", older.status)
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertEqual(task.id, claimed)
+    self.assertEqual("dispatching", task.status)
+    self.assertEqual("local-worker", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+
+
 def _test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease(self):
     task = BinarySecurityTask(
         id="t1",
@@ -29177,6 +29346,7 @@ TaskManagerTests.test_refresh_task_status_after_sync_pending_next_stage_uses_res
 TaskManagerTests.test_finalize_task_requeues_owned_execution_without_active_holder = _test_finalize_task_requeues_owned_execution_without_active_holder
 TaskManagerTests.test_apply_archive_job_status_requeues_owned_execution_without_active_holder = _test_apply_archive_job_status_requeues_owned_execution_without_active_holder
 TaskManagerTests.test_requeue_orphaned_owned_execution_locked_recovers_orphan = _test_requeue_orphaned_owned_execution_locked_recovers_orphan
+TaskManagerTests.test_owner_drift_requeue_can_be_claimed_and_runtime_restarted = _test_owner_drift_requeue_can_be_claimed_and_runtime_restarted
 TaskManagerTests.test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease = _test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease
 
 
