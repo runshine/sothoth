@@ -816,7 +816,7 @@ class BinarySecurityEntrySelectionConfirmPayload(BaseModel):
     selected_entry_keys: list[str] = Field(default_factory=list)
 
 
-class BinarySecurityProjectConfigPayload(BaseModel):
+class BinarySecurityTaskPolicyConfigPayload(BaseModel):
     pipeline_mode: str = Field(default="mixed_streaming")
     max_stage_parallelism: int = Field(default=5, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
@@ -836,9 +836,17 @@ class BinarySecurityProjectConfigPayload(BaseModel):
     )
 
 
-class BinarySecurityProjectConfigResponse(BaseModel):
+class BinarySecurityTaskPolicyConfigResponse(BaseModel):
     project_id: str
-    config: BinarySecurityProjectConfigPayload
+    config: BinarySecurityTaskPolicyConfigPayload
+
+
+class BinarySecurityProjectConfigPayload(BinarySecurityTaskPolicyConfigPayload):
+    """Backward-compatible alias for the global task policy config payload."""
+
+
+class BinarySecurityProjectConfigResponse(BinarySecurityTaskPolicyConfigResponse):
+    """Backward-compatible alias for the global task policy config response."""
 
 
 class BinarySecurityServiceConfigPayload(BaseModel):

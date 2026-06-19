@@ -19,6 +19,8 @@ from app.schemas import (
     BinarySecurityModuleSelectionResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
+    BinarySecurityTaskPolicyConfigPayload,
+    BinarySecurityTaskPolicyConfigResponse,
     BinarySecurityTaskCreate,
     BinarySecurityTaskPolicyUpdatePayload,
     BinarySecurityTaskDetailResponse,
@@ -347,22 +349,45 @@ class TaskControlServiceMixin:
             policy["entry_selection_mode"] = "auto"
         return policy
 
+    def save_task_policy_config(
+        self: TaskManager,
+        db: Session,
+        payload: BinarySecurityTaskPolicyConfigPayload,
+    ) -> BinarySecurityTaskPolicyConfigResponse:
+        response = self.save_config(db, BinarySecurityGlobalConfigPayload(**payload.model_dump()))
+        return BinarySecurityTaskPolicyConfigResponse(
+            project_id="global",
+            config=BinarySecurityTaskPolicyConfigPayload(**response.config.model_dump()),
+        )
+
+    def get_task_policy_config(self: TaskManager, db: Session) -> BinarySecurityTaskPolicyConfigResponse:
+        response = self.get_config(db)
+        return BinarySecurityTaskPolicyConfigResponse(
+            project_id="global",
+            config=BinarySecurityTaskPolicyConfigPayload(**response.config.model_dump()),
+        )
+
     def save_project_config(
         self: TaskManager,
         db: Session,
         project_id: str,
         payload: BinarySecurityProjectConfigPayload,
     ) -> BinarySecurityProjectConfigResponse:
-        response = self.save_config(db, BinarySecurityGlobalConfigPayload(**payload.model_dump()))
+        del project_id
+        response = self.save_task_policy_config(
+            db,
+            BinarySecurityTaskPolicyConfigPayload(**payload.model_dump()),
+        )
         return BinarySecurityProjectConfigResponse(
-            project_id=project_id,
+            project_id="global",
             config=BinarySecurityProjectConfigPayload(**response.config.model_dump()),
         )
 
     def get_project_config(self: TaskManager, db: Session, project_id: str) -> BinarySecurityProjectConfigResponse:
-        response = self.get_config(db)
+        del project_id
+        response = self.get_task_policy_config(db)
         return BinarySecurityProjectConfigResponse(
-            project_id=project_id,
+            project_id="global",
             config=BinarySecurityProjectConfigPayload(**response.config.model_dump()),
         )
 

@@ -41,6 +41,7 @@ from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import (
     BinarySecurityInputFile,
     BinarySecurityProjectConfigPayload,
+    BinarySecurityTaskPolicyConfigPayload,
     BinarySecurityArchiveJobResponse,
     BinarySecurityStageSummary,
     BinarySecurityTaskCreate,
@@ -23251,8 +23252,8 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         payload = BinarySecurityServiceConfigPayload()
         self.assertEqual(90, payload.lease_timeout_seconds)
 
-    def test_project_config_includes_partial_success_stage_advancement_defaults(self):
-        payload = BinarySecurityProjectConfigPayload()
+    def test_task_policy_config_includes_partial_success_stage_advancement_defaults(self):
+        payload = BinarySecurityTaskPolicyConfigPayload()
         self.assertEqual("mixed_streaming", payload.pipeline_mode)
         self.assertEqual(5, payload.max_stage_parallelism)
         self.assertEqual(
@@ -23265,7 +23266,31 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         )
         self.assertTrue(all(value == 5 for value in payload.stage_parallelism.values()))
 
-    def test_save_project_config_normalizes_pipeline_mode(self):
+    def test_get_task_policy_config_normalizes_legacy_pipeline_mode(self):
+        row = BinarySecurityServiceConfig(config_key="global")
+        row.config = {
+            "pipeline_mode": "legacy-mode",
+            "partial_success_stage_advancement": {
+                "binary_to_source": False,
+                "entry_analysis": True,
+                "dataflow_vuln_scan": False,
+            },
+        }
+        db = _ModelAwareDb(service_configs=[row])
+
+        response = self.manager.get_task_policy_config(db)
+
+        self.assertEqual("barrier", response.config.pipeline_mode)
+        self.assertEqual(
+            {
+                "binary_to_source": False,
+                "entry_analysis": True,
+                "dataflow_vuln_scan": False,
+            },
+            response.config.partial_success_stage_advancement,
+        )
+
+    def test_save_project_config_alias_normalizes_pipeline_mode(self):
         db = _AppendingModelAwareDb()
 
         response = self.manager.save_project_config(
@@ -23278,7 +23303,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual(1, len(db.service_configs))
         self.assertEqual("mixed_streaming", db.service_configs[0].config["pipeline_mode"])
 
-    def test_get_project_config_normalizes_legacy_pipeline_mode(self):
+    def test_get_project_config_alias_normalizes_legacy_pipeline_mode(self):
         row = BinarySecurityServiceConfig(config_key="global")
         row.config = {
             "pipeline_mode": "legacy-mode",

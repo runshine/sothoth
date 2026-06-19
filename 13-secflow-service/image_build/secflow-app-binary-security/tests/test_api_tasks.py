@@ -29,6 +29,8 @@ from app.schemas import (
     BinarySecurityStageItemPageResponse,
     BinarySecurityStageItemResponse,
     BinarySecurityStageSummary,
+    BinarySecurityTaskPolicyConfigPayload,
+    BinarySecurityTaskPolicyConfigResponse,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskListResponse,
     BinarySecurityTaskOperationPageResponse,
@@ -150,6 +152,28 @@ class _RouteManagerStub:
         return BinarySecurityProjectConfigResponse(
             project_id=project_id,
             config=BinarySecurityProjectConfigPayload(
+                pipeline_mode=payload.pipeline_mode,
+                max_stage_parallelism=payload.max_stage_parallelism,
+                max_retries_per_item=payload.max_retries_per_item,
+                continue_on_item_failure=payload.continue_on_item_failure,
+                partial_success_stage_advancement=payload.partial_success_stage_advancement,
+                stage_parallelism=payload.stage_parallelism,
+                stage_options=payload.stage_options,
+            ),
+        )
+
+    def get_task_policy_config(self, db):
+        self.calls.append(("get_task_policy_config", db))
+        return BinarySecurityTaskPolicyConfigResponse(
+            project_id="global",
+            config=BinarySecurityTaskPolicyConfigPayload(pipeline_mode="mixed_streaming"),
+        )
+
+    def save_task_policy_config(self, db, payload):
+        self.calls.append(("save_task_policy_config", db, payload))
+        return BinarySecurityTaskPolicyConfigResponse(
+            project_id="global",
+            config=BinarySecurityTaskPolicyConfigPayload(
                 pipeline_mode=payload.pipeline_mode,
                 max_stage_parallelism=payload.max_stage_parallelism,
                 max_retries_per_item=payload.max_retries_per_item,
@@ -509,7 +533,7 @@ class TaskApiRouteTests(unittest.TestCase):
             manager.calls[0],
         )
 
-    def test_put_project_config_route_round_trips_pipeline_mode(self):
+    def test_put_project_config_route_remains_legacy_alias(self):
         app, fake_db = self._build_client()
         manager = _RouteManagerStub()
 
@@ -529,7 +553,7 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual("p1", manager.calls[0][2])
         self.assertEqual("mixed_streaming", manager.calls[0][3].pipeline_mode)
 
-    def test_get_project_config_route_returns_pipeline_mode(self):
+    def test_get_project_config_route_remains_legacy_alias(self):
         app, fake_db = self._build_client()
         manager = _RouteManagerStub()
 
@@ -544,6 +568,41 @@ class TaskApiRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
         self.assertEqual(("get_project_config", fake_db, "p1"), manager.calls[0])
+
+    def test_get_task_policy_config_route_returns_pipeline_mode(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/task-policy-config",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
+        self.assertEqual(("get_task_policy_config", fake_db), manager.calls[0])
+
+    def test_put_task_policy_config_route_round_trips_pipeline_mode(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.put(
+                    "/api/app/binary-security/task-policy-config",
+                    json={"pipeline_mode": "mixed_streaming"},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
+        self.assertEqual("save_task_policy_config", manager.calls[0][0])
+        self.assertIs(fake_db, manager.calls[0][1])
+        self.assertEqual("mixed_streaming", manager.calls[0][2].pipeline_mode)
 
     def test_get_orchestration_observability_route_returns_streaming_snapshot(self):
         app, fake_db = self._build_client()

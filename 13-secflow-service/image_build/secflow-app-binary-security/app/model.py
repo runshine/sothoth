@@ -583,6 +583,7 @@ class BinarySecurityCoordinatorLease(Base):
 
 
 class BinarySecurityProjectConfig(Base, JsonMixin):
+    """Legacy per-project config row kept only as a migration source for global task policy."""
     __tablename__ = "secflow_binary_security_project_config"
 
     id = Column(Integer, primary_key=True, autoincrement=True)

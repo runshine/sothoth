@@ -28,6 +28,8 @@ from app.schemas import (
     BinarySecurityGlobalConfigResponse,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
+    BinarySecurityTaskPolicyConfigPayload,
+    BinarySecurityTaskPolicyConfigResponse,
     BinarySecurityReducerEventPageResponse,
     BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemPageResponse,
@@ -179,6 +181,25 @@ async def create_task(
         created_by=created_by,
         authorization_token=token,
     )
+
+
+# Preferred endpoint for the global task policy config used during task creation.
+@router.get("/task-policy-config", response_model=BinarySecurityTaskPolicyConfigResponse)
+def get_task_policy_config(
+    _: TokenUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_task_policy_config(db)
+
+
+# Preferred endpoint for the global task policy config used during task creation.
+@router.put("/task-policy-config", response_model=BinarySecurityTaskPolicyConfigResponse)
+def save_task_policy_config(
+    payload: BinarySecurityTaskPolicyConfigPayload,
+    _: TokenUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().save_task_policy_config(db, payload=payload)
 
 
 # Backward-compatible alias for the global task policy config endpoint.
