@@ -1235,6 +1235,23 @@ class TaskManager(
         payload: dict[str, Any],
         event_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        active_delete_operation = self._active_delete_operation(db, task.id)
+        if active_delete_operation is not None:
+            self._record_event(
+                db,
+                task,
+                "downstream_create_skipped_due_to_delete_operation",
+                f"任务删除已受理，已阻止新的下游子任务创建: {service}",
+                level="warning",
+                stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
+                item=item,
+                payload={
+                    "service": str(service or ""),
+                    "operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                    "operation_type": str(getattr(active_delete_operation, "operation_type", "") or "").strip() or None,
+                },
+            )
+            raise ValidationError("任务删除已受理，后台正在清理任务及下游资源，禁止创建新的下游子任务")
         has_root_task_key = bool(self._root_task_key_secret(task))
         if has_root_task_key:
             self._record_event(

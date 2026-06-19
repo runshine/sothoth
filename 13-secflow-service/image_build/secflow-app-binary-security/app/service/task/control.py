@@ -30,6 +30,14 @@ if TYPE_CHECKING:
 
 
 class TaskControlServiceMixin:
+    def _active_delete_operation(self: TaskManager, db: Session, task_id: str):
+        from app.service import task_manager as task_manager_module
+
+        active_operation = self._active_operation(db, task_id)
+        if active_operation is not None and str(active_operation.operation_type or "").strip() == task_manager_module.TASK_ACTION_DELETE:
+            return active_operation
+        return None
+
     def _task_workspace_root(self: TaskManager, task) -> Path:
         return Path(str(task.workspace_root or "")).expanduser()
 

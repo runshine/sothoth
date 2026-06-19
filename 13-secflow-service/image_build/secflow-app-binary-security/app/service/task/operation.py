@@ -227,6 +227,12 @@ class TaskOperationServiceMixin:
 
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
+            active_operation_type = str(active_operation.operation_type or "").strip()
+            if (
+                active_operation_type == task_manager_module.TASK_ACTION_DELETE
+                and str(operation_type or "").strip() != task_manager_module.TASK_ACTION_DELETE
+            ):
+                raise ValidationError("任务删除已受理，后台正在清理任务及下游资源，暂不支持其它操作")
             raise ValidationError(f"当前任务已有进行中的操作: {active_operation.operation_type}")
         operation = task_manager_module.BinarySecurityTaskOperation(
             id=f"op_{uuid.uuid4().hex[:24]}",

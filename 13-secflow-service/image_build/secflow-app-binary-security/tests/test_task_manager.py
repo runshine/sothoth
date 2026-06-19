@@ -10961,6 +10961,39 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("accepted", operation.status)
             self.assertEqual(operation.id, task.current_operation_id)
 
+    def test_create_task_operation_rejects_non_delete_when_delete_is_active(self):
+        task = BinarySecurityTask(
+            id="t-delete-active",
+            project_id="p1",
+            name="binary",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op-delete",
+        )
+        delete_operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="delete",
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[delete_operation])
+
+        with self.assertRaisesRegex(ValidationError, "任务删除已受理"):
+            self.manager._create_task_operation(
+                db,
+                task,
+                operation_type="retry_stage_full",
+                target_stage="binary_to_source",
+                requested_by=None,
+                request_payload={"target_stage": "binary_to_source"},
+            )
+
     def test_retry_task_clears_stage_output_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)

@@ -1,7 +1,9 @@
 import tempfile
 import unittest
+from unittest.mock import AsyncMock
 from pathlib import Path
 
+from app.exception import ValidationError
 from app.model import BinarySecurityArchiveJob, BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask
 from app.service.task.downstream import TaskDownstreamServiceMixin
 from app.service.task_manager import TaskManager
@@ -156,3 +158,43 @@ class TaskDownstreamServiceBehaviorTests(unittest.TestCase):
 
         self.assertFalse(allowed)
         self.assertEqual("stale_child_payload", reason)
+
+    def test_downstream_create_task_rejects_when_delete_operation_is_active(self):
+        task = self._task()
+        item = BinarySecurityStageItem(
+            id="item-delete-guard",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="module-1",
+            status="pending",
+            downstream_service="binary_to_source",
+        )
+        delete_operation = type(
+            "DeleteOperation",
+            (),
+            {"id": "op-delete", "operation_type": "delete"},
+        )()
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        self.manager._active_delete_operation = lambda _db, _task_id: delete_operation
+        self.manager._downstream_tasks = lambda: type(
+            "DownstreamTasksStub",
+            (),
+            {"create_child_task": AsyncMock(return_value={"task_id": "should-not-happen"})},
+        )()
+
+        async def _run():
+            with self.assertRaisesRegex(ValidationError, "禁止创建新的下游子任务"):
+                await self.manager._downstream_create_task(
+                    db,
+                    task,
+                    item,
+                    service="binary_to_source",
+                    token=None,
+                    payload={"module_dir": "/tmp/src"},
+                )
+
+        __import__("asyncio").run(_run())
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("downstream_create_skipped_due_to_delete_operation", event_types)
