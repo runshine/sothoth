@@ -284,6 +284,8 @@ class _ModelAwareDb:
             self.events.remove(obj)
         if obj in self.state_events:
             self.state_events.remove(obj)
+        if obj in self.runtime_leases:
+            self.runtime_leases.remove(obj)
         if obj in self.archive_jobs:
             self.archive_jobs.remove(obj)
         if obj in self.stage_items:
@@ -658,6 +660,222 @@ class ArchiveReclaimTests(unittest.TestCase):
         self.assertIsNone(job)
         event_types = [event.event_type for event in db.events]
         self.assertIn("stale_archive_trigger_ignored", event_types)
+
+    def test_archive_full_retry_support_uses_authoritative_stage_item_status(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            output_root="/tmp/out",
+            workspace_root="/tmp/task-1",
+            status="running",
+            current_stage="system_analysis",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        task.current_stage = "system_analysis"
+        task.status = "failed"
+        stage_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        item = self._item(status="success")
+        item.id = "si-system"
+        item.stage_name = "system_analysis"
+        item.stage_run_id = stage_run.id
+        item.downstream_service = "system_analyse"
+        item.result = {"downstream": {"status": "completed"}}
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[], events=[])
+
+        supported, reason, jobs, stage_items = self.manager._archive_full_retry_support(
+            db,
+            task,
+            "system_analysis",
+            ignore_operation_lock=True,
+        )
+
+        self.assertTrue(supported)
+        self.assertIsNone(reason)
+        self.assertEqual([], jobs)
+        self.assertEqual([item], stage_items)
+
+    def test_prepare_archive_retry_full_rebuilds_current_stage_archive_and_clears_descendants(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            output_root="/tmp/out",
+            workspace_root="/tmp/task-1",
+            status="running",
+            current_stage="system_analysis",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        task.current_stage = "system_analysis"
+        task.status = "failed"
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        dataflow_run = BinarySecurityStageRun(
+            id="sr-dataflow",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="failed",
+        )
+        system_item = self._item(status="success")
+        system_item.id = "si-system"
+        system_item.stage_name = "system_analysis"
+        system_item.stage_run_id = system_run.id
+        system_item.downstream_service = "system_analyse"
+        system_item.downstream_task_id = "sat-1"
+        system_item.result = {"downstream": {"status": "completed"}}
+        entry_item = self._item(status="failed")
+        entry_item.id = "si-entry"
+        entry_item.stage_name = "entry_analysis"
+        entry_item.stage_run_id = entry_run.id
+        entry_item.downstream_service = "entry_analyse"
+        entry_item.downstream_task_id = "eat-1"
+        dataflow_item = self._item(status="failed")
+        dataflow_item.id = "si-dataflow"
+        dataflow_item.stage_name = "dataflow_vuln_scan"
+        dataflow_item.stage_run_id = dataflow_run.id
+        dataflow_item.downstream_service = "dataflow_vuln_scan"
+        dataflow_item.downstream_task_id = "dvs-1"
+        system_archive = BinarySecurityArchiveJob(
+            id="aj-system-old",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            item_id=system_item.id,
+            item_key=system_item.item_key,
+            downstream_service=system_item.downstream_service,
+            downstream_task_id=system_item.downstream_task_id,
+            archive_status="failed",
+            payload={"mapped_status": "success"},
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        entry_archive = BinarySecurityArchiveJob(
+            id="aj-entry-old",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            item_id=entry_item.id,
+            item_key=entry_item.item_key,
+            downstream_service=entry_item.downstream_service,
+            downstream_task_id=entry_item.downstream_task_id,
+            archive_status="failed",
+            payload={"mapped_status": "failed"},
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[system_run, entry_run, dataflow_run],
+            stage_items=[system_item, entry_item, dataflow_item],
+            archive_jobs=[system_archive, entry_archive],
+            events=[],
+            state_events=[],
+        )
+
+        async def _noop_cleanup(*_args, **_kwargs):
+            return None
+
+        original_cleanup = self.manager._cleanup_downstream_refs
+        try:
+            self.manager._cleanup_downstream_refs = _noop_cleanup
+            affected = asyncio.run(self.manager._prepare_archive_retry_full(db, task, "system_analysis"))
+        finally:
+            self.manager._cleanup_downstream_refs = original_cleanup
+
+        self.assertEqual(["system_analysis"], affected)
+        self.assertEqual("running", task.status)
+        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual({"system_analysis"}, {item.stage_name for item in db.stage_items})
+        self.assertEqual({"system_analysis"}, {job.stage_name for job in db.archive_jobs})
+        self.assertEqual("pending", db.archive_jobs[0].archive_status)
+
+    def test_archive_full_retry_support_rejects_stage_without_authoritative_success(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            output_root="/tmp/out",
+            workspace_root="/tmp/task-1",
+            status="failed",
+            current_stage="system_analysis",
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="failed",
+        )
+        item = self._item(status="failed")
+        item.id = "si-system"
+        item.stage_name = "system_analysis"
+        item.stage_run_id = stage_run.id
+        item.downstream_service = "system_analyse"
+        item.result = {"downstream": {"status": "success"}}
+        existing_job = BinarySecurityArchiveJob(
+            id="aj-system-old",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            item_id=item.id,
+            item_key=item.item_key,
+            downstream_service=item.downstream_service,
+            downstream_task_id=item.downstream_task_id,
+            archive_status="failed",
+            payload={"mapped_status": "failed"},
+            created_at=_now(),
+            updated_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[existing_job], events=[])
+
+        supported, reason, jobs, stage_items = self.manager._archive_full_retry_support(
+            db,
+            task,
+            "system_analysis",
+            ignore_operation_lock=True,
+        )
+
+        self.assertFalse(supported)
+        self.assertEqual("system_analysis has no authoritative successful result for archive rebuild", reason)
+        self.assertEqual([existing_job], jobs)
+        self.assertEqual([], stage_items)
 
 
 class _ScalarResult:
@@ -35181,6 +35399,137 @@ TaskManagerTests.test_stage_sequence_uses_pipeline_profile_for_source_kg_scan = 
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary = _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results = _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results
 TaskManagerTests.test_task_response_exposes_pipeline_profile = _test_task_response_exposes_pipeline_profile
+
+
+def _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state(self):
+    task = BinarySecurityTask(
+        id="task-force-reset",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        current_operation_id="op-force-reset",
+        dispatcher_instance_id="worker-a",
+        dispatch_started_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=120),
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        execution_mode=TASK_ACTION_CONTINUE,
+        tail_reconcile_state="handoff_waiting",
+        last_error="stale owner",
+    )
+    task.summary = {
+        "failure_code": "owner_lost",
+        "failure_message": "retry_in_process",
+        "runtime_workset": {
+            "pending_operation_repair": {"reason": "stale_owner"},
+            "pending_downstream_sync": {"reason": "sync_needed"},
+        },
+    }
+    operation = BinarySecurityTaskOperation(
+        id="op-force-reset",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry",
+        status="running",
+        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+        target_stage="system_analysis",
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        owner_pod_uid="pod-1",
+        owner_boot_id="boot-1",
+        lease_expires_at=_now() + timedelta(seconds=120),
+        generation=1,
+        execution_epoch=1,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease], events=[])
+    queued: list[str] = []
+    cancellations: list[tuple[str, bool]] = []
+    released_tail_owners: list[str] = []
+    original_enqueue = self.manager._enqueue_task
+    original_cancel = self.manager._request_local_worker_cancel
+    original_release_tail_owner = self.manager._release_tail_reconcile_owner
+    original_clear_runtime_lease = self.manager._clear_runtime_lease
+
+    async def _fake_cancel(task_id: str, *, wait_for_runner: bool):
+        cancellations.append((task_id, wait_for_runner))
+
+    try:
+        self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        self.manager._request_local_worker_cancel = _fake_cancel
+        self.manager._release_tail_reconcile_owner = lambda task_id: released_tail_owners.append(task_id)
+        self.manager._clear_runtime_lease = lambda _db, _task_id, **_kwargs: db.runtime_leases.clear()
+        response = asyncio.run(
+            self.manager.force_reset_task_to_pending(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                requested_by="tester",
+            )
+        )
+    finally:
+        self.manager._enqueue_task = original_enqueue
+        self.manager._request_local_worker_cancel = original_cancel
+        self.manager._release_tail_reconcile_owner = original_release_tail_owner
+        self.manager._clear_runtime_lease = original_clear_runtime_lease
+
+    self.assertTrue(response.accepted)
+    self.assertEqual("force_reset_to_pending", response.action)
+    self.assertEqual("pending", response.task_status_after_accept)
+    self.assertEqual([(task.id, False)], cancellations)
+    self.assertEqual([task.id], queued)
+    self.assertEqual([task.id], released_tail_owners)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.current_operation_id)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertIsNone(task.execution_mode)
+    self.assertIsNone(task.last_error)
+    self.assertEqual("idle", task.tail_reconcile_state)
+    self.assertEqual({}, dict(task.summary or {}).get("runtime_workset") or {})
+    self.assertNotIn("failure_code", dict(task.summary or {}))
+    self.assertEqual("superseded", operation.status)
+    self.assertIsNotNone(operation.finished_at)
+    self.assertEqual([], db.runtime_leases)
+    self.assertTrue(any(event.event_type == "task_force_reset_to_pending" for event in db.events))
+    self.assertTrue(any(event.event_type == "operation_force_reset_superseded" for event in db.events))
+
+
+def _test_force_reset_task_to_pending_rejects_terminal_success(self):
+    task = BinarySecurityTask(
+        id="task-force-reset-terminal",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="success",
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+
+    with self.assertRaises(ValidationError):
+        asyncio.run(
+            self.manager.force_reset_task_to_pending(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                requested_by="tester",
+            )
+        )
+
+
+TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
+TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 
 
 if __name__ == "__main__":

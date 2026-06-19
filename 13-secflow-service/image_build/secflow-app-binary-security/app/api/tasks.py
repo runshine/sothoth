@@ -470,6 +470,22 @@ async def delete_task(
     return await get_task_manager().delete_task(db, project_id=project_id, task_id=task_id, force=force)
 
 
+@router.post("/projects/{project_id}/tasks/{task_id}/force-reset", response_model=BinarySecurityActionResponse)
+async def force_reset_task(
+    project_id: str,
+    task_id: str,
+    user: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    requested_by = user.username or user.user_id or "unknown"
+    return await get_task_manager().force_reset_task_to_pending(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        requested_by=requested_by,
+    )
+
+
 @router.post("/projects/{project_id}/tasks/{task_id}/retry", response_model=BinarySecurityActionResponse)
 def retry_task(
     project_id: str,
