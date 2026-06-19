@@ -1995,7 +1995,7 @@ class TaskStateMachineMixin:
         if statuses and all(status == "success" for status in statuses):
             task.status = "success"
         elif vuln_run and vuln_run.status in {"success", "partial_success"}:
-            task.status = "partial_success" if any(status in {"failed", "partial_success", "downstream_missing"} for status in statuses) else "success"
+            task.status = "success"
         elif any(status in {"failed", "partial_success", "downstream_missing"} for status in statuses):
             task.status = "failed"
         else:

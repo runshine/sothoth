@@ -909,7 +909,7 @@ class TaskReadModelServiceMixin:
         elif pending_active or redispatch_waiting:
             status = "pending"
         elif failed_like_all and success:
-            status = "partial_success"
+            status = "success" if normalized_summary_key == "dataflow_results" else "partial_success"
         elif failed_like_all:
             status = "failed"
         elif cancelled and not success:

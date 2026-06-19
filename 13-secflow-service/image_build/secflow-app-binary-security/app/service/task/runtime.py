@@ -3251,18 +3251,6 @@ class TaskRuntimeServiceMixin:
                 )
                 session.commit()
                 return {"status": "failed", "error": item.error_message, "item": entry}
-            if not taint_params:
-                item.status = "failed"
-                item.finished_at = _now()
-                item.error_message = "未识别到明确污点参数，无法执行数据流分析"
-                self._persist_stage_item_result(
-                    task,
-                    item,
-                    stage_name=stage_run.stage_name,
-                    result={**entry, "failed": True, "failure_reason": item.error_message},
-                )
-                session.commit()
-                return {"status": "failed", "error": item.error_message, "item": entry}
             if not module_input_path:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -3419,6 +3407,8 @@ class TaskRuntimeServiceMixin:
                             "function_description_source": str(entry.get("function_description_source") or ""),
                             "entry_reason": str(entry.get("entry_reason") or ""),
                             "entry_reason_source": str(entry.get("entry_reason_source") or ""),
+                            "taint_mode": "explicit" if taint_params else "no_explicit_taint",
+                            "taint_params_missing": not bool(taint_params),
                             "taint_details": [
                                 dict(detail)
                                 for detail in (entry.get("taint_details") or [])

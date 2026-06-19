@@ -6576,9 +6576,49 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual("partial_success", status)
+
+    def test_aggregate_dataflow_stage_items_prefers_success_when_any_child_succeeds(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        db = _FakeDb()
+
+        status, summary = self.manager._aggregate_stage_items(
+            db,
+            task,
+            results=[
+                {
+                    "status": "success",
+                    "item": {
+                        "entry_key": "e1",
+                        "module_key": "m1",
+                        "module_name": "mod-1",
+                        "function_name": "main",
+                        "source_dir": "/tmp/src",
+                        "source_root_path": "/tmp/src",
+                        "module_input_path": "/tmp/src",
+                        "source_file": "main.c",
+                        "dataflow_dir": "/tmp/out",
+                    },
+                },
+                {"status": "failed", "item": {"entry_key": "e2", "module_key": "m1"}, "error": "boom"},
+            ],
+            summary_key="dataflow_results",
+        )
+
+        self.assertEqual("success", status)
         self.assertEqual(1, summary["success_count"])
         self.assertEqual(1, summary["failed_count"])
-        self.assertEqual(1, summary["downstream_missing_count"])
+        self.assertEqual(0, summary["downstream_missing_count"])
 
     def test_aggregate_stage_items_compacts_b2s_results_for_summary_storage(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
@@ -6996,7 +7036,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("/tmp/archive/openssl", compact["artifact_root"])
         self.assertNotIn("archive_root", compact)
 
-    def test_finalize_task_prefers_partial_success_after_vuln_stage(self):
+    def test_finalize_task_prefers_success_after_vuln_stage(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         db = _ModelAwareDb(
             tasks=[task],
@@ -7008,7 +7048,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager._finalize_task(db, task)
 
-        self.assertEqual("partial_success", task.status)
+        self.assertEqual("success", task.status)
         self.assertIsNotNone(task.finished_at)
         self.assertTrue(any(isinstance(obj, BinarySecurityEvent) for obj in db.added))
 
@@ -24629,6 +24669,84 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("main.c", item.output_ref["source_file"])
         self.assertEqual("/tmp", item.output_ref["data_flow_root"])
         self.assertEqual("/tmp/dataflow", item.output_ref["dataflow_dir"])
+
+    def test_run_dataflow_item_allows_empty_taint_params(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="main",
+            parent_key="module-1",
+            downstream_service="dataflow_vuln_scan",
+            status="pending",
+            output_ref={},
+        )
+        entry = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "file_name": "main.c",
+            "module_key": "module-1",
+            "module_name": "module-1",
+            "source_dir": "/tmp/repo/src",
+            "source_file": "main.c",
+            "is_definition_found": True,
+            "definition_kind": "definition",
+            "definition_file": "/tmp/repo/src/main.c",
+            "definition_line": "10",
+            "taint_params": [],
+            "module_input_path": "/tmp/repo/modules/module-1",
+            "source_root_path": "/tmp/repo/src",
+        }
+        fake_session = _ModelAwareDb()
+        create_calls: list[dict[str, object]] = []
+
+        async def fake_create_task(project_id, module_task_name, module_input_path, source_root_path, prompt, origin, **kwargs):
+            create_calls.append(
+                {
+                    "project_id": project_id,
+                    "task_name": module_task_name,
+                    "module_input_path": module_input_path,
+                    "source_root_path": source_root_path,
+                    "taint_params": list(kwargs.get("taint_params") or []),
+                    "taint_mode": kwargs.get("taint_mode"),
+                    "taint_params_missing": kwargs.get("taint_params_missing"),
+                }
+            )
+            return {"task_id": "dfa-empty-taint"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scan_client", return_value=SimpleNamespace(create_task=fake_create_task, get_task=lambda *args, **kwargs: None)),
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-empty-taint", "status": "passed"})),
+            patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_resolve_dataflow_directory", return_value=Path("/tmp/dataflow")),
+            patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+            patch.object(self.manager, "_normalize_dfa_source_file", return_value="main.c"),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token=None, retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual(1, len(create_calls))
+        self.assertEqual([], create_calls[0]["taint_params"])
+        self.assertEqual("no_explicit_taint", create_calls[0]["taint_mode"])
+        self.assertTrue(create_calls[0]["taint_params_missing"])
     def test_run_dataflow_item_rejects_declaration_only_entries(self):
         task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
         stage_run = BinarySecurityStageRun(
