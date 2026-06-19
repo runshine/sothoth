@@ -30692,6 +30692,66 @@ def _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_ope
     self.assertEqual(operation.id, task.current_operation_id)
 
 
+def _test_release_unsupported_task_row_owner_repairs_stale_active_operations(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-release-owner-repair-op",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="old-worker",
+        current_operation_id="op-old",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    older = BinarySecurityTaskOperation(
+        id="op-old",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="continue",
+        target_stage="system_analysis",
+        status="accepted",
+        created_at=_now() - timedelta(minutes=2),
+        updated_at=_now() - timedelta(minutes=2),
+    )
+    newer = BinarySecurityTaskOperation(
+        id="op-new",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry_stage_full",
+        target_stage="system_analysis",
+        status="queued",
+        created_at=_now() - timedelta(minutes=1),
+        updated_at=_now() - timedelta(minutes=1),
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[older, newer], runtime_leases=[])
+
+    released = manager._release_unsupported_task_row_owner(
+        db,
+        task,
+        active_operation=older,
+        reason="unit_test_owner_drift",
+    )
+
+    self.assertTrue(released)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertEqual("op-new", task.current_operation_id)
+    self.assertEqual("superseded", older.status)
+    self.assertEqual("op-new", older.superseded_by_operation_id)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("task_operation_binding_repaired", event_types)
+    self.assertIn("task_row_owner_released_without_local_runtime", event_types)
+
+
 def _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -33823,6 +33883,7 @@ TaskManagerTests.test_dispatch_task_by_id_releases_fake_local_owner_without_runt
 TaskManagerTests.test_dispatch_task_by_id_claims_ownerless_active_operation = _test_dispatch_task_by_id_claims_ownerless_active_operation
 TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _test_refresh_task_status_after_sync_clears_fake_local_owner
 TaskManagerTests.test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation = _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation
+TaskManagerTests.test_release_unsupported_task_row_owner_repairs_stale_active_operations = _test_release_unsupported_task_row_owner_repairs_stale_active_operations
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
 TaskManagerTests.test_run_current_task_operation_stops_on_stale_task_ownership = _test_run_current_task_operation_stops_on_stale_task_ownership

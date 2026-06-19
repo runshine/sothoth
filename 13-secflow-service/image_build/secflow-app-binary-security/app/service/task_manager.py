@@ -2109,6 +2109,7 @@ class TaskManager(
         task.finished_at = None
         task.last_error = None
         self._clear_runtime_lease(db, task.id, owner_instance_id=previous_dispatcher_instance_id)
+        self._repair_active_operations_for_task(db, task)
         self._record_event(
             db,
             task,
