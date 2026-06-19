@@ -545,6 +545,10 @@ class TaskReadModelServiceMixin:
             "failed_items_truncated",
             "cancelled_items_truncated",
             "status_synced",
+            "streaming_completion_gate_ready",
+            "expected_entry_count",
+            "materialized_item_count",
+            "missing_entry_count",
         ]
         for key in scalar_keys:
             value = summary.get(key)
@@ -645,6 +649,10 @@ class TaskReadModelServiceMixin:
             "failed_items_truncated",
             "cancelled_items_truncated",
             "status_synced",
+            "streaming_completion_gate_ready",
+            "expected_entry_count",
+            "materialized_item_count",
+            "missing_entry_count",
         }
         fitted = {key: value for key, value in payload.items() if key in scalar_allowlist}
         fitted["db_summary_truncated"] = True

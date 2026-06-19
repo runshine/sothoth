@@ -14,6 +14,93 @@ if TYPE_CHECKING:
 
 
 class TaskStageRuntimeMixin:
+    def _streaming_dataflow_expected_entry_keys(
+        self: TaskManager,
+        task: BinarySecurityTask,
+    ) -> list[str]:
+        if not self._streaming_mode_enabled(task):
+            return []
+        keys: list[str] = []
+        seen: set[str] = set()
+        for row in list(self._effective_entry_inputs(task) or []):
+            if not isinstance(row, dict):
+                continue
+            for entry in list(row.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                entry_key = str(entry.get("entry_key") or "").strip()
+                if not entry_key or entry_key in seen:
+                    continue
+                seen.add(entry_key)
+                keys.append(entry_key)
+        return keys
+
+    def _streaming_dataflow_materialized_item_keys(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> list[str]:
+        if not self._streaming_mode_enabled(task):
+            return []
+        keys: list[str] = []
+        seen: set[str] = set()
+        for item in list(self._stage_items(db, task.id, "dataflow_vuln_scan") or []):
+            entry_key = str(getattr(item, "item_key", "") or "").strip()
+            if not entry_key or entry_key in seen:
+                continue
+            seen.add(entry_key)
+            keys.append(entry_key)
+        return keys
+
+    def _build_streaming_dataflow_completion_gate(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> dict[str, object]:
+        entry_run = (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == "entry_analysis",
+            )
+            .first()
+        )
+        entry_status = self._normalize_downstream_status(getattr(entry_run, "status", None)) or str(getattr(entry_run, "status", "") or "").strip()
+        entry_analysis_terminal = self._task_status_is_terminal(entry_status)
+        expected_entry_keys = self._streaming_dataflow_expected_entry_keys(task)
+        materialized_item_keys = self._streaming_dataflow_materialized_item_keys(db, task)
+        expected_key_set = set(expected_entry_keys)
+        materialized_key_set = set(materialized_item_keys)
+        missing_entry_keys = [key for key in expected_entry_keys if key not in materialized_key_set]
+        counts_aligned = len(expected_key_set) == len(materialized_key_set)
+        ready_for_terminal_status = bool(
+            entry_analysis_terminal
+            and counts_aligned
+            and not missing_entry_keys
+        )
+        return {
+            "entry_analysis_status": entry_status or None,
+            "entry_analysis_terminal": entry_analysis_terminal,
+            "expected_entry_keys": expected_entry_keys,
+            "expected_entry_count": len(expected_key_set),
+            "materialized_item_keys": materialized_item_keys,
+            "materialized_item_count": len(materialized_key_set),
+            "counts_aligned": counts_aligned,
+            "missing_entry_keys": missing_entry_keys,
+            "missing_entry_count": len(missing_entry_keys),
+            "ready_for_terminal_status": ready_for_terminal_status,
+        }
+
+    def _streaming_dataflow_gate_deferred_status(
+        self: TaskManager,
+        items: list[BinarySecurityStageItem],
+    ) -> str:
+        if any(str(item.status or "").strip() == "running" for item in items):
+            return "running"
+        if any(str(item.status or "").strip() == "dispatching" for item in items):
+            return "dispatching"
+        return "pending"
+
     def _empty_streaming_stage_run_status(
         self: TaskManager,
         task: BinarySecurityTask,
@@ -196,12 +283,46 @@ class TaskStageRuntimeMixin:
                 seen_identity_keys.add(identity_key)
             deduped_items.append(item)
         items = deduped_items
+        streaming_dataflow_gate: dict[str, object] | None = None
         if items:
             status = self._aggregate_item_statuses([item.status for item in items])
             if status in {"success", "partial_success"} and self._stage_has_sync_degraded_items(items):
                 status = "running" if any(str(item.status or "").strip() in {"running", "dispatching"} for item in items) else "pending"
             if status in {"success", "partial_success"} and self._stage_has_orchestration_degraded_items(items):
                 status = "running" if any(str(item.status or "").strip() in {"running", "dispatching"} for item in items) else "pending"
+            if (
+                self._streaming_mode_enabled(task)
+                and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+                and self._is_streaming_tail_stage(task, stage_name)
+            ):
+                streaming_dataflow_gate = self._build_streaming_dataflow_completion_gate(db, task)
+                if not bool(streaming_dataflow_gate.get("ready_for_terminal_status")) and status in {
+                    "success",
+                    "partial_success",
+                    "failed",
+                    "cancelled",
+                    "downstream_missing",
+                }:
+                    deferred_status = self._streaming_dataflow_gate_deferred_status(items)
+                    if deferred_status != status:
+                        self._record_event(
+                            db,
+                            task,
+                            "dataflow_terminalization_deferred_for_missing_streaming_items",
+                            "数据流漏洞挖掘阶段仍在等待流式条目到齐，暂不进入终态",
+                            level="info",
+                            stage_name=stage_name,
+                            payload={
+                                "aggregated_item_status": status,
+                                "deferred_stage_status": deferred_status,
+                                "entry_analysis_status": streaming_dataflow_gate.get("entry_analysis_status"),
+                                "expected_entry_count": int(streaming_dataflow_gate.get("expected_entry_count") or 0),
+                                "materialized_item_count": int(streaming_dataflow_gate.get("materialized_item_count") or 0),
+                                "missing_entry_count": int(streaming_dataflow_gate.get("missing_entry_count") or 0),
+                                "missing_entry_keys_sample": list(streaming_dataflow_gate.get("missing_entry_keys") or [])[:10],
+                            },
+                        )
+                    status = deferred_status
         else:
             status = self._empty_streaming_stage_run_status(task, stage_run)
         stage_run.status = status
@@ -226,6 +347,16 @@ class TaskStageRuntimeMixin:
             {
                 "status_synced": True,
                 "sync_status": status,
+                **(
+                    {
+                        "streaming_completion_gate_ready": bool(streaming_dataflow_gate.get("ready_for_terminal_status")),
+                        "expected_entry_count": int(streaming_dataflow_gate.get("expected_entry_count") or 0),
+                        "materialized_item_count": int(streaming_dataflow_gate.get("materialized_item_count") or 0),
+                        "missing_entry_count": int(streaming_dataflow_gate.get("missing_entry_count") or 0),
+                    }
+                    if streaming_dataflow_gate is not None
+                    else {}
+                ),
                 **stage_run.counts,
             },
         )

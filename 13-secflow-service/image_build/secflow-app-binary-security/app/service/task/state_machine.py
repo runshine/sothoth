@@ -130,6 +130,16 @@ class TaskStateMachineMixin:
     def _task_status_is_terminal(status: str | None) -> bool:
         return str(status or "").strip() in {"success", "failed", "downstream_missing", "partial_success", "cancelled"}
 
+    def _streaming_dataflow_terminalization_ready(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        if not self._streaming_mode_enabled(task):
+            return True
+        gate = self._build_streaming_dataflow_completion_gate(db, task)
+        return bool(gate.get("ready_for_terminal_status"))
+
     def _stage_failure_snapshot(
         self: TaskManager,
         task: BinarySecurityTask,
@@ -1550,6 +1560,7 @@ class TaskStateMachineMixin:
 
         current_status = str(previous_status or "").strip()
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
+        streaming_dataflow_ready = self._streaming_dataflow_terminalization_ready(db, task)
         had_stage_retry_mode = task.execution_mode in {"stage_retry", "stage_retry_failed_items", "stage_retry_full"} and bool(task.target_stage_name)
         had_task_retry_mode = task.execution_mode in {"task_retry", "task_retry_failed_items"} and bool(task.target_stage_name)
         original_target_stage_name = str(task.target_stage_name or "").strip() or None
@@ -1599,6 +1610,7 @@ class TaskStateMachineMixin:
             failed_stage_run is not None
             and vuln_run is not None
             and normalize_stage_name(str(failed_stage_run.stage_name or "").strip()) == "dataflow_vuln_scan"
+            and streaming_dataflow_ready
             and str(vuln_run.status or "").strip() in {"success", "partial_success"}
         ):
             failed_stage_run = None
@@ -1606,12 +1618,16 @@ class TaskStateMachineMixin:
             failed_stage_run is not None
             and self._streaming_mode_enabled(task)
             and normalize_stage_name(str(failed_stage_run.stage_name or "").strip()) == "dataflow_vuln_scan"
+            and not streaming_dataflow_ready
             and not had_stage_retry_mode
             and not had_task_retry_mode
         ):
-            task.status = "running"
+            failed_items = self._stage_items(db, task.id, "dataflow_vuln_scan")
+            deferred_status = "running" if any(str(item.status or "").strip() in {"running", "dispatching"} for item in failed_items) else "pending"
+            task.status = deferred_status
             task.current_stage = failed_stage_run.stage_name or task.current_stage
             task.finished_at = None
+            task.last_error = None
             if self._tail_requires_execution_takeover(db, task):
                 self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
                 task.tail_reconcile_state = "idle"
@@ -1965,7 +1981,16 @@ class TaskStateMachineMixin:
             task.lease_expires_at = None
             task.finished_at = task.finished_at or task_manager_module._now()
             return True
-        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
+        if (
+            failed_stage_run is not None
+            and not had_stage_retry_mode
+            and not had_task_retry_mode
+            and not (
+                self._streaming_mode_enabled(task)
+                and normalize_stage_name(str(failed_stage_run.stage_name or "").strip()) == "dataflow_vuln_scan"
+                and not streaming_dataflow_ready
+            )
+        ):
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             if failed_items and not self._stage_has_nonterminal_items(failed_items):
                 task.status = "failed"
@@ -1988,15 +2013,43 @@ class TaskStateMachineMixin:
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         if self._finalize_task_handle_active_progress(db, task, stage_runs=stage_runs):
             return
+        streaming_dataflow_ready = self._streaming_dataflow_terminalization_ready(db, task)
         if self._finalize_task_handle_resume_or_missing_stage(db, task, stage_runs=stage_runs):
             return
         statuses = [run.status for run in stage_runs]
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
+        if (
+            self._streaming_mode_enabled(task)
+            and vuln_run is not None
+            and str(vuln_run.status or "").strip() in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
+            and not streaming_dataflow_ready
+        ):
+            dataflow_items = self._stage_items(db, task.id, "dataflow_vuln_scan")
+            task.status = "running" if any(str(item.status or "").strip() in {"running", "dispatching"} for item in dataflow_items) else "pending"
+            task.current_stage = "dataflow_vuln_scan"
+            self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+            task.tail_reconcile_state = "idle"
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
+            task.finished_at = None
+            task.last_error = None
+            self._last_task_heartbeat_at.pop(task.id, None)
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
+            return
         if statuses and all(status == "success" for status in statuses):
             task.status = "success"
-        elif vuln_run and vuln_run.status in {"success", "partial_success"}:
+        elif vuln_run and vuln_run.status in {"success", "partial_success"} and streaming_dataflow_ready:
             task.status = "success"
-        elif any(status in {"failed", "partial_success", "downstream_missing"} for status in statuses):
+        elif any(
+            str(run.status or "").strip() in {"failed", "partial_success", "downstream_missing"}
+            and not (
+                self._streaming_mode_enabled(task)
+                and normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"
+                and not streaming_dataflow_ready
+            )
+            for run in stage_runs
+        ):
             task.status = "failed"
         else:
             task.status = "success"
@@ -2214,7 +2267,7 @@ class TaskStateMachineMixin:
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
         next_stage = self._next_incomplete_stage(db, task)
         if next_stage:
-            if vuln_run and vuln_run.status in {"success", "partial_success"}:
+            if vuln_run and vuln_run.status in {"success", "partial_success"} and streaming_dataflow_ready:
                 next_stage = None
             else:
                 next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
@@ -2224,6 +2277,12 @@ class TaskStateMachineMixin:
                     if next_stage_run is not None
                     else "pending"
                 )
+                if (
+                    self._streaming_mode_enabled(task)
+                    and normalize_stage_name(next_stage) == "dataflow_vuln_scan"
+                    and not streaming_dataflow_ready
+                ):
+                    next_stage_status = "running" if any(str(item.status or "").strip() in {"running", "dispatching"} for item in next_stage_items) else "pending"
                 if next_stage_items:
                     item_status = self._aggregate_item_statuses([item.status for item in next_stage_items])
                     if item_status in {"pending", "queued", "running", "dispatching"}:
@@ -2303,7 +2362,7 @@ class TaskStateMachineMixin:
                 ),
                 None,
             )
-            if missing_enabled_stage and not (vuln_run and vuln_run.status in {"success", "partial_success"}):
+            if missing_enabled_stage and not (vuln_run and vuln_run.status in {"success", "partial_success"} and streaming_dataflow_ready):
                 task.status = "pending"
                 self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
                 task.current_stage = missing_enabled_stage

@@ -7090,6 +7090,61 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             )
         )
 
+    def test_finalize_task_defers_streaming_dataflow_failure_until_all_expected_items_materialized(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        task.summary = {
+            "entry_results": [
+                {"entries": [{"entry_key": "entry-a"}]},
+                {"entries": [{"entry_key": "entry-b"}]},
+                {"entries": [{"entry_key": "entry-c"}]},
+            ]
+        }
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[
+                BinarySecurityStageRun(id="sr1", task_id="t1", project_id="p1", stage_name="system_analysis", sequence_no=1, status="success"),
+                BinarySecurityStageRun(id="sr2", task_id="t1", project_id="p1", stage_name="entry_analysis", sequence_no=2, status="success"),
+                BinarySecurityStageRun(id="sr3", task_id="t1", project_id="p1", stage_name="dataflow_vuln_scan", sequence_no=3, status="failed"),
+            ],
+            stage_items=[
+                BinarySecurityStageItem(
+                    id="si1",
+                    task_id="t1",
+                    project_id="p1",
+                    stage_run_id="sr3",
+                    stage_name="dataflow_vuln_scan",
+                    item_key="entry-a",
+                    parent_key="mod-a",
+                    item_identity_key="entry-a::mod-a",
+                    status="failed",
+                    downstream_service="dataflow_vuln_scan",
+                    downstream_task_id="dfa-1",
+                    error_message="worker exited",
+                )
+            ],
+        )
+
+        self.manager._finalize_task(db, task)
+
+        self.assertEqual("pending", task.status)
+        self.assertEqual("dataflow_vuln_scan", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertIsNone(task.finished_at)
+        self.assertIsNone(task.last_error)
+
     def test_finalize_task_defers_failure_when_any_enabled_stage_is_still_active(self):
         task = BinarySecurityTask(
             id="t1",
@@ -15035,6 +15090,68 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("pending", task.stage_summary["dataflow_vuln_scan"]["status"])
         self.assertIsNone(task.stage_summary["dataflow_vuln_scan"]["last_error"])
+
+    def test_refresh_stage_run_from_items_defers_streaming_dataflow_failed_until_entries_complete(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        task.summary = {
+            "entry_results": [
+                {"entries": [{"entry_key": "entry-a"}]},
+                {"entries": [{"entry_key": "entry-b"}]},
+            ]
+        }
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        run = BinarySecurityStageRun(
+            id="sr-df",
+            task_id="task1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="failed",
+        )
+        item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-a",
+            parent_key="mod-a",
+            item_identity_key="entry-a::mod-a",
+            status="failed",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa-1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run, run], stage_items=[item])
+
+        self.manager._refresh_stage_run_from_items(db, task, "dataflow_vuln_scan")
+
+        self.assertEqual("pending", run.status)
+        self.assertEqual("pending", task.stage_summary["dataflow_vuln_scan"]["status"])
+        self.assertTrue(run.output_summary["streaming_completion_gate_ready"] is False)
+        self.assertEqual(2, run.output_summary["expected_entry_count"])
+        self.assertEqual(1, run.output_summary["materialized_item_count"])
+        self.assertEqual(1, run.output_summary["missing_entry_count"])
+        self.assertTrue(any(row.event_type == "dataflow_terminalization_deferred_for_missing_streaming_items" for row in db.events))
 
     def test_refresh_stage_run_from_items_keeps_empty_streaming_tail_pending_without_started_at(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
