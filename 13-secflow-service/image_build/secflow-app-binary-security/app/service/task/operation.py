@@ -25,6 +25,51 @@ if TYPE_CHECKING:
 
 
 class TaskOperationServiceMixin:
+    def _capture_blocking_operation_task_snapshot(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> None:
+        if not self._operation_blocks_runtime_resume(operation):
+            return
+        payload = dict(getattr(operation, "request_payload", None) or {})
+        if isinstance(payload.get("task_state_snapshot"), dict):
+            return
+        payload["task_state_snapshot"] = {
+            "status": str(getattr(task, "status", "") or "").strip() or None,
+            "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
+            "runtime_phase": self._task_runtime_phase(task),
+            "last_error": str(getattr(task, "last_error", "") or "").strip() or None,
+            "finished_at": task_shared._isoformat_or_none(getattr(task, "finished_at", None)),
+            "execution_mode": str(getattr(task, "execution_mode", "") or "").strip() or None,
+            "target_stage_name": str(getattr(task, "target_stage_name", "") or "").strip() or None,
+        }
+        operation.request_payload = payload
+
+    def _restore_failed_blocking_operation_task_snapshot(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        if not self._operation_blocks_runtime_resume(operation):
+            return
+        payload = dict(getattr(operation, "request_payload", None) or {})
+        snapshot = dict(payload.get("task_state_snapshot") or {})
+        if not snapshot:
+            return
+        previous_status = str(snapshot.get("status") or "").strip() or None
+        if previous_status:
+            task.status = previous_status
+        task.current_stage = str(snapshot.get("current_stage") or getattr(task, "current_stage", "") or "").strip() or None
+        self._set_task_runtime_phase(task, str(snapshot.get("runtime_phase") or self._task_runtime_phase(task) or "").strip())
+        task.last_error = str(snapshot.get("last_error") or "").strip() or str(getattr(operation, "error_message", "") or "").strip() or None
+        task.execution_mode = str(snapshot.get("execution_mode") or "").strip() or None
+        task.target_stage_name = str(snapshot.get("target_stage_name") or "").strip() or None
+        if str(previous_status or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES:
+            task.finished_at = task.finished_at or task_manager_module._now()
+
     @staticmethod
     def _commit_or_rollback(db: Session) -> None:
         try:
@@ -2477,6 +2522,7 @@ class TaskOperationServiceMixin:
             operation_type = operation.operation_type
             should_record_start = str(getattr(operation, "status", "") or "").strip().lower() != "running"
             now_value = task_manager_module._now()
+            self._capture_blocking_operation_task_snapshot(task, operation)
             operation.status = "running"
             operation.updated_at = now_value
             if getattr(operation, "started_at", None) is None:
@@ -2618,6 +2664,8 @@ class TaskOperationServiceMixin:
                     task.current_operation_id = operation.id
                 elif operation is not None and str(getattr(task, "current_operation_id", "") or "").strip() == operation.id:
                     task.current_operation_id = None
+                if operation is not None:
+                    self._restore_failed_blocking_operation_task_snapshot(task, operation)
                 task.last_error = str(exc)
                 if operation is not None:
                     self._record_operation_event(

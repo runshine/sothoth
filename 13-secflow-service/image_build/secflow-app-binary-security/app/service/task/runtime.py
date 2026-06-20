@@ -444,13 +444,17 @@ class TaskRuntimeServiceMixin:
             db.commit()
             self._enqueue_task(task.id)
             return None
-        has_owner_inbox_work = bool(
+        has_active_operation = bool(
             current_operation is not None
             and str(getattr(current_operation, "status", "") or "").strip().lower()
             in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
         )
+        operation_allows_runtime_resume = bool(
+            has_active_operation
+            and not self._operation_blocks_runtime_resume(current_operation)
+        )
         current_status = str(getattr(task, "status", "") or "").strip().lower()
-        if has_owner_inbox_work and current_status:
+        if has_active_operation and current_status:
             if current_status != "pending":
                 task_manager_module.logger.info(
                     "binary-security dispatch claiming non-pending task because owner inbox work is active: "
@@ -482,6 +486,14 @@ class TaskRuntimeServiceMixin:
                     db.commit()
                     self._enqueue_task(task.id)
                     return None
+        if has_active_operation and not operation_allows_runtime_resume:
+            if (
+                str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+                and self._task_owner_runtime_supported_locally(task, active_operation=current_operation)
+            ):
+                return None
+            if current_status != "pending":
+                return None
         if (
             self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._tail_requires_execution_takeover(db, task)
@@ -496,9 +508,9 @@ class TaskRuntimeServiceMixin:
         if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
             return None
         current_status = str(getattr(task, "status", "") or "").strip().lower()
-        if current_status != "pending" and not has_owner_inbox_work:
+        if current_status != "pending" and not operation_allows_runtime_resume:
             return None
-        if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not has_owner_inbox_work:
+        if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not operation_allows_runtime_resume:
             return None
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
@@ -1207,6 +1219,36 @@ class TaskRuntimeServiceMixin:
                     )
             finally:
                 verification_db.close()
+            execution_gate_db = session_factory()
+            try:
+                task_before_execute = (
+                    execution_gate_db.query(task_manager_module.BinarySecurityTask)
+                    .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                    .first()
+                )
+                if task_before_execute is None:
+                    return
+                if str(getattr(task_before_execute, "current_operation_id", "") or "").strip():
+                    task_manager_module.logger.info(
+                        "binary-security run_task skipped business execution because control operation is still active: "
+                        "task_id=%s current_operation_id=%s status=%s runtime_phase=%s",
+                        task_id,
+                        str(getattr(task_before_execute, "current_operation_id", "") or "").strip(),
+                        str(getattr(task_before_execute, "status", "") or "").strip(),
+                        self._task_runtime_phase(task_before_execute),
+                    )
+                    return
+                if str(getattr(task_before_execute, "status", "") or "").strip().lower() != "running":
+                    task_manager_module.logger.info(
+                        "binary-security run_task skipped business execution because task is no longer runnable after control operation: "
+                        "task_id=%s status=%s runtime_phase=%s",
+                        task_id,
+                        str(getattr(task_before_execute, "status", "") or "").strip(),
+                        self._task_runtime_phase(task_before_execute),
+                    )
+                    return
+            finally:
+                execution_gate_db.close()
             while await self._run_task_runtime_signals(task_id):
                 pass
             await self._execute_task(task_id)

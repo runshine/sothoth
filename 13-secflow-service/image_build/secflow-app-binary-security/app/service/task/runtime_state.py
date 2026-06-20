@@ -28,6 +28,41 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeStateServiceMixin:
+    def _operation_blocks_runtime_resume(self: TaskManager, operation: BinarySecurityTaskOperation | None) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if operation is None:
+            return False
+        status = str(getattr(operation, "status", "") or "").strip().lower()
+        if status not in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+        return operation_type in task_manager_module.TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES
+
+    def _task_active_operation(
+        self: TaskManager,
+        db: Session,
+        task,
+    ) -> BinarySecurityTaskOperation | None:
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+        if not current_operation_id:
+            return None
+        return (
+            db.query(BinarySecurityTaskOperation)
+            .filter(BinarySecurityTaskOperation.id == current_operation_id)
+            .first()
+        )
+
+    def _task_blocks_runtime_resume(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        active_operation: BinarySecurityTaskOperation | None = None,
+    ) -> bool:
+        operation = active_operation if active_operation is not None else self._task_active_operation(db, task)
+        return self._operation_blocks_runtime_resume(operation)
+
     def _load_service_config(self: TaskManager, db: Session) -> Any:
         from app.service import task_manager as task_manager_module
 

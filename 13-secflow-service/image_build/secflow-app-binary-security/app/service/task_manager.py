@@ -360,6 +360,16 @@ TASK_PENDING_ACTIONS = {
     TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FULL,
 }
+TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
+    TASK_ACTION_CONTINUE,
+    TASK_ACTION_RETRY,
+    TASK_ACTION_RETRY_FAILED_ITEMS,
+    TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+    TASK_ACTION_RETRY_STAGE_FULL,
+    TASK_ACTION_CANCEL,
+    TASK_ACTION_DELETE,
+    "force_reset_to_pending",
+}
 TASK_OPERATION_ACTIVE_STATUSES = {"requested", "accepted", "queued", "claimed", "running"}
 TASK_OPERATION_TERMINAL_STATUSES = {"succeeded", "failed", "superseded", "cancelled"}
 TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN = "collect_cleanup_plan"
@@ -1420,12 +1430,22 @@ class TaskManager(
 
     async def start(self) -> None:
         if self._running:
+            logger.info("binary-security task manager start skipped: already_running=true")
             return
         self._running = True
         observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
         role = str(os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all").strip().lower()
         run_worker_loops = role in {"", "all", "worker"}
         run_reducer_loop = role in {"", "all", "reducer"}
+        logger.info(
+            "binary-security task manager starting: role=%s run_worker_loops=%s run_reducer_loop=%s "
+            "queue_redis=%s task_queue_key=%s",
+            role or "all",
+            run_worker_loops,
+            run_reducer_loop,
+            str(getattr(self.cfg.queue, "redis_url", "") or "").strip() or None,
+            str(getattr(self.cfg.queue, "task_queue_key", "") or "").strip() or None,
+        )
         if run_worker_loops:
             self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
             self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
@@ -1448,7 +1468,10 @@ class TaskManager(
                 name="binary-security-reducer-metrics-snapshot",
             )
         if run_worker_loops:
+            logger.info("binary-security task manager seeding work queues")
             await self._seed_work_queues()
+            logger.info("binary-security task manager seeded work queues")
+        logger.info("binary-security task manager started")
 
     async def _cancel_loop_task(self, task: asyncio.Task | None) -> None:
         if task is None:
@@ -3116,7 +3139,10 @@ class TaskManager(
             allow_dispatching=allow_dispatching,
         )
 
-    def _invalidate_task_execution(self, task: BinarySecurityTask) -> None:
+    def _invalidate_task_execution(self, task: BinarySecurityTask, *, force: bool = False) -> None:
+        if not force and str(getattr(task, "current_operation_id", "") or "").strip():
+            self._last_task_heartbeat_at.pop(task.id, None)
+            return
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None

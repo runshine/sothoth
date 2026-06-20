@@ -23406,6 +23406,113 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertIsNone(task.latest_abnormal_reason)
         self.assertTrue(db.closed)
 
+    def test_invalidate_task_execution_preserves_owner_during_active_operation(self):
+        task = BinarySecurityTask(
+            id="task-op-hold",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="worker-a",
+        )
+        started_at = _now()
+        lease_expires_at = started_at + timedelta(seconds=30)
+        task.dispatch_started_at = started_at
+        task.lease_expires_at = lease_expires_at
+
+        self.manager._invalidate_task_execution(task)
+
+        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertEqual(started_at, task.dispatch_started_at)
+        self.assertEqual(lease_expires_at, task.lease_expires_at)
+
+        self.manager._invalidate_task_execution(task, force=True)
+
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
+
+    def test_run_task_skips_business_execution_after_blocking_operation_failure(self):
+        task = BinarySecurityTask(
+            id="task-blocking-op",
+            project_id="p1",
+            name="n",
+            status="dispatching",
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id=self.manager.instance_id,
+        )
+        task.dispatch_started_at = _now()
+        task.lease_expires_at = task.dispatch_started_at + timedelta(seconds=30)
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=TASK_ACTION_RETRY,
+            target_stage="firmware_unpack",
+            status="queued",
+            request_payload={},
+        )
+
+        class _RunTaskDb(_ModelAwareDb):
+            def __init__(self, current_task, current_operation):
+                super().__init__(tasks=[current_task], operations=[current_operation], events=[])
+                self.closed = False
+                self.commits = 0
+
+            def commit(self):
+                self.commits += 1
+
+            def rollback(self):
+                return None
+
+            def close(self):
+                self.closed = True
+
+        db = _RunTaskDb(task, operation)
+        original_factory = task_manager_module.get_session_factory
+        original_run_current_task_operation = self.manager._run_current_task_operation
+        original_execute_task = self.manager._execute_task
+        executed: list[str] = []
+
+        async def fake_run_current_task_operation(task_id: str) -> bool:
+            del task_id
+            operation.status = "failed"
+            operation.error_message = "cleanup verify failed"
+            task.status = "failed"
+            task.last_error = "cleanup verify failed"
+            task.current_operation_id = None
+            return False
+
+        async def fake_execute_task(task_id: str):
+            executed.append(task_id)
+
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        self.manager._run_current_task_operation = fake_run_current_task_operation
+        self.manager._execute_task = fake_execute_task
+        try:
+            asyncio.run(self.manager._run_task(task.id))
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            self.manager._run_current_task_operation = original_run_current_task_operation
+            self.manager._execute_task = original_execute_task
+
+        self.assertEqual([], executed)
+        self.assertEqual("failed", task.status)
+        self.assertEqual("cleanup verify failed", task.last_error)
+        self.assertTrue(db.closed)
+
     def test_record_polled_child_sync_failure_skips_confirmation_waiting_tasks(self):
         task = BinarySecurityTask(
             id="task1",
