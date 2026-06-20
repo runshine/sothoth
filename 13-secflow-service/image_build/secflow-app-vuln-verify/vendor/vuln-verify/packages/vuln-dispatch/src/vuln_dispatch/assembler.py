@@ -5,7 +5,7 @@ import json
 import shutil
 
 from vuln_dispatch.log import logged
-from vuln_dispatch.models import RouterOutput, VerifierGroup
+from vuln_dispatch.models import RouterOutput
 
 
 def _safe_copy2(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:
@@ -15,24 +15,6 @@ def _safe_copy2(src: str | Path, dst: str | Path, *, follow_symlinks: bool = Tru
         return "reused"
     shutil.copy2(src, dst, follow_symlinks=follow_symlinks)
     return "copied"
-
-
-def _write_manifest(
-    manifest_path: Path, group: VerifierGroup, source_root: Path | None, binary_root: Path | None
-) -> None:
-    manifest = {
-        "group_id": group.group_id,
-        "file": group.file,
-        "binary_root": str(binary_root.resolve()) if binary_root else None,
-        "function": group.function,
-        "report_ids": [report.report_id for report in group.reports],
-    }
-    if source_root and group.file != "file_unknown":
-        manifest["file_path"] = str(source_root.resolve() / group.file)
-
-    with manifest_path.open("w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, indent=2)
-        handle.write("\n")
 
 
 def _routing_log(output_data: RouterOutput) -> dict:
@@ -73,8 +55,7 @@ def assemble(
     output_path = Path(output_dir)
     groups_path = output_path / "groups"
     unrouteable_path = output_path / "unrouteable"
-    source_root_path = Path(source_root) if source_root else None
-    binary_root_path = Path(binary_root) if binary_root else None
+    del source_root, binary_root
 
     groups_path.mkdir(parents=True, exist_ok=True)
     unrouteable_path.mkdir(parents=True, exist_ok=True)
@@ -87,9 +68,6 @@ def assemble(
         group_path = groups_path / group.group_id
         reports_path = group_path / "reports"
         reports_path.mkdir(parents=True, exist_ok=True)
-
-        manifest_path = group_path / "manifest.json"
-        _write_manifest(manifest_path, group, source_root_path, binary_root_path)
 
         for report in group.reports:
             source = Path(report.source_path)

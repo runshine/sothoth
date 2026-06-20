@@ -63,8 +63,16 @@ def _run_pipeline(args: argparse.Namespace, output_dir: Path, logfile: Path) -> 
     )
     session_dir = Path(args.session_dir).expanduser().resolve() if args.session_dir else output_dir.parent / "run"
     session_dir.mkdir(parents=True, exist_ok=True)
-    launch(output_dir, str(threat_path) if threat_path else None, model=args.model,
-           concurrency=args.concurrency, resume=args.resume, session_dir=session_dir)
+    launch(
+        output_dir,
+        str(threat_path) if threat_path else None,
+        model=args.model,
+        concurrency=args.concurrency,
+        resume=args.resume,
+        session_dir=session_dir,
+        source_root=source_root,
+        binary_root=binary_root,
+    )
     return 0
 
 

@@ -82,8 +82,16 @@ def _verify_one(
     return (group_dir.name, returncode)
 
 
-def launch(assembled_dir: Path, threat_path: str | None = None, model: str | None = None,
-           concurrency: int = 4, resume: bool = False, session_dir: Path | None = None) -> None:
+def launch(
+    assembled_dir: Path,
+    threat_path: str | None = None,
+    model: str | None = None,
+    concurrency: int = 4,
+    resume: bool = False,
+    session_dir: Path | None = None,
+    source_root: Path | str | None = None,
+    binary_root: Path | str | None = None,
+) -> None:
     log = get_logger("vuln_verify.launcher")
     """
     遍历 {assembled_dir}/groups/group_*/ 目录。
@@ -122,8 +130,21 @@ def launch(assembled_dir: Path, threat_path: str | None = None, model: str | Non
     base_prompt = load_prompt(threat_path)
     tmp_files: list[Path] = []
 
+    source_root_text = str(Path(source_root).resolve()) if source_root else ""
+    binary_root_text = str(Path(binary_root).resolve()) if binary_root else ""
+    binary_hint = (
+        f"二进制根目录 binary_root 为：{binary_root_text}。"
+        if binary_root_text
+        else "优先使用源码完成验证。"
+    )
     prompt_msg = (
-        "分析 reports/ 下的漏洞报告。manifest.json 中有 file_path 和 binary_root 路径。"
+        "分析 reports/ 下的漏洞报告。"
+        f"源码根目录 source_root 为：{source_root_text}。"
+        f"{binary_hint}"
+        "请从报告正文中提取文件路径、函数名、行号等定位信息，并在 source_root 下查找对应源码文件。"
+        "如果报告路径是 openGauss-server-master/xxx.cpp，则源码文件通常位于 "
+        f"{source_root_text}/openGauss-server-master/xxx.cpp。"
+        "只在 source_root 指向的源码根目录内查找源码文件，不要访问项目外路径。"
         f"将 result_*.json 输出到 {out_dir}。"
         "不需要生成任何 .md 文件，仅输出 JSON 格式的验证结果。"
     )

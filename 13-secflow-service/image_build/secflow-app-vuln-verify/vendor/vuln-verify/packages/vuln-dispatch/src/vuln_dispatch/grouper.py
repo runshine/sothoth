@@ -8,28 +8,20 @@ log = get_logger("vuln_dispatch.grouper")
 
 
 def group(reports: list[ParsedReport]) -> list[VerifierGroup]:
-    """Groups by (file, function)."""
+    """KISS: no file/function routing; each report gets one verifier group."""
     groups: list[VerifierGroup] = []
-    by_key: dict[tuple[str, str], VerifierGroup] = {}
 
     for report in reports:
-        if report.file is None or report.function is None:
-            file = report.file or "file_unknown"
-            function = report.function or "function_unknown"
-            group_id = f"group_{len(groups) + 1:03d}"
-            vg = VerifierGroup(group_id=group_id, file=file, function=function, reports=[report])
-            groups.append(vg)
-            continue
-
-        key = (report.file, report.function)
-        if key not in by_key:
-            group_id = f"group_{len(groups) + 1:03d}"
-            vg = VerifierGroup(group_id=group_id, file=report.file, function=report.function)
-            by_key[key] = vg
-            groups.append(vg)
-
-        by_key[key].reports.append(report)
+        group_id = f"group_{len(groups) + 1:03d}"
+        groups.append(
+            VerifierGroup(
+                group_id=group_id,
+                file="report",
+                function="report",
+                reports=[report],
+            )
+        )
 
     total_reports = sum(len(g.reports) for g in groups)
-    log.info("group", group_count=len(groups), report_count=total_reports)
+    log.info("group", group_count=len(groups), report_count=total_reports, strategy="one_report_per_group")
     return groups
