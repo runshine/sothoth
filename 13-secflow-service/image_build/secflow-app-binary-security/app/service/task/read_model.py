@@ -1783,6 +1783,9 @@ class TaskReadModelServiceMixin:
         tail_summary = self._tail_stage_work_summary(db, task)
         failure_snapshot = self._stage_failure_snapshot(task, active_stage_run)
         terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
+        workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
+        workflow_terminalization_ready = self._workflow_ready_for_finalization(workflow_snapshots)
+        workflow_blocked_by_stage = self._workflow_blocked_on_stage(task, workflow_snapshots)
         active_operation = self._active_operation(db, task.id)
         if (
             active_operation is not None
@@ -1803,6 +1806,8 @@ class TaskReadModelServiceMixin:
             current_operation_id=task.current_operation_id,
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
+            workflow_terminalization_ready=workflow_terminalization_ready,
+            workflow_blocked_by_stage=workflow_blocked_by_stage,
             last_error=task.last_error,
             terminal_failure=terminal_failure,
             requeue_suppressed=terminal_failure,
@@ -3630,10 +3635,15 @@ class TaskReadModelServiceMixin:
             if include_retry_support
             else {}
         )
+        workflow_snapshots = {
+            str(snapshot.get("stage_name") or "").strip(): snapshot
+            for snapshot in self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
+        }
         summaries = []
         for index, stage_name in enumerate(stage_sequence, start=1):
             run = runs_by_stage.get(stage_name)
             stage_items = items_by_stage.get(stage_name, [])
+            stage_snapshot = workflow_snapshots.get(stage_name, {})
             current_downstream_status_counts = dict((downstream_status_counts or {}).get(stage_name, {}))
             if not current_downstream_status_counts:
                 for item in stage_items:
@@ -3665,6 +3675,10 @@ class TaskReadModelServiceMixin:
                 stage_name=stage_name,
                 sequence_no=run.sequence_no if run else index,
                 status=self._business_stage_status(task, stage_name, run, stage_items, db=db),
+                stage_terminalization_ready=bool(stage_snapshot.get("ready_for_terminalization")),
+                stage_failure_escalation_ready=bool(stage_snapshot.get("ready_for_failure_escalation")),
+                previous_stages_terminal=bool(stage_snapshot.get("previous_stages_terminal")),
+                has_unresolved_expected_outputs=bool(stage_snapshot.get("has_unresolved_expected_outputs")),
                 retry_count=int(run.retry_count or 0) if run else 0,
                 retry_supported=stage_retry_support.get(stage_name, (False, None))[0],
                 retry_reason=stage_retry_support.get(stage_name, (False, None))[1],

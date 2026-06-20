@@ -98,6 +98,10 @@ class BinarySecurityStageSummary(BaseModel):
     stage_name: str
     sequence_no: int
     status: str
+    stage_terminalization_ready: bool = False
+    stage_failure_escalation_ready: bool = False
+    previous_stages_terminal: bool = False
+    has_unresolved_expected_outputs: bool = False
     retry_count: int = 0
     retry_supported: bool = False
     retry_reason: Optional[str] = None
@@ -166,6 +170,8 @@ class BinarySecurityTaskResponse(BaseModel):
     current_operation_id: Optional[str] = None
     execution_epoch: int = 0
     current_stage: Optional[str] = None
+    workflow_terminalization_ready: bool = False
+    workflow_blocked_by_stage: Optional[str] = None
     last_error: Optional[str] = None
     terminal_failure: bool = False
     requeue_suppressed: bool = False

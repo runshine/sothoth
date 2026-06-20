@@ -5986,11 +5986,11 @@ class TaskManager(
         retried_upstream_completed_at = [
             comparable
             for comparable in (
-                self._comparable_datetime(run.finished_at or run.started_at)
+                self._comparable_datetime(getattr(run, "finished_at", None) or getattr(run, "started_at", None))
                 for run in runs_by_stage.values()
                 if run
                 and str(run.stage_name or "").strip() in upstream_stages
-                and int(run.retry_count or 0) > 0
+                and int(getattr(run, "retry_count", 0) or 0) > 0
             )
             if comparable is not None
         ]
@@ -6014,12 +6014,14 @@ class TaskManager(
 
         for upstream_stage in upstream_stages:
             run = runs_by_stage.get(upstream_stage)
-            if not run or int(run.retry_count or 0) <= 0:
+            if not run or int(getattr(run, "retry_count", 0) or 0) <= 0:
                 continue
-            upstream_completed_at = self._comparable_datetime(run.finished_at or run.started_at)
+            upstream_completed_at = self._comparable_datetime(
+                getattr(run, "finished_at", None) or getattr(run, "started_at", None)
+            )
             if earliest_target_created_at and upstream_completed_at and earliest_target_created_at >= upstream_completed_at:
                 continue
-            if run and int(run.retry_count or 0) > 0:
+            if run and int(getattr(run, "retry_count", 0) or 0) > 0:
                 return True, upstream_stage
         return False, None
 
@@ -6335,8 +6337,11 @@ class TaskManager(
         db: Session,
         task: BinarySecurityTask,
         stage_name: str,
+        *,
+        allow_rebuild: bool = True,
     ) -> bool:
-        self._ensure_stage_inputs_available(db, task, stage_name)
+        if allow_rebuild:
+            self._ensure_stage_inputs_available(db, task, stage_name)
         normalized_stage = normalize_stage_name(stage_name)
         handler = self._stage_handler(normalized_stage)
         if handler is not None and normalized_stage in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "knowledge_graph_entry_fetch", "dataflow_vuln_scan"}:
@@ -7987,28 +7992,9 @@ class TaskManager(
         db: Session,
         task: BinarySecurityTask,
     ) -> tuple[bool, str | None, str | None, list[BinarySecurityStageItem]]:
-        if self._streaming_tail_auto_progressing(db, task):
-            return False, "当前任务处于 streaming tail 自动推进中，暂不支持失败项重试", None, []
-        active_operation = self._active_operation(db, task.id)
-        if active_operation is not None:
-            return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None, []
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
-            return False, "当前任务尚未完成输入准备，不能重试失败项", None, []
-        blocked_statuses = {"pending", "dispatching", "running"}
-        if task.status in blocked_statuses:
-            return False, f"当前任务正在执行或排队中，不能重试失败项: {task.status}", None, []
-        if task.status == TASK_STATUS_PENDING_MODULE_CONFIRMATION:
-            return False, "当前任务等待模块确认，请先确认模块后再重试失败项", None, []
-        stage_name, items = self._first_failed_retry_stage(db, task)
-        if not stage_name or not items:
-            return False, "当前任务没有可重试的失败项", None, []
-        upstream_retried, upstream_stage = self._upstream_stage_retried(db, task, stage_name)
-        if upstream_retried:
-            return False, f"阶段 {STAGE_TITLES.get(stage_name, stage_name)} 的上游阶段 {STAGE_TITLES.get(upstream_stage or '', upstream_stage or '')} 已发生重试，不能只重试失败项", None, []
-        reason = self._continue_stage_input_error(db, task, stage_name)
-        if reason:
-            return False, reason, stage_name, []
-        return True, None, stage_name, items
+        from app.service.task.state_machine import TaskStateMachineMixin
+
+        return TaskStateMachineMixin._task_retry_failed_items_support(self, db, task)
 
     def _ensure_stage_inputs_available(self, db: Session, task: BinarySecurityTask, stage_name: str) -> None:
         """Rebuild target-stage inputs from the previous successful stage when possible."""

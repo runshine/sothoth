@@ -130,13 +130,18 @@ class TaskRuntimeServiceMixin:
                 or authoritative_tail_run_present
                 or current_stage_before_sync == "dataflow_vuln_scan"
             )
+            tail_materialized_without_entry_summary = bool(authoritative_tail_progress and tail_items)
             missing_entry_results_failure = self._missing_entry_results_failure_context(
                 db,
                 task,
                 stage_name="dataflow_vuln_scan",
                 reason="tail_state_sync_missing_entry_results",
             )
-            if missing_entry_results_failure is not None and authoritative_tail_progress:
+            if (
+                missing_entry_results_failure is not None
+                and authoritative_tail_progress
+                and not tail_materialized_without_entry_summary
+            ):
                 self._finalize_task_after_authoritative_failure(
                     db,
                     task,

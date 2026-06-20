@@ -876,9 +876,16 @@ class DownstreamTaskController:
         best_effort: bool = False,
         cleanup_scope: str = "retry_prepare",
     ) -> int:
+        normalized_refs = [
+            {
+                **dict(ref or {}),
+                "project_id": str((ref or {}).get("project_id") or task.project_id or "").strip() or None,
+            }
+            for ref in refs
+        ]
         cleanup_results: list[dict[str, Any]] = []
         setattr(self.manager, "_last_downstream_cleanup_results", cleanup_results)
-        for ref in refs:
+        for ref in normalized_refs:
             event_item = self.manager._event_item_for_downstream_ref(db, task, ref)
             self._record_event(
                 db,
@@ -934,7 +941,7 @@ class DownstreamTaskController:
 
         db.commit()
         results = await self.manager._run_with_limits(
-            refs,
+            normalized_refs,
             do_delete,
             concurrency=self.manager.cfg.scheduler.downstream_action_concurrency,
             timeout_seconds=self.manager.cfg.scheduler.downstream_request_timeout_seconds,
