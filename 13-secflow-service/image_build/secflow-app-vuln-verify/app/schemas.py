@@ -15,7 +15,8 @@ class TokenUser(BaseModel):
 class TaskCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str | None = None
-    reports_dir: str
+    reports_dir: str | None = None
+    raw_report: str | None = None
     source_root: str
     binary_root: str | None = None
     threat_path: str | None = None
