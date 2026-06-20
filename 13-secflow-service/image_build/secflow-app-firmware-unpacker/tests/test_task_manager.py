@@ -1062,6 +1062,41 @@ class TaskManagerLlmSnapshotTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_record_task_event_injects_recorder_metadata(self):
+        with patch.dict(
+            os.environ,
+            {
+                "FIRMWARE_UNPACKER_RUNTIME_ROLE": "dispatcher",
+                "POD_NAME": "fw-dispatcher-0",
+                "NODE_NAME": "secflow-node-a",
+                "POD_IP": "10.0.0.8",
+                "HOSTNAME": "fw-dispatcher-0",
+            },
+            clear=False,
+        ):
+            event_id = record_task_event(
+                "t-recorder",
+                project_id="p1",
+                event_type="task_started",
+                summary="任务开始执行",
+                detail={"foo": "bar"},
+                created_by="manual-api",
+            )
+
+        db = get_db_session()
+        try:
+            row = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.id == event_id).first()
+            payload = row.to_dict()
+            self.assertEqual("fw-dispatcher-0", payload["recorder_pod_name"])
+            self.assertEqual("fw-dispatcher-0", payload["recorder_hostname"])
+            self.assertEqual("secflow-node-a", payload["recorder_node_name"])
+            self.assertEqual("10.0.0.8", payload["recorder_pod_ip"])
+            self.assertEqual("dispatcher", payload["recorder_role"])
+            self.assertEqual("firmware-unpacker", payload["detail"]["recorder"]["service"])
+            self.assertEqual("bar", payload["detail"]["foo"])
+        finally:
+            db.close()
+
     def test_cancel_task_records_cancel_requested_event(self):
         provider_keys = {
             "llm_config_file_key_executor": "provider-executor-v1",

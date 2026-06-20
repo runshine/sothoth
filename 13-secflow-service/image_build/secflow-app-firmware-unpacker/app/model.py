@@ -321,6 +321,8 @@ class UnpackTaskEvent(Base):
                 detail = json.loads(self.detail_json)
             except Exception:
                 detail = {"raw": self.detail_json}
+        recorder = detail.get("recorder") if isinstance(detail, dict) and isinstance(detail.get("recorder"), dict) else {}
+        origin = detail.get("event_origin") if isinstance(detail, dict) and isinstance(detail.get("event_origin"), dict) else {}
         return {
             "id": self.id,
             "task_id": self.task_id,
@@ -333,6 +335,17 @@ class UnpackTaskEvent(Base):
             "owner_id": self.owner_id,
             "created_by": self.created_by,
             "created_at": isoformat_local(self.created_at),
+            "recorder_instance_id": recorder.get("instance_id"),
+            "recorder_hostname": recorder.get("hostname"),
+            "recorder_pod_name": recorder.get("pod_name"),
+            "recorder_node_name": recorder.get("node_name"),
+            "recorder_pod_ip": recorder.get("pod_ip"),
+            "recorder_role": recorder.get("role"),
+            "origin_instance_id": origin.get("instance_id"),
+            "origin_hostname": origin.get("hostname"),
+            "origin_pod_name": origin.get("pod_name"),
+            "origin_node_name": origin.get("node_name"),
+            "origin_role": origin.get("role"),
         }
 
 

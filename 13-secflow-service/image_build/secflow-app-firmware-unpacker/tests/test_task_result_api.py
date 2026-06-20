@@ -103,6 +103,68 @@ class TaskResultApiTests(unittest.TestCase):
         finally:
             db.close()
 
+    def test_event_to_dict_flattens_recorder_metadata_and_keeps_legacy_detail(self):
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTaskEvent(
+                    id="event-recorder",
+                    task_id="t1",
+                    project_id="p1",
+                    event_type="task_started",
+                    summary="任务开始",
+                    detail_json=json.dumps(
+                        {
+                            "message": "ok",
+                            "recorder": {
+                                "service": "firmware-unpacker",
+                                "instance_id": "fw-1",
+                                "hostname": "pod-host",
+                                "pod_name": "pod-name",
+                                "node_name": "node-1",
+                                "pod_ip": "10.2.3.4",
+                                "role": "worker",
+                            }
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            )
+            db.commit()
+            row = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.id == "event-recorder").first()
+            payload = row.to_dict()
+            self.assertEqual("fw-1", payload["recorder_instance_id"])
+            self.assertEqual("pod-host", payload["recorder_hostname"])
+            self.assertEqual("pod-name", payload["recorder_pod_name"])
+            self.assertEqual("node-1", payload["recorder_node_name"])
+            self.assertEqual("10.2.3.4", payload["recorder_pod_ip"])
+            self.assertEqual("worker", payload["recorder_role"])
+            self.assertEqual("ok", payload["detail"]["message"])
+        finally:
+            db.close()
+
+    def test_event_to_dict_handles_legacy_non_json_detail(self):
+        db = get_db_session()
+        try:
+            db.add(
+                UnpackTaskEvent(
+                    id="event-legacy-raw",
+                    task_id="t2",
+                    project_id="p1",
+                    event_type="task_failed",
+                    summary="任务失败",
+                    detail_json="not-json",
+                )
+            )
+            db.commit()
+            row = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.id == "event-legacy-raw").first()
+            payload = row.to_dict()
+            self.assertEqual({"raw": "not-json"}, payload["detail"])
+            self.assertIsNone(payload["recorder_pod_name"])
+            self.assertIsNone(payload["recorder_role"])
+        finally:
+            db.close()
+
     def test_get_task_result_warns_when_output_missing(self):
         output_root = self.root / "missing-task" / "output"
         self._add_task("t-missing", output_root)
