@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any, Optional
 
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect
@@ -12,6 +13,7 @@ from app.config import get_config
 from app.time_utils import now_local
 
 Base = declarative_base()
+logger = logging.getLogger(__name__)
 
 
 class VulnVerifyTask(Base):
@@ -142,7 +144,10 @@ def init_database() -> None:
 
 def _ensure_columns(engine) -> None:
     table = VulnVerifyTask.__tablename__
-    existing = {column["name"] for column in inspect(engine).get_columns(table)}
+    inspector = inspect(engine)
+    columns = inspector.get_columns(table)
+    column_by_name = {column["name"]: column for column in columns}
+    existing = set(column_by_name)
     statements: list[str] = []
     for name, ddl in {
         "pid": "INTEGER NULL",
@@ -156,8 +161,26 @@ def _ensure_columns(engine) -> None:
     }.items():
         if name not in existing:
             statements.append(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+    # Older MySQL deployments created these columns as NOT NULL.  The current
+    # native task API intentionally allows callers to omit binary_root,
+    # threat_path and model so default/runtime behaviour can be used.
+    # create_all() does not alter existing columns, therefore fix legacy schema
+    # drift during service startup.
+    if engine.dialect.name in {"mysql", "mariadb"}:
+        nullable_migrations = {
+            "binary_root": "TEXT NULL",
+            "threat_path": "TEXT NULL",
+            "model": "VARCHAR(255) NULL",
+        }
+        for name, ddl in nullable_migrations.items():
+            column = column_by_name.get(name)
+            if column and not bool(column.get("nullable", True)):
+                statements.append(f"ALTER TABLE {table} MODIFY COLUMN {name} {ddl}")
+
     with engine.begin() as conn:
         for statement in statements:
+            logger.info("Applying vuln-verify DB migration: %s", statement)
             conn.exec_driver_sql(statement)
 
 
