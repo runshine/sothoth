@@ -93,5 +93,5 @@ def resolve_effective_default_model(db: Session) -> tuple[str | None, str]:
         return service_default, "service_config"
     pi_default = read_pi_settings_default()
     if pi_default:
-        return pi_default, "configcenter_pi_settings"
+        return pi_default, "pi_settings"
     return None, "none"

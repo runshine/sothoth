@@ -251,6 +251,8 @@ def build_project_stats(tasks: list[VulnVerifyTask]) -> dict:
     # frontend project-level stats cards to time out.
     for task in tasks:
         summary = dict(task.result_summary or {})
+        if (summary.get("result_count") or 0) and "confirmed_count" not in summary:
+            summary = summarize_results(task)
         result_count = int(summary.get("result_count") or 0)
         if result_count > 0:
             totals["verified_tasks"] += 1

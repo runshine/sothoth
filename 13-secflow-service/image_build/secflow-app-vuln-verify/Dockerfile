@@ -23,7 +23,7 @@ COPY app/ /app/app/
 COPY config.yaml /app/config.yaml
 RUN printf '{"build_version":"%s"}\n' "$SECFLOW_BUILD_VERSION" > /app/build_meta.json
 
-RUN mkdir -p /root/.pi/agent/bin /data/config /data/files \
+RUN mkdir -p /root/.pi/agent/bin /data/config /data/files /data/vuln-verify \
     && for _cmd in rg grep find head tail cat sed awk cut tr sort uniq wc xargs ls stat file basename dirname readlink realpath jq python3; do \
         _target="$(command -v "$_cmd" 2>/dev/null)" && [ -x "$_target" ] && ln -sf "$_target" "/root/.pi/agent/bin/$_cmd" 2>/dev/null || true; \
     done

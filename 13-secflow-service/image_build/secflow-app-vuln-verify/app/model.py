@@ -6,6 +6,8 @@ import json
 import logging
 from typing import Any, Optional
 
+from pathlib import Path
+
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, inspect
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -120,12 +122,23 @@ def get_engine():
     global _engine
     if _engine is None:
         cfg = get_config().database
-        _engine = create_engine(
-            cfg.url,
-            pool_size=cfg.pool_size,
-            max_overflow=cfg.max_overflow,
-            pool_pre_ping=True,
-        )
+        url = cfg.sqlalchemy_url
+        if url.startswith("sqlite:///"):
+            sqlite_file = url.removeprefix("sqlite:///")
+            if sqlite_file and sqlite_file != ":memory:":
+                Path(sqlite_file).parent.mkdir(parents=True, exist_ok=True)
+            _engine = create_engine(
+                url,
+                connect_args={"check_same_thread": False},
+                pool_pre_ping=True,
+            )
+        else:
+            _engine = create_engine(
+                url,
+                pool_size=cfg.pool_size,
+                max_overflow=cfg.max_overflow,
+                pool_pre_ping=True,
+            )
     return _engine
 
 

@@ -26,8 +26,6 @@ from app.schemas import (
     TaskResultResponse,
     TokenUser,
 )
-from app.service.auth import get_auth_service
-from app.service.project import get_project_service
 from app.service.config_service import get_service_config, resolve_effective_default_model, save_service_config
 from app.service.security import validate_project_id
 from app.service.task_service import (
@@ -64,16 +62,26 @@ async def ready_check():
 
 
 async def get_current_context(project_id: str, authorization: Optional[str] = Header(None)) -> TokenUser:
+    """Local auth context.
+
+    By default local mode is open and does not call external Auth/Project
+    services.  If auth_service.enabled=true and auth_service.dev_token is set,
+    requests must provide Authorization: Bearer <dev_token>.
+    """
+    from app.config import get_config
+
     validate_project_id(project_id)
+    cfg = get_config().auth_service
+    if not cfg.enabled or not cfg.dev_token:
+        return TokenUser(user_id="local", username="local", token_type="local")
     if not authorization:
         raise UnauthorizedError("缺少Authorization头")
     parts = authorization.split()
     if len(parts) != 2 or parts[0].lower() != "bearer":
         raise UnauthorizedError("Authorization格式错误，应为 Bearer <token>")
-    token = parts[1]
-    user = await get_auth_service().validate_token(token)
-    await get_project_service().require_access(token, project_id)
-    return TokenUser(**user)
+    if parts[1] != cfg.dev_token:
+        raise UnauthorizedError("Token无效")
+    return TokenUser(user_id="local", username="local", token_type="local")
 
 
 @router.get("/projects/{project_id}/tasks", response_model=TaskListResponse)

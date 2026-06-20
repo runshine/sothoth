@@ -7,8 +7,6 @@ import logging
 import os
 import sys
 from contextlib import asynccontextmanager
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,8 +15,7 @@ from app.api.tasks import router
 from app.config import get_config, load_config
 from app.exception import setup_exception_handlers
 from app.model import get_engine, init_database
-from app.service.llm_provider_sync import sync_providers_to_pi
-from app.service.registry import get_registry_service
+from app.service.local_llm import materialize_local_llm_config
 from app.service.worker import get_worker
 
 logging.basicConfig(
@@ -41,61 +38,17 @@ def _worker_enabled() -> bool:
     return _role() in {"all", "worker"}
 
 
-def _machine_token() -> str:
-    cfg = get_config().auth_service
-    return os.environ.get("SECFLOW_SERVICE_MACHINE_TOKEN") or cfg.service_machine_token or ""
-
-
 def sync_llm_providers_on_startup() -> None:
     cfg = get_config()
-    if not cfg.configcenter.sync_on_startup:
+    if not cfg.local_llm.sync_on_startup:
         return
-    result = sync_providers_to_pi(
-        base_url=cfg.configcenter.base_url,
-        token=_machine_token(),
-        timeout=cfg.configcenter.timeout,
-        preferred_provider_key=cfg.configcenter.default_provider_key,
-    )
-    if not result.ok:
-        logger.warning("启动时同步 LLM Provider 失败，保留现有 pi 配置: %s", result.error)
+    materialize_local_llm_config(require_api_key=False)
 
 
 def verify_auth_service_or_exit() -> None:
-    cfg = get_config().auth_service
-    machine_token = _machine_token()
-    if not machine_token:
-        logger.error("未配置auth_service.service_machine_token或SECFLOW_SERVICE_MACHINE_TOKEN，拒绝启动")
-        sys.exit(1)
-    try:
-        with urlopen(f"http://{cfg.host}:{cfg.port}/api/auth/health", timeout=cfg.timeout) as response:
-            if response.status != 200:
-                logger.error("Auth服务健康检查失败: status=%s", response.status)
-                sys.exit(1)
-    except Exception as exc:
-        logger.error("Auth服务不可达: %s", exc)
-        sys.exit(1)
-    try:
-        request = Request(cfg.validate_url, method="POST")
-        request.add_header("Authorization", f"Bearer {machine_token}")
-        with urlopen(request, timeout=cfg.timeout) as response:
-            body = response.read().decode("utf-8", errors="ignore")
-            if response.status != 200:
-                logger.error("机机Token校验失败: status=%s, body=%s", response.status, body)
-                sys.exit(1)
-            payload = json.loads(body or "{}")
-            if payload.get("token_type") != "machine":
-                logger.error("机机Token类型异常: token_type=%s", payload.get("token_type"))
-                sys.exit(1)
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="ignore") if hasattr(exc, "read") else ""
-        logger.error("机机Token校验失败: status=%s, body=%s", exc.code, body)
-        sys.exit(1)
-    except URLError as exc:
-        logger.error("机机Token校验失败，Auth服务不可达: %s", exc)
-        sys.exit(1)
-    except Exception as exc:
-        logger.error("机机Token校验失败: %s", exc)
-        sys.exit(1)
+    # Local build: no external Auth service is required.  Optional dev-token
+    # validation is handled per request in app.api.tasks.
+    return
 
 
 @asynccontextmanager
@@ -108,8 +61,6 @@ async def lifespan(_: FastAPI):
             conn.exec_driver_sql("SELECT 1")
         verify_auth_service_or_exit()
         sync_llm_providers_on_startup()
-        if _api_enabled():
-            await get_registry_service().start()
         if _worker_enabled():
             get_worker().start()
     except Exception as exc:
@@ -120,8 +71,6 @@ async def lifespan(_: FastAPI):
     try:
         if _worker_enabled():
             await get_worker().stop()
-        if _api_enabled():
-            await get_registry_service().stop()
     finally:
         logger.info("SecFlow漏洞验证服务已关闭")
 

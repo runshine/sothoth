@@ -33,7 +33,7 @@ def project_root(project_id: str) -> Path:
 def ensure_path_in_project(project_id: str, path: str, *, must_be_file: bool = False, must_be_dir: bool = False) -> Path:
     root = project_root(project_id)
     resolved = Path(path).expanduser().resolve()
-    if not resolved.is_relative_to(root):
+    if not get_config().storage.allow_external_input_paths and not resolved.is_relative_to(root):
         raise ValidationError(f"路径不在当前项目目录内: {path}")
     if must_be_file and get_config().storage.require_input_exists and not resolved.is_file():
         raise ValidationError(f"输入文件不存在: {path}")
