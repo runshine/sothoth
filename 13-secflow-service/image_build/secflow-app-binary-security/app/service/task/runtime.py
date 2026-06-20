@@ -159,29 +159,76 @@ class TaskRuntimeServiceMixin:
             if self._entry_results(task) and authoritative_tail_progress:
                 task.current_stage = "dataflow_vuln_scan"
                 if active_tail_item:
-                    task.status = "running"
+                    self._set_task_status(
+                        db,
+                        task,
+                        "running",
+                        reason="tail 阶段存在活跃子项，任务保持运行态",
+                        source="runtime_worker",
+                        stage_name="dataflow_vuln_scan",
+                    )
                 elif failed_tail_run is not None:
-                    task.status = (
+                    self._set_task_status(
+                        db,
+                        task,
                         "failed"
                         if current_stage_before_sync == "dataflow_vuln_scan"
-                        else "pending" if nonterminal_tail_run is not None and not str(getattr(failed_tail_run, "last_error", "") or "").strip() else "failed"
+                        else "pending" if nonterminal_tail_run is not None and not str(getattr(failed_tail_run, "last_error", "") or "").strip() else "failed",
+                        reason="tail 阶段根据权威运行结果刷新任务状态",
+                        source="runtime_worker",
+                        stage_name="dataflow_vuln_scan",
                     )
                 elif nonterminal_tail_run is not None:
-                    task.status = "pending"
+                    self._set_task_status(
+                        db,
+                        task,
+                        "pending",
+                        reason="tail 阶段存在未终态 stage run，任务回到待执行",
+                        source="runtime_worker",
+                        stage_name="dataflow_vuln_scan",
+                    )
                 else:
-                    task.status = "running"
+                    self._set_task_status(
+                        db,
+                        task,
+                        "running",
+                        reason="tail 阶段已有权威进度，任务保持运行态",
+                        source="runtime_worker",
+                        stage_name="dataflow_vuln_scan",
+                    )
                 task.last_error = None
                 task.finished_at = None
             elif active_tail_item or authoritative_tail_progress:
                 task.current_stage = "dataflow_vuln_scan"
-                task.status = "running" if active_tail_item else "pending"
+                self._set_task_status(
+                    db,
+                    task,
+                    "running" if active_tail_item else "pending",
+                    reason="tail 阶段进度同步后刷新任务状态",
+                    source="runtime_worker",
+                    stage_name="dataflow_vuln_scan",
+                )
                 task.last_error = None
                 task.finished_at = None
             elif str(task.current_stage or "").strip() == "dataflow_vuln_scan":
-                task.status = "failed"
+                self._set_task_status(
+                    db,
+                    task,
+                    "failed",
+                    reason="tail 阶段缺少权威进度且当前阶段停留在 tail，任务失败",
+                    source="runtime_worker",
+                    stage_name="dataflow_vuln_scan",
+                )
                 task.finished_at = None
             else:
-                task.status = "pending"
+                self._set_task_status(
+                    db,
+                    task,
+                    "pending",
+                    reason="tail 阶段无权威进度，任务回到待执行",
+                    source="runtime_worker",
+                    stage_name=task.current_stage,
+                )
                 task.finished_at = None
             if str(task.current_stage or "").strip() == "dataflow_vuln_scan":
                 task.dispatcher_instance_id = self.instance_id
@@ -202,6 +249,7 @@ class TaskRuntimeServiceMixin:
 
         if not isinstance(db, Session):
             return (
+                self._repair_running_tasks_without_active_lease_locked(db),
                 self._requeue_stale_operations(db),
                 self._reclaim_stale_dispatching_locked(db),
                 self._requeue_orphaned_owned_execution_locked(db),
@@ -211,8 +259,9 @@ class TaskRuntimeServiceMixin:
                 self._recover_missing_stage_terminal_events_locked(db),
             )
         if not self._acquire_coordinator_lease(task_manager_module.PARENT_RECLAIM_COORDINATOR_LEASE):
-            return False, False, False, False, False, False, False
+            return False, False, False, False, False, False, False, False
         return (
+            self._repair_running_tasks_without_active_lease_locked(db),
             self._requeue_stale_operations(db),
             self._reclaim_stale_dispatching_locked(db),
             self._requeue_orphaned_owned_execution_locked(db),
@@ -221,6 +270,30 @@ class TaskRuntimeServiceMixin:
             self._requeue_released_running_locked(db),
             self._recover_missing_stage_terminal_events_locked(db),
         )
+
+    def _repair_running_tasks_without_active_lease_locked(self: TaskManager, db: Session) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        rows = (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(task_manager_module.BinarySecurityTask.status == "running")
+            .all()
+        )
+        repaired = False
+        for task in rows:
+            if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
+                continue
+            if self._repair_running_lease_invariant(
+                db,
+                task,
+                reason="parent_reclaim_pass_running_without_active_lease",
+                stage_name=str(task.current_stage or "").strip() or None,
+                event_payload={"source": "parent_reclaim_pass"},
+            ):
+                repaired = True
+        if repaired:
+            db.flush()
+        return repaired
 
     async def _dispatch_loop(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module
@@ -389,6 +462,7 @@ class TaskRuntimeServiceMixin:
 
     def _dispatch_once(self: TaskManager, db: Session) -> list[str]:
         (
+            running_lease_repaired,
             stale_operations_requeued,
             stale_reclaimed,
             orphaned_owned_execution_requeued,
@@ -402,7 +476,8 @@ class TaskRuntimeServiceMixin:
         slots = max(0, service_config.max_concurrent_tasks - active_count)
         claimed_ids = self._claim_pending_tasks(db, slots)
         if (
-            stale_operations_requeued
+            running_lease_repaired
+            or stale_operations_requeued
             or stale_reclaimed
             or orphaned_owned_execution_requeued
             or stale_stage_item_reclaimed
@@ -816,7 +891,14 @@ class TaskRuntimeServiceMixin:
             dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip() or None
             dispatch_started_at = task.dispatch_started_at
             task_lease_expires_at = task.lease_expires_at
-            task.status = "pending"
+            self._set_task_status(
+                db,
+                task,
+                "pending",
+                reason="调度超时，任务回收并重新进入队列",
+                source="runtime_worker",
+                stage_name=task.current_stage,
+            )
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
@@ -968,7 +1050,14 @@ class TaskRuntimeServiceMixin:
             has_downstream_refs = any(str(item.downstream_task_id or "").strip() for item in active_items)
             if active_items or has_downstream_refs:
                 continue
-            task.status = "pending"
+            self._set_task_status(
+                db,
+                task,
+                "pending",
+                reason="释放后的运行任务重新纳入待调度队列",
+                source="runtime_worker",
+                stage_name=stage_name,
+            )
             task.updated_at = task_manager_module._now()
             task.last_error = None
             task_manager_module.observe_running_requeue("released_without_owner")
@@ -1025,6 +1114,33 @@ class TaskRuntimeServiceMixin:
             ):
                 reclaimed = True
                 continue
+            current_stage_name = str(task.current_stage or "").strip()
+            runnable_work_exists = bool(
+                current_stage_name
+                and self._should_requeue_for_owned_execution(
+                    db,
+                    task,
+                    next_stage=current_stage_name,
+                    next_stage_status="running",
+                )
+            )
+            if not runnable_work_exists and str(getattr(task, "current_operation_id", "") or "").strip():
+                runnable_work_exists = True
+            if not runnable_work_exists and self._is_streaming_tail_stage(task, current_stage_name):
+                runnable_work_exists = bool(
+                    self._should_enter_tail_reconciliation(db, task)
+                    or self._tail_requires_execution_takeover(db, task)
+                    or self._tail_has_runnable_unbound_work(db, task)
+                )
+            if runnable_work_exists and self._repair_running_lease_invariant(
+                db,
+                task,
+                reason="stale_running_without_active_runtime_lease",
+                stage_name=current_stage_name or None,
+                event_payload={"source": "reclaim_stale_running"},
+            ):
+                reclaimed = True
+                continue
             reference_time = task.updated_at or task.dispatch_started_at or task.started_at
             elapsed_seconds = task_manager_module._elapsed_seconds_since(reference_time)
             if elapsed_seconds is None or elapsed_seconds < timeout_seconds:
@@ -1067,7 +1183,14 @@ class TaskRuntimeServiceMixin:
                     item.status = "failed"
                     item.finished_at = item.finished_at or task_manager_module._now()
                     item.error_message = item.error_message or "任务运行心跳超时"
-            task.status = "failed"
+            self._set_task_status(
+                db,
+                task,
+                "failed",
+                reason="任务运行心跳超时，任务失败",
+                source="runtime_worker",
+                stage_name=current_stage_name or None,
+            )
             task.finished_at = task.finished_at or task_manager_module._now()
             task.last_error = task.last_error or "任务运行心跳超时"
             self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_TERMINAL)
@@ -1146,7 +1269,14 @@ class TaskRuntimeServiceMixin:
             task.dispatch_started_at = started_at
             task.lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
             execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
-            task.status = "running"
+            self._set_task_status(
+                db,
+                task,
+                "running",
+                reason="任务进入调度执行",
+                source="runtime_worker",
+                stage_name=task.current_stage,
+            )
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
             self._clear_task_abnormal_reason_snapshot(db, task)
             self._bind_execution_token(task)
@@ -1594,7 +1724,14 @@ class TaskRuntimeServiceMixin:
                 ).first()
             if requeued and item is not None:
                 if task is not None and self._should_hold_task_on_stage_after_requeue(db, task, item.stage_name):
-                    task.status = "running"
+                    self._set_task_status(
+                        db,
+                        task,
+                        "running",
+                        reason="阶段子项重排队后任务保持在当前阶段运行",
+                        source="runtime_worker",
+                        stage_name=item.stage_name,
+                    )
                     task.current_stage = item.stage_name
                     task.finished_at = None
                     task.last_error = None

@@ -293,6 +293,43 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["called", "called"], reconcile_calls)
 
+
+class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.manager = TaskManager()
+
+    def test_reclaim_stale_running_prefers_requeue_when_runnable_work_exists(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=_now() - timedelta(minutes=30),
+            lease_expires_at=_now() - timedelta(minutes=10),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        self.manager._release_streaming_parent_for_takeover_locked = lambda *args, **kwargs: False
+        self.manager._task_has_active_cancel_operation = lambda *args, **kwargs: False
+        self.manager._should_requeue_for_owned_execution = lambda *args, **kwargs: True
+        self.manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        enqueued: list[str] = []
+        self.manager._enqueue_task = lambda task_id: enqueued.append(task_id)
+
+        reclaimed = self.manager._reclaim_stale_running_locked(db)
+
+        self.assertTrue(reclaimed)
+        self.assertEqual("pending", task.status)
+        self.assertEqual(["task-1"], enqueued)
+        self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
+
     async def test_dispatch_loop_does_not_log_crash_for_redis_timeout_empty_poll(self):
         manager = TaskManager()
         manager._running = True
@@ -757,7 +794,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 

@@ -236,23 +236,48 @@ class TaskResultServiceMixin:
         normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
         if not normalized:
             return 0
-        deleted = int(
+        preserved_event_types = {
+            "stage_retry_full_cleanup_started",
+            "stage_retry_full_cleanup_finished",
+            "child_task_cancel_requested",
+            "child_task_cancel_succeeded",
+            "child_task_cancel_failed",
+            "child_task_inactive_check_requested",
+            "child_task_inactive_check_succeeded",
+            "child_task_inactive_check_blocked",
+            "child_task_delete_requested",
+            "child_task_delete_succeeded",
+            "child_task_delete_verified_absent",
+            "child_task_delete_failed_but_ignored",
+            "child_task_delete_failed_blocking",
+        }
+        candidate_rows = (
             db.query(BinarySecurityEvent)
             .filter(
                 BinarySecurityEvent.task_id == task_id,
                 BinarySecurityEvent.stage_name.in_(normalized),
             )
+            .all()
+        )
+        removable_ids = [
+            str(getattr(row, "id", "") or "").strip()
+            for row in candidate_rows
+            if str(getattr(row, "operation_id", "") or "").strip() == ""
+            or str(getattr(row, "event_type", "") or "").strip() not in preserved_event_types
+        ]
+        if not removable_ids:
+            return 0
+        deleted = int(
+            db.query(BinarySecurityEvent)
+            .filter(BinarySecurityEvent.id.in_(removable_ids))
             .delete(synchronize_session=False)
             or 0
         )
         if hasattr(db, "events") and isinstance(getattr(db, "events"), list):
-            allowed = set(normalized)
+            removable = set(removable_ids)
             db.events = [
                 row for row in db.events
-                if not (
-                    str(getattr(row, "task_id", "") or "").strip() == task_id
-                    and str(getattr(row, "stage_name", "") or "").strip() in allowed
-                )
+                if str(getattr(row, "id", "") or "").strip() not in removable
             ]
         return deleted
 

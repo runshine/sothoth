@@ -1,14 +1,17 @@
 import unittest
+from datetime import timedelta
 
 from app.model import (
     BinarySecurityTask,
+    BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_RUNTIME_PHASE_TERMINAL,
     TASK_TYPE_BINARY,
 )
 from app.service.task.runtime_state import TaskRuntimeStateServiceMixin
-from app.service.task_manager import TaskManager
+from app.service.task_manager import TaskManager, _now
+from test_task_manager import _ModelAwareDb
 
 
 class TaskRuntimeStateServiceStructureTests(unittest.TestCase):
@@ -93,6 +96,59 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
 
         self.manager._set_task_runtime_phase(task, "")
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+
+    def test_repair_running_lease_invariant_requeues_owned_execution_task_without_active_lease(self):
+        task = self._task(
+            status="running",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=_now() - timedelta(minutes=5),
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+        enqueued: list[str] = []
+
+        self.manager._enqueue_task = lambda task_id: enqueued.append(task_id)
+        repaired = self.manager._repair_running_lease_invariant(
+            db,
+            task,
+            reason="unit_test",
+            stage_name="system_analysis",
+        )
+
+        self.assertTrue(repaired)
+        self.assertEqual("pending", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual("idle", task.tail_reconcile_state)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
+        self.assertEqual(["task-1"], enqueued)
+        self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
+
+    def test_repair_running_lease_invariant_keeps_tail_task_with_active_runtime_lease(self):
+        task = self._task(
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        self.manager._enqueue_task = lambda _task_id: self.fail("should not enqueue healthy tail task")
+        repaired = self.manager._repair_running_lease_invariant(
+            db,
+            task,
+            reason="unit_test",
+        )
+
+        self.assertFalse(repaired)
+        self.assertEqual("running", task.status)
+        self.assertEqual([], db.events)
 
 
 if __name__ == "__main__":

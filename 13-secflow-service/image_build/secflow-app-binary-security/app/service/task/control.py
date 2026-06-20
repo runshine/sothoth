@@ -627,7 +627,14 @@ class TaskControlServiceMixin:
         metrics = dict(getattr(task, "metrics", {}) or {})
         metrics.update(self._entry_selection_metrics(task))
         task.metrics = metrics
-        task.status = "pending"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="入口选择确认完成，任务恢复待执行",
+            source="task_control",
+            stage_name="entry_analysis",
+        )
         task.current_stage = "entry_analysis"
         self._record_event(
             db,
@@ -673,7 +680,14 @@ class TaskControlServiceMixin:
             **dict(task.metrics or {}),
             **self._module_metrics(candidates, candidates, selected_modules),
         }
-        task.status = "pending"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="模块选择确认完成，任务恢复待执行",
+            source="task_control",
+            stage_name="entry_analysis",
+        )
         task.current_stage = "entry_analysis"
         self._record_event(
             db,
@@ -858,7 +872,14 @@ class TaskControlServiceMixin:
             accepted_event_type="task_cancel_accepted",
             accepted_message="任务取消已受理，后台正在停止执行并清理下游任务",
         )
-        task.status = task_manager_module.TASK_STATUS_CANCELLING
+        self._set_task_status(
+            db,
+            task,
+            task_manager_module.TASK_STATUS_CANCELLING,
+            reason="收到取消请求",
+            source="task_control",
+            stage_name=task.current_stage,
+        )
         task.finished_at = None
         task.last_error = None
         task.current_operation_id = operation.id
@@ -986,7 +1007,14 @@ class TaskControlServiceMixin:
 
         self._set_task_runtime_workset(task, {})
         task.summary = self._clear_failure_fields_from_summary(dict(getattr(task, "summary", None) or {}))
-        task.status = "pending"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="人工强制重置任务为待调度",
+            source="task_control",
+            stage_name=task.current_stage,
+        )
         task.last_error = None
         task.finished_at = None
         task.current_operation_id = None

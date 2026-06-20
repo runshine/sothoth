@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.exception import ValidationError
+from app.model import TASK_RUNTIME_PHASE_OWNED_EXECUTION
 
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager
@@ -458,17 +459,29 @@ class TaskArchiveServiceMixin:
         return True, None, jobs, retryable_items
 
     def _mark_task_waiting_for_archive_retry(self: TaskManager, db: Session, task: Any, stage_name: str) -> None:
-        task.status = "running"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="归档重试后重新排队",
+            source="archive_worker",
+            stage_name=stage_name,
+        )
         task.current_stage = stage_name
         task.execution_mode = None
         task.target_stage_name = None
         task.last_error = None
         self._clear_task_abnormal_reason_snapshot(db, task)
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        task.tail_reconcile_state = "idle"
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
         task.finished_at = None
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="running")
+        self._clear_runtime_lease(db, task.id)
+        self._release_tail_reconcile_owner(task.id)
+        self._enqueue_task(task.id)
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
         self._record_event(
             db,
             task,

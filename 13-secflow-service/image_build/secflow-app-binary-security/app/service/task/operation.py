@@ -2017,7 +2017,14 @@ class TaskOperationServiceMixin:
                 await self._cancel_downstream_refs(db, task, cancel_refs, token)
             return [stage.stage_name for stage in active_stage_runs]
 
-        task.status = task_manager_module.TASK_STATUS_CANCELLING
+        self._set_task_status(
+            db,
+            task,
+            task_manager_module.TASK_STATUS_CANCELLING,
+            reason="取消操作进入执行，任务切换为取消中",
+            source="task_operation",
+            stage_name=target_stage,
+        )
         self._invalidate_task_execution(task)
         task.finished_at = None
         running_items = db.query(task_manager_module.BinarySecurityStageItem).filter(
@@ -2166,7 +2173,14 @@ class TaskOperationServiceMixin:
 
         cleanup_status = await self._cleanup_task_workspace(task, token=token)
         if cleanup_status != "deleted":
-            task.status = task_manager_module.TASK_STATUS_DELETE_FAILED
+            self._set_task_status(
+                db,
+                task,
+                task_manager_module.TASK_STATUS_DELETE_FAILED,
+                reason="删除任务时任务目录清理失败",
+                source="task_operation",
+                stage_name=task.current_stage,
+            )
             task.finished_at = task_manager_module._now()
             task.last_error = "任务目录清理失败"
             self._record_event(
@@ -2215,7 +2229,14 @@ class TaskOperationServiceMixin:
                 ),
                 None,
             ) or "下游删除未完成"
-            task.status = task_manager_module.TASK_STATUS_DELETE_FAILED
+            self._set_task_status(
+                db,
+                task,
+                task_manager_module.TASK_STATUS_DELETE_FAILED,
+                reason="删除任务时下游子任务尚未完成删除确认",
+                source="task_operation",
+                stage_name=task.current_stage,
+            )
             task.finished_at = task_manager_module._now()
             task.last_error = cleanup_error
             self._record_event(
@@ -2712,7 +2733,14 @@ class TaskOperationServiceMixin:
             )
             if task is not None:
                 if operation is not None and operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
-                    task.status = task_manager_module.TASK_STATUS_DELETE_FAILED
+                    self._set_task_status(
+                        db,
+                        task,
+                        task_manager_module.TASK_STATUS_DELETE_FAILED,
+                        reason="后台操作执行异常，删除任务失败",
+                        source="task_operation",
+                        stage_name=task.current_stage,
+                    )
                     task.finished_at = task_manager_module._now()
                     task.current_operation_id = operation.id
                 elif operation is not None and str(getattr(task, "current_operation_id", "") or "").strip() == operation.id:
@@ -3305,7 +3333,14 @@ class TaskOperationServiceMixin:
         )
         resume_decision.event_type = "task_requeued"
         if self._can_resume_retry_operation_in_place(task, operation):
-            task.status = "running"
+            self._set_task_status(
+                db,
+                task,
+                "running",
+                reason="失败项重试完成，当前 runtime 原地继续推进任务",
+                source="task_operation",
+                stage_name=target_stage or task.current_stage,
+            )
             task.current_stage = target_stage or task.current_stage
             task.last_error = None
             task.finished_at = None
@@ -3345,7 +3380,14 @@ class TaskOperationServiceMixin:
             )
             return
         if not resume_decision.should_resume:
-            task.status = "pending"
+            self._set_task_status(
+                db,
+                task,
+                "pending",
+                reason="失败项重试完成，任务重新进入待调度",
+                source="task_operation",
+                stage_name=target_stage or task.current_stage,
+            )
             task.current_stage = target_stage or task.current_stage
             task.last_error = None
             task.finished_at = None
@@ -3427,7 +3469,14 @@ class TaskOperationServiceMixin:
             return result
 
         async def _mark_task_cancelling() -> dict[str, Any]:
-            task.status = task_manager_module.TASK_STATUS_CANCELLING
+            self._set_task_status(
+                db,
+                task,
+                task_manager_module.TASK_STATUS_CANCELLING,
+                reason="取消操作已开始，任务进入取消中",
+                source="task_operation",
+                stage_name=operation.target_stage,
+            )
             task.finished_at = None
             task.last_error = None
             task.current_operation_id = operation.id
@@ -3600,7 +3649,14 @@ class TaskOperationServiceMixin:
                     operation.current_step = operation_refreshed.current_step
 
         async def _finalize_cancelled() -> dict[str, Any]:
-            task.status = "cancelled"
+            self._set_task_status(
+                db,
+                task,
+                "cancelled",
+                reason="取消操作已确认完成",
+                source="task_operation",
+                stage_name=operation.target_stage,
+            )
             task.finished_at = task_manager_module._now()
             task.last_error = None
             self._invalidate_task_execution(task)
@@ -3625,7 +3681,14 @@ class TaskOperationServiceMixin:
             return {"task_status": task.status}
 
         async def _finalize_cancel_failed(error: Exception) -> dict[str, Any]:
-            task.status = task_manager_module.TASK_STATUS_CANCEL_FAILED
+            self._set_task_status(
+                db,
+                task,
+                task_manager_module.TASK_STATUS_CANCEL_FAILED,
+                reason="取消操作执行失败",
+                source="task_operation",
+                stage_name=operation.target_stage,
+            )
             task.finished_at = task_manager_module._now()
             task.last_error = str(error)
             self._invalidate_task_execution(task)

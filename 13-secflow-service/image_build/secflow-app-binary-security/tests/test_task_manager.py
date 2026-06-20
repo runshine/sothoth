@@ -28096,19 +28096,22 @@ def _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exi
     client.get_task = _existing_task
 
     with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
-        with self.assertRaises(ValidationError):
-            asyncio.run(
-                self.manager._delete_downstream_refs(
-                    db,
-                    task,
-                    [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
-                    "token",
-                )
+        deleted = asyncio.run(
+            self.manager._delete_downstream_refs(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                "token",
             )
+        )
+    self.assertEqual(1, deleted)
     cleanup_results = list(getattr(self.manager, "_last_downstream_cleanup_results", []) or [])
     self.assertEqual(1, len(cleanup_results))
     self.assertEqual("failed", cleanup_results[0]["verify_status"])
+    self.assertEqual("terminal_error_state", cleanup_results[0]["ignored_reason"])
     self.assertFalse(cleanup_results[0]["blocking"])
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("child_task_delete_failed_but_ignored", event_types)
 
 
 def _test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active(self):
@@ -28378,6 +28381,45 @@ TaskManagerTests.test_downstream_controller_query_does_not_write_timeline = _tes
 TaskManagerTests.test_downstream_controller_retry_records_child_task_event = _test_downstream_controller_retry_records_child_task_event
 TaskManagerTests.test_downstream_controller_cancel_records_child_task_events = _test_downstream_controller_cancel_records_child_task_events
 TaskManagerTests.test_downstream_controller_delete_blocking_failure_records_event = _test_downstream_controller_delete_blocking_failure_records_event
+
+
+def _test_downstream_controller_inactive_check_records_child_task_events(self):
+    task = BinarySecurityTask(
+        id="t-inactive",
+        project_id="p1",
+        name="binary",
+        status="failed",
+        current_operation_id="op-inactive",
+    )
+    item = BinarySecurityStageItem(
+        id="si-inactive",
+        task_id="t-inactive",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="module-1",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        status="failed",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub(fetched={"eat-1": {"task_id": "eat-1", "status": "failed"}})
+
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+        asyncio.run(
+            self.manager._ensure_downstream_refs_inactive(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat-1", "project_id": "p1", "stage_name": "entry_analysis"}],
+                "token",
+            )
+        )
+
+    inactive_events = [event for event in db.added if getattr(event, "event_type", "") in {"child_task_inactive_check_requested", "child_task_inactive_check_succeeded"}]
+    self.assertEqual(2, len(inactive_events))
+    self.assertTrue(all(getattr(event, "operation_id", None) == "op-inactive" for event in inactive_events))
+
+
+TaskManagerTests.test_downstream_controller_inactive_check_records_child_task_events = _test_downstream_controller_inactive_check_records_child_task_events
 
 
 def _test_downstream_controller_delete_treats_dfa_delete_500_with_absent_task_as_success(self):

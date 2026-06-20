@@ -625,10 +625,14 @@ class TaskRuntimeStateServiceMixin:
                 payload=conflict_payload,
             )
         if fallback_status is not None:
-            if self._is_streaming_tail_stage(task, task.current_stage):
-                task.status = "running"
-            else:
-                task.status = fallback_status
+            self._set_task_status(
+                db,
+                task,
+                fallback_status,
+                reason="tail 收口 handoff 未获取有效租约，回退任务状态",
+                source="runtime_state",
+                stage_name=str(task.current_stage or "").strip() or None,
+            )
         task.tail_reconcile_state = "handoff_waiting"
         observe_tail_reconcile_heartbeat("handoff")
         observe_tail_reconcile_owner("handoff_started")
@@ -736,7 +740,14 @@ class TaskRuntimeStateServiceMixin:
         if hasattr(task, "_preferred_requeue_event_stage_name"):
             setattr(task, "_preferred_requeue_event_stage_name", None)
         task.current_stage = stage_name or task.current_stage
-        task.status = "pending"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="owned execution 接管重排队",
+            source="runtime_state",
+            stage_name=event_stage_name,
+        )
         self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         task.tail_reconcile_state = "idle"
         task.dispatcher_instance_id = None
@@ -806,3 +817,107 @@ class TaskRuntimeStateServiceMixin:
         if phase == TASK_RUNTIME_PHASE_TERMINAL:
             return TASK_RUNTIME_PHASE_TERMINAL
         return TASK_RUNTIME_PHASE_OWNED_EXECUTION
+
+    def _task_has_live_runtime_lease(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        lease = self._runtime_lease_for_task(db, task.id)
+        if not self._runtime_lease_is_active(lease):
+            return False
+        return True
+
+    def _running_task_requires_live_runtime_lease(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        if str(getattr(task, "status", "") or "").strip().lower() != "running":
+            return False
+        phase = self._task_runtime_phase(task)
+        if phase not in {
+            TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        }:
+            return False
+        return True
+
+    def _running_task_has_valid_runtime_ownership(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        if not self._running_task_requires_live_runtime_lease(db, task):
+            return True
+        phase = self._task_runtime_phase(task)
+        if phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            return self._task_has_live_runtime_lease(db, task)
+        if phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return self._task_has_live_runtime_lease(db, task)
+        return False
+
+    def _repair_running_lease_invariant(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        reason: str,
+        stage_name: str | None = None,
+        event_type: str = "running_without_active_lease_requeued",
+        event_level: str = "warning",
+        event_payload: dict[str, Any] | None = None,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if not self._running_task_requires_live_runtime_lease(db, task):
+            return False
+        if self._running_task_has_valid_runtime_ownership(db, task):
+            return False
+        lease = self._runtime_lease_for_task(db, task.id)
+        runtime_phase = self._task_runtime_phase(task)
+        runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
+        runtime_lease_expires_at = getattr(lease, "lease_expires_at", None) if lease is not None else None
+        next_stage_name = str(stage_name or task.current_stage or "").strip() or None
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        task.tail_reconcile_state = "idle"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="检测到运行中任务缺少有效租约，重置为待执行",
+            source="runtime_state",
+            stage_name=next_stage_name,
+        )
+        task.current_stage = next_stage_name or task.current_stage
+        task.dispatcher_instance_id = None
+        task.dispatch_started_at = None
+        task.lease_expires_at = None
+        task.finished_at = None
+        task.last_error = None
+        task.updated_at = task_manager_module._now()
+        self._clear_runtime_lease(db, task.id)
+        self._release_tail_reconcile_owner(task.id)
+        self._last_task_heartbeat_at.pop(task.id, None)
+        self._clear_task_abnormal_reason_snapshot(db, task)
+        self._record_event(
+            db,
+            task,
+            event_type,
+            "检测到 running 任务缺少有效租约，已重置为 pending 并重新排队等待 owner 接管",
+            level=event_level,
+            stage_name=next_stage_name,
+            payload={
+                "reason": reason,
+                "runtime_phase": runtime_phase,
+                "previous_task_status": "running",
+                "previous_task_lease_owner": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                "previous_task_lease_expires_at": getattr(task, "lease_expires_at", None),
+                "runtime_lease_owner": runtime_lease_owner,
+                "runtime_lease_expires_at": runtime_lease_expires_at,
+                "repair_action": "pending_requeue_owned_execution",
+                **(event_payload or {}),
+            },
+        )
+        self._enqueue_task(task.id)
+        return True

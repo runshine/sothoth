@@ -346,6 +346,7 @@ class DownstreamTaskController:
         item: BinarySecurityStageItem | dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> None:
+        operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         self.manager._record_event(
             db,
             task,
@@ -355,7 +356,35 @@ class DownstreamTaskController:
             stage_name=stage_name,
             item=item,
             payload=payload,
+            operation_id=operation_id,
         )
+
+    @staticmethod
+    def _cleanup_ref_payload(
+        ref: dict[str, Any],
+        *,
+        operation: str,
+        phase: str,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        return {
+            **dict(ref or {}),
+            "operation": operation,
+            "cleanup_phase": phase,
+            **extra,
+        }
+
+    @staticmethod
+    def _is_terminal_error_like_status(status: str | None) -> bool:
+        return str(status or "").strip().lower() in {"failed", "cancelled", "downstream_missing"}
+
+    @staticmethod
+    def _failure_reason_text(*values: Any) -> str | None:
+        for value in values:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return None
 
     def _record_downstream_item_disposition(
         self,
@@ -789,7 +818,7 @@ class DownstreamTaskController:
                 f"请求取消下游任务: {ref['service']}:{ref['task_id']}",
                 stage_name=ref.get("stage_name"),
                 item=event_item,
-                payload={**ref, "operation": "cancel"},
+                payload=self._cleanup_ref_payload(ref, operation="cancel", phase="cancel"),
             )
 
         async def do_cancel(ref: dict[str, str]) -> bool:
@@ -819,18 +848,18 @@ class DownstreamTaskController:
                     event_item,
                     event_type="child_task_cancel_succeeded",
                     message=f"下游子任务已取消: {ref['service']}:{ref['task_id']}",
-                    payload={**ref, "operation": "cancel"},
+                    payload=self._cleanup_ref_payload(ref, operation="cancel", phase="cancel", result="succeeded"),
                 )
                 continue
             self._record_event(
                 db,
                 task,
                 "child_task_cancel_failed",
-                f"下游取消失败: {ref['service']}:{ref['task_id']} - {exc}",
+                f"下游取消失败: {ref['service']}:{ref['task_id']} - {self._failure_reason_text(exc) or 'unknown_error'}",
                 stage_name=ref.get("stage_name"),
                 item=event_item,
                 level="warning",
-                payload={**ref, "operation": "cancel", "error": str(exc)},
+                payload=self._cleanup_ref_payload(ref, operation="cancel", phase="cancel", result="failed", error=str(exc)),
             )
         db.commit()
         return success_count
@@ -860,7 +889,61 @@ class DownstreamTaskController:
             raise ValidationError(f"旧下游任务仍在运行，不能安全继续: {ref.get('service')}:{ref.get('task_id')}")
 
     async def ensure_child_refs_inactive(self, refs: list[dict[str, str]], token: str | None) -> None:
-        await self.wait_child_refs_inactive(list(refs), token)
+        pending_refs = [dict(ref) for ref in list(refs or []) if isinstance(ref, dict)]
+        if not pending_refs:
+            return
+        observed_results: dict[tuple[str, str], dict[str, Any]] = {}
+        timeout_seconds = max(
+            int(self.manager.cfg.scheduler.downstream_request_timeout_seconds or 120),
+            int(self.manager.cfg.scheduler.stage_poll_interval_seconds or 5) * 2,
+        )
+        deadline = now_local() + timedelta(seconds=timeout_seconds)
+        while pending_refs and now_local() <= deadline:
+            active_refs: list[dict[str, str]] = []
+            for ref in pending_refs:
+                service = str(ref.get("service") or "").strip()
+                task_id = str(ref.get("task_id") or "").strip()
+                key = (service, task_id)
+                try:
+                    payload = await self.fetch_child_ref_payload(ref, token)
+                except NotFoundError:
+                    observed_results[key] = {
+                        **dict(ref),
+                        "inactive_check_status": "succeeded",
+                        "observed_status": "downstream_missing",
+                        "observed_active": False,
+                        "verified_absent": True,
+                    }
+                    continue
+                payload_status = str((payload or {}).get("status") or "").strip().lower()
+                mapped_status = self.manager._map_downstream_status(payload_status) or payload_status
+                observed_active = mapped_status in DOWNSTREAM_REF_ACTIVE_STATUSES
+                observed_results[key] = {
+                    **dict(ref),
+                    "inactive_check_status": "succeeded" if not observed_active else "active",
+                    "observed_status": mapped_status,
+                    "observed_active": observed_active,
+                    "verified_absent": False,
+                }
+                if observed_active:
+                    active_refs.append(ref)
+            if not active_refs:
+                return
+            pending_refs = active_refs
+            await asyncio.sleep(max(1, int(self.manager.cfg.scheduler.stage_poll_interval_seconds or 5)))
+        if pending_refs:
+            ref = pending_refs[0]
+            service = str(ref.get("service") or "").strip()
+            task_id = str(ref.get("task_id") or "").strip()
+            key = (service, task_id)
+            previous = observed_results.get(key) or {}
+            observed_results[key] = {
+                **dict(ref),
+                **previous,
+                "inactive_check_status": "blocked",
+                "observed_active": True,
+            }
+            raise ValidationError(f"旧下游任务仍在运行，不能安全继续: {ref.get('service')}:{ref.get('task_id')}")
 
     async def delete_child_task(self, *, service: str, project_id: str | None, task_id: str, token: str | None) -> dict[str, Any]:
         return await self.gateway.delete_task(service, project_id=project_id, task_id=task_id, token=token)
@@ -936,6 +1019,12 @@ class DownstreamTaskController:
                 result["delete_status"] = "succeeded_after_verify"
                 result["blocking"] = False
                 return result
+            observed_status = str(verification.get("observed_status") or "").strip().lower() or None
+            if self._is_terminal_error_like_status(observed_status):
+                result["blocking"] = False
+                result["ignored_reason"] = "terminal_error_state"
+                result["delete_status"] = "failed_but_terminal_error_ignored"
+                return result
             result["blocking"] = bool(verification.get("observed_active") or result.get("delete_status") == "conflict")
             return result
 
@@ -996,7 +1085,10 @@ class DownstreamTaskController:
                     task,
                     event_item,
                     event_type="child_task_delete_failed_but_ignored",
-                    message=f"下游删除报错但已降级忽略: {ref['service']}:{ref['task_id']}",
+                    message=(
+                        f"下游删除报错但已降级忽略: {ref['service']}:{ref['task_id']} - "
+                        f"{self._failure_reason_text(cleanup_result.get('error'), cleanup_result.get('verification_error')) or 'verified_absent'}"
+                    ),
                     level="warning",
                     payload=cleanup_result,
                 )
@@ -1009,7 +1101,25 @@ class DownstreamTaskController:
                     task,
                     event_item,
                     event_type="child_task_delete_failed_but_ignored",
-                    message=f"下游删除失败但已按强制删除忽略: {ref['service']}:{ref['task_id']}",
+                    message=(
+                        f"下游删除失败但已按强制删除忽略: {ref['service']}:{ref['task_id']} - "
+                        f"{self._failure_reason_text(cleanup_result.get('error'), cleanup_result.get('verification_error')) or 'force_delete'}"
+                    ),
+                    level="warning",
+                    payload=cleanup_result,
+                )
+                continue
+            if cleanup_result.get("ignored_reason") == "terminal_error_state":
+                success_count += 1
+                self._record_downstream_item_disposition(
+                    db,
+                    task,
+                    event_item,
+                    event_type="child_task_delete_failed_but_ignored",
+                    message=(
+                        f"下游任务已处于错误终态，删除失败已忽略: {ref['service']}:{ref['task_id']} - "
+                        f"{self._failure_reason_text(cleanup_result.get('error'), cleanup_result.get('observed_status')) or 'terminal_error_state'}"
+                    ),
                     level="warning",
                     payload=cleanup_result,
                 )
@@ -1033,7 +1143,10 @@ class DownstreamTaskController:
                     task,
                     event_item,
                     event_type="child_task_delete_failed_but_ignored",
-                    message=f"下游删除失败，已转为后台补偿: {ref['service']}:{ref['task_id']}",
+                    message=(
+                        f"下游删除失败，已转为后台补偿: {ref['service']}:{ref['task_id']} - "
+                        f"{self._failure_reason_text(cleanup_result.get('error'), cleanup_result.get('verification_error'), cleanup_result.get('deferred_reason')) or 'deferred'}"
+                    ),
                     level="warning",
                     payload=cleanup_result,
                 )

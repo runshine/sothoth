@@ -1201,7 +1201,14 @@ class TaskItemSyncServiceMixin:
         ):
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
             if self._tail_requires_execution_takeover(db, task):
-                task.status = "pending"
+                self._set_task_status(
+                    db,
+                    task,
+                    "pending",
+                    reason="检测到尾段阶段未完成，退出收口并重新交给 worker 执行",
+                    source="item_sync",
+                    stage_name=task.current_stage,
+                )
                 task.current_stage = active_stage_name or task.current_stage
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
@@ -1232,7 +1239,6 @@ class TaskItemSyncServiceMixin:
                     message="已退出 tail 收口并重新交给 worker 继续执行",
                 )
             if active_item_count > 0 or has_downstream_refs:
-                task.status = "running"
                 task.current_stage = active_stage_name or task.current_stage
                 task.dispatcher_instance_id = None
                 task.dispatch_started_at = None
@@ -1247,9 +1253,25 @@ class TaskItemSyncServiceMixin:
                     takeover_result="sync_reclaim",
                 )
                 if self._runtime_lease_is_active(lease):
+                    self._set_task_status(
+                        db,
+                        task,
+                        "running",
+                        reason="tail 收口重新获取有效租约并恢复运行",
+                        source="item_sync",
+                        stage_name=active_stage_name or task.current_stage,
+                    )
                     self._clear_task_abnormal_reason_snapshot(db, task)
                     db.commit()
                     task = self._task_or_404(db, project_id, task_id)
+                else:
+                    self._repair_running_lease_invariant(
+                        db,
+                        task,
+                        reason="tail_reconcile_activation_failed_during_sync_reclaim",
+                        stage_name=active_stage_name or task.current_stage,
+                        event_payload={"source": "request_task_reconcile"},
+                    )
 
         batch_size = max(1, int(getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50))
         if stage_name and stage_name not in self._stage_sequence_for_task(task):

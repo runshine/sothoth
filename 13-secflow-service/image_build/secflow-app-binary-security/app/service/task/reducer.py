@@ -68,7 +68,14 @@ class TaskReducerServiceMixin:
         stage_run.counts = self._stage_counts(db, stage_run)
         task.current_stage = stage_name
         if str(task.status or "").strip() != "cancelled":
-            task.status = "running"
+            self._set_task_status(
+                db,
+                task,
+                "running",
+                reason="阶段启动事件触发任务进入运行态",
+                source="state_reducer",
+                stage_name=stage_name,
+            )
         task.started_at = task.started_at or now_value
         task.finished_at = None
         task.updated_at = now_value
@@ -631,9 +638,19 @@ class TaskReducerServiceMixin:
             },
         )
         if self._is_streaming_tail_stage(task, item.stage_name) and mapped_status in {"failed", "downstream_missing", "cancelled"}:
-            task.status = "running"
             task.current_stage = item.stage_name
             task.finished_at = None
+            self._repair_running_lease_invariant(
+                db,
+                task,
+                reason="downstream_status_event_without_active_holder",
+                stage_name=item.stage_name,
+                event_payload={
+                    "source": "downstream_status_event_applied",
+                    "item_id": item.id,
+                    "downstream_task_id": item.downstream_task_id,
+                },
+            )
         self._record_event(
             db,
             task,
@@ -957,7 +974,14 @@ class TaskReducerServiceMixin:
             stage_run.finished_at = stage_run.finished_at or task_shared._now()
             stage_run.last_error = summary.get("failure_message") or summary.get("error") or stage_run.last_error
         if active_stage_status:
-            task.status = "running"
+            self._set_task_status(
+                db,
+                task,
+                "running",
+                reason="阶段仍等待下游明确状态，任务保持运行态",
+                source="state_reducer",
+                stage_name=stage_name,
+            )
             task.current_stage = stage_name
             task.last_error = None
             task.finished_at = None
@@ -1068,7 +1092,14 @@ class TaskReducerServiceMixin:
             )
             return
         error_message = str(payload.get("error") or "任务执行失败")
-        task.status = "failed"
+        self._set_task_status(
+            db,
+            task,
+            "failed",
+            reason="任务执行失败事件触发任务失败",
+            source="state_reducer",
+            stage_name=task.current_stage,
+        )
         task.last_error = error_message
         self._invalidate_task_execution(task)
         task.finished_at = task_shared._now()
@@ -1156,7 +1187,14 @@ class TaskReducerServiceMixin:
         job.completed_at = job.completed_at or task_shared._now()
         job.updated_at = task_shared._now()
         if task.status not in TASK_TERMINAL_STATUSES:
-            task.status = "failed"
+            self._set_task_status(
+                db,
+                task,
+                "failed",
+                reason="下游产物归档复制失败，任务标记失败",
+                source="state_reducer",
+                stage_name=job.stage_name,
+            )
             task.current_stage = job.stage_name
             task.last_error = job.error_message
             task.finished_at = task_shared._now()

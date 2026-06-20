@@ -2214,11 +2214,33 @@ class TaskManager(
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         if previous_status == "running":
-            task.status = "pending"
+            self._set_task_status(
+                db,
+                task,
+                "pending",
+                reason="检测到任务 owner 元数据漂移，释放 owner 并等待重新调度",
+                source="task_manager",
+                stage_name=task.current_stage,
+            )
         elif previous_status == "dispatching":
-            task.status = "pending"
+            self._set_task_status(
+                db,
+                task,
+                "pending",
+                reason="检测到 dispatching 任务 owner 元数据漂移，释放 owner 并等待重新调度",
+                source="task_manager",
+                stage_name=task.current_stage,
+            )
         elif previous_status == TASK_STATUS_CANCELLING:
-            task.status = TASK_STATUS_CANCELLING
+            self._set_task_status(
+                db,
+                task,
+                TASK_STATUS_CANCELLING,
+                reason="任务取消中但 owner 元数据漂移，保留取消状态并释放 owner",
+                source="task_manager",
+                stage_name=task.current_stage,
+                allow_noop=True,
+            )
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
@@ -2463,7 +2485,13 @@ class TaskManager(
                         "path": f"{task.summary.get('input_dir')}/{relative_path}",
                     }
                 )
-        task.status = "ready_to_start"
+        self._set_task_status(
+            db,
+            task,
+            "ready_to_start",
+            reason="输入文件上传完成，任务已就绪",
+            source="task_manager",
+        )
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
@@ -2506,7 +2534,14 @@ class TaskManager(
         input_files = task.summary.get("input_files") or []
         if not input_files:
             raise ValidationError("没有可用的输入文件")
-        task.status = "pending"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="任务启动请求已受理，进入待调度",
+            source="task_manager",
+            stage_name=self._stage_sequence_for_task(task)[0],
+        )
         task.current_stage = self._stage_sequence_for_task(task)[0]
         task.execution_mode = None
         task.target_stage_name = None
@@ -3292,7 +3327,14 @@ class TaskManager(
             return False
         previous_status = str(task.status or "").strip()
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
-        task.status = "running"
+        self._set_task_status(
+            db,
+            task,
+            "running",
+            reason="流式尾段存在活跃子项，父任务恢复为运行态",
+            source="task_manager",
+            stage_name=active_stage_name or task.current_stage,
+        )
         task.current_stage = active_stage_name or task.current_stage
         task.finished_at = None
         task.last_error = None
@@ -3316,7 +3358,13 @@ class TaskManager(
                 takeover_result="recovered",
             )
             if not self._runtime_lease_is_active(lease):
-                task.status = "running"
+                self._repair_running_lease_invariant(
+                    db,
+                    task,
+                    reason="streaming_parent_state_recovered_without_active_tail_lease",
+                    stage_name=active_stage_name or task.current_stage,
+                    event_payload={"source": "recover_parent_state_from_tail_items"},
+                )
         self._clear_task_abnormal_reason_snapshot(db, task)
         if record_event:
             self._record_event(
@@ -3360,7 +3408,14 @@ class TaskManager(
         if active_item_count <= 0:
             return False
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
-        task.status = "pending"
+        self._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="运行实例租约失效，父任务释放并重新排队等待接管",
+            source="task_manager",
+            stage_name=active_stage_name or task.current_stage,
+        )
         task.current_stage = active_stage_name or task.current_stage
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
@@ -9208,8 +9263,56 @@ class TaskManager(
         refs: list[dict[str, str]],
         token: str | None,
     ) -> None:
-        del db, task
-        await self._downstream_ensure_refs_inactive(refs, token)
+        normalized_refs = [dict(ref) for ref in list(refs or []) if isinstance(ref, dict)]
+        for ref in normalized_refs:
+            event_item = self._event_item_for_downstream_ref(db, task, ref)
+            self._record_event(
+                db,
+                task,
+                "child_task_inactive_check_requested",
+                f"检查下游任务是否已静止: {ref.get('service')}:{ref.get('task_id')}",
+                stage_name=ref.get("stage_name"),
+                item=event_item,
+                payload={**ref, "operation": "inactive_check", "cleanup_phase": "inactive_check"},
+            )
+        try:
+            await self._downstream_ensure_refs_inactive(normalized_refs, token)
+        except Exception as exc:
+            for ref in normalized_refs:
+                event_item = self._event_item_for_downstream_ref(db, task, ref)
+                self._record_event(
+                    db,
+                    task,
+                    "child_task_inactive_check_blocked",
+                    f"下游任务仍未静止: {ref.get('service')}:{ref.get('task_id')} - {str(exc)}",
+                    stage_name=ref.get("stage_name"),
+                    item=event_item,
+                    level="warning",
+                    payload={
+                        **ref,
+                        "operation": "inactive_check",
+                        "cleanup_phase": "inactive_check",
+                        "result": "blocked",
+                        "error": str(exc),
+                    },
+                )
+            raise
+        for ref in normalized_refs:
+            event_item = self._event_item_for_downstream_ref(db, task, ref)
+            self._record_event(
+                db,
+                task,
+                "child_task_inactive_check_succeeded",
+                f"下游任务已静止，可继续清理: {ref.get('service')}:{ref.get('task_id')}",
+                stage_name=ref.get("stage_name"),
+                item=event_item,
+                payload={
+                    **ref,
+                    "operation": "inactive_check",
+                    "cleanup_phase": "inactive_check",
+                    "result": "succeeded",
+                },
+            )
 
     async def _delete_downstream_refs(
         self,
@@ -9475,7 +9578,14 @@ class TaskManager(
         task.last_error = None
         db.commit()
         if status in {"success", "partial_success"} and selection_mode == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
-            task.status = TASK_STATUS_PENDING_MODULE_CONFIRMATION
+            self._set_task_status(
+                db,
+                task,
+                TASK_STATUS_PENDING_MODULE_CONFIRMATION,
+                reason="系统分析已完成，等待人工确认模块",
+                source="task_manager",
+                stage_name=stage_run.stage_name,
+            )
             self._record_event(
                 db,
                 task,
@@ -9608,7 +9718,14 @@ class TaskManager(
                 "selected_entry_count": 0,
                 "entry_count": 0,
             }
-            task.status = TASK_STATUS_PENDING_ENTRY_CONFIRMATION
+            self._set_task_status(
+                db,
+                task,
+                TASK_STATUS_PENDING_ENTRY_CONFIRMATION,
+                reason="入口分析已完成，等待人工确认入口",
+                source="task_manager",
+                stage_name=stage_run.stage_name,
+            )
             stage_run.status = "waiting_confirmation"
             stage_run.finished_at = None
             stage_run.counts = self._stage_counts(db, stage_run)

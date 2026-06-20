@@ -13,6 +13,7 @@ from datetime import timedelta
 class TaskEventServiceStructureTests(unittest.TestCase):
     def test_task_manager_event_methods_are_bound_to_event_mixin(self):
         self.assertIs(TaskManager._record_event, TaskEventServiceMixin._record_event)
+        self.assertIs(TaskManager._set_task_status, TaskEventServiceMixin._set_task_status)
         self.assertIs(TaskManager._prepare_event_payload_for_db, TaskEventServiceMixin._prepare_event_payload_for_db)
         self.assertIs(TaskManager._load_externalized_event_payload, TaskEventServiceMixin._load_externalized_event_payload)
 
@@ -192,3 +193,63 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("binary-security-worker-pod", recorder.get("pod_name"))
         self.assertEqual("binary-security-worker-pod", recorder.get("hostname"))
         self.assertEqual("secflow-node-01", recorder.get("node_name"))
+
+    def test_set_task_status_records_structured_status_change_event(self):
+        task = BinarySecurityTask(
+            id="task-status-change",
+            project_id="p1",
+            name="timeline-status-change",
+            status="pending",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+
+        changed = self.manager._set_task_status(
+            db,
+            task,
+            "running",
+            reason="任务进入调度执行",
+            source="runtime_worker",
+            stage_name="system_analysis",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual("running", task.status)
+        self.assertEqual(1, len(db.events))
+        self.assertEqual("task_status_changed", db.events[0].event_type)
+        self.assertEqual("任务状态变更: pending -> running", db.events[0].message)
+        self.assertEqual("pending", db.events[0].payload.get("from_status"))
+        self.assertEqual("running", db.events[0].payload.get("to_status"))
+        self.assertEqual("任务进入调度执行", db.events[0].payload.get("reason"))
+        self.assertEqual("runtime_worker", db.events[0].payload.get("source"))
+
+    def test_set_task_status_skips_noop_by_default(self):
+        task = BinarySecurityTask(
+            id="task-status-noop",
+            project_id="p1",
+            name="timeline-status-noop",
+            status="pending",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+
+        changed = self.manager._set_task_status(
+            db,
+            task,
+            "pending",
+            reason="状态未变化",
+            source="task_manager",
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual([], db.events)

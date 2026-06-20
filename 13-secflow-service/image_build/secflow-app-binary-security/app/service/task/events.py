@@ -18,6 +18,50 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
+    def _set_task_status(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        new_status: str,
+        *,
+        reason: str,
+        source: str,
+        event_type: str = "task_status_changed",
+        message: str | None = None,
+        level: str = "info",
+        stage_name: str | None = None,
+        payload: dict[str, Any] | None = None,
+        operation_id: str | None = None,
+        record_event: bool = True,
+        allow_noop: bool = False,
+    ) -> bool:
+        previous_status = str(getattr(task, "status", "") or "").strip()
+        next_status = str(new_status or "").strip()
+        if not next_status:
+            return False
+        if not allow_noop and previous_status == next_status:
+            return False
+        task.status = next_status
+        if not record_event:
+            return previous_status != next_status or allow_noop
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message or f"任务状态变更: {previous_status or '-'} -> {next_status}",
+            level=level,
+            stage_name=stage_name,
+            payload={
+                "from_status": previous_status or None,
+                "to_status": next_status,
+                "reason": str(reason or "").strip() or None,
+                "source": str(source or "").strip() or None,
+                **(payload or {}),
+            },
+            operation_id=operation_id,
+        )
+        return True
+
     def _event_hostname(self: TaskManager) -> str | None:
         hostname = str(os.environ.get("HOSTNAME") or "").strip()
         if hostname:
