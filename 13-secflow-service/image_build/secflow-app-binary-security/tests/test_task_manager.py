@@ -15012,6 +15012,266 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("operation_step_succeeded", event_types)
         self.assertIn("task_requeued", event_types)
 
+    def test_run_task_operation_steps_retry_verifies_cleanup_before_requeue(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation])
+        calls = []
+
+        async def fake_prepare_retry(_db, task_arg):
+            calls.append(("cleanup", task_arg.id))
+            task_arg.cleanup_snapshot = {
+                "previous_epoch": 1,
+                "stage_sequence": ["firmware_unpack", "system_analysis"],
+                "cleanup_counts": {"stage_items_deleted": 3},
+                "cleanup_partial_failed": False,
+                "remaining_downstream_count": 0,
+                "remaining_downstream_refs": [],
+            }
+            self.manager._set_retry_plan(
+                task_arg,
+                {
+                    "mode": "retry",
+                    "cleanup_mode": "hard_reset",
+                    "cleanup_verification": {"validated": False, "issues": [{"issue": "cleanup_verification_pending"}]},
+                },
+            )
+            return ["firmware_unpack", "system_analysis"]
+
+        async def fake_verify_retry_cleanup(_db, task_arg, _operation):
+            calls.append(("verify", task_arg.id))
+            payload = {
+                "validated": True,
+                "cleanup_mode": "hard_reset",
+                "cleanup_counts": {"stage_items_deleted": 3},
+                "remaining_downstream_count": 0,
+                "remaining_downstream_refs": [],
+                "issues": [],
+            }
+            self.manager._set_retry_plan(
+                task_arg,
+                {
+                    **self.manager._retry_plan(task_arg),
+                    "cleanup_verification": payload,
+                },
+            )
+            return payload
+
+        original_prepare = self.manager._prepare_retry_task
+        original_verify = self.manager._operation_verify_retry_cleanup_state
+        original_decide = self.manager._decide_task_resume_after_stage_reset
+        try:
+            self.manager._prepare_retry_task = fake_prepare_retry
+            self.manager._operation_verify_retry_cleanup_state = fake_verify_retry_cleanup
+            self.manager._enqueue_task = lambda task_id: calls.append(("requeue", task_id))
+            self.manager._decide_task_resume_after_stage_reset = lambda *args, **kwargs: task_manager_module._TaskResumeDecision(
+                should_resume=True,
+                next_stage="firmware_unpack",
+                resume_reason="task_operation_requeue",
+                source="retry",
+                message="ok",
+                event_type="task_requeued",
+                payload={"next_stage": "firmware_unpack"},
+            )
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager._prepare_retry_task = original_prepare
+            self.manager._operation_verify_retry_cleanup_state = original_verify
+            self.manager._decide_task_resume_after_stage_reset = original_decide
+
+        self.assertEqual(
+            [("cleanup", "task1"), ("verify", "task1"), ("requeue", "task1")],
+            calls,
+        )
+        self.assertEqual("pending", task.status)
+        self.assertEqual("firmware_unpack", task.current_stage)
+        step_payload = dict(operation.step_payload or {})
+        self.assertEqual("succeeded", step_payload["collect_cleanup_plan"]["status"])
+        self.assertEqual("succeeded", step_payload["verify_cleanup_state"]["status"])
+        self.assertEqual("succeeded", step_payload["requeue_task"]["status"])
+
+    def test_run_task_operation_steps_retry_stops_when_cleanup_verification_fails(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation])
+        calls = []
+
+        async def fake_prepare_retry(_db, task_arg):
+            calls.append(("cleanup", task_arg.id))
+            task_arg.cleanup_snapshot = {
+                "previous_epoch": 1,
+                "stage_sequence": ["firmware_unpack", "system_analysis"],
+                "cleanup_counts": {"stage_items_deleted": 1},
+                "cleanup_partial_failed": False,
+                "remaining_downstream_count": 0,
+                "remaining_downstream_refs": [],
+            }
+            self.manager._set_retry_plan(
+                task_arg,
+                {
+                    "mode": "retry",
+                    "cleanup_mode": "hard_reset",
+                    "cleanup_verification": {"validated": False, "issues": [{"issue": "cleanup_verification_pending"}]},
+                },
+            )
+            return ["firmware_unpack", "system_analysis"]
+
+        async def fake_verify_retry_cleanup(_db, task_arg, _operation):
+            calls.append(("verify", task_arg.id))
+            raise ValidationError("cleanup verify failed")
+
+        original_prepare = self.manager._prepare_retry_task
+        original_verify = self.manager._operation_verify_retry_cleanup_state
+        try:
+            self.manager._prepare_retry_task = fake_prepare_retry
+            self.manager._operation_verify_retry_cleanup_state = fake_verify_retry_cleanup
+            self.manager._enqueue_task = lambda task_id: calls.append(("requeue", task_id))
+            with self.assertRaises(ValidationError):
+                asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager._prepare_retry_task = original_prepare
+            self.manager._operation_verify_retry_cleanup_state = original_verify
+
+        self.assertEqual([("cleanup", "task1"), ("verify", "task1")], calls)
+        step_payload = dict(operation.step_payload or {})
+        self.assertEqual("succeeded", step_payload["collect_cleanup_plan"]["status"])
+        self.assertEqual("failed", step_payload["verify_cleanup_state"]["status"])
+        self.assertNotIn("requeue_task", step_payload)
+
+    def test_classify_retry_downstream_strategy_forces_recreate_after_hard_reset_cleanup_verified(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "retry_plan": {
+                "cleanup_mode": "hard_reset",
+                "cleanup_verification": {"validated": True, "issues": []},
+            }
+        }
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="source_project",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-1",
+        )
+
+        strategy, observed_status = self.manager._classify_retry_downstream_strategy(
+            item,
+            task=task,
+            active_payload={"task_id": "sat-1", "status": "running"},
+        )
+
+        self.assertEqual("recreate_from_abnormal", strategy)
+        self.assertEqual("running", observed_status)
+
+    def test_collect_retry_item_actions_does_not_adopt_active_child_after_hard_reset_cleanup_verified(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "retry_plan": {
+                "cleanup_mode": "hard_reset",
+                "cleanup_verification": {"validated": True, "issues": []},
+                "retry_item_keys": [self.manager._stage_item_identity("source_project", None)],
+                "item_actions": [],
+                "affected_stages": ["system_analysis"],
+            }
+        }
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="source_project",
+            status="running",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], stage_runs=[], archive_jobs=[], state_events=[], events=[])
+
+        async def fake_active_payload(*args, **kwargs):
+            del args, kwargs
+            return {"task_id": "sat-1", "status": "running"}
+
+        original_active_payload = self.manager._active_downstream_payload
+        try:
+            self.manager._active_downstream_payload = fake_active_payload
+            actions = asyncio.run(
+                self.manager._collect_retry_item_actions(
+                    db,
+                    task,
+                    target_stage="system_analysis",
+                    token="tok",
+                )
+            )
+        finally:
+            self.manager._active_downstream_payload = original_active_payload
+
+        self.assertEqual(1, len(actions))
+        self.assertEqual("recreate_from_abnormal", actions[0]["strategy"])
+        self.assertEqual("running", actions[0]["observed_status"])
+
     def test_sync_streaming_task_tail_state_rebuilds_entry_results_without_advancing_to_dataflow_without_tail_facts(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         with tempfile.TemporaryDirectory() as tmp:

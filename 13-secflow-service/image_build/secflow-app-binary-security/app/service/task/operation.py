@@ -681,6 +681,18 @@ class TaskOperationServiceMixin:
 
     async def _prepare_retry_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> list[str]:
         cleanup_snapshot = await self._prepare_hard_restart_task(db, task)
+        self._set_retry_plan(
+            task,
+            {
+                **self._retry_plan(task),
+                "mode": "retry",
+                "cleanup_mode": "hard_reset",
+                "cleanup_verification": {
+                    "validated": False,
+                    "issues": [{"issue": "cleanup_verification_pending"}],
+                },
+            },
+        )
         return list(cleanup_snapshot.get("stage_sequence") or self._stage_sequence_for_task(task))
 
     def _build_retry_prepare_result(
@@ -709,8 +721,45 @@ class TaskOperationServiceMixin:
             "retry_item_keys": retry_item_keys,
             "item_actions": item_actions,
             "affected_stages": affected_stages,
+            "cleanup_mode": self._retry_cleanup_mode(task),
+            "cleanup_verification": dict((self._retry_plan(task).get("cleanup_verification") or {})),
             "validation": validation,
         }
+
+    async def _operation_verify_retry_cleanup_state(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        verification = self._build_hard_restart_cleanup_verification(db, task)
+        self._set_retry_plan(
+            task,
+            {
+                **self._retry_plan(task),
+                "mode": "retry",
+                "cleanup_mode": "hard_reset",
+                "cleanup_verification": verification,
+            },
+        )
+        self._update_operation_result_payload(
+            operation,
+            {"cleanup_verification": verification},
+            workspace_root=task.workspace_root,
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "retry_cleanup_verification_finished" if verification.get("validated") else "retry_cleanup_verification_failed",
+            "清空校验完成" if verification.get("validated") else "清空校验失败",
+            level="info" if verification.get("validated") else "error",
+            stage_name=operation.target_stage or task.current_stage,
+            payload=verification,
+        )
+        if not verification.get("validated"):
+            raise ValidationError("清空校验失败，禁止继续重试")
+        return verification
 
     def _retry_target_items(
         self: TaskManager,
@@ -801,7 +850,11 @@ class TaskOperationServiceMixin:
                     active_payload = await self._active_downstream_payload(task, item, token)
                 except Exception:
                     active_payload = None
-            strategy, observed_status = self._classify_retry_downstream_strategy(item, active_payload=active_payload)
+            strategy, observed_status = self._classify_retry_downstream_strategy(
+                item,
+                task=task,
+                active_payload=active_payload,
+            )
             if active_payload is None and str(item.downstream_task_id or "").strip():
                 normalized_current_status = (
                     self._map_downstream_status(str(item.status or ""))
@@ -1081,7 +1134,11 @@ class TaskOperationServiceMixin:
                             payload = await self._active_downstream_payload(task, item, self._service_token())
                         except Exception:
                             payload = None
-                    strategy, observed_status = self._classify_retry_downstream_strategy(item, active_payload=payload)
+                    strategy, observed_status = self._classify_retry_downstream_strategy(
+                        item,
+                        task=task,
+                        active_payload=payload,
+                    )
                     self._update_retry_item_action(
                         task,
                         item_id=item.id,
@@ -2978,9 +3035,13 @@ class TaskOperationServiceMixin:
                     task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                 }
                 next_step = (
-                    task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK
-                    if requeue_required
-                    else task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+                    task_manager_module.TASK_OPERATION_STEP_VERIFY_CLEANUP_STATE
+                    if requeue_required and operation.operation_type == task_manager_module.TASK_ACTION_RETRY
+                    else (
+                        task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK
+                        if requeue_required
+                        else task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+                    )
                 )
                 self._record_operation_step_finished(
                     db,
@@ -3002,7 +3063,43 @@ class TaskOperationServiceMixin:
                 if not requeue_required:
                     db.commit()
                     return
-                resume_step = task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK
+                resume_step = next_step
+
+        if resume_step == task_manager_module.TASK_OPERATION_STEP_VERIFY_CLEANUP_STATE:
+            self._record_operation_step_started(
+                db,
+                task,
+                operation,
+                step_name=task_manager_module.TASK_OPERATION_STEP_VERIFY_CLEANUP_STATE,
+                message=f"后台操作进入清空校验步骤: {operation.operation_type}",
+                stage_name=operation.target_stage or task.current_stage,
+            )
+            db.commit()
+            try:
+                payload = await self._operation_verify_retry_cleanup_state(db, task, operation)
+            except Exception as exc:
+                self._record_operation_step_failed(
+                    db,
+                    task,
+                    operation,
+                    step_name=task_manager_module.TASK_OPERATION_STEP_VERIFY_CLEANUP_STATE,
+                    error=exc,
+                    stage_name=operation.target_stage or task.current_stage,
+                )
+                db.commit()
+                raise
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=task_manager_module.TASK_OPERATION_STEP_VERIFY_CLEANUP_STATE,
+                message=f"后台操作清空校验步骤已完成: {operation.operation_type}",
+                stage_name=operation.target_stage or task.current_stage,
+                payload=payload,
+                next_step=task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK,
+            )
+            db.commit()
+            resume_step = task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK
 
         if resume_step != task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK:
             return

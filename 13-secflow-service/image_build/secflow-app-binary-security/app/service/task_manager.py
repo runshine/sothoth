@@ -363,6 +363,7 @@ TASK_PENDING_ACTIONS = {
 TASK_OPERATION_ACTIVE_STATUSES = {"requested", "accepted", "queued", "claimed", "running"}
 TASK_OPERATION_TERMINAL_STATUSES = {"succeeded", "failed", "superseded", "cancelled"}
 TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN = "collect_cleanup_plan"
+TASK_OPERATION_STEP_VERIFY_CLEANUP_STATE = "verify_cleanup_state"
 TASK_OPERATION_STEP_CANCEL_DOWNSTREAM = "cancel_downstream"
 TASK_OPERATION_STEP_DELETE_DOWNSTREAM = "delete_downstream"
 TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_ABSENT = "verify_downstream_absent"
@@ -394,6 +395,7 @@ RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL = "recreate_from_abnormal"
 RETRY_CHILD_ABNORMAL_STATUSES = {"failed", "cancelled", "downstream_missing"}
 TASK_OPERATION_SAGA_STEPS = (
     TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+    TASK_OPERATION_STEP_VERIFY_CLEANUP_STATE,
     TASK_OPERATION_STEP_SYNC_TARGET_STAGE_STATE,
     TASK_OPERATION_STEP_PREPARE_RETRY_ITEMS,
     TASK_OPERATION_STEP_CLEANUP_ABNORMAL_CHILDREN,
@@ -5895,6 +5897,21 @@ class TaskManager(
         plan = summary.get("retry_plan") or {}
         return dict(plan) if isinstance(plan, dict) else {}
 
+    def _retry_cleanup_mode(self, task: BinarySecurityTask) -> str | None:
+        plan = self._retry_plan(task)
+        mode = str(plan.get("cleanup_mode") or "").strip()
+        return mode or None
+
+    def _retry_cleanup_is_hard_reset_verified(self, task: BinarySecurityTask) -> bool:
+        plan = self._retry_plan(task)
+        verification = plan.get("cleanup_verification") or {}
+        if not isinstance(verification, dict):
+            return False
+        return (
+            str(plan.get("cleanup_mode") or "").strip() == "hard_reset"
+            and bool(verification.get("validated"))
+        )
+
     def _set_retry_plan(self, task: BinarySecurityTask, plan: dict[str, Any] | None) -> None:
         summary = dict(task.summary or {})
         if plan:
@@ -6055,6 +6072,49 @@ class TaskManager(
         stage_context = (summary.get("stage_retry_context") or {}).get(stage_name) or {}
         snapshot = stage_context.get(item_key)
         return dict(snapshot) if isinstance(snapshot, dict) else None
+
+    def _build_hard_restart_cleanup_verification(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> dict[str, Any]:
+        cleanup_snapshot = dict(task.cleanup_snapshot or {})
+        remaining_refs = [
+            dict(row)
+            for row in list(cleanup_snapshot.get("remaining_downstream_refs") or [])
+            if isinstance(row, dict)
+        ]
+        cleanup_counts = dict(cleanup_snapshot.get("cleanup_counts") or {})
+        try:
+            residue_counts = dict(self._validate_hard_restart_cleanup(db, task) or {})
+            validated = True
+            residue_error = None
+        except ValidationError as exc:
+            residue_counts = {}
+            validated = False
+            residue_error = str(exc)
+        issues: list[dict[str, Any]] = []
+        if bool(cleanup_snapshot.get("cleanup_partial_failed")):
+            issues.append(
+                {
+                    "issue": "remaining_downstream_refs",
+                    "remaining_downstream_count": int(cleanup_snapshot.get("remaining_downstream_count") or 0),
+                    "remaining_downstream_refs": remaining_refs,
+                }
+            )
+        if residue_error:
+            issues.append({"issue": "runtime_residue_detected", "message": residue_error})
+        return {
+            "validated": validated and not bool(cleanup_snapshot.get("cleanup_partial_failed")),
+            "cleanup_mode": "hard_reset",
+            "previous_epoch": cleanup_snapshot.get("previous_epoch"),
+            "stage_sequence": list(cleanup_snapshot.get("stage_sequence") or []),
+            "cleanup_counts": cleanup_counts,
+            "remaining_downstream_count": int(cleanup_snapshot.get("remaining_downstream_count") or 0),
+            "remaining_downstream_refs": remaining_refs,
+            "residue_counts": residue_counts,
+            "issues": issues,
+        }
 
     def _stage_result_keys(self, stage_name: str) -> list[str]:
         stage_name = normalize_stage_name(stage_name)
@@ -6952,12 +7012,16 @@ class TaskManager(
         self,
         item: BinarySecurityStageItem,
         *,
+        task: BinarySecurityTask | None = None,
         active_payload: dict[str, Any] | None = None,
         observed_payload: dict[str, Any] | None = None,
     ) -> tuple[str, str | None]:
+        hard_reset_verified = bool(task is not None and self._retry_cleanup_is_hard_reset_verified(task))
         if active_payload is not None:
             status = self._map_downstream_status(str(active_payload.get("status") or ""))
             if status in {"pending", "queued", "dispatching", "running"}:
+                if hard_reset_verified:
+                    return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, status
                 return RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, status
         payload = observed_payload if isinstance(observed_payload, dict) else None
         raw_status = None
@@ -6968,6 +7032,8 @@ class TaskManager(
         if mapped_status == "success":
             return RETRY_CHILD_STRATEGY_REUSE_SUCCESS, mapped_status
         if mapped_status in {"pending", "queued", "dispatching", "running"}:
+            if hard_reset_verified:
+                return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, mapped_status
             return RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, mapped_status
         if mapped_status in RETRY_CHILD_ABNORMAL_STATUSES:
             return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, mapped_status
