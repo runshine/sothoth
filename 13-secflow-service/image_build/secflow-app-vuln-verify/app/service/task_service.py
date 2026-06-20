@@ -132,13 +132,34 @@ def _normalize_concurrency(value: int | None) -> int:
     return max(1, min(raw, int(cfg.max_concurrency or 16)))
 
 
+def _materialize_raw_report(project_id: str, task_id: str, raw_report: str | None) -> Path:
+    markdown = str(raw_report or "").strip()
+    if not markdown:
+        raise ValidationError("reports_dir or raw_report is required")
+
+    task_root = app_task_root(project_id, task_id).resolve()
+    input_dir = task_root.joinpath("input").resolve()
+    if not input_dir.is_relative_to(task_root):
+        raise ValidationError("输入目录不合法")
+    input_dir.mkdir(parents=True, exist_ok=True)
+    input_dir.joinpath("raw_report.md").write_text(markdown, encoding="utf-8")
+    return input_dir
+
+
 async def create_task(db: Session, project_id: str, req: TaskCreate, operator: TokenUser | str | None) -> TaskResponse:
     task_id = validate_task_id(req.task_id) if req.task_id else generate_task_id(db, project_id)
     if db.query(VulnVerifyTask).filter(VulnVerifyTask.project_id == project_id, VulnVerifyTask.id == task_id).first():
         raise ConflictError("漏洞验证任务ID已存在")
 
-    reports_dir = ensure_path_in_project(project_id, req.reports_dir, must_be_dir=True)
     source_root = ensure_path_in_project(project_id, req.source_root, must_be_dir=True)
+    raw_report = str(req.raw_report or "").strip()
+    reports_dir_input = str(req.reports_dir or "").strip()
+    if raw_report:
+        reports_dir = _materialize_raw_report(project_id, task_id, raw_report)
+    elif reports_dir_input:
+        reports_dir = ensure_path_in_project(project_id, reports_dir_input, must_be_dir=True)
+    else:
+        raise ValidationError("reports_dir or raw_report is required")
     binary_root = ensure_path_in_project(project_id, req.binary_root, must_be_dir=True) if req.binary_root else None
     threat_path = ensure_path_in_project(project_id, req.threat_path, must_be_file=True) if req.threat_path else None
     output_dir = safe_output_dir(project_id, task_id)
