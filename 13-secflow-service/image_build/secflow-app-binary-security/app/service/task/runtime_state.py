@@ -28,6 +28,17 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeStateServiceMixin:
+    def _operation_allows_owner_claim(self: TaskManager, operation: BinarySecurityTaskOperation | None) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if operation is None:
+            return False
+        status = str(getattr(operation, "status", "") or "").strip().lower()
+        return status in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+
+    def _operation_allows_runtime_resume(self: TaskManager, operation: BinarySecurityTaskOperation | None) -> bool:
+        return not self._operation_blocks_runtime_resume(operation)
+
     def _operation_blocks_runtime_resume(self: TaskManager, operation: BinarySecurityTaskOperation | None) -> bool:
         from app.service import task_manager as task_manager_module
 

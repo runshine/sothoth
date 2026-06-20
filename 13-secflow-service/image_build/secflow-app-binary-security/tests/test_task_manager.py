@@ -32015,6 +32015,44 @@ def _test_dispatch_task_by_id_claims_ownerless_active_operation(self):
     self.assertIsNotNone(task.lease_expires_at)
 
 
+def _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-queued-cancel-op",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id=None,
+        current_operation_id="op-cancel-queued",
+        lease_expires_at=None,
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-queued",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        status="queued",
+        current_step=None,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertEqual(task.id, claimed)
+    self.assertEqual("dispatching", task.status)
+    self.assertEqual("local-worker", task.dispatcher_instance_id)
+    self.assertEqual(operation.id, task.current_operation_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+
+
 def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -32243,6 +32281,38 @@ def _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without
     db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
     supported = manager._task_row_owner_is_runtime_supported(db, task)
+
+    self.assertFalse(supported)
+
+
+def _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-cancel-no-runtime-handle",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        current_operation_id="op-cancel-queued",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-queued",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        status="queued",
+        current_step=None,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+
+    supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
 
     self.assertFalse(supported)
 
@@ -35581,10 +35651,12 @@ TaskManagerTests.test_refresh_task_status_after_sync_fails_owner_lost_child_afte
 TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
 TaskManagerTests.test_dispatch_task_by_id_releases_fake_local_owner_without_runtime = _test_dispatch_task_by_id_releases_fake_local_owner_without_runtime
 TaskManagerTests.test_dispatch_task_by_id_claims_ownerless_active_operation = _test_dispatch_task_by_id_claims_ownerless_active_operation
+TaskManagerTests.test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle = _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle
 TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _test_refresh_task_status_after_sync_clears_fake_local_owner
 TaskManagerTests.test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation = _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation
 TaskManagerTests.test_release_unsupported_task_row_owner_repairs_stale_active_operations = _test_release_unsupported_task_row_owner_repairs_stale_active_operations
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
+TaskManagerTests.test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel = _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
 TaskManagerTests.test_run_current_task_operation_stops_on_stale_task_ownership = _test_run_current_task_operation_stops_on_stale_task_ownership
 TaskManagerTests.test_run_current_task_operation_finalizes_after_requeue_owner_handoff = _test_run_current_task_operation_finalizes_after_requeue_owner_handoff

@@ -435,7 +435,12 @@ class TaskRuntimeServiceMixin:
                 .filter(task_manager_module.BinarySecurityTaskOperation.id == current_operation_id)
                 .first()
             )
-        if self._release_unsupported_task_row_owner(
+        has_active_operation = self._operation_allows_owner_claim(current_operation)
+        operation_allows_runtime_resume = bool(
+            has_active_operation and self._operation_allows_runtime_resume(current_operation)
+        )
+        operation_requires_runtime_handle = bool(has_active_operation and operation_allows_runtime_resume)
+        if operation_requires_runtime_handle and self._release_unsupported_task_row_owner(
             db,
             task,
             active_operation=current_operation,
@@ -444,18 +449,9 @@ class TaskRuntimeServiceMixin:
             db.commit()
             self._enqueue_task(task.id)
             return None
-        has_active_operation = bool(
-            current_operation is not None
-            and str(getattr(current_operation, "status", "") or "").strip().lower()
-            in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
-        )
-        operation_allows_runtime_resume = bool(
-            has_active_operation
-            and not self._operation_blocks_runtime_resume(current_operation)
-        )
         current_status = str(getattr(task, "status", "") or "").strip().lower()
         if has_active_operation and current_status:
-            if current_status != "pending":
+            if current_status != "pending" and operation_allows_runtime_resume:
                 task_manager_module.logger.info(
                     "binary-security dispatch claiming non-pending task because owner inbox work is active: "
                     "task_id=%s status=%s runtime_phase=%s current_operation_id=%s operation_status=%s dispatcher_instance_id=%s",
@@ -466,7 +462,19 @@ class TaskRuntimeServiceMixin:
                     str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
                     str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
                 )
-            if not self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation):
+            elif current_status != "pending":
+                task_manager_module.logger.info(
+                    "binary-security dispatch claiming task for control operation execution: "
+                    "task_id=%s status=%s runtime_phase=%s current_operation_id=%s operation_type=%s operation_status=%s dispatcher_instance_id=%s",
+                    task_id,
+                    current_status,
+                    self._task_runtime_phase(task),
+                    current_operation_id,
+                    str(getattr(current_operation, "operation_type", "") or "").strip() or None,
+                    str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                )
+            if operation_requires_runtime_handle and not self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation):
                 task_manager_module.logger.warning(
                     "binary-security dispatch observed active owner inbox work but task row owner is unsupported and will be reclaimed: "
                     "task_id=%s status=%s runtime_phase=%s current_operation_id=%s operation_status=%s dispatcher_instance_id=%s",
@@ -492,7 +500,7 @@ class TaskRuntimeServiceMixin:
                 and self._task_owner_runtime_supported_locally(task, active_operation=current_operation)
             ):
                 return None
-            if current_status != "pending":
+            if current_status != "pending" and not has_active_operation:
                 return None
         if (
             self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
@@ -508,9 +516,9 @@ class TaskRuntimeServiceMixin:
         if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
             return None
         current_status = str(getattr(task, "status", "") or "").strip().lower()
-        if current_status != "pending" and not operation_allows_runtime_resume:
+        if current_status != "pending" and not operation_allows_runtime_resume and not has_active_operation:
             return None
-        if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not operation_allows_runtime_resume:
+        if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not operation_allows_runtime_resume and not has_active_operation:
             return None
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
