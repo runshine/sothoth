@@ -18,6 +18,48 @@ if TYPE_CHECKING:
 
 
 class TaskArchiveServiceMixin:
+    def _archive_pending_full_retry_stage(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        stage_name: str | None = None,
+    ) -> tuple[str | None, str | None]:
+        from app.service import task_manager as task_manager_module
+
+        stage_sequence = self._stage_sequence_for_task(task)
+        if not stage_sequence:
+            return None, None
+
+        candidate_stages = (
+            [str(stage_name or "").strip()]
+            if str(stage_name or "").strip()
+            else list(stage_sequence)
+        )
+        for candidate in candidate_stages:
+            normalized_stage = task_manager_module.normalize_stage_name(candidate)
+            if normalized_stage not in stage_sequence:
+                continue
+            jobs = self._archive_jobs_for_stages(db, task.id, [normalized_stage])
+            if not jobs:
+                continue
+            has_pending_like_job = any(
+                str(getattr(job, "archive_status", "") or "").strip() in {"pending", "running", "archived", "applying"}
+                for job in jobs
+            )
+            if not has_pending_like_job:
+                continue
+            supported, reason, _, _ = self._archive_full_retry_support(
+                db,
+                task,
+                normalized_stage,
+                ignore_operation_lock=True,
+            )
+            if supported:
+                return normalized_stage, None
+            if reason:
+                return normalized_stage, reason
+        return None, None
+
     def _archive_stage_full_retry_failure_reason(self: TaskManager, stage_name: str) -> str:
         return f"{stage_name} has no authoritative successful result for archive rebuild"
 

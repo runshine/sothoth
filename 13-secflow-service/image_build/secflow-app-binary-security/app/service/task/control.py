@@ -1080,11 +1080,46 @@ class TaskControlServiceMixin:
 
         task = self._task_or_404(db, project_id, task_id)
         supported, reason, stage_name, items = self._task_retry_failed_items_support(db, task)
+        if supported and stage_name and not items:
+            operation = self._queue_task_operation(
+                db,
+                task,
+                operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+                target_stage=stage_name,
+                requested_by=task.created_by,
+                request_payload={
+                    "target_stage": stage_name,
+                    "fallback_from": task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
+                    "upgrade_reason": "archive_pending_full_retry",
+                },
+                accepted_event_type="task_retry_failed_items_archive_full_accepted",
+                accepted_message=f"检测到阶段 {stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
+            )
+            task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
+            return operation
         if not supported or not stage_name:
+            archive_stage_name, archive_reason = self._archive_pending_full_retry_stage(db, task)
+            if archive_stage_name:
+                operation = self._queue_task_operation(
+                    db,
+                    task,
+                    operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+                    target_stage=archive_stage_name,
+                    requested_by=task.created_by,
+                    request_payload={
+                        "target_stage": archive_stage_name,
+                        "fallback_from": task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
+                        "upgrade_reason": "archive_pending_full_retry",
+                    },
+                    accepted_event_type="task_retry_failed_items_archive_full_accepted",
+                    accepted_message=f"检测到阶段 {archive_stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
+                )
+                task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
+                return operation
             continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
             if not continue_supported or not continue_stage:
                 task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "rejected")
-                raise ValidationError(reason or continue_reason or "当前任务不支持重试失败项")
+                raise ValidationError(archive_reason or reason or continue_reason or "当前任务不支持重试失败项")
             operation = self._queue_task_operation(
                 db,
                 task,
@@ -1138,10 +1173,45 @@ class TaskControlServiceMixin:
 
         task = self._task_or_404(db, project_id, task_id)
         supported, reason, items = self._stage_retry_failed_items_support(db, task, stage_name)
+        if supported and not items:
+            operation = self._queue_task_operation(
+                db,
+                task,
+                operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+                target_stage=stage_name,
+                requested_by=task.created_by,
+                request_payload={
+                    "target_stage": stage_name,
+                    "requested_stage": stage_name,
+                    "fallback_from": task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+                    "upgrade_reason": "archive_pending_full_retry",
+                },
+                accepted_event_type="stage_retry_failed_items_archive_full_accepted",
+                accepted_message=f"阶段 {stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
+            )
+            return operation
         if not supported:
+            archive_stage_name, archive_reason = self._archive_pending_full_retry_stage(db, task, stage_name)
+            if archive_stage_name:
+                operation = self._queue_task_operation(
+                    db,
+                    task,
+                    operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+                    target_stage=archive_stage_name,
+                    requested_by=task.created_by,
+                    request_payload={
+                        "target_stage": archive_stage_name,
+                        "requested_stage": stage_name,
+                        "fallback_from": task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+                        "upgrade_reason": "archive_pending_full_retry",
+                    },
+                    accepted_event_type="stage_retry_failed_items_archive_full_accepted",
+                    accepted_message=f"阶段 {archive_stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
+                )
+                return operation
             continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
             if not continue_supported or not continue_stage:
-                raise ValidationError(reason or continue_reason or f"阶段 {stage_name} 不支持重试失败项")
+                raise ValidationError(archive_reason or reason or continue_reason or f"阶段 {stage_name} 不支持重试失败项")
             operation = self._queue_task_operation(
                 db,
                 task,
