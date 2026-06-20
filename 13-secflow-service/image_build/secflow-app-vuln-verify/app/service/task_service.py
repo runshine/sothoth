@@ -223,8 +223,13 @@ def build_project_stats(tasks: list[VulnVerifyTask]) -> dict:
         "unresolved_count": 0,
         "unverified_count": 0,
     }
+    # Stats must be fast and only read the persisted result_summary_json.
+    # Do not call get_task_result_summary() here: it falls back to scanning the
+    # verifier_output directory on disk for legacy tasks, which makes the stats
+    # endpoint take minutes for projects with thousands of tasks and causes the
+    # frontend project-level stats cards to time out.
     for task in tasks:
-        summary = get_task_result_summary(task)
+        summary = dict(task.result_summary or {})
         result_count = int(summary.get("result_count") or 0)
         if result_count > 0:
             totals["verified_tasks"] += 1
