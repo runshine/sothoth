@@ -2010,6 +2010,83 @@ class TaskManager(
         worker = self._operation_workers.get(normalized_operation_id)
         return bool(worker is not None and not worker.done())
 
+    def _operation_runtime_snapshot(
+        self,
+        operation: BinarySecurityTaskOperation | None,
+    ) -> dict[str, Any]:
+        if operation is None:
+            return {
+                "operation_id": None,
+                "operation_type": None,
+                "operation_status": None,
+                "current_step": None,
+                "updated_at": None,
+                "local_operation_worker_alive": False,
+                "step_updated_at": None,
+                "recent_progress": False,
+            }
+        current_step = str(getattr(operation, "current_step", "") or "").strip() or None
+        step_snapshot = self._operation_step_snapshot(operation, current_step) if current_step else {}
+        step_updated_at = step_snapshot.get("updated_at")
+        if not isinstance(step_updated_at, datetime):
+            step_updated_at = _parse_iso_datetime(step_updated_at)
+        updated_at = getattr(operation, "updated_at", None)
+        recent_progress = False
+        for candidate in (step_updated_at, updated_at):
+            age_seconds = _elapsed_seconds_since(candidate)
+            if age_seconds is not None and age_seconds <= max(30, self._task_operation_lock_heartbeat_interval_seconds() * 3):
+                recent_progress = True
+                break
+        return {
+            "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+            "operation_type": str(getattr(operation, "operation_type", "") or "").strip() or None,
+            "operation_status": str(getattr(operation, "status", "") or "").strip().lower() or None,
+            "current_step": current_step,
+            "updated_at": updated_at,
+            "local_operation_worker_alive": self._local_operation_worker_alive(getattr(operation, "id", None)),
+            "step_updated_at": step_updated_at,
+            "recent_progress": recent_progress,
+        }
+
+    def _task_has_supported_control_operation_runtime(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> bool:
+        if task is None:
+            return False
+        operation = active_operation
+        if operation is None:
+            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            if current_operation_id:
+                operation = (
+                    db.query(BinarySecurityTaskOperation)
+                    .filter(BinarySecurityTaskOperation.id == current_operation_id)
+                    .first()
+                )
+        snapshot = self._operation_runtime_snapshot(operation)
+        if snapshot["operation_status"] not in TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        if snapshot["operation_id"] != str(getattr(task, "current_operation_id", "") or "").strip():
+            return False
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
+            return False
+        if not snapshot["local_operation_worker_alive"]:
+            return False
+        if not snapshot["recent_progress"]:
+            return False
+        if snapshot["operation_type"] != TASK_ACTION_CANCEL:
+            return True
+        return snapshot["current_step"] in {
+            TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
+            TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
+            TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+            TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+        }
+
     def _task_owner_runtime_supported_locally(
         self,
         task: BinarySecurityTask | None,
@@ -2088,6 +2165,8 @@ class TaskManager(
         if not dispatcher_instance_id:
             return not has_active_operation
         if dispatcher_instance_id == str(self.instance_id or "").strip():
+            if self._task_has_supported_control_operation_runtime(db, task, active_operation=operation):
+                return True
             return self._task_owner_runtime_supported_locally(task, active_operation=operation)
         if current_status in {"dispatching", "running"}:
             dispatch_started_at = getattr(task, "dispatch_started_at", None)
@@ -2160,6 +2239,10 @@ class TaskManager(
                 "current_operation_id": current_operation_id,
                 "previous_dispatcher_instance_id": previous_dispatcher_instance_id,
                 "released_by_instance_id": str(self.instance_id or "").strip() or None,
+                "operation_runtime": self._operation_runtime_snapshot(active_operation),
+                "local_task_runtime_handle_alive": self._has_local_task_execution_owner(task.id),
+                "local_streaming_stage_worker_alive": self._task_has_active_streaming_stage_workers(task.id),
+                "active_runtime_lease_owner": active_runtime_lease_owner,
             },
         )
         return True

@@ -23,6 +23,19 @@ if TYPE_CHECKING:
 
 
 class TaskLifecycleServiceMixin:
+    def _should_defer_stale_operation_release(self: TaskManager, db: Session, task, operation) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if operation is None:
+            return False
+        if str(getattr(operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_CANCEL:
+            return False
+        if str(getattr(task, "current_operation_id", "") or "").strip() != str(getattr(operation, "id", "") or "").strip():
+            return False
+        if not self._task_has_supported_control_operation_runtime(db, task, active_operation=operation):
+            return False
+        return True
+
     def _requeue_stale_operations(self: TaskManager, db: Session) -> bool:
         from app.service import task_manager as task_manager_module
 
@@ -49,6 +62,21 @@ class TaskLifecycleServiceMixin:
                 continue
             if self._reconcile_stale_task_operation(db, task, operation):
                 changed = True
+                continue
+            if self._should_defer_stale_operation_release(db, task, operation):
+                self._record_event(
+                    db,
+                    task,
+                    "task_owner_release_deferred_for_active_cancel_finalize",
+                    "检测到取消收尾窗口仍由当前 control operation 正常推进，本次不释放 owner",
+                    level="info",
+                    stage_name=task.current_stage,
+                    payload={
+                        "reason_code": "cancel_finalize_window_runtime_supported",
+                        "current_operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                        "operation_runtime": self._operation_runtime_snapshot(operation),
+                    },
+                )
                 continue
             if self._task_row_owner_is_runtime_supported(db, task, active_operation=operation):
                 continue
