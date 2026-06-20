@@ -470,34 +470,39 @@ class TaskReducerServiceMixin:
     async def _apply_state_event_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
         from app.service import task_manager as task_manager_module
 
-        payload = dict(event.payload or {})
-        if event.event_type == "archive_job_copied":
-            await self._apply_archive_job_status_locked(
-                db,
-                event.archive_job_id or "",
-                payload.get("archive_root"),
-                state_event_id=event.id,
-            )
-            return
-        if event.event_type == "archive_job_copy_failed":
-            self._apply_archive_job_copy_failed_locked(db, event)
-            return
-        if event.event_type in {"downstream_status_observed", "downstream_terminal_observed"}:
-            await self._apply_downstream_status_event_locked(db, event)
-            return
-        if event.event_type == "stage_worker_terminal_observed":
-            await self._apply_stage_worker_terminal_event_locked(db, event)
-            return
-        if event.event_type == "task_execution_failed":
-            await self._apply_task_execution_failed_locked(db, event)
-            return
-        if event.event_type == "stage_worker_start_requested":
-            self._apply_stage_worker_start_requested_locked(db, event)
-            return
-        if event.event_type == "manual_policy_update_requested":
-            self._apply_manual_policy_update_requested_locked(db, event)
-            return
-        task_manager_module.logger.info("binary-security state reducer ignored event type: %s", event.event_type)
+        previous_origin = getattr(self, "_active_timeline_origin_state_event", None)
+        self._active_timeline_origin_state_event = event
+        try:
+            payload = dict(event.payload or {})
+            if event.event_type == "archive_job_copied":
+                await self._apply_archive_job_status_locked(
+                    db,
+                    event.archive_job_id or "",
+                    payload.get("archive_root"),
+                    state_event_id=event.id,
+                )
+                return
+            if event.event_type == "archive_job_copy_failed":
+                self._apply_archive_job_copy_failed_locked(db, event)
+                return
+            if event.event_type in {"downstream_status_observed", "downstream_terminal_observed"}:
+                await self._apply_downstream_status_event_locked(db, event)
+                return
+            if event.event_type == "stage_worker_terminal_observed":
+                await self._apply_stage_worker_terminal_event_locked(db, event)
+                return
+            if event.event_type == "task_execution_failed":
+                await self._apply_task_execution_failed_locked(db, event)
+                return
+            if event.event_type == "stage_worker_start_requested":
+                self._apply_stage_worker_start_requested_locked(db, event)
+                return
+            if event.event_type == "manual_policy_update_requested":
+                self._apply_manual_policy_update_requested_locked(db, event)
+                return
+            task_manager_module.logger.info("binary-security state reducer ignored event type: %s", event.event_type)
+        finally:
+            self._active_timeline_origin_state_event = previous_origin
 
     async def _apply_downstream_status_event_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
         from app.service import task_manager as task_manager_module

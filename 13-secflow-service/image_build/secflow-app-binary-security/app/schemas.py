@@ -691,6 +691,16 @@ class BinarySecurityTaskEventResponse(BaseModel):
     event_type: str
     message: str
     payload: dict[str, Any] = Field(default_factory=dict)
+    recorder_instance_id: Optional[str] = None
+    recorder_hostname: Optional[str] = None
+    recorder_pod_name: Optional[str] = None
+    recorder_node_name: Optional[str] = None
+    recorder_role: Optional[str] = None
+    origin_instance_id: Optional[str] = None
+    origin_hostname: Optional[str] = None
+    origin_pod_name: Optional[str] = None
+    origin_node_name: Optional[str] = None
+    origin_role: Optional[str] = None
     compressed: bool = False
     repeat_count: int = 1
     created_at: datetime

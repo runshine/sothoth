@@ -186,6 +186,20 @@ CONTROL_OPERATION_SUPERSEDED_TOTAL = Counter(
     "Total control-plane task operations superseded by another operation.",
     labelnames=("operation_type",),
 )
+CONTROL_OPERATION_STALE_TOTAL = Counter(
+    "secflow_binary_security_task_operations_stale_total",
+    "Total stale non-terminal control-plane task operations detected by operation type.",
+    labelnames=("operation_type",),
+)
+CONTROL_OPERATION_AUTO_RECONCILED_TOTAL = Counter(
+    "secflow_binary_security_task_operations_auto_reconciled_total",
+    "Total stale control-plane task operations auto-reconciled by type and result.",
+    labelnames=("operation_type", "result"),
+)
+CONTROL_OPERATION_STUCK_SECONDS = Gauge(
+    "secflow_binary_security_task_current_operation_stuck_seconds",
+    "Observed age in seconds of the current stale non-terminal task operation.",
+)
 
 ARCHIVE_ACTIONS_TOTAL = Counter(
     "secflow_binary_security_archive_actions_total",
@@ -589,6 +603,21 @@ def observe_control_operation_step_retry(*, operation_type: str, step: str) -> N
 
 def observe_control_operation_superseded(operation_type: str) -> None:
     CONTROL_OPERATION_SUPERSEDED_TOTAL.labels(operation_type=str(operation_type or "unknown")).inc()
+
+
+def observe_control_operation_stale(operation_type: str, *, age_seconds: float | None = None) -> None:
+    CONTROL_OPERATION_STALE_TOTAL.labels(operation_type=str(operation_type or "unknown")).inc()
+    if age_seconds is not None:
+        CONTROL_OPERATION_STUCK_SECONDS.set(max(0.0, float(age_seconds)))
+
+
+def observe_control_operation_auto_reconciled(operation_type: str, result: str, *, age_seconds: float | None = None) -> None:
+    CONTROL_OPERATION_AUTO_RECONCILED_TOTAL.labels(
+        operation_type=str(operation_type or "unknown"),
+        result=str(result or "unknown"),
+    ).inc()
+    if age_seconds is not None:
+        CONTROL_OPERATION_STUCK_SECONDS.set(max(0.0, float(age_seconds)))
 
 
 def observe_task_lifecycle(event: str, *, status: str, task_type: str) -> None:

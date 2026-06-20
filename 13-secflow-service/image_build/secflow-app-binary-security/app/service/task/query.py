@@ -540,7 +540,17 @@ class TaskQueryServiceMixin:
                     level=event.level,
                     event_type=event.event_type,
                     message=self._timeline_event_display_message(event),
-                    payload=getattr(event, "_timeline_payload", event.payload),
+                    payload=self._timeline_response_payload(event),
+                    recorder_instance_id=self._timeline_recorder_value(event, "instance_id"),
+                    recorder_hostname=self._timeline_recorder_value(event, "hostname"),
+                    recorder_pod_name=self._timeline_recorder_value(event, "pod_name"),
+                    recorder_node_name=self._timeline_recorder_value(event, "node_name"),
+                    recorder_role=self._timeline_recorder_value(event, "role"),
+                    origin_instance_id=self._timeline_origin_value(event, "emitted_by_instance_id"),
+                    origin_hostname=self._timeline_origin_value(event, "emitted_by_hostname"),
+                    origin_pod_name=self._timeline_origin_value(event, "emitted_by_pod_name"),
+                    origin_node_name=self._timeline_origin_value(event, "emitted_by_node_name"),
+                    origin_role=self._timeline_origin_value(event, "emitted_by_role"),
                     compressed=bool(getattr(event, "_timeline_compressed", False)),
                     repeat_count=int(getattr(event, "_timeline_repeat_count", 1) or 1),
                     created_at=event.created_at,
@@ -548,6 +558,21 @@ class TaskQueryServiceMixin:
                 for event in timeline_events
             ],
         )
+
+    def _timeline_response_payload(self: TaskManager, event: BinarySecurityEvent) -> dict[str, Any]:
+        return getattr(event, "_timeline_payload", event.payload)
+
+    def _timeline_recorder_value(self: TaskManager, event: BinarySecurityEvent, key: str) -> str | None:
+        payload = dict(self._timeline_response_payload(event) or {})
+        recorder = dict(payload.get("recorder") or {})
+        value = str(recorder.get(key) or "").strip()
+        return value or None
+
+    def _timeline_origin_value(self: TaskManager, event: BinarySecurityEvent, key: str) -> str | None:
+        payload = dict(self._timeline_response_payload(event) or {})
+        origin = dict(payload.get("event_origin") or {})
+        value = str(origin.get(key) or "").strip()
+        return value or None
 
     def _compress_timeline_events(self: TaskManager, events: list[BinarySecurityEvent]) -> list[BinarySecurityEvent]:
         compressed: list[BinarySecurityEvent] = []
@@ -609,6 +634,8 @@ class TaskQueryServiceMixin:
             return False
         left_payload = left.payload or {}
         right_payload = right.payload or {}
+        left_recorder = dict(left_payload.get("recorder") or {})
+        right_recorder = dict(right_payload.get("recorder") or {})
         return (
             str(left.stage_name or "") == str(right.stage_name or "")
             and str(left.item_id or "") == str(right.item_id or "")
@@ -624,6 +651,9 @@ class TaskQueryServiceMixin:
             and str(left_payload.get("recovery_action") or "") == str(right_payload.get("recovery_action") or "")
             and str(left_payload.get("task_execution_token") or "") == str(right_payload.get("task_execution_token") or "")
             and str(left_payload.get("dispatcher_instance_id") or "") == str(right_payload.get("dispatcher_instance_id") or "")
+            and str(left_recorder.get("instance_id") or "") == str(right_recorder.get("instance_id") or "")
+            and str(left_recorder.get("pod_name") or left_recorder.get("hostname") or "") == str(right_recorder.get("pod_name") or right_recorder.get("hostname") or "")
+            and str(left_recorder.get("role") or "") == str(right_recorder.get("role") or "")
         )
 
     def get_operations(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperationPageResponse:

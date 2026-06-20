@@ -369,13 +369,14 @@ class _RouteManagerStub:
         project_id,
         status=None,
         task_type=None,
+        pipeline_profile=None,
         search=None,
         sort_by="created_at",
         sort_order="desc",
         page=1,
         page_size=50,
     ):
-        self.calls.append(("list_tasks", db, project_id, status, task_type, search, sort_by, sort_order, page, page_size))
+        self.calls.append(("list_tasks", db, project_id, status, task_type, pipeline_profile, search, sort_by, sort_order, page, page_size))
         return BinarySecurityTaskListResponse(
             total=1,
             page=page,
@@ -467,6 +468,64 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual("task_running", payload["manual_operation_state"]["blocking_code"])
         self.assertEqual(("get_task_detail", fake_db, "p1", "t1"), manager.calls[0])
 
+    def test_get_task_detail_route_preserves_degraded_manual_operation_state(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        def _degraded_detail(db, project_id, task_id):
+            manager.calls.append(("get_task_detail", db, project_id, task_id))
+            return BinarySecurityTaskDetailResponse(
+                id=task_id,
+                project_id=project_id,
+                task_type="source",
+                name="stale-op-task",
+                status="pending",
+                queue_state="idle",
+                current_stage="entry_analysis",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root="/w",
+                stage_summaries=[
+                    BinarySecurityStageSummary(
+                        stage_name="entry_analysis",
+                        sequence_no=2,
+                        status="failed",
+                    )
+                ],
+                manual_operation_state={
+                    "overall": "degraded",
+                    "blocking_code": "stale_operation_finalize_pending",
+                    "blocking_reason": "后台重试已生效，操作收口滞后，系统正在自动修复",
+                    "operation_in_progress": False,
+                    "operation_stale": True,
+                    "operation_reconcile_pending": True,
+                    "requeue_applied": True,
+                    "auto_reconcile_candidate": True,
+                    "operation_type": "retry_stage_full",
+                },
+                policy={"pipeline_mode": "mixed_streaming"},
+            )
+
+        manager.get_task_detail = _degraded_detail
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("degraded", payload["manual_operation_state"]["overall"])
+        self.assertEqual(
+            "stale_operation_finalize_pending",
+            payload["manual_operation_state"]["blocking_code"],
+        )
+        self.assertTrue(payload["manual_operation_state"]["operation_stale"])
+        self.assertTrue(payload["manual_operation_state"]["requeue_applied"])
+        self.assertEqual(("get_task_detail", fake_db, "p1", "t1"), manager.calls[0])
+
     def test_list_tasks_route_preserves_filters_and_pagination(self):
         app, fake_db = self._build_client()
         manager = _RouteManagerStub()
@@ -485,7 +544,92 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(20, payload["page_size"])
         self.assertEqual("task_running", payload["items"][0]["manual_operation_state"]["blocking_code"])
         self.assertEqual(
-            ("list_tasks", fake_db, "p1", "running", "source", None, "created_at", "desc", 2, 20),
+            ("list_tasks", fake_db, "p1", "running", "source", None, None, "created_at", "desc", 2, 20),
+            manager.calls[0],
+        )
+
+    def test_list_tasks_route_preserves_degraded_manual_operation_state(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        def _degraded_list(
+            db,
+            project_id,
+            status=None,
+            task_type=None,
+            pipeline_profile=None,
+            search=None,
+            sort_by="created_at",
+            sort_order="desc",
+            page=1,
+            page_size=50,
+        ):
+            manager.calls.append(
+                ("list_tasks", db, project_id, status, task_type, pipeline_profile, search, sort_by, sort_order, page, page_size)
+            )
+            return BinarySecurityTaskListResponse(
+                total=1,
+                page=page,
+                page_size=page_size,
+                total_pages=1,
+                running_count=0,
+                queued_count=1,
+                max_concurrent_tasks=12,
+                project_stats=BinarySecurityProjectStats(total=1, running=0),
+                project_stage_aggregates=[],
+                queue_runtime={"last_reconcile_at": None},
+                items=[
+                    BinarySecurityTaskResponse(
+                        id="t-list-1",
+                        project_id=project_id,
+                        task_type=task_type or "source",
+                        name="list-task",
+                        status="pending",
+                        queue_state="idle",
+                        current_stage="entry_analysis",
+                        firmware_path="/src",
+                        stage_summaries=[
+                            BinarySecurityStageSummary(
+                                stage_name="entry_analysis",
+                                sequence_no=2,
+                                status="failed",
+                            )
+                        ],
+                        manual_operation_state={
+                            "overall": "degraded",
+                            "blocking_code": "stale_operation_finalize_pending",
+                            "operation_in_progress": False,
+                            "operation_stale": True,
+                            "operation_reconcile_pending": True,
+                            "requeue_applied": True,
+                            "auto_reconcile_candidate": True,
+                            "operation_type": "retry_failed_items",
+                        },
+                    )
+                ],
+            )
+
+        manager.list_tasks = _degraded_list
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks",
+                    params={"task_type": "source", "status": "pending"},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("degraded", payload["items"][0]["manual_operation_state"]["overall"])
+        self.assertEqual(
+            "stale_operation_finalize_pending",
+            payload["items"][0]["manual_operation_state"]["blocking_code"],
+        )
+        self.assertTrue(payload["items"][0]["manual_operation_state"]["operation_stale"])
+        self.assertTrue(payload["items"][0]["manual_operation_state"]["requeue_applied"])
+        self.assertEqual(
+            ("list_tasks", fake_db, "p1", "pending", "source", None, None, "created_at", "desc", 1, 50),
             manager.calls[0],
         )
 

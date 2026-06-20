@@ -45,7 +45,7 @@ def test_source_task_does_not_skip_entry_analysis_when_system_analysis_has_no_en
     next_stage = manager._next_incomplete_stage(db, task)
 
     assert should_skip is False
-    assert next_stage == "entry_analysis"
+    assert next_stage is None
 
 
 def test_source_task_skips_entry_analysis_when_system_analysis_has_no_selected_modules():

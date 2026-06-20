@@ -68,9 +68,11 @@ from app.observability import (
     observe_archive_duration,
     observe_archive_reclaim,
     observe_control_operation,
+    observe_control_operation_auto_reconciled,
     observe_control_operation_duration,
     observe_control_operation_lease_lost,
     observe_control_operation_step_retry,
+    observe_control_operation_stale,
     observe_control_operation_superseded,
     observe_archive_job_statuses,
     observe_downstream_reconcile_observation,
@@ -4464,6 +4466,20 @@ class TaskManager(
         payload: dict[str, Any] | None = None,
         task: BinarySecurityTask | None = None,
     ) -> BinarySecurityStateEvent | None:
+        normalized_payload = dict(payload or {})
+        emitted_by = dict(normalized_payload.get("emitted_by") or {})
+        emitted_by.update(
+            {
+                "service": "binary-security",
+                "role": self._event_runtime_role(),
+                "instance_id": str(self.instance_id or "").strip() or None,
+                "hostname": self._event_hostname(),
+                "pod_name": self._event_pod_name(),
+                "node_name": self._event_node_name(),
+            }
+        )
+        normalized_payload["emitted_by"] = emitted_by
+        normalized_payload.setdefault("runtime_role", self._event_runtime_role())
         event = BinarySecurityStateEvent(
             id=f"sev_{uuid.uuid4().hex[:24]}",
             task_id=task_id,
@@ -4483,7 +4499,7 @@ class TaskManager(
             event_id=event.id,
             event_type=event_type,
             stage_name=stage_name,
-            payload=payload or {},
+            payload=normalized_payload,
             state_event=True,
             task_id=task_id,
             project_id=project_id,

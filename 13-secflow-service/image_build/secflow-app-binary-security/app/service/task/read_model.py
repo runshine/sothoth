@@ -25,6 +25,114 @@ logger = logging.getLogger(__name__)
 
 
 class TaskReadModelServiceMixin:
+    def _manual_operation_state_from_active_operation(
+        self: TaskManager,
+        task,
+        active_operation,
+    ) -> dict[str, Any]:
+        result_payload = dict(active_operation.result_payload or {})
+        request_payload = dict(active_operation.request_payload or {})
+        fallback_from = self._string_or_none(request_payload.get("fallback_from"))
+        requested_stage = self._string_or_none(request_payload.get("requested_stage"))
+        item_actions = [dict(row) for row in list(result_payload.get("item_actions") or []) if isinstance(row, dict)]
+        validation = dict(result_payload.get("validation") or {})
+        requeue = dict(result_payload.get("requeue") or {})
+        cleanup_result = dict(result_payload.get("cleanup_result") or {})
+        downstream_cleanup_results = [
+            dict(row)
+            for row in list(cleanup_result.get("downstream_cleanup_results") or result_payload.get("downstream_cleanup_results") or [])
+            if isinstance(row, dict)
+        ]
+        downstream_cleanup_blocking_refs = [
+            dict(row)
+            for row in list(cleanup_result.get("downstream_cleanup_blocking_refs") or result_payload.get("downstream_cleanup_blocking_refs") or [])
+            if isinstance(row, dict)
+        ]
+        downstream_cleanup_deferred_refs = [
+            dict(row)
+            for row in list(cleanup_result.get("downstream_cleanup_deferred_refs") or result_payload.get("downstream_cleanup_deferred_refs") or [])
+            if isinstance(row, dict)
+        ]
+        cleanup_partial_failed = bool(cleanup_result.get("cleanup_partial_failed")) or bool(downstream_cleanup_deferred_refs)
+        task_owner = str(task.dispatcher_instance_id or "").strip() or None
+        age_seconds = self._task_operation_age_seconds(active_operation)
+        is_stale = bool(age_seconds is not None and age_seconds >= float(self._operation_stale_threshold_seconds()))
+        requeue_applied = bool(self._operation_requeue_applied(task, active_operation))
+        auto_reconcile_candidate = bool(
+            is_stale
+            and str(getattr(active_operation, "operation_type", "") or "").strip() in self._operation_requeue_family_types()
+        )
+        if requeue_applied and is_stale:
+            overall = "degraded"
+            blocking_code = "stale_operation_finalize_pending"
+            blocking_reason = "后台重试已生效，操作收口滞后，系统正在自动修复"
+            summary = blocking_reason
+        elif is_stale:
+            overall = "blocked"
+            blocking_code = "operation_stalled"
+            blocking_reason = f"当前任务后台操作已停滞: {active_operation.operation_type}"
+            summary = blocking_reason
+        else:
+            overall = "in_progress"
+            blocking_code = "task_operation_in_progress"
+            blocking_reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
+            summary = blocking_reason
+        return {
+            "overall": overall,
+            "summary": summary,
+            "blocking_code": blocking_code,
+            "blocking_reason": blocking_reason,
+            "operation_in_progress": not is_stale,
+            "operation_stale": is_stale,
+            "operation_reconcile_pending": bool(is_stale),
+            "requeue_applied": requeue_applied,
+            "auto_reconcile_candidate": auto_reconcile_candidate,
+            "operation_id": active_operation.id,
+            "operation_type": active_operation.operation_type,
+            "requested_operation_type": fallback_from or active_operation.operation_type,
+            "operation_status": active_operation.status,
+            "operation_owner": task_owner,
+            "operation_owner_model": "task_lease_owner" if task_owner else "owner_unknown",
+            "operation_started_at": task_shared._isoformat_or_none(active_operation.started_at),
+            "operation_updated_at": task_shared._isoformat_or_none(active_operation.updated_at),
+            "operation_age_seconds": None if age_seconds is None else round(float(age_seconds), 3),
+            "current_step": active_operation.current_step,
+            "target_stage": active_operation.target_stage,
+            "requested_stage": requested_stage or active_operation.target_stage,
+            "fallback_from": fallback_from,
+            "item_actions": item_actions,
+            "item_actions_count": len(item_actions),
+            "validation": validation,
+            "issues": list(validation.get("issues") or []),
+            "requeue": requeue,
+            "error_code": active_operation.error_code,
+            "error_message": active_operation.error_message,
+            "downstream_cleanup_results": downstream_cleanup_results,
+            "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
+            "downstream_cleanup_deferred_refs": downstream_cleanup_deferred_refs,
+            "downstream_cleanup_result_count": len(downstream_cleanup_results),
+            "downstream_cleanup_blocking_count": len(downstream_cleanup_blocking_refs),
+            "downstream_cleanup_deferred_count": len(downstream_cleanup_deferred_refs),
+            "cleanup_partial_failed": cleanup_partial_failed,
+            "downstream_cleanup_warning_summary": (
+                f"检测到 {len(downstream_cleanup_deferred_refs)} 个历史删除遗留引用，系统正在尝试恢复清理"
+                if downstream_cleanup_deferred_refs else None
+            ),
+            "can_cancel": False,
+            "can_continue": False,
+            "can_retry": False,
+            "can_retry_failed_items": False,
+            "can_retry_stage": False,
+            "can_retry_stage_failed_items": False,
+            "can_retry_stage_full": False,
+            "can_retry_archive": False,
+            "can_retry_archive_failed_items": False,
+            "can_retry_archive_full": False,
+            "can_delete": False,
+            "can_edit_policy": False,
+            "can_confirm_modules": False,
+        }
+
     def _active_reconcile_stage_name(self: TaskManager, task) -> str | None:
         from app.service import task_manager as task_manager_module
 
@@ -2947,34 +3055,7 @@ class TaskReadModelServiceMixin:
         from app.service import task_manager as task_manager_module
 
         if active_operation is not None:
-            reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
-            task_owner = str(task.dispatcher_instance_id or "").strip() or None
-            return {
-                "overall": "in_progress",
-                "summary": reason,
-                "blocking_code": "task_operation_in_progress",
-                "blocking_reason": reason,
-                "operation_in_progress": True,
-                "operation_id": active_operation.id,
-                "operation_type": active_operation.operation_type,
-                "operation_status": active_operation.status,
-                "operation_owner": task_owner,
-                "operation_owner_model": "task_lease_owner" if task_owner else "owner_unknown",
-                "operation_started_at": task_shared._isoformat_or_none(active_operation.started_at),
-                "can_cancel": False,
-                "can_continue": False,
-                "can_retry": False,
-                "can_retry_failed_items": False,
-                "can_retry_stage": False,
-                "can_retry_stage_failed_items": False,
-                "can_retry_stage_full": False,
-                "can_retry_archive": False,
-                "can_retry_archive_failed_items": False,
-                "can_retry_archive_full": False,
-                "can_delete": False,
-                "can_edit_policy": False,
-                "can_confirm_modules": False,
-            }
+            return self._manual_operation_state_from_active_operation(task, active_operation)
         running_statuses = {"pending", "dispatching", "running"}
         running = str(task.status or "").strip() in running_statuses
         has_failed_stage = any(summary.status in {"failed", "downstream_missing", "cancelled"} for summary in stage_summaries)
@@ -3098,81 +3179,7 @@ class TaskReadModelServiceMixin:
 
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
-            blocking_reason = f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
-            task_owner = str(task.dispatcher_instance_id or "").strip() or None
-            request_payload = dict(active_operation.request_payload or {})
-            fallback_from = self._string_or_none(request_payload.get("fallback_from"))
-            requested_stage = self._string_or_none(request_payload.get("requested_stage"))
-            result_payload = dict(active_operation.result_payload or {})
-            item_actions = [dict(row) for row in list(result_payload.get("item_actions") or []) if isinstance(row, dict)]
-            validation = dict(result_payload.get("validation") or {})
-            requeue = dict(result_payload.get("requeue") or {})
-            cleanup_result = dict(result_payload.get("cleanup_result") or {})
-            downstream_cleanup_results = [
-                dict(row)
-                for row in list(cleanup_result.get("downstream_cleanup_results") or result_payload.get("downstream_cleanup_results") or [])
-                if isinstance(row, dict)
-            ]
-            downstream_cleanup_blocking_refs = [
-                dict(row)
-                for row in list(cleanup_result.get("downstream_cleanup_blocking_refs") or result_payload.get("downstream_cleanup_blocking_refs") or [])
-                if isinstance(row, dict)
-            ]
-            downstream_cleanup_deferred_refs = [
-                dict(row)
-                for row in list(cleanup_result.get("downstream_cleanup_deferred_refs") or result_payload.get("downstream_cleanup_deferred_refs") or [])
-                if isinstance(row, dict)
-            ]
-            cleanup_partial_failed = bool(cleanup_result.get("cleanup_partial_failed")) or bool(downstream_cleanup_deferred_refs)
-            return {
-                "overall": "in_progress",
-                "summary": blocking_reason,
-                "blocking_code": "task_operation_in_progress",
-                "blocking_reason": blocking_reason,
-                "operation_in_progress": True,
-                "operation_id": active_operation.id,
-                "operation_type": active_operation.operation_type,
-                "requested_operation_type": fallback_from or active_operation.operation_type,
-                "operation_status": active_operation.status,
-                "operation_owner": task_owner,
-                "operation_owner_model": "task_lease_owner" if task_owner else "owner_unknown",
-                "operation_started_at": task_shared._isoformat_or_none(active_operation.started_at),
-                "current_step": active_operation.current_step,
-                "target_stage": active_operation.target_stage,
-                "requested_stage": requested_stage or active_operation.target_stage,
-                "fallback_from": fallback_from,
-                "item_actions": item_actions,
-                "item_actions_count": len(item_actions),
-                "validation": validation,
-                "issues": list(validation.get("issues") or []),
-                "requeue": requeue,
-                "error_code": active_operation.error_code,
-                "error_message": active_operation.error_message,
-                "downstream_cleanup_results": downstream_cleanup_results,
-                "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
-                "downstream_cleanup_deferred_refs": downstream_cleanup_deferred_refs,
-                "downstream_cleanup_result_count": len(downstream_cleanup_results),
-                "downstream_cleanup_blocking_count": len(downstream_cleanup_blocking_refs),
-                "downstream_cleanup_deferred_count": len(downstream_cleanup_deferred_refs),
-                "cleanup_partial_failed": cleanup_partial_failed,
-                "downstream_cleanup_warning_summary": (
-                    f"检测到 {len(downstream_cleanup_deferred_refs)} 个历史删除遗留引用，系统正在尝试恢复清理"
-                    if downstream_cleanup_deferred_refs else None
-                ),
-                "can_cancel": False,
-                "can_continue": False,
-                "can_retry": False,
-                "can_retry_failed_items": False,
-                "can_retry_stage": False,
-                "can_retry_stage_failed_items": False,
-                "can_retry_stage_full": False,
-                "can_retry_archive": False,
-                "can_retry_archive_failed_items": False,
-                "can_retry_archive_full": False,
-                "can_delete": False,
-                "can_edit_policy": False,
-                "can_confirm_modules": False,
-            }
+            return self._manual_operation_state_from_active_operation(task, active_operation)
         has_stage_retry = any(bool(summary.retry_full_supported) for summary in stage_summaries)
         has_stage_retry_failed = any(bool(summary.retry_failed_supported) for summary in stage_summaries)
         has_item_level_stage_retry_failed = self._has_retryable_failed_stage_items(db, task)

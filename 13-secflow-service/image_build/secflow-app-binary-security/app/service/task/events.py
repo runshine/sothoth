@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -16,6 +18,107 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
+    def _event_hostname(self: TaskManager) -> str | None:
+        hostname = str(os.environ.get("HOSTNAME") or "").strip()
+        if hostname:
+            return hostname
+        try:
+            resolved = str(socket.gethostname() or "").strip()
+        except Exception:
+            resolved = ""
+        return resolved or None
+
+    def _event_pod_name(self: TaskManager) -> str | None:
+        pod_name = str(os.environ.get("POD_NAME") or "").strip()
+        if pod_name:
+            return pod_name
+        return self._event_hostname()
+
+    def _event_node_name(self: TaskManager) -> str | None:
+        node_name = str(os.environ.get("NODE_NAME") or "").strip()
+        return node_name or None
+
+    def _event_runtime_role(self: TaskManager) -> str:
+        normalized = str(self._service_role() or "").strip().lower()
+        if normalized == "api":
+            return "api"
+        if normalized == "reducer":
+            return "reducer"
+        if normalized == "worker":
+            return "worker"
+        return "worker"
+
+    def _build_event_recorder_metadata(
+        self: TaskManager,
+        *,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_role = str(role or "").strip().lower() or self._event_runtime_role()
+        return {
+            "service": "binary-security",
+            "role": normalized_role,
+            "instance_id": str(self.instance_id or "").strip() or None,
+            "hostname": self._event_hostname(),
+            "pod_name": self._event_pod_name(),
+            "node_name": self._event_node_name(),
+        }
+
+    def _merge_event_recorder_metadata(
+        self: TaskManager,
+        payload: dict[str, Any] | None,
+        *,
+        role: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_payload = dict(payload or {})
+        existing = normalized_payload.get("recorder")
+        normalized_payload["recorder"] = {
+            **(existing if isinstance(existing, dict) else {}),
+            **self._build_event_recorder_metadata(role=role),
+        }
+        return normalized_payload
+
+    def _build_event_origin_metadata_from_state_event(
+        self: TaskManager,
+        state_event: Any | None,
+    ) -> dict[str, Any] | None:
+        if state_event is None:
+            return None
+        payload = dict(getattr(state_event, "payload", None) or {})
+        emitted_by = dict(payload.get("emitted_by") or {})
+        origin = {
+            "kind": "state_event",
+            "state_event_id": str(getattr(state_event, "id", "") or "").strip() or None,
+            "emitted_by_instance_id": str(emitted_by.get("instance_id") or "").strip() or None,
+            "emitted_by_hostname": str(emitted_by.get("hostname") or "").strip() or None,
+            "emitted_by_pod_name": str(emitted_by.get("pod_name") or "").strip() or None,
+            "emitted_by_node_name": str(emitted_by.get("node_name") or "").strip() or None,
+            "emitted_by_role": str(emitted_by.get("role") or payload.get("runtime_role") or "worker").strip().lower() or "worker",
+            "processed_by_instance_id": str(self.instance_id or "").strip() or None,
+            "processed_by_hostname": self._event_hostname(),
+            "processed_by_pod_name": self._event_pod_name(),
+            "processed_by_node_name": self._event_node_name(),
+            "processed_by_role": "reducer" if self._is_reducer_role() else self._event_runtime_role(),
+        }
+        meaningful = {key: value for key, value in origin.items() if key != "kind" and value}
+        return origin if meaningful else None
+
+    def _merge_event_origin_metadata(
+        self: TaskManager,
+        payload: dict[str, Any] | None,
+        *,
+        state_event: Any | None,
+    ) -> dict[str, Any]:
+        normalized_payload = dict(payload or {})
+        origin = self._build_event_origin_metadata_from_state_event(state_event)
+        if not origin:
+            return normalized_payload
+        existing = normalized_payload.get("event_origin")
+        normalized_payload["event_origin"] = {
+            **(existing if isinstance(existing, dict) else {}),
+            **origin,
+        }
+        return normalized_payload
+
     def _record_event(
         self: TaskManager,
         db: Session,
@@ -29,7 +132,11 @@ class TaskEventServiceMixin:
         payload: dict[str, Any] | None = None,
         operation_id: str | None = None,
     ) -> None:
-        normalized_payload = payload or {}
+        normalized_payload = self._merge_event_recorder_metadata(payload, role=self._event_runtime_role())
+        normalized_payload = self._merge_event_origin_metadata(
+            normalized_payload,
+            state_event=getattr(self, "_active_timeline_origin_state_event", None),
+        )
         if self._should_skip_duplicate_event(
             db,
             task=task,

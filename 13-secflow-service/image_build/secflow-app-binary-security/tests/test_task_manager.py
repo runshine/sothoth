@@ -54,6 +54,7 @@ from app.service import downstream_tasks as downstream_tasks_module
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import (
     TASK_ACTION_CONTINUE,
+    TASK_ACTION_RETRY,
     TASK_OPERATION_STEP_REQUEUE_TASK,
     TASK_STATUS_CANCEL_FAILED,
     TaskManager,
@@ -8147,7 +8148,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             target_stage="entry_analysis",
             status="running",
             current_step="requeue_task",
-            result_payload={"requeue": {"requested": True}},
+            result_payload={
+                "requeue": {
+                    "requested": True,
+                    "applied": True,
+                    "current_stage_after": "entry_analysis",
+                }
+            },
         )
         operation.resume_cursor = {"current_step": "requeue_task"}
         db = _ModelAwareDb(tasks=[task], operations=[operation])
@@ -8202,7 +8209,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             target_stage="entry_analysis",
             status="running",
             current_step="requeue_task",
-            result_payload={"requeue": {"requested": True}},
+            result_payload={
+                "requeue": {
+                    "requested": True,
+                    "applied": True,
+                    "current_stage_after": "entry_analysis",
+                }
+            },
         )
         operation.resume_cursor = {"current_step": "requeue_task"}
         db = _ModelAwareDb(tasks=[task], operations=[operation])
@@ -12724,6 +12737,64 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["validation"]["validated"])
         self.assertEqual([], state["issues"])
         self.assertTrue(state["requeue"]["requested"])
+
+    def test_build_manual_operation_state_degrades_stale_requeue_applied_operation(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/in",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            status="pending",
+            current_stage="entry_analysis",
+            current_operation_id="op1",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+            dispatcher_instance_id=None,
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+            updated_at=_now() - timedelta(seconds=120),
+            result_payload={
+                "requeue": {
+                    "requested": True,
+                    "applied": True,
+                    "current_stage_after": "entry_analysis",
+                    "task_status_after": "pending",
+                    "runtime_phase_after": TASK_RUNTIME_PHASE_TERMINAL,
+                    "in_place_runtime_resume": False,
+                }
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        state = self.manager._build_manual_operation_state(
+            db,
+            task,
+            task_retry_supported=False,
+            task_retry_reason=None,
+            task_retry_failed_supported=False,
+            task_retry_failed_reason=None,
+            task_continue_supported=False,
+            task_continue_reason=None,
+            stage_summaries=[BinarySecurityStageSummary(stage_name="entry_analysis", sequence_no=3, status="failed")],
+        )
+
+        self.assertEqual("degraded", state["overall"])
+        self.assertEqual("stale_operation_finalize_pending", state["blocking_code"])
+        self.assertFalse(state["operation_in_progress"])
+        self.assertTrue(state["operation_stale"])
+        self.assertTrue(state["operation_reconcile_pending"])
+        self.assertTrue(state["requeue_applied"])
+        self.assertTrue(state["auto_reconcile_candidate"])
 
     def test_build_manual_operation_state_exposes_retry_failed_items_continue_fallback(self):
         task = BinarySecurityTask(
@@ -20047,6 +20118,54 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(manual_state["operation_in_progress"])
         self.assertEqual("op1", manual_state["operation_id"])
         self.assertEqual("retry_stage_full", manual_state["operation_type"])
+
+    def test_list_tasks_manual_operation_state_degrades_stale_requeue_applied_operation(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source-task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            current_operation_id="op1",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        task.policy = {}
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="retry_stage_full",
+            operation_token="tok1",
+            status="running",
+            current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+            updated_at=_now() - timedelta(seconds=120),
+            result_payload={
+                "requeue": {
+                    "requested": True,
+                    "applied": True,
+                    "current_stage_after": "entry_analysis",
+                    "task_status_after": "pending",
+                    "runtime_phase_after": TASK_RUNTIME_PHASE_TERMINAL,
+                    "in_place_runtime_resume": False,
+                }
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        with patch.object(task_manager_module, "get_session_factory", side_effect=AssertionError("list_tasks should not allocate per-task sessions")):
+            response = self.manager.list_tasks(db, project_id="p1")
+
+        manual_state = response.items[0].manual_operation_state
+        self.assertEqual("degraded", manual_state["overall"])
+        self.assertEqual("stale_operation_finalize_pending", manual_state["blocking_code"])
+        self.assertFalse(manual_state["operation_in_progress"])
+        self.assertTrue(manual_state["operation_stale"])
+        self.assertTrue(manual_state["requeue_applied"])
 
     def test_refresh_system_analysis_stage_preserves_failed_item_reason_when_no_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -31881,6 +32000,307 @@ def _test_run_current_task_operation_stops_on_stale_task_ownership(self):
     self.assertFalse(result)
 
 
+def _test_run_current_task_operation_finalizes_after_requeue_owner_handoff(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-stale-operation-finalize",
+        project_id="p1",
+        name="source",
+        status="pending",
+        runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        current_operation_id="op-requeue",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id=None,
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-requeue",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry",
+        target_stage="system_analysis",
+        status="running",
+        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+        result_payload={
+            "requeue": {
+                "requested": True,
+                "applied": True,
+                "current_stage_after": "system_analysis",
+                "task_status_after": "pending",
+                "runtime_phase_after": TASK_RUNTIME_PHASE_TERMINAL,
+                "in_place_runtime_resume": False,
+            }
+        },
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    original_ensure = manager._ensure_task_write_ownership
+    original_run_steps = manager._run_task_operation_steps
+    call_count = {"value": 0}
+
+    def _ensure(*args, **kwargs):
+        del args, kwargs
+        call_count["value"] += 1
+        if call_count["value"] >= 2:
+            raise task_manager_module.StaleTaskExecution("owner handed off after requeue")
+        return None
+
+    async def _no_op_run_steps(_db, _task, _operation):
+        return None
+
+    task_manager_module.get_session_factory = lambda: (lambda: db)
+    manager._ensure_task_write_ownership = _ensure
+    manager._run_task_operation_steps = _no_op_run_steps
+    try:
+        result = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._ensure_task_write_ownership = original_ensure
+        manager._run_task_operation_steps = original_run_steps
+
+    self.assertTrue(result)
+    self.assertEqual("succeeded", operation.status)
+    self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+    self.assertIsNone(task.current_operation_id)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("operation_finalize_after_owner_handoff", event_types)
+    self.assertIn("operation_succeeded", event_types)
+
+
+def _test_run_current_task_operation_finalizes_after_requeue_owner_handoff_for_retry_family(self):
+    operation_types = [
+        TASK_ACTION_CONTINUE,
+        TASK_ACTION_RETRY,
+        "retry_failed_items",
+        "retry_stage_full",
+        "retry_stage_failed_items",
+    ]
+    for operation_type in operation_types:
+        with self.subTest(operation_type=operation_type):
+            manager = TaskManager()
+            manager.instance_id = "local-worker"
+            task = BinarySecurityTask(
+                id=f"task-handoff-{operation_type}",
+                project_id="p1",
+                name="source",
+                status="pending",
+                runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                current_operation_id=f"op-{operation_type}",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root="/w",
+                dispatcher_instance_id=None,
+            )
+            operation = BinarySecurityTaskOperation(
+                id=f"op-{operation_type}",
+                task_id=task.id,
+                project_id=task.project_id,
+                operation_type=operation_type,
+                target_stage="system_analysis",
+                status="running",
+                current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+                result_payload={
+                    "requeue": {
+                        "requested": True,
+                        "applied": True,
+                        "current_stage_after": "system_analysis",
+                        "task_status_after": "pending",
+                        "runtime_phase_after": TASK_RUNTIME_PHASE_TERMINAL,
+                        "in_place_runtime_resume": False,
+                    }
+                },
+            )
+            db = _ModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+            original_factory = task_manager_module.get_session_factory
+            original_ensure = manager._ensure_task_write_ownership
+            original_run_steps = manager._run_task_operation_steps
+            call_count = {"value": 0}
+
+            def _ensure(*args, **kwargs):
+                del args, kwargs
+                call_count["value"] += 1
+                if call_count["value"] >= 2:
+                    raise task_manager_module.StaleTaskExecution("owner handed off after requeue")
+                return None
+
+            async def _no_op_run_steps(_db, _task, _operation):
+                return None
+
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            manager._ensure_task_write_ownership = _ensure
+            manager._run_task_operation_steps = _no_op_run_steps
+            try:
+                result = asyncio.run(manager._run_current_task_operation(task.id))
+            finally:
+                task_manager_module.get_session_factory = original_factory
+                manager._ensure_task_write_ownership = original_ensure
+                manager._run_task_operation_steps = original_run_steps
+
+            self.assertTrue(result)
+            self.assertEqual("succeeded", operation.status)
+            self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+            self.assertIsNone(task.current_operation_id)
+
+
+def _test_reconcile_stale_retry_family_operation_to_succeeded_when_requeue_applied(self):
+    operation_types = [
+        TASK_ACTION_CONTINUE,
+        TASK_ACTION_RETRY,
+        "retry_failed_items",
+        "retry_stage_full",
+        "retry_stage_failed_items",
+    ]
+    for operation_type in operation_types:
+        with self.subTest(operation_type=operation_type):
+            task = BinarySecurityTask(
+                id=f"task-reconcile-ok-{operation_type}",
+                project_id="p1",
+                name="source",
+                status="pending",
+                runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+                current_stage="entry_analysis",
+                current_operation_id=f"op-{operation_type}",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            operation = BinarySecurityTaskOperation(
+                id=f"op-{operation_type}",
+                task_id=task.id,
+                project_id=task.project_id,
+                operation_type=operation_type,
+                target_stage="entry_analysis",
+                status="running",
+                current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+                updated_at=_now() - timedelta(seconds=120),
+                result_payload={
+                    "requeue": {
+                        "requested": True,
+                        "applied": True,
+                        "current_stage_after": "entry_analysis",
+                        "task_status_after": "pending",
+                        "runtime_phase_after": TASK_RUNTIME_PHASE_TERMINAL,
+                        "in_place_runtime_resume": False,
+                    }
+                },
+            )
+            db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+            changed = self.manager._reconcile_stale_task_operation(db, task, operation)
+
+            self.assertTrue(changed)
+            self.assertEqual("succeeded", operation.status)
+            self.assertIsNone(task.current_operation_id)
+            event_types = [event.event_type for event in db.events]
+            self.assertIn("operation_reconciled_to_succeeded", event_types)
+
+
+def _test_reconcile_stale_retry_family_operation_requeues_for_resume_when_not_applied(self):
+    operation_types = [
+        TASK_ACTION_CONTINUE,
+        TASK_ACTION_RETRY,
+        "retry_failed_items",
+        "retry_stage_full",
+        "retry_stage_failed_items",
+    ]
+    for operation_type in operation_types:
+        with self.subTest(operation_type=operation_type):
+            task = BinarySecurityTask(
+                id=f"task-reconcile-resume-{operation_type}",
+                project_id="p1",
+                name="source",
+                status="running",
+                runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                current_stage="entry_analysis",
+                current_operation_id=f"op-{operation_type}",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            operation = BinarySecurityTaskOperation(
+                id=f"op-{operation_type}",
+                task_id=task.id,
+                project_id=task.project_id,
+                operation_type=operation_type,
+                target_stage="entry_analysis",
+                status="running",
+                current_step="collect_cleanup_plan",
+                updated_at=_now() - timedelta(seconds=120),
+                result_payload={"requeue": {"requested": False, "applied": False}},
+            )
+            db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+            queued: list[str] = []
+            self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+
+            changed = self.manager._reconcile_stale_task_operation(db, task, operation)
+
+            self.assertTrue(changed)
+            self.assertEqual("running", operation.status)
+            self.assertEqual([task.id], queued)
+            event_types = [event.event_type for event in db.events]
+            self.assertIn("operation_requeued_for_resume", event_types)
+
+
+def _test_reconcile_stale_retry_family_operation_fails_when_not_applied_and_not_resumable(self):
+    operation_types = [
+        TASK_ACTION_CONTINUE,
+        TASK_ACTION_RETRY,
+        "retry_failed_items",
+        "retry_stage_full",
+        "retry_stage_failed_items",
+    ]
+    for operation_type in operation_types:
+        with self.subTest(operation_type=operation_type):
+            task = BinarySecurityTask(
+                id=f"task-reconcile-fail-{operation_type}",
+                project_id="p1",
+                name="source",
+                status="failed",
+                runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+                current_stage="entry_analysis",
+                current_operation_id=f"op-{operation_type}",
+                task_type=TASK_TYPE_SOURCE,
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root="/o",
+                workspace_root="/w",
+            )
+            operation = BinarySecurityTaskOperation(
+                id=f"op-{operation_type}",
+                task_id=task.id,
+                project_id=task.project_id,
+                operation_type=operation_type,
+                target_stage="entry_analysis",
+                status="running",
+                current_step="collect_cleanup_plan",
+                updated_at=_now() - timedelta(seconds=120),
+                result_payload={"requeue": {"requested": False, "applied": False}},
+            )
+            db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+            changed = self.manager._reconcile_stale_task_operation(db, task, operation)
+
+            self.assertTrue(changed)
+            self.assertEqual("failed", operation.status)
+            self.assertIsNone(task.current_operation_id)
+            event_types = [event.event_type for event in db.events]
+            self.assertIn("operation_reconciled_to_failed", event_types)
+
+
 def _test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count(self):
     manager = TaskManager()
     stale_success = BinarySecurityStageItem(
@@ -34800,6 +35220,11 @@ TaskManagerTests.test_release_unsupported_task_row_owner_repairs_stale_active_op
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
 TaskManagerTests.test_run_current_task_operation_stops_on_stale_task_ownership = _test_run_current_task_operation_stops_on_stale_task_ownership
+TaskManagerTests.test_run_current_task_operation_finalizes_after_requeue_owner_handoff = _test_run_current_task_operation_finalizes_after_requeue_owner_handoff
+TaskManagerTests.test_run_current_task_operation_finalizes_after_requeue_owner_handoff_for_retry_family = _test_run_current_task_operation_finalizes_after_requeue_owner_handoff_for_retry_family
+TaskManagerTests.test_reconcile_stale_retry_family_operation_to_succeeded_when_requeue_applied = _test_reconcile_stale_retry_family_operation_to_succeeded_when_requeue_applied
+TaskManagerTests.test_reconcile_stale_retry_family_operation_requeues_for_resume_when_not_applied = _test_reconcile_stale_retry_family_operation_requeues_for_resume_when_not_applied
+TaskManagerTests.test_reconcile_stale_retry_family_operation_fails_when_not_applied_and_not_resumable = _test_reconcile_stale_retry_family_operation_fails_when_not_applied_and_not_resumable
 TaskManagerTests.test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child = _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child
 TaskManagerTests.test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child = _test_sync_downstream_status_skips_recovery_event_for_terminal_failed_child
 TaskManagerTests.test_confirm_module_selection_updates_task = _test_confirm_module_selection_updates_task

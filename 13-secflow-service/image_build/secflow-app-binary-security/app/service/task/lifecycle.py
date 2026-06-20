@@ -47,6 +47,9 @@ class TaskLifecycleServiceMixin:
             )
             if task is None:
                 continue
+            if self._reconcile_stale_task_operation(db, task, operation):
+                changed = True
+                continue
             if self._task_row_owner_is_runtime_supported(db, task, active_operation=operation):
                 continue
             released = self._release_unsupported_task_row_owner(

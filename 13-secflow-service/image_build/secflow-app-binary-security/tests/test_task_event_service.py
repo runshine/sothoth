@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 from app.model import BinarySecurityEvent, BinarySecurityTask, TASK_TYPE_SOURCE
@@ -19,6 +20,18 @@ class TaskEventServiceStructureTests(unittest.TestCase):
 class TaskEventServiceBehaviorTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
+        self._old_env = {key: os.environ.get(key) for key in ("POD_NAME", "HOSTNAME", "NODE_NAME", "SECFLOW_BINARY_SECURITY_ROLE")}
+        os.environ["POD_NAME"] = "binary-security-worker-pod"
+        os.environ["HOSTNAME"] = "binary-security-worker-pod"
+        os.environ["NODE_NAME"] = "secflow-node-01"
+        os.environ["SECFLOW_BINARY_SECURITY_ROLE"] = "worker"
+
+    def tearDown(self):
+        for key, value in self._old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_record_event_trims_task_timeline_to_limit(self):
         task = BinarySecurityTask(
@@ -148,3 +161,34 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             else:
                 self.assertIn("summary", compact)
                 self.assertEqual(payload["summary"]["huge"], compact["summary"]["huge"])
+
+    def test_record_event_injects_recorder_metadata(self):
+        task = BinarySecurityTask(
+            id="task-recorder",
+            project_id="p1",
+            name="timeline-recorder",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+
+        self.manager._record_event(
+            db,
+            task,
+            "stage_started",
+            "阶段开始执行: system_analysis",
+            stage_name="system_analysis",
+        )
+
+        self.assertEqual(1, len(db.events))
+        recorder = dict(db.events[0].payload.get("recorder") or {})
+        self.assertEqual("binary-security", recorder.get("service"))
+        self.assertEqual("worker", recorder.get("role"))
+        self.assertEqual("binary-security-worker-pod", recorder.get("pod_name"))
+        self.assertEqual("binary-security-worker-pod", recorder.get("hostname"))
+        self.assertEqual("secflow-node-01", recorder.get("node_name"))

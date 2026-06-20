@@ -18,6 +18,7 @@ from sqlalchemy.exc import OperationalError
 
 from app.model import BinarySecurityTask, BinarySecurityTaskOperation
 from app.service import task_manager as task_manager_module
+from . import shared as task_shared
 
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager
@@ -2446,7 +2447,28 @@ class TaskOperationServiceMixin:
             )
 
             await self._run_task_operation_steps(db, task, operation)
-            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
+            try:
+                self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
+            except task_manager_module.StaleTaskExecution:
+                if operation.operation_type in self._operation_requeue_family_types() and self._finalize_task_operation_after_requeue(
+                    db,
+                    task_id=task_id,
+                    operation_id=operation.id,
+                    finalize_event_type="operation_finalize_after_owner_handoff",
+                    finalize_message="后台操作在 owner 切换后已完成控制面收口",
+                    source="task_owner_handoff",
+                ):
+                    db.commit()
+                    task_manager_module.logger.info(
+                        "binary-security task owner finalized operation after ownership handoff: "
+                        "task_id=%s operation_id=%s operation_type=%s",
+                        task_id,
+                        operation.id,
+                        str(operation.operation_type or "").strip(),
+                    )
+                    task_manager_module.observe_control_operation(operation_type, "succeeded")
+                    return True
+                raise
 
             if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
                 task_deleted = (
@@ -2468,6 +2490,16 @@ class TaskOperationServiceMixin:
                 if refreshed_task is not None and str(getattr(refreshed_task, "current_operation_id", "") or "").strip() == operation.id:
                     refreshed_task.current_operation_id = None
                 if refreshed_task is not None:
+                    if operation.operation_type in self._operation_requeue_family_types():
+                        self._record_operation_event(
+                            db,
+                            refreshed_task,
+                            operation,
+                            "operation_finalize_after_requeue",
+                            "后台操作已在重排队后完成控制面收口",
+                            stage_name=operation.target_stage,
+                            payload={"source": "task_owner", "auto_reconciled": False},
+                        )
                     self._record_operation_event(
                         db,
                         refreshed_task,
@@ -2475,7 +2507,7 @@ class TaskOperationServiceMixin:
                         "operation_succeeded",
                         f"任务 owner 已完成后台操作: {operation.operation_type}",
                         stage_name=operation.target_stage,
-                        payload={"source": "task_owner"},
+                        payload={"source": "task_owner", "auto_reconciled": False},
                     )
             db.commit()
             task_manager_module.logger.info(
@@ -2567,6 +2599,272 @@ class TaskOperationServiceMixin:
                 duration_seconds=time.perf_counter() - started,
             )
             db.close()
+
+    def _operation_requeue_family_types(self: TaskManager) -> set[str]:
+        from app.service import task_manager as task_manager_module
+
+        return {
+            task_manager_module.TASK_ACTION_CONTINUE,
+            task_manager_module.TASK_ACTION_RETRY,
+            task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
+            task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
+            task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+        }
+
+    def _operation_stale_threshold_seconds(self: TaskManager) -> int:
+        configured = int(getattr(self.cfg.scheduler, "stale_operation_requeue_interval_seconds", 30) or 30)
+        return max(15, configured)
+
+    def _task_operation_age_seconds(self: TaskManager, operation: BinarySecurityTaskOperation) -> float | None:
+        started_at = getattr(operation, "updated_at", None) or getattr(operation, "started_at", None) or getattr(operation, "created_at", None)
+        return task_shared._elapsed_seconds_since(started_at)
+
+    def _operation_requeue_payload_snapshot(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        *,
+        target_stage: str | None,
+        in_place_runtime_resume: bool,
+    ) -> dict[str, Any]:
+        from app.service import task_manager as task_manager_module
+
+        now_value = task_manager_module._now()
+        return {
+            "requested": True,
+            "applied": True,
+            "applied_at": task_shared._isoformat_or_none(now_value),
+            "task_status_after": str(getattr(task, "status", "") or "").strip() or None,
+            "runtime_phase_after": self._task_runtime_phase(task),
+            "current_stage_after": str(target_stage or getattr(task, "current_stage", "") or "").strip() or None,
+            "in_place_runtime_resume": bool(in_place_runtime_resume),
+        }
+
+    def _mark_operation_requeue_applied(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        target_stage: str | None,
+        in_place_runtime_resume: bool,
+        extra_payload: dict[str, Any] | None = None,
+        record_event: bool = True,
+    ) -> dict[str, Any]:
+        requeue_payload = {
+            **self._operation_requeue_payload_snapshot(
+                task,
+                target_stage=target_stage,
+                in_place_runtime_resume=in_place_runtime_resume,
+            ),
+            **dict(extra_payload or {}),
+        }
+        merged = self._update_operation_result_payload(
+            operation,
+            {"requeue": requeue_payload},
+            workspace_root=task.workspace_root,
+        )
+        if record_event:
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "operation_requeue_applied",
+                "后台操作已完成重排队并生成恢复快照",
+                stage_name=target_stage or operation.target_stage,
+                payload={
+                    "operation_id": operation.id,
+                    "operation_type": operation.operation_type,
+                    "current_step": operation.current_step,
+                    "task_status": str(getattr(task, "status", "") or "").strip(),
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "in_place_runtime_resume": bool(in_place_runtime_resume),
+                    "auto_reconciled": False,
+                    "requeue": requeue_payload,
+                },
+            )
+        return merged
+
+    def _operation_requeue_applied(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        result_payload = dict(self._operation_result_data(operation) or {})
+        requeue_payload = dict(result_payload.get("requeue") or {})
+        if not bool(requeue_payload.get("requested")) or not bool(requeue_payload.get("applied")):
+            return False
+        target_stage = str(
+            requeue_payload.get("current_stage_after")
+            or operation.target_stage
+            or task.current_stage
+            or ""
+        ).strip() or None
+        in_place_runtime_resume = bool(requeue_payload.get("in_place_runtime_resume"))
+        task_status = str(task.status or "").strip()
+        if in_place_runtime_resume:
+            if task_status not in {"running", "dispatching"}:
+                return False
+            if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                return False
+        elif task_status != "pending":
+            return False
+        if target_stage and str(task.current_stage or "").strip() != target_stage:
+            return False
+        if task.last_error not in {None, ""}:
+            return False
+        return True
+
+    def _finalize_task_operation_after_requeue(
+        self: TaskManager,
+        db: Session,
+        *,
+        task_id: str,
+        operation_id: str,
+        finalize_event_type: str,
+        finalize_message: str,
+        source: str,
+        auto_reconciled: bool = False,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        refreshed_operation = (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.id == operation_id)
+            .first()
+        )
+        if refreshed_operation is None:
+            return False
+        if str(getattr(refreshed_operation, "status", "") or "").strip().lower() in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+            return False
+        refreshed_task = (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(task_manager_module.BinarySecurityTask.id == task_id)
+            .first()
+        )
+        if refreshed_task is None:
+            return False
+        if str(getattr(refreshed_operation, "task_id", "") or "").strip() != str(task_id or "").strip():
+            return False
+        if str(getattr(refreshed_task, "current_operation_id", "") or "").strip() not in {"", operation_id}:
+            return False
+        if not self._operation_requeue_applied(refreshed_task, refreshed_operation) and str(getattr(refreshed_operation, "current_step", "") or "").strip() != task_manager_module.TASK_OPERATION_STEP_SUCCEEDED:
+            return False
+        refreshed_operation.status = "succeeded"
+        refreshed_operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+        refreshed_operation.finished_at = task_manager_module._now()
+        refreshed_operation.updated_at = refreshed_operation.finished_at
+        if str(getattr(refreshed_task, "current_operation_id", "") or "").strip() == operation_id:
+            refreshed_task.current_operation_id = None
+        payload = {
+            "operation_id": refreshed_operation.id,
+            "operation_type": refreshed_operation.operation_type,
+            "current_step": refreshed_operation.current_step,
+            "task_status": str(getattr(refreshed_task, "status", "") or "").strip(),
+            "runtime_phase": self._task_runtime_phase(refreshed_task),
+            "in_place_runtime_resume": bool(dict(self._operation_result_data(refreshed_operation) or {}).get("requeue", {}).get("in_place_runtime_resume")),
+            "previous_owner": str(getattr(refreshed_task, "dispatcher_instance_id", "") or "").strip() or None,
+            "current_owner": str(getattr(refreshed_task, "dispatcher_instance_id", "") or "").strip() or None,
+            "auto_reconciled": bool(auto_reconciled),
+            "source": source,
+        }
+        self._record_operation_event(
+            db,
+            refreshed_task,
+            refreshed_operation,
+            finalize_event_type,
+            finalize_message,
+            stage_name=refreshed_operation.target_stage,
+            payload=payload,
+        )
+        self._record_operation_event(
+            db,
+            refreshed_task,
+            refreshed_operation,
+            "operation_succeeded",
+            f"任务 owner 已完成后台操作: {refreshed_operation.operation_type}",
+            stage_name=refreshed_operation.target_stage,
+            payload={"source": source, "auto_reconciled": bool(auto_reconciled)},
+        )
+        return True
+
+    def _reconcile_stale_task_operation(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+        if operation_type not in self._operation_requeue_family_types():
+            return False
+        age_seconds = self._task_operation_age_seconds(operation)
+        if age_seconds is None or age_seconds < float(self._operation_stale_threshold_seconds()):
+            return False
+        task_manager_module.observe_control_operation_stale(operation_type, age_seconds=age_seconds)
+        if self._operation_requeue_applied(task, operation):
+            finalized = self._finalize_task_operation_after_requeue(
+                db,
+                task_id=task.id,
+                operation_id=operation.id,
+                finalize_event_type="operation_reconciled_to_succeeded",
+                finalize_message="检测到重排队已生效，系统已自动收口后台操作",
+                source="reconcile",
+                auto_reconciled=True,
+            )
+            if finalized:
+                task_manager_module.observe_control_operation_auto_reconciled(operation_type, "succeeded", age_seconds=age_seconds)
+            return finalized
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+        if current_operation_id in {"", operation.id} and str(getattr(task, "status", "") or "").strip() in {"pending", "dispatching", "running"}:
+            self._enqueue_task(task.id)
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "operation_requeued_for_resume",
+                "检测到后台操作停滞，系统已重新投递任务以恢复执行",
+                stage_name=operation.target_stage,
+                payload={
+                    "operation_id": operation.id,
+                    "operation_type": operation.operation_type,
+                    "current_step": operation.current_step,
+                    "task_status": str(getattr(task, "status", "") or "").strip(),
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "auto_reconciled": True,
+                },
+            )
+            return True
+        if current_operation_id not in {"", operation.id}:
+            return False
+        operation.status = "failed"
+        operation.error_code = "operation_stale_reconciled"
+        operation.error_message = "operation stalled before requeue was applied"
+        operation.finished_at = task_manager_module._now()
+        operation.updated_at = operation.finished_at
+        if current_operation_id == operation.id:
+            task.current_operation_id = None
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "operation_reconciled_to_failed",
+            "检测到后台操作已停滞且未完成重排队，系统已自动收口为失败",
+            level="warning",
+            stage_name=operation.target_stage,
+            payload={
+                "operation_id": operation.id,
+                "operation_type": operation.operation_type,
+                "current_step": operation.current_step,
+                "task_status": str(getattr(task, "status", "") or "").strip(),
+                "runtime_phase": self._task_runtime_phase(task),
+                "auto_reconciled": True,
+            },
+        )
+        task_manager_module.observe_control_operation_auto_reconciled(operation_type, "failed", age_seconds=age_seconds)
+        return True
 
     async def _run_task_operation_steps(self: TaskManager, db: Session, task, operation) -> None:
         from app.service import task_manager as task_manager_module
@@ -2769,25 +3067,7 @@ class TaskOperationServiceMixin:
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
     ) -> bool:
-        result_payload = dict(self._operation_result_data(operation) or {})
-        requeue_payload = dict(result_payload.get("requeue") or {})
-        if not bool(requeue_payload.get("requested")):
-            return False
-        target_stage = str(operation.target_stage or task.current_stage or "").strip() or None
-        in_place_runtime_resume = bool(requeue_payload.get("in_place_runtime_resume"))
-        task_status = str(task.status or "").strip()
-        if in_place_runtime_resume:
-            if task_status not in {"running", "dispatching"}:
-                return False
-            if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
-                return False
-        elif task_status != "pending":
-            return False
-        if target_stage and str(task.current_stage or "").strip() != target_stage:
-            return False
-        if task.last_error not in {None, ""}:
-            return False
-        return True
+        return self._operation_requeue_applied(task, operation)
 
     def _can_resume_retry_operation_in_place(
         self: TaskManager,
@@ -2836,17 +3116,20 @@ class TaskOperationServiceMixin:
             self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
             self._update_operation_result_payload(
                 operation,
-                {
-                    "requeue": {
-                        "requested": True,
-                        "in_place_runtime_resume": True,
-                        "task_status_before": "retry_operation_succeeded",
-                        "task_status_after": task.status,
-                        "resume_reason": resume_decision.resume_reason,
-                        "source": resume_decision.source,
-                    },
-                },
+                {},
                 workspace_root=task.workspace_root,
+            )
+            self._mark_operation_requeue_applied(
+                db,
+                task,
+                operation,
+                target_stage=target_stage or task.current_stage,
+                in_place_runtime_resume=True,
+                extra_payload={
+                    "task_status_before": "retry_operation_succeeded",
+                    "resume_reason": resume_decision.resume_reason,
+                    "source": resume_decision.source,
+                },
             )
             self._record_operation_event(
                 db,
@@ -2870,16 +3153,16 @@ class TaskOperationServiceMixin:
             task.finished_at = None
             self._invalidate_task_execution(task)
             self._enqueue_task(task.id)
-            self._update_operation_result_payload(
+            self._mark_operation_requeue_applied(
+                db,
+                task,
                 operation,
-                {
-                    "requeue": {
-                        "requested": True,
-                        "task_status_before": "retry_operation_succeeded",
-                        "task_status_after": task.status,
-                    },
+                target_stage=target_stage or task.current_stage,
+                in_place_runtime_resume=False,
+                extra_payload={
+                    "task_status_before": "retry_operation_succeeded",
                 },
-                workspace_root=task.workspace_root,
+                record_event=True,
             )
             self._record_operation_event(
                 db,
