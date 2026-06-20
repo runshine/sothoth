@@ -11,6 +11,14 @@
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-vuln-scan"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan
 	url = https://github.com/ict-bin/dataflow_vuln_scan.git
+[submodule "13-secflow-service/image_build/chirmera-platform-schedule"]
+	path = 13-secflow-service/image_build/chirmera-platform-schedule
+	url = https://github.com/GaiaSecHW/chirmera-platform-schedule.git
+	branch = main
+[submodule "13-secflow-service/image_build/secflow-app-code-server"]
+	path = 13-secflow-service/image_build/secflow-app-code-server
+	url = https://github.com/GaiaSecHW/secflow-app-code-server.git
+	branch = main
 [submodule "13-secflow-service/image_build/secflow-platform-agent"]
 	path = 13-secflow-service/image_build/secflow-platform-agent
 	url = https://github.com/GaiaSecHW/secflow-platform-agent.git
