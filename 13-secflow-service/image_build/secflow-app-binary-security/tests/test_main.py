@@ -2,7 +2,7 @@ import asyncio
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app import main
 from app.observability import observe_http_request
@@ -130,6 +130,95 @@ class MainRoleTests(unittest.TestCase):
         self.assertEqual("ok", payload["status"])
         self.assertEqual("worker", payload["role"])
         self.assertEqual("secflow-app-binary-security", payload["service"])
+
+    def test_lifespan_logs_startup_steps_on_success(self):
+        fake_cfg = SimpleNamespace(
+            database=SimpleNamespace(host="mysql.example", port=3306, name="binary_security"),
+            queue=SimpleNamespace(redis_url="redis://redis.example:6379/0", task_queue_key="secflow:binary-security:tasks"),
+            auth_service=SimpleNamespace(host="auth.example", port=9000, timeout=10),
+            registry=SimpleNamespace(menu_service_url="http://menu.example", service_id="secflow-app-binary-security"),
+        )
+        fake_conn = MagicMock()
+        fake_engine = MagicMock()
+        fake_engine.connect.return_value.__enter__.return_value = fake_conn
+        fake_engine.connect.return_value.__exit__.return_value = None
+
+        async def _run():
+            async with main.lifespan(main.app):
+                return None
+
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=True), \
+            patch("app.main.load_config"), \
+            patch("app.main.get_config", return_value=fake_cfg), \
+            patch("app.main._external_probe_process_enabled", return_value=True), \
+            patch("app.main.init_database"), \
+            patch("app.main.get_engine", return_value=fake_engine), \
+            patch("app.main.verify_auth_service_or_exit"), \
+            patch("app.main._registry_enabled", return_value=False), \
+            patch("app.main._scheduler_enabled", return_value=False), \
+            patch.object(main.logger, "info") as logger_info:
+            asyncio.run(_run())
+
+        info_calls = [call.args for call in logger_info.call_args_list if call.args]
+
+        def _has_step(step_name: str) -> bool:
+            return any(
+                len(args) >= 3
+                and args[0] == "Binary Security startup step=%s%s"
+                and args[1] == step_name
+                for args in info_calls
+            )
+
+        def _has_step_done(step_name: str) -> bool:
+            return any(
+                len(args) >= 3
+                and args[0] == "Binary Security startup step=%s status=ok%s"
+                and args[1] == step_name
+                for args in info_calls
+            )
+
+        self.assertTrue(_has_step("load_config"))
+        self.assertTrue(_has_step_done("load_config"))
+        self.assertTrue(_has_step("init_database"))
+        self.assertTrue(_has_step_done("init_database"))
+        self.assertTrue(_has_step("database_ping"))
+        self.assertTrue(_has_step_done("database_ping"))
+        self.assertTrue(_has_step("verify_auth"))
+        self.assertTrue(_has_step_done("verify_auth"))
+        self.assertTrue(any(args[0] == "SecFlow Binary Security 服务启动成功" for args in info_calls))
+
+    def test_lifespan_logs_failed_startup_step_context(self):
+        fake_cfg = SimpleNamespace(
+            database=SimpleNamespace(host="mysql.example", port=3306, name="binary_security"),
+            queue=SimpleNamespace(redis_url="redis://redis.example:6379/0", task_queue_key="secflow:binary-security:tasks"),
+            auth_service=SimpleNamespace(host="auth.example", port=9000, timeout=10),
+            registry=SimpleNamespace(menu_service_url="http://menu.example", service_id="secflow-app-binary-security"),
+        )
+
+        async def _run():
+            async with main.lifespan(main.app):
+                return None
+
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=True), \
+            patch("app.main.load_config"), \
+            patch("app.main.get_config", return_value=fake_cfg), \
+            patch("app.main._external_probe_process_enabled", return_value=True), \
+            patch("app.main.init_database", side_effect=TimeoutError("Timeout connecting to server")), \
+            patch("app.main._registry_enabled", return_value=False), \
+            patch("app.main._scheduler_enabled", return_value=True), \
+            patch.object(main.logger, "exception") as logger_exception, \
+            patch("app.main.sys.exit", side_effect=SystemExit(1)):
+            with self.assertRaises(SystemExit):
+                asyncio.run(_run())
+
+        self.assertTrue(logger_exception.called)
+        args = logger_exception.call_args.args
+        self.assertIn("Binary Security 服务启动失败: step=%s role=%s scheduler_enabled=%s registry_enabled=%s error=%s", args[0])
+        self.assertEqual("init_database", args[1])
+        self.assertEqual("worker", args[2])
+        self.assertTrue(args[3])
+        self.assertFalse(args[4])
+        self.assertIn("Timeout connecting to server", str(args[5]))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,14 @@ class TaskQueue:
     def _new_client(self) -> Redis:
         if self._client is not None:
             return self._client
+        logger.info(
+            "binary-security task queue creating redis client: redis_url=%s task_queue_key=%s "
+            "socket_connect_timeout=%s socket_timeout=%s",
+            str(self.config.redis_url or "").strip() or None,
+            str(self.config.task_queue_key or "").strip() or None,
+            5,
+            max(10, int(self.config.block_timeout_seconds) + 5),
+        )
         return Redis.from_url(
             self.config.redis_url,
             decode_responses=True,
@@ -39,6 +47,16 @@ class TaskQueue:
         injected_client = self._client is client
         try:
             await self._push_unique(client, self.config.task_queue_key, str(task_id))
+        except Exception as exc:
+            logger.exception(
+                "binary-security task queue push failed: task_id=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                str(task_id or "").strip() or None,
+                str(self.config.redis_url or "").strip() or None,
+                str(self.config.task_queue_key or "").strip() or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
         finally:
             if not injected_client:
                 await self._close_client(client)
@@ -48,6 +66,16 @@ class TaskQueue:
         injected_client = self._client is client
         try:
             await self._force_requeue(client, self.config.task_queue_key, str(task_id))
+        except Exception as exc:
+            logger.exception(
+                "binary-security task queue force requeue failed: task_id=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                str(task_id or "").strip() or None,
+                str(self.config.redis_url or "").strip() or None,
+                str(self.config.task_queue_key or "").strip() or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
         finally:
             if not injected_client:
                 await self._close_client(client)

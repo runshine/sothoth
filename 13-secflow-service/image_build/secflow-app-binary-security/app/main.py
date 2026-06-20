@@ -52,6 +52,16 @@ logger = logging.getLogger(__name__)
 _probe_server: ThreadedProbeServer | None = None
 
 
+def _log_startup_step(step: str, *, detail: str | None = None) -> None:
+    suffix = f" detail={detail}" if detail else ""
+    logger.info("Binary Security startup step=%s%s", str(step or "unknown").strip(), suffix)
+
+
+def _log_startup_step_done(step: str, *, detail: str | None = None) -> None:
+    suffix = f" detail={detail}" if detail else ""
+    logger.info("Binary Security startup step=%s status=ok%s", str(step or "unknown").strip(), suffix)
+
+
 def _external_probe_process_enabled() -> bool:
     return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -190,25 +200,81 @@ def verify_auth_service_or_exit() -> None:
 async def lifespan(_: FastAPI):
     logger.info("正在启动 SecFlow Binary Security 服务...")
     mark_startup_state(shutting_down=False, startup_ready=False, startup_error=None)
+    startup_step = "bootstrap"
     try:
+        startup_step = "load_config"
+        _log_startup_step(startup_step)
         load_config()
+        cfg = get_config()
+        _log_startup_step_done(
+            startup_step,
+            detail=(
+                f"role={_service_role()} scheduler_enabled={_scheduler_enabled()} "
+                f"registry_enabled={_registry_enabled()} db_host={cfg.database.host}:{cfg.database.port} "
+                f"redis_url={cfg.queue.redis_url}"
+            ),
+        )
+
+        startup_step = "probe_server"
         if not _external_probe_process_enabled():
+            _log_startup_step(startup_step, detail="mode=embedded")
             _ensure_probe_server_started()
+            _log_startup_step_done(startup_step, detail="mode=embedded")
+        else:
+            _log_startup_step_done(startup_step, detail="mode=external")
+
+        startup_step = "init_database"
+        _log_startup_step(
+            startup_step,
+            detail=f"engine=mysql+pymysql://{cfg.database.host}:{cfg.database.port}/{cfg.database.name}",
+        )
         init_database()
+        _log_startup_step_done(startup_step)
+
+        startup_step = "database_ping"
+        _log_startup_step(startup_step, detail="sql=SELECT 1")
         mark_startup_state(database_ready=True)
         with get_engine().connect() as conn:
             conn.exec_driver_sql("SELECT 1")
+        _log_startup_step_done(startup_step)
+
+        startup_step = "verify_auth"
+        _log_startup_step(
+            startup_step,
+            detail=f"auth_host={cfg.auth_service.host}:{cfg.auth_service.port} timeout={cfg.auth_service.timeout}s",
+        )
         verify_auth_service_or_exit()
         mark_startup_state(auth_ready=True)
+        _log_startup_step_done(startup_step)
+
         if _registry_enabled():
+            startup_step = "registry_start"
+            _log_startup_step(
+                startup_step,
+                detail=f"menu_service_url={cfg.registry.menu_service_url} service_id={cfg.registry.service_id}",
+            )
             await get_registry_service().start()
             mark_startup_state(registry_ready=True)
+            _log_startup_step_done(startup_step)
         if _scheduler_enabled():
+            startup_step = "task_manager_start"
+            _log_startup_step(
+                startup_step,
+                detail=f"role={_service_role()} queue_redis={cfg.queue.redis_url} task_queue_key={cfg.queue.task_queue_key}",
+            )
             await get_task_manager().start()
+            _log_startup_step_done(startup_step)
         mark_startup_state(startup_ready=True, startup_error=None)
     except Exception as exc:
         mark_startup_state(startup_ready=False, startup_error=str(exc))
-        logger.exception("Binary Security 服务启动失败: %s", exc)
+        logger.exception(
+            "Binary Security 服务启动失败: step=%s role=%s scheduler_enabled=%s registry_enabled=%s error=%s",
+            startup_step,
+            _service_role(),
+            _scheduler_enabled(),
+            _registry_enabled(),
+            exc,
+        )
         sys.exit(1)
 
     logger.info("SecFlow Binary Security 服务启动成功")
