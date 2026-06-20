@@ -79,3 +79,7 @@
 	path = 101-Chimera-deploy
 	url = https://github.com/GaiaSecHW/Chimera-deploy.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-app-vuln-verify-v2"]
+	path = 13-secflow-service/image_build/secflow-app-vuln-verify-v2
+	url = https://github.com/skiyer/vuln-verify-service.git
+	branch = main
