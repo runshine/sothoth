@@ -87,6 +87,39 @@ class TaskOperationServiceMixin:
             return status
         return "unknown"
 
+    def _is_old_child_already_terminal_and_superseded(
+        self: TaskManager,
+        item: task_manager_module.BinarySecurityStageItem,
+        downstream_task_id: str | None,
+    ) -> bool:
+        task_id = str(downstream_task_id or "").strip()
+        if not task_id:
+            return False
+        replacement_state = self._replacement_in_progress_state(item)
+        old_task_id = str(replacement_state.get("old_downstream_task_id") or "").strip()
+        if old_task_id != task_id:
+            return False
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = dict(result.get("sync_observation") or {})
+        superseded_task_id = str(
+            sync_observation.get("superseded_downstream_task_id")
+            or sync_observation.get("old_downstream_task_id")
+            or ""
+        ).strip()
+        if superseded_task_id != task_id:
+            return False
+        terminal_status = self._normalize_downstream_status(
+            sync_observation.get("mapped_status")
+            or sync_observation.get("downstream_status")
+            or sync_observation.get("status_raw")
+        )
+        verification_status = str(sync_observation.get("verification_status") or "").strip().lower()
+        if terminal_status in {"success", "failed", "cancelled", "downstream_missing"} and verification_status in {"succeeded", "deleted", "absent"}:
+            return True
+        if verification_status in {"succeeded", "deleted", "absent"} and not replacement_state.get("replacement_in_progress"):
+            return True
+        return False
+
     def _collect_cancel_targets(self: TaskManager, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         targets: list[dict[str, Any]] = []
         stage_items = db.query(task_manager_module.BinarySecurityStageItem).filter(
@@ -128,6 +161,26 @@ class TaskOperationServiceMixin:
                         "downstream_service": downstream_service,
                         "downstream_task_id": downstream_task_id,
                         "blocking": True,
+                    }
+                )
+            replacement_state = self._replacement_in_progress_state(item)
+            old_downstream_task_id = str(replacement_state.get("old_downstream_task_id") or "").strip()
+            if (
+                downstream_service
+                and old_downstream_task_id
+                and not self._is_old_child_already_terminal_and_superseded(item, old_downstream_task_id)
+            ):
+                targets.append(
+                    {
+                        "target_type": "downstream_task",
+                        "stage_name": item.stage_name,
+                        "item_id": item.id,
+                        "item_key": item.item_key,
+                        "project_id": task.project_id,
+                        "downstream_service": downstream_service,
+                        "downstream_task_id": old_downstream_task_id,
+                        "blocking": True,
+                        "superseded": True,
                     }
                 )
         orphan_refs = []
@@ -3551,6 +3604,9 @@ class TaskOperationServiceMixin:
             task.finished_at = task_manager_module._now()
             task.last_error = None
             self._invalidate_task_execution(task)
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
             self._record_operation_event(
                 db,
                 task,

@@ -8055,6 +8055,59 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_row_owner_released_without_local_runtime", events)
         self.assertEqual([("t1", "stale-worker")], cleared_leases)
 
+    def test_requeue_stale_operations_defers_release_for_active_cancel_finalize_with_local_operation_runtime(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status=task_manager_module.TASK_STATUS_CANCELLING,
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="local-worker",
+            dispatch_started_at=_now() - timedelta(seconds=5),
+            lease_expires_at=_now() + timedelta(seconds=60),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_CANCEL,
+            target_stage="system_analysis",
+            status="running",
+            current_step=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+            updated_at=_now(),
+        )
+        operation.step_payload = {
+            task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED: {
+                "status": "running",
+                "updated_at": _now().isoformat(),
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        queued: list[str] = []
+        events: list[str] = []
+        self.manager.instance_id = "local-worker"
+        self.manager._enqueue_task = queued.append
+        self.manager._record_event = lambda *args, **kwargs: events.append(args[2])
+        self.manager._operation_workers["op1"] = SimpleNamespace(done=lambda: False)
+
+        try:
+            changed = self.manager._requeue_stale_operations(db)
+        finally:
+            self.manager._operation_workers.pop("op1", None)
+
+        self.assertFalse(changed)
+        self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
+        self.assertEqual("local-worker", task.dispatcher_instance_id)
+        self.assertEqual([], queued)
+        self.assertIn("task_owner_release_deferred_for_active_cancel_finalize", events)
+        self.assertNotIn("task_row_owner_released_without_local_runtime", events)
+
     def test_task_row_owner_is_runtime_supported_rejects_active_operation_without_owner_support(self):
         task = BinarySecurityTask(
             id="t1",
@@ -8083,6 +8136,48 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
 
         self.assertFalse(supported)
+
+    def test_task_row_owner_is_runtime_supported_accepts_active_cancel_finalize_with_local_operation_runtime(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status=task_manager_module.TASK_STATUS_CANCELLING,
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="local-worker",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_CANCEL,
+            target_stage="system_analysis",
+            status="running",
+            current_step=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+            updated_at=_now(),
+        )
+        operation.step_payload = {
+            task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED: {
+                "status": "running",
+                "updated_at": _now().isoformat(),
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+        self.manager.instance_id = "local-worker"
+        self.manager._operation_workers["op1"] = SimpleNamespace(done=lambda: False)
+
+        try:
+            supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        finally:
+            self.manager._operation_workers.pop("op1", None)
+
+        self.assertTrue(supported)
 
     def test_release_unsupported_task_row_owner_noops_when_no_owner_metadata_exists(self):
         task = BinarySecurityTask(
@@ -10386,6 +10481,44 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         downstream_targets = [target for target in targets if target.get("target_type") == "downstream_task"]
         self.assertEqual(["eat_1"], [target.get("downstream_task_id") for target in downstream_targets])
+
+    def test_collect_cancel_targets_skips_terminal_superseded_old_child(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_key="source_project",
+            status="pending",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_new",
+        )
+        item.result = {
+            "sync_observation": {
+                "old_downstream_task_id": "sat_old",
+                "superseded_downstream_task_id": "sat_old",
+                "verification_status": "deleted",
+                "mapped_status": "cancelled",
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        targets = self.manager._collect_cancel_targets(db, task)
+
+        downstream_targets = [target for target in targets if target.get("target_type") == "downstream_task"]
+        self.assertEqual(["sat_new"], [target.get("downstream_task_id") for target in downstream_targets])
 
     def test_cancel_state_preview_is_capped_for_large_blocking_target_sets(self):
         task = BinarySecurityTask(
