@@ -2044,7 +2044,7 @@ class TaskReadModelServiceMixin:
             else:
                 rendered_value = str(value)
             rendered_evidence.append({"label": label, "value": rendered_value})
-        reference_at = last_heartbeat_at or started_at
+        reference_at = last_heartbeat_at
         return {
             "unit_key": unit_key,
             "unit_label": unit_label,
@@ -2155,7 +2155,7 @@ class TaskReadModelServiceMixin:
                     "status": unit.get("status") or "unknown",
                     "unit_key": unit.get("unit_key"),
                     "owner_instance_id": unit.get("owner_instance_id"),
-                    "last_heartbeat_at": unit.get("last_heartbeat_at") or unit.get("started_at"),
+                    "last_heartbeat_at": unit.get("last_heartbeat_at"),
                     "age_seconds": unit.get("age_seconds"),
                     "reason": unit.get("reason"),
                     "evidence": list(unit.get("evidence") or [])[:4],
@@ -2411,7 +2411,8 @@ class TaskReadModelServiceMixin:
         del lease_pod_uid, lease_boot_id, lease_generation
         local_worker = self._workers.get(task.id)
         local_worker_alive = bool(local_worker is not None and not local_worker.done())
-        last_task_heartbeat_at = self._last_task_heartbeat_at.get(task.id)
+        runtime_lease = self._runtime_lease_for_task(db, task.id)
+        last_task_heartbeat_at = getattr(runtime_lease, "heartbeat_at", None)
         has_local_owner = self._has_local_task_execution_owner(task.id)
         owner_count = self._task_execution_owner_count(task.id)
         operation_lock_owner = str(task.operation_lock_owner or "").strip() or None
