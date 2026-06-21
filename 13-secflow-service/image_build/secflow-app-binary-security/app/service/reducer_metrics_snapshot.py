@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any
 
@@ -11,6 +12,14 @@ from redis.asyncio import Redis
 
 from app.config import get_config
 from app.observability import CONTENT_TYPE_LATEST
+from app.service.task_queue import (
+    DEFAULT_QUEUE_CONTEXT,
+    REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+    REDIS_SOCKET_TIMEOUT_SECONDS,
+)
+
+
+logger = logging.getLogger(__name__)
 
 
 _SNAPSHOT_TTL_SECONDS = 1800
@@ -23,11 +32,25 @@ class ReducerMetricsSnapshotStore:
         self._redis_url = get_config().queue.redis_url
         self._lock = asyncio.Lock()
 
-    def _new_client(self) -> Redis:
-        return Redis.from_url(self._redis_url, decode_responses=True)
+    def _new_client(self, *, context: str = "reducer_metrics_snapshot") -> Redis:
+        logger.info(
+            "binary-security reducer metrics redis client creating: context=%s redis_url=%s socket_connect_timeout=%s socket_timeout=%s",
+            str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            str(self._redis_url or "").strip() or None,
+            REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+            REDIS_SOCKET_TIMEOUT_SECONDS,
+        )
+        return Redis.from_url(
+            self._redis_url,
+            decode_responses=True,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+            health_check_interval=30,
+            socket_keepalive=True,
+        )
 
-    async def _client_or_create(self) -> Redis:
-        return self._new_client()
+    async def _client_or_create(self, *, context: str = "reducer_metrics_snapshot") -> Redis:
+        return self._new_client(context=context)
 
     async def write_snapshot(
         self,
@@ -36,7 +59,7 @@ class ReducerMetricsSnapshotStore:
         source_pod: str,
         generated_at: float | None = None,
     ) -> None:
-        client = await self._client_or_create()
+        client = await self._client_or_create(context="reducer_metrics_snapshot")
         created_at = float(generated_at or time.time())
         payload = {
             "metrics_payload": str(metrics_payload or ""),
@@ -49,7 +72,7 @@ class ReducerMetricsSnapshotStore:
             await self._close_client(client)
 
     async def read_snapshot(self) -> dict[str, Any] | None:
-        client = await self._client_or_create()
+        client = await self._client_or_create(context="reducer_metrics_snapshot")
         try:
             raw = await client.get(_SNAPSHOT_KEY)
         finally:

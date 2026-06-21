@@ -17,6 +17,7 @@ from app.config import get_config
 logger = logging.getLogger(__name__)
 REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 10
 REDIS_SOCKET_TIMEOUT_SECONDS = 10
+DEFAULT_QUEUE_CONTEXT = "unspecified"
 
 
 class TaskQueue:
@@ -24,12 +25,13 @@ class TaskQueue:
         self.config = get_config().queue
         self._client: Redis | None = None
 
-    def _new_client(self) -> Redis:
+    def _new_client(self, *, context: str = DEFAULT_QUEUE_CONTEXT) -> Redis:
         if self._client is not None:
             return self._client
         logger.info(
-            "binary-security task queue creating redis client: redis_url=%s task_queue_key=%s "
+            "binary-security task queue creating redis client: context=%s redis_url=%s task_queue_key=%s "
             "socket_connect_timeout=%s socket_timeout=%s",
+            str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
             str(self.config.redis_url or "").strip() or None,
             str(self.config.task_queue_key or "").strip() or None,
             REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
@@ -44,14 +46,76 @@ class TaskQueue:
             socket_keepalive=True,
         )
 
-    async def push_task(self, task_id: str) -> None:
-        client = self._new_client()
+    async def ping(self, *, context: str = "startup_warmup") -> None:
+        client = self._new_client(context=context)
+        injected_client = self._client is client
+        try:
+            await client.ping()
+        except Exception as exc:
+            logger.exception(
+                "binary-security task queue redis ping failed: context=%s redis_url=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(self.config.redis_url or "").strip() or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+        finally:
+            if not injected_client:
+                await self._close_client(client)
+
+    async def wait_until_ready(
+        self,
+        *,
+        context: str = "startup_warmup",
+        timeout_seconds: int | None = None,
+        retry_interval_seconds: int | None = None,
+    ) -> None:
+        timeout_budget = max(1, int(timeout_seconds or self.config.startup_ready_timeout_seconds or 60))
+        retry_seconds = max(1, int(retry_interval_seconds or self.config.startup_retry_interval_seconds or 2))
+        deadline = time.monotonic() + timeout_budget
+        attempt = 0
+        last_error: Exception | None = None
+        while True:
+            attempt += 1
+            try:
+                await self.ping(context=context)
+                logger.info(
+                    "binary-security task queue redis warmup ok: context=%s attempts=%s timeout_seconds=%s retry_interval_seconds=%s",
+                    str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                    attempt,
+                    timeout_budget,
+                    retry_seconds,
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                remaining = deadline - time.monotonic()
+                logger.warning(
+                    "binary-security task queue redis warmup retrying: context=%s attempts=%s remaining_seconds=%.2f error_type=%s error=%s",
+                    str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                    attempt,
+                    max(0.0, remaining),
+                    exc.__class__.__name__,
+                    exc,
+                )
+                if remaining <= 0:
+                    break
+                await asyncio.sleep(min(retry_seconds, max(0.0, remaining)))
+        raise TimeoutError(
+            f"redis_warmup_failed context={context or DEFAULT_QUEUE_CONTEXT} "
+            f"timeout_seconds={timeout_budget} attempts={attempt} last_error={last_error}"
+        )
+
+    async def push_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
+        client = self._new_client(context=context)
         injected_client = self._client is client
         try:
             await self._push_unique(client, self.config.task_queue_key, str(task_id))
         except Exception as exc:
             logger.exception(
-                "binary-security task queue push failed: task_id=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                "binary-security task queue push failed: context=%s task_id=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
                 str(task_id or "").strip() or None,
                 str(self.config.redis_url or "").strip() or None,
                 str(self.config.task_queue_key or "").strip() or None,
@@ -63,14 +127,15 @@ class TaskQueue:
             if not injected_client:
                 await self._close_client(client)
 
-    async def force_requeue_task(self, task_id: str) -> None:
-        client = self._new_client()
+    async def force_requeue_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
+        client = self._new_client(context=context)
         injected_client = self._client is client
         try:
             await self._force_requeue(client, self.config.task_queue_key, str(task_id))
         except Exception as exc:
             logger.exception(
-                "binary-security task queue force requeue failed: task_id=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                "binary-security task queue force requeue failed: context=%s task_id=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
                 str(task_id or "").strip() or None,
                 str(self.config.redis_url or "").strip() or None,
                 str(self.config.task_queue_key or "").strip() or None,
@@ -82,8 +147,8 @@ class TaskQueue:
             if not injected_client:
                 await self._close_client(client)
 
-    async def pop_task(self, timeout_seconds: int | None = None) -> Optional[str]:
-        client = self._new_client()
+    async def pop_task(self, timeout_seconds: int | None = None, *, context: str = "task_dispatch_pop") -> Optional[str]:
+        client = self._new_client(context=context)
         injected_client = self._client is client
         try:
             try:
@@ -91,9 +156,25 @@ class TaskQueue:
                     self.config.task_queue_key,
                     timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
                 )
-            except RedisTimeoutError:
+            except RedisTimeoutError as exc:
+                logger.debug(
+                    "binary-security task queue pop timeout: context=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                    str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                    str(self.config.redis_url or "").strip() or None,
+                    str(self.config.task_queue_key or "").strip() or None,
+                    exc.__class__.__name__,
+                    exc,
+                )
                 return None
-            except (RedisConnectionError, OSError):
+            except (RedisConnectionError, OSError) as exc:
+                logger.warning(
+                    "binary-security task queue pop failed: context=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                    str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                    str(self.config.redis_url or "").strip() or None,
+                    str(self.config.task_queue_key or "").strip() or None,
+                    exc.__class__.__name__,
+                    exc,
+                )
                 return None
             return await self._consume_result(client, self.config.task_queue_key, result)
         finally:
@@ -168,8 +249,8 @@ class TaskQueue:
                 pass
         return task_id
 
-    async def queue_stats(self, queue_key: str) -> dict[str, float | int]:
-        client = self._new_client()
+    async def queue_stats(self, queue_key: str, *, context: str = "queue_snapshot") -> dict[str, float | int]:
+        client = self._new_client(context=context)
         injected_client = self._client is client
         try:
             length = int(await client.llen(queue_key) or 0)
@@ -196,7 +277,7 @@ class TaskQueue:
         }
 
     async def snapshot(self) -> dict[str, dict[str, float | int]]:
-        task_queue = await self.queue_stats(self.config.task_queue_key)
+        task_queue = await self.queue_stats(self.config.task_queue_key, context="queue_snapshot")
         return {
             "task_queue": task_queue,
             "operation_queue": {
@@ -207,7 +288,7 @@ class TaskQueue:
         }
 
     async def dedupe_orphans(self, queue_key: str) -> dict[str, Any]:
-        client = self._new_client()
+        client = self._new_client(context="queue_snapshot")
         injected_client = self._client is client
         try:
             members = sorted(list(await client.smembers(f"{queue_key}:dedupe") or []))

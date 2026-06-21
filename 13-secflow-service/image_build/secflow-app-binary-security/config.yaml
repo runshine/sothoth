@@ -63,6 +63,8 @@ queue:
   block_timeout_seconds: 5
   reconcile_interval_seconds: 30
   seed_batch_size: 20
+  startup_ready_timeout_seconds: 60
+  startup_retry_interval_seconds: 2
 
 runtime_policy:
   pipeline_mode: barrier

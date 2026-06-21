@@ -1447,7 +1447,23 @@ class TaskManager(
             str(getattr(self.cfg.queue, "task_queue_key", "") or "").strip() or None,
         )
         try:
+            if run_worker_loops or run_reducer_loop:
+                logger.info(
+                    "binary-security task manager redis_warmup starting: timeout_seconds=%s retry_interval_seconds=%s",
+                    int(getattr(self.cfg.queue, "startup_ready_timeout_seconds", 60) or 60),
+                    int(getattr(self.cfg.queue, "startup_retry_interval_seconds", 2) or 2),
+                )
+                await get_task_queue().wait_until_ready(
+                    context="startup_warmup",
+                    timeout_seconds=int(getattr(self.cfg.queue, "startup_ready_timeout_seconds", 60) or 60),
+                    retry_interval_seconds=int(getattr(self.cfg.queue, "startup_retry_interval_seconds", 2) or 2),
+                )
+                logger.info("binary-security task manager redis_warmup ok")
             if run_worker_loops:
+                logger.info("binary-security task manager seeding work queues")
+                await self._seed_work_queues()
+                logger.info("binary-security task manager seeded work queues")
+                logger.info("binary-security task manager starting dispatch loops")
                 self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
                 self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
                 self._stage_item_loop_task = asyncio.create_task(
@@ -1468,10 +1484,6 @@ class TaskManager(
                     self._reducer_metrics_snapshot_loop(),
                     name="binary-security-reducer-metrics-snapshot",
                 )
-            if run_worker_loops:
-                logger.info("binary-security task manager seeding work queues")
-                await self._seed_work_queues()
-                logger.info("binary-security task manager seeded work queues")
             logger.info("binary-security task manager started")
         except Exception:
             logger.exception("binary-security task manager start failed; stopping partially started runtime")
@@ -1713,13 +1725,13 @@ class TaskManager(
             loop = asyncio.get_running_loop()
         except RuntimeError:
             try:
-                asyncio.run(get_task_queue().push_task(normalized_task_id))
+                asyncio.run(get_task_queue().push_task(normalized_task_id, context="task_enqueue"))
             except Exception:
                 logger.warning("failed to enqueue task without running loop", extra={"task_id": normalized_task_id}, exc_info=True)
             return
         async def _push() -> None:
             try:
-                await get_task_queue().push_task(normalized_task_id)
+                await get_task_queue().push_task(normalized_task_id, context="task_enqueue")
             except Exception:
                 logger.warning("failed to enqueue task", extra={"task_id": normalized_task_id}, exc_info=True)
 

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from unittest import mock
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -12,6 +13,7 @@ class _FakeRedis:
         self.sets = {}
         self.lists = {}
         self.sorted_sets = {}
+        self.ping_calls = 0
 
     async def sadd(self, key, value):
         bucket = self.sets.setdefault(key, set())
@@ -82,6 +84,10 @@ class _FakeRedis:
     async def aclose(self):
         return None
 
+    async def ping(self):
+        self.ping_calls += 1
+        return True
+
 
 class _FakeRedisTimeout(_FakeRedis):
     def __init__(self):
@@ -109,6 +115,19 @@ class _FakeRedisStatsConnectionError(_FakeRedis):
     async def aclose(self):
         self.closed = True
         return None
+
+
+class _FakeRedisPingFlaky(_FakeRedis):
+    def __init__(self, failures_before_success):
+        super().__init__()
+        self.failures_before_success = failures_before_success
+
+    async def ping(self):
+        self.ping_calls += 1
+        if self.failures_before_success > 0:
+            self.failures_before_success -= 1
+            raise RedisTimeoutError("Timeout connecting to server")
+        return True
 
 
 class TaskQueueTests(unittest.TestCase):
@@ -217,6 +236,45 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(1, snapshot["task_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["enabled"])
+
+    def test_wait_until_ready_succeeds_after_ping(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+
+        asyncio.run(queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1))
+
+        self.assertEqual(1, fake.ping_calls)
+
+    def test_wait_until_ready_retries_until_ping_succeeds(self):
+        queue = TaskQueue()
+        fake = _FakeRedisPingFlaky(failures_before_success=2)
+        queue._client = fake
+
+        async def _no_sleep(_seconds):
+            return None
+
+        with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+            asyncio.run(queue.wait_until_ready(timeout_seconds=3, retry_interval_seconds=1))
+
+        self.assertEqual(3, fake.ping_calls)
+
+    def test_wait_until_ready_times_out_when_ping_never_recovers(self):
+        queue = TaskQueue()
+        fake = _FakeRedisPingFlaky(failures_before_success=99)
+        queue._client = fake
+
+        async def _no_sleep(_seconds):
+            return None
+
+        monotonic_values = iter([0.0, 0.0, 0.6, 1.2] + [2.0] * 64)
+
+        with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep), mock.patch(
+            "app.service.task_queue.time.monotonic",
+            side_effect=lambda: next(monotonic_values),
+        ):
+            with self.assertRaises(TimeoutError):
+                asyncio.run(queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1))
 
 
 if __name__ == "__main__":

@@ -101,12 +101,15 @@ class TaskLifecycleServiceMixin:
         try:
             queue = task_manager_module.get_task_queue()
             task_ids: list[str] = []
+            task_count = 0
+            operation_task_count = 0
             for task in db.query(task_manager_module.BinarySecurityTask).all():
                 status = str(getattr(task, "status", "") or "").strip().lower()
                 task_id = str(getattr(task, "id", "") or "").strip()
                 if not task_id:
                     continue
                 if status in {"pending", "dispatching", "running"}:
+                    task_count += 1
                     task_ids.append(task_id)
             for operation in db.query(task_manager_module.BinarySecurityTaskOperation).all():
                 operation_task_id = str(getattr(operation, "task_id", "") or "").strip()
@@ -114,9 +117,29 @@ class TaskLifecycleServiceMixin:
                 if not operation_task_id:
                     continue
                 if status in {"pending", "queued", "accepted", "running"}:
+                    operation_task_count += 1
                     task_ids.append(operation_task_id)
-            for task_id in task_ids:
-                await queue.push_task(task_id)
+            unique_task_ids = list(dict.fromkeys(task_ids))
+            task_manager_module.logger.info(
+                "binary-security seed_work_queues starting: db_task_candidates=%s operation_task_candidates=%s unique_task_ids=%s",
+                task_count,
+                operation_task_count,
+                len(unique_task_ids),
+            )
+            try:
+                for task_id in unique_task_ids:
+                    await queue.push_task(task_id, context="startup_seed")
+            except Exception:
+                task_manager_module.logger.exception(
+                    "binary-security seed_work_queues_failed: unique_task_ids=%s first_failed_task_id=%s",
+                    len(unique_task_ids),
+                    task_id,
+                )
+                raise
+            task_manager_module.logger.info(
+                "binary-security seed_work_queues completed: unique_task_ids=%s",
+                len(unique_task_ids),
+            )
         finally:
             with suppress(Exception):
                 db.close()

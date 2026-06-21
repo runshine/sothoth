@@ -155,35 +155,90 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager = TaskManager()
         manager.cfg.queue.redis_url = "redis://redis.example:6379/0"
         manager.cfg.queue.task_queue_key = "secflow:binary-security:tasks"
-        cancelled = asyncio.Event()
+        warmup_calls = []
 
-        async def _idle_loop():
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-        manager._dispatch_loop = _idle_loop
-        manager._archive_dispatch_loop = _idle_loop
-        manager._stage_item_dispatch_loop = _idle_loop
-        manager._task_heartbeat_loop = _idle_loop
+        class _Queue:
+            async def wait_until_ready(self, **kwargs):
+                warmup_calls.append(kwargs)
 
         async def _fail_seed():
             raise RedisTimeoutError("Timeout connecting to server")
 
         manager._seed_work_queues = _fail_seed
 
-        with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+        with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False), patch(
+            "app.service.task_manager.get_task_queue",
+            return_value=_Queue(),
+        ):
             with self.assertRaises(RedisTimeoutError):
                 await manager.start()
 
-        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        self.assertEqual("startup_warmup", warmup_calls[0]["context"])
         self.assertFalse(manager._running)
-        self.assertTrue(manager._loop_task.done())
-        self.assertTrue(manager._archive_loop_task.done())
-        self.assertTrue(manager._stage_item_loop_task.done())
-        self.assertTrue(manager._task_heartbeat_loop_task.done())
+        self.assertIsNone(manager._loop_task)
+        self.assertIsNone(manager._archive_loop_task)
+        self.assertIsNone(manager._stage_item_loop_task)
+        self.assertIsNone(manager._task_heartbeat_loop_task)
+
+    async def test_start_waits_for_redis_before_starting_worker_loops(self):
+        manager = TaskManager()
+        call_order = []
+
+        class _Queue:
+            async def wait_until_ready(self, **kwargs):
+                call_order.append(("warmup", kwargs["context"]))
+
+        async def _seed():
+            call_order.append(("seed", None))
+
+        async def _idle_loop():
+            call_order.append(("loop_started", None))
+            await asyncio.sleep(3600)
+
+        manager._seed_work_queues = _seed
+        manager._dispatch_loop = _idle_loop
+        manager._archive_dispatch_loop = _idle_loop
+        manager._stage_item_dispatch_loop = _idle_loop
+        manager._task_heartbeat_loop = _idle_loop
+
+        with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False), patch(
+            "app.service.task_manager.get_task_queue",
+            return_value=_Queue(),
+        ):
+            await manager.start()
+            await asyncio.sleep(0)
+            await manager.stop()
+
+        self.assertEqual(("warmup", "startup_warmup"), call_order[0])
+        self.assertEqual(("seed", None), call_order[1])
+        self.assertIn(("loop_started", None), call_order[2:])
+
+    async def test_start_waits_for_redis_before_reducer_loops(self):
+        manager = TaskManager()
+        call_order = []
+
+        class _Queue:
+            async def wait_until_ready(self, **kwargs):
+                call_order.append(("warmup", kwargs["context"]))
+
+        async def _idle_loop():
+            call_order.append(("reducer_loop_started", None))
+            await asyncio.sleep(3600)
+
+        manager._state_reducer_loop = _idle_loop
+        manager._reducer_metrics_snapshot_loop = _idle_loop
+        manager._task_heartbeat_loop = _idle_loop
+
+        with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False), patch(
+            "app.service.task_manager.get_task_queue",
+            return_value=_Queue(),
+        ):
+            await manager.start()
+            await asyncio.sleep(0)
+            await manager.stop()
+
+        self.assertEqual(("warmup", "startup_warmup"), call_order[0])
+        self.assertIn(("reducer_loop_started", None), call_order[1:])
 
     async def test_start_task_runtime_creates_runner_and_heartbeat_handle(self):
         manager = TaskManager()

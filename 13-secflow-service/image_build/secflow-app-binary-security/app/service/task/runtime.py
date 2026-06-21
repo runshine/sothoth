@@ -305,7 +305,10 @@ class TaskRuntimeServiceMixin:
             try:
                 with task_manager_module.observe_scheduler_loop("task_dispatch"):
                     self._mark_loop_heartbeat("task_dispatch")
-                    task_id = await task_manager_module.get_task_queue().pop_task(self.cfg.queue.block_timeout_seconds)
+                    task_id = await task_manager_module.get_task_queue().pop_task(
+                        self.cfg.queue.block_timeout_seconds,
+                        context="task_dispatch_pop",
+                    )
                     if task_id:
                         claimed_id = self._dispatch_task_by_id(db, task_id)
                         if claimed_id:

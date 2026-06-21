@@ -145,6 +145,8 @@ class QueueConfig(BaseModel):
     block_timeout_seconds: int = 5
     reconcile_interval_seconds: int = 30
     seed_batch_size: int = 20
+    startup_ready_timeout_seconds: int = 60
+    startup_retry_interval_seconds: int = 2
 
 
 class RuntimePolicyConfig(BaseModel):
