@@ -202,6 +202,7 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual("task-1", popped)
         self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
+        self.assertIs(fake, queue._client)
 
     def test_pop_task_treats_redis_timeout_as_empty_poll(self):
         queue = TaskQueue()
@@ -236,6 +237,7 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(1, snapshot["task_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["enabled"])
+        self.assertIs(fake, queue._client)
 
     def test_wait_until_ready_succeeds_after_ping(self):
         queue = TaskQueue()
@@ -300,6 +302,18 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertIs(fake, queue._client)
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
+
+    def test_dedupe_orphans_keeps_cached_client_alive_on_success(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+        fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
+        fake.lists[queue.config.task_queue_key] = ["task-1"]
+
+        snapshot = asyncio.run(queue.dedupe_orphans(queue.config.task_queue_key))
+
+        self.assertEqual(0, snapshot["orphan_count"])
+        self.assertIs(fake, queue._client)
 
 
 if __name__ == "__main__":

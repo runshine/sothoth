@@ -49,7 +49,6 @@ class TaskQueue:
 
     async def ping(self, *, context: str = "startup_warmup") -> None:
         client = self._new_client(context=context)
-        injected_client = self._client is client
         try:
             await client.ping()
         except Exception as exc:
@@ -61,9 +60,6 @@ class TaskQueue:
                 exc,
             )
             raise
-        finally:
-            if not injected_client:
-                await self._close_client(client)
 
     async def wait_until_ready(
         self,
@@ -110,7 +106,6 @@ class TaskQueue:
 
     async def push_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
         client = self._new_client(context=context)
-        injected_client = self._client is client
         try:
             await self._push_unique(client, self.config.task_queue_key, str(task_id))
         except Exception as exc:
@@ -124,13 +119,9 @@ class TaskQueue:
                 exc,
             )
             raise
-        finally:
-            if not injected_client:
-                await self._close_client(client)
 
     async def force_requeue_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
         client = self._new_client(context=context)
-        injected_client = self._client is client
         try:
             await self._force_requeue(client, self.config.task_queue_key, str(task_id))
         except Exception as exc:
@@ -144,49 +135,37 @@ class TaskQueue:
                 exc,
             )
             raise
-        finally:
-            if not injected_client:
-                await self._close_client(client)
 
     async def pop_task(self, timeout_seconds: int | None = None, *, context: str = "task_dispatch_pop") -> Optional[str]:
         client = self._new_client(context=context)
-        injected_client = self._client is client
         try:
-            try:
-                result = await client.blpop(
-                    self.config.task_queue_key,
-                    timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
-                )
-            except RedisTimeoutError as exc:
-                logger.debug(
-                    "binary-security task queue pop timeout: context=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
-                    str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
-                    str(self.config.redis_url or "").strip() or None,
-                    str(self.config.task_queue_key or "").strip() or None,
-                    exc.__class__.__name__,
-                    exc,
-                )
-                if injected_client:
-                    await self._close_client(client)
-                return None
-            except (RedisConnectionError, OSError) as exc:
-                logger.warning(
-                    "binary-security task queue pop failed: context=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
-                    str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
-                    str(self.config.redis_url or "").strip() or None,
-                    str(self.config.task_queue_key or "").strip() or None,
-                    exc.__class__.__name__,
-                    exc,
-                )
-                if injected_client:
-                    await self._close_client(client)
-                return None
-            return await self._consume_result(client, self.config.task_queue_key, result)
-        finally:
-            if injected_client:
-                self._client = None
-            else:
-                await self._close_client(client)
+            result = await client.blpop(
+                self.config.task_queue_key,
+                timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
+            )
+        except RedisTimeoutError as exc:
+            logger.debug(
+                "binary-security task queue pop timeout: context=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(self.config.redis_url or "").strip() or None,
+                str(self.config.task_queue_key or "").strip() or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            await self._close_client(client)
+            return None
+        except (RedisConnectionError, OSError) as exc:
+            logger.warning(
+                "binary-security task queue pop failed: context=%s redis_url=%s task_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(self.config.redis_url or "").strip() or None,
+                str(self.config.task_queue_key or "").strip() or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            await self._close_client(client)
+            return None
+        return await self._consume_result(client, self.config.task_queue_key, result)
 
     async def _close_client(self, client: Redis) -> None:
         try:
@@ -257,22 +236,15 @@ class TaskQueue:
 
     async def queue_stats(self, queue_key: str, *, context: str = "queue_snapshot") -> dict[str, float | int]:
         client = self._new_client(context=context)
-        injected_client = self._client is client
         try:
             length = int(await client.llen(queue_key) or 0)
             oldest = await client.zrange(f"{queue_key}:enqueued_at", 0, 0, withscores=True)
         except (RedisTimeoutError, RedisConnectionError, OSError):
-            if injected_client:
-                await self._close_client(client)
+            await self._close_client(client)
             return {
                 "length": 0,
                 "oldest_age_seconds": 0.0,
             }
-        finally:
-            if injected_client:
-                self._client = None
-            else:
-                await self._close_client(client)
         oldest_age_seconds = 0.0
         if oldest:
             _, score = oldest[0]
@@ -298,7 +270,6 @@ class TaskQueue:
 
     async def dedupe_orphans(self, queue_key: str) -> dict[str, Any]:
         client = self._new_client(context="queue_snapshot")
-        injected_client = self._client is client
         try:
             members = sorted(list(await client.smembers(f"{queue_key}:dedupe") or []))
             orphaned: list[str] = []
@@ -319,8 +290,7 @@ class TaskQueue:
                 "missing_timestamp_ids": missing_timestamps,
             }
         except (RedisTimeoutError, RedisConnectionError, OSError):
-            if injected_client:
-                await self._close_client(client)
+            await self._close_client(client)
             return {
                 "dedupe_count": 0,
                 "orphan_count": 0,
@@ -328,15 +298,9 @@ class TaskQueue:
                 "missing_timestamp_count": 0,
                 "missing_timestamp_ids": [],
             }
-        finally:
-            if injected_client:
-                self._client = None
-            else:
-                await self._close_client(client)
 
     async def cleanup_dedupe_orphans(self, queue_key: str) -> dict[str, Any]:
         client = self._new_client()
-        injected_client = self._client is client
         try:
             snapshot = await self.dedupe_orphans(queue_key)
             orphan_ids = list(snapshot.get("orphan_ids") or [])
@@ -353,8 +317,7 @@ class TaskQueue:
                 "removed_orphan_ids": removed_ids,
             }
         except (RedisTimeoutError, RedisConnectionError, OSError):
-            if injected_client:
-                await self._close_client(client)
+            await self._close_client(client)
             return {
                 "dedupe_count": 0,
                 "orphan_count": 0,
@@ -364,11 +327,6 @@ class TaskQueue:
                 "removed_orphan_count": 0,
                 "removed_orphan_ids": [],
             }
-        finally:
-            if injected_client:
-                self._client = None
-            else:
-                await self._close_client(client)
 
     async def close(self) -> None:
         client = self._client
