@@ -276,6 +276,21 @@ class TaskQueueTests(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 asyncio.run(queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1))
 
+    def test_new_client_is_cached_after_first_creation(self):
+        queue = TaskQueue()
+
+        with mock.patch("app.service.task_queue.Redis.from_url") as from_url:
+            fake_client = object()
+            from_url.return_value = fake_client
+
+            first = queue._new_client(context="startup_warmup")
+            second = queue._new_client(context="startup_seed")
+
+        self.assertIs(fake_client, first)
+        self.assertIs(fake_client, second)
+        self.assertIs(fake_client, queue._client)
+        from_url.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

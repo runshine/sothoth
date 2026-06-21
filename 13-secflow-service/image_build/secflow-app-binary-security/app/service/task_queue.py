@@ -37,7 +37,7 @@ class TaskQueue:
             REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
             REDIS_SOCKET_TIMEOUT_SECONDS,
         )
-        return Redis.from_url(
+        self._client = Redis.from_url(
             self.config.redis_url,
             decode_responses=True,
             socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
@@ -45,6 +45,7 @@ class TaskQueue:
             health_check_interval=30,
             socket_keepalive=True,
         )
+        return self._client
 
     async def ping(self, *, context: str = "startup_warmup") -> None:
         client = self._new_client(context=context)
@@ -356,7 +357,10 @@ class TaskQueue:
                 self._client = None
 
     async def close(self) -> None:
-        return
+        client = self._client
+        self._client = None
+        if client is not None:
+            await self._close_client(client)
 
 
 _task_queue: TaskQueue | None = None
