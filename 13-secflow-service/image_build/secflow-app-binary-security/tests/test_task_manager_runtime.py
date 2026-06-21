@@ -20,6 +20,7 @@ from app.model import (
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import StaleTaskExecution, TaskManager, _now
+from app.service.task_queue import REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, REDIS_SOCKET_TIMEOUT_SECONDS, TaskQueue
 from test_task_manager import _ModelAwareDb
 
 
@@ -137,8 +138,53 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         expires_at = self.manager._task_operation_lock_expires_at(now_value=now_value)
         self.assertEqual(60, int((expires_at - now_value).total_seconds()))
 
+    def test_task_queue_uses_fixed_redis_socket_timeouts(self):
+        queue = TaskQueue()
+
+        with patch("app.service.task_queue.Redis.from_url") as from_url:
+            from_url.return_value = object()
+            queue._new_client()
+
+        kwargs = from_url.call_args.kwargs
+        self.assertEqual(REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, kwargs["socket_connect_timeout"])
+        self.assertEqual(REDIS_SOCKET_TIMEOUT_SECONDS, kwargs["socket_timeout"])
+
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
+    async def test_start_stops_partially_started_loops_when_seed_work_queues_fails(self):
+        manager = TaskManager()
+        manager.cfg.queue.redis_url = "redis://redis.example:6379/0"
+        manager.cfg.queue.task_queue_key = "secflow:binary-security:tasks"
+        cancelled = asyncio.Event()
+
+        async def _idle_loop():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        manager._dispatch_loop = _idle_loop
+        manager._archive_dispatch_loop = _idle_loop
+        manager._stage_item_dispatch_loop = _idle_loop
+        manager._task_heartbeat_loop = _idle_loop
+
+        async def _fail_seed():
+            raise RedisTimeoutError("Timeout connecting to server")
+
+        manager._seed_work_queues = _fail_seed
+
+        with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+            with self.assertRaises(RedisTimeoutError):
+                await manager.start()
+
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        self.assertFalse(manager._running)
+        self.assertTrue(manager._loop_task.done())
+        self.assertTrue(manager._archive_loop_task.done())
+        self.assertTrue(manager._stage_item_loop_task.done())
+        self.assertTrue(manager._task_heartbeat_loop_task.done())
+
     async def test_start_task_runtime_creates_runner_and_heartbeat_handle(self):
         manager = TaskManager()
         started: list[str] = []

@@ -58,7 +58,7 @@ scheduler:
 
 queue:
   enabled: true
-  redis_url: "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
+  redis_url: "redis://secflow-app-binary-security-redis.secflow-ns.svc.cluster.local:6379/0"
   task_queue_key: "secflow:binary-security:tasks"
   block_timeout_seconds: 5
   reconcile_interval_seconds: 30

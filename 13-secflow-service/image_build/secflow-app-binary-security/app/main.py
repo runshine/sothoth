@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from contextlib import asynccontextmanager
 from contextlib import suppress
 from urllib.error import HTTPError, URLError
@@ -52,6 +53,36 @@ logger = logging.getLogger(__name__)
 _probe_server: ThreadedProbeServer | None = None
 
 
+def _emit_startup_banner(*, cfg) -> None:
+    build_meta = build_service_meta()
+    app_cfg = getattr(cfg, "app", None)
+    lines = [
+        "",
+        "=" * 88,
+        "SecFlow Binary Security Boot Banner",
+        "=" * 88,
+        f"service_id={build_meta.get('service_id') or 'secflow-app-binary-security'}",
+        f"service_name={build_meta.get('service_name') or 'SecFlow Binary Security'}",
+        f"build_version={build_meta.get('build_version') or 'unknown'}",
+        f"role={_service_role()} scheduler_enabled={_scheduler_enabled()} registry_enabled={_registry_enabled()}",
+        f"listen={getattr(app_cfg, 'host', '0.0.0.0')}:{getattr(app_cfg, 'port', '8080')} "
+        f"debug={bool(getattr(app_cfg, 'debug', False))} "
+        f"keepalive={getattr(app_cfg, 'timeout_keep_alive_seconds', None)}",
+        f"database=mysql+pymysql://{cfg.database.host}:{cfg.database.port}/{cfg.database.name}",
+        f"redis_url={cfg.queue.redis_url}",
+        f"task_queue_key={cfg.queue.task_queue_key}",
+        f"external_probe_process={_external_probe_process_enabled()} probe_port={os.environ.get('SECFLOW_PROBE_PORT', '18080')}",
+        f"probe_pid_file={os.environ.get('SECFLOW_MAIN_PID_FILE', '/tmp/secflow-main.pid')}",
+        f"probe_started_at_file={os.environ.get('SECFLOW_MAIN_STARTED_AT_FILE', '/tmp/secflow-main.started_at')}",
+        f"auth_service={cfg.auth_service.host}:{cfg.auth_service.port} timeout={cfg.auth_service.timeout}s",
+        f"pod_name={os.environ.get('POD_NAME') or '-'} pod_ip={os.environ.get('POD_IP') or '-'} pod_uid={os.environ.get('POD_UID') or '-'}",
+        "=" * 88,
+    ]
+    banner = "\n".join(lines)
+    print(banner, file=sys.stdout, flush=True)
+    logger.info("Binary Security startup banner\n%s", banner)
+
+
 def _log_startup_step(step: str, *, detail: str | None = None) -> None:
     suffix = f" detail={detail}" if detail else ""
     logger.info("Binary Security startup step=%s%s", str(step or "unknown").strip(), suffix)
@@ -64,6 +95,16 @@ def _log_startup_step_done(step: str, *, detail: str | None = None) -> None:
 
 def _external_probe_process_enabled() -> bool:
     return str(os.environ.get("SECFLOW_EXTERNAL_PROBE_PROCESS", "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _external_probe_started_at_file() -> Path:
+    return Path(os.environ.get("SECFLOW_MAIN_STARTED_AT_FILE", "/tmp/secflow-main.started_at"))
+
+
+def _mark_external_probe_startup_complete() -> None:
+    if not _external_probe_process_enabled():
+        return
+    _external_probe_started_at_file().write_text(f"{time.time()}\n", encoding="utf-8")
 
 
 def _service_role() -> str:
@@ -206,6 +247,7 @@ async def lifespan(_: FastAPI):
         _log_startup_step(startup_step)
         load_config()
         cfg = get_config()
+        _emit_startup_banner(cfg=cfg)
         _log_startup_step_done(
             startup_step,
             detail=(
@@ -265,6 +307,7 @@ async def lifespan(_: FastAPI):
             await get_task_manager().start()
             _log_startup_step_done(startup_step)
         mark_startup_state(startup_ready=True, startup_error=None)
+        _mark_external_probe_startup_complete()
     except Exception as exc:
         mark_startup_state(startup_ready=False, startup_error=str(exc))
         logger.exception(

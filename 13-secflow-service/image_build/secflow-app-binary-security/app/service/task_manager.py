@@ -1446,32 +1446,37 @@ class TaskManager(
             str(getattr(self.cfg.queue, "redis_url", "") or "").strip() or None,
             str(getattr(self.cfg.queue, "task_queue_key", "") or "").strip() or None,
         )
-        if run_worker_loops:
-            self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
-            self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
-            self._stage_item_loop_task = asyncio.create_task(
-                self._stage_item_dispatch_loop(),
-                name="binary-security-stage-item-dispatcher",
-            )
-        if run_worker_loops or run_reducer_loop:
-            self._task_heartbeat_loop_task = asyncio.create_task(
-                self._task_heartbeat_loop(),
-                name="binary-security-task-heartbeat",
-            )
-        if run_reducer_loop:
-            self._state_reducer_loop_task = asyncio.create_task(
-                self._state_reducer_loop(),
-                name="binary-security-state-reducer",
-            )
-            self._reducer_metrics_snapshot_loop_task = asyncio.create_task(
-                self._reducer_metrics_snapshot_loop(),
-                name="binary-security-reducer-metrics-snapshot",
-            )
-        if run_worker_loops:
-            logger.info("binary-security task manager seeding work queues")
-            await self._seed_work_queues()
-            logger.info("binary-security task manager seeded work queues")
-        logger.info("binary-security task manager started")
+        try:
+            if run_worker_loops:
+                self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
+                self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
+                self._stage_item_loop_task = asyncio.create_task(
+                    self._stage_item_dispatch_loop(),
+                    name="binary-security-stage-item-dispatcher",
+                )
+            if run_worker_loops or run_reducer_loop:
+                self._task_heartbeat_loop_task = asyncio.create_task(
+                    self._task_heartbeat_loop(),
+                    name="binary-security-task-heartbeat",
+                )
+            if run_reducer_loop:
+                self._state_reducer_loop_task = asyncio.create_task(
+                    self._state_reducer_loop(),
+                    name="binary-security-state-reducer",
+                )
+                self._reducer_metrics_snapshot_loop_task = asyncio.create_task(
+                    self._reducer_metrics_snapshot_loop(),
+                    name="binary-security-reducer-metrics-snapshot",
+                )
+            if run_worker_loops:
+                logger.info("binary-security task manager seeding work queues")
+                await self._seed_work_queues()
+                logger.info("binary-security task manager seeded work queues")
+            logger.info("binary-security task manager started")
+        except Exception:
+            logger.exception("binary-security task manager start failed; stopping partially started runtime")
+            await self.stop()
+            raise
 
     async def _cancel_loop_task(self, task: asyncio.Task | None) -> None:
         if task is None:

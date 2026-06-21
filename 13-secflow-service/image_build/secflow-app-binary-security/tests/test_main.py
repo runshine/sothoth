@@ -1,5 +1,6 @@
 import asyncio
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -133,6 +134,7 @@ class MainRoleTests(unittest.TestCase):
 
     def test_lifespan_logs_startup_steps_on_success(self):
         fake_cfg = SimpleNamespace(
+            app=SimpleNamespace(host="0.0.0.0", port=8080, debug=False, timeout_keep_alive_seconds=5),
             database=SimpleNamespace(host="mysql.example", port=3306, name="binary_security"),
             queue=SimpleNamespace(redis_url="redis://redis.example:6379/0", task_queue_key="secflow:binary-security:tasks"),
             auth_service=SimpleNamespace(host="auth.example", port=9000, timeout=10),
@@ -142,22 +144,39 @@ class MainRoleTests(unittest.TestCase):
         fake_engine = MagicMock()
         fake_engine.connect.return_value.__enter__.return_value = fake_conn
         fake_engine.connect.return_value.__exit__.return_value = None
+        with tempfile.TemporaryDirectory() as temp_dir:
+            started_at_file = os.path.join(temp_dir, "started_at")
 
-        async def _run():
-            async with main.lifespan(main.app):
-                return None
+            async def _run():
+                async with main.lifespan(main.app):
+                    return None
 
-        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=True), \
-            patch("app.main.load_config"), \
-            patch("app.main.get_config", return_value=fake_cfg), \
-            patch("app.main._external_probe_process_enabled", return_value=True), \
-            patch("app.main.init_database"), \
-            patch("app.main.get_engine", return_value=fake_engine), \
-            patch("app.main.verify_auth_service_or_exit"), \
-            patch("app.main._registry_enabled", return_value=False), \
-            patch("app.main._scheduler_enabled", return_value=False), \
-            patch.object(main.logger, "info") as logger_info:
-            asyncio.run(_run())
+            with patch.dict(
+                os.environ,
+                {
+                    "SECFLOW_BINARY_SECURITY_ROLE": "worker",
+                    "SECFLOW_MAIN_STARTED_AT_FILE": started_at_file,
+                },
+                clear=True,
+            ), \
+                patch("app.main.load_config"), \
+                patch("app.main.get_config", return_value=fake_cfg), \
+                patch("app.main._external_probe_process_enabled", return_value=True), \
+                patch("app.main.init_database"), \
+                patch("app.main.get_engine", return_value=fake_engine), \
+                patch("app.main.verify_auth_service_or_exit"), \
+                patch("app.main._registry_enabled", return_value=False), \
+                patch("app.main._scheduler_enabled", return_value=False), \
+                patch("builtins.print") as mock_print, \
+                patch.object(main.logger, "info") as logger_info:
+                asyncio.run(_run())
+
+            self.assertTrue(os.path.exists(started_at_file))
+            self.assertTrue(float(open(started_at_file, "r", encoding="utf-8").read().strip()) > 0)
+            self.assertTrue(mock_print.called)
+            printed_banner = mock_print.call_args.args[0]
+            self.assertIn("SecFlow Binary Security Boot Banner", printed_banner)
+            self.assertIn("redis_url=redis://redis.example:6379/0", printed_banner)
 
         info_calls = [call.args for call in logger_info.call_args_list if call.args]
 
@@ -185,31 +204,44 @@ class MainRoleTests(unittest.TestCase):
         self.assertTrue(_has_step_done("database_ping"))
         self.assertTrue(_has_step("verify_auth"))
         self.assertTrue(_has_step_done("verify_auth"))
+        self.assertTrue(any(args[0] == "Binary Security startup banner\n%s" for args in info_calls))
         self.assertTrue(any(args[0] == "SecFlow Binary Security 服务启动成功" for args in info_calls))
 
     def test_lifespan_logs_failed_startup_step_context(self):
         fake_cfg = SimpleNamespace(
+            app=SimpleNamespace(host="0.0.0.0", port=8080, debug=False, timeout_keep_alive_seconds=5),
             database=SimpleNamespace(host="mysql.example", port=3306, name="binary_security"),
             queue=SimpleNamespace(redis_url="redis://redis.example:6379/0", task_queue_key="secflow:binary-security:tasks"),
             auth_service=SimpleNamespace(host="auth.example", port=9000, timeout=10),
             registry=SimpleNamespace(menu_service_url="http://menu.example", service_id="secflow-app-binary-security"),
         )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            started_at_file = os.path.join(temp_dir, "started_at")
 
-        async def _run():
-            async with main.lifespan(main.app):
-                return None
+            async def _run():
+                async with main.lifespan(main.app):
+                    return None
 
-        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=True), \
-            patch("app.main.load_config"), \
-            patch("app.main.get_config", return_value=fake_cfg), \
-            patch("app.main._external_probe_process_enabled", return_value=True), \
-            patch("app.main.init_database", side_effect=TimeoutError("Timeout connecting to server")), \
-            patch("app.main._registry_enabled", return_value=False), \
-            patch("app.main._scheduler_enabled", return_value=True), \
-            patch.object(main.logger, "exception") as logger_exception, \
-            patch("app.main.sys.exit", side_effect=SystemExit(1)):
-            with self.assertRaises(SystemExit):
-                asyncio.run(_run())
+            with patch.dict(
+                os.environ,
+                {
+                    "SECFLOW_BINARY_SECURITY_ROLE": "worker",
+                    "SECFLOW_MAIN_STARTED_AT_FILE": started_at_file,
+                },
+                clear=True,
+            ), \
+                patch("app.main.load_config"), \
+                patch("app.main.get_config", return_value=fake_cfg), \
+                patch("app.main._external_probe_process_enabled", return_value=True), \
+                patch("app.main.init_database", side_effect=TimeoutError("Timeout connecting to server")), \
+                patch("app.main._registry_enabled", return_value=False), \
+                patch("app.main._scheduler_enabled", return_value=True), \
+                patch.object(main.logger, "exception") as logger_exception, \
+                patch("app.main.sys.exit", side_effect=SystemExit(1)):
+                with self.assertRaises(SystemExit):
+                    asyncio.run(_run())
+
+            self.assertFalse(os.path.exists(started_at_file))
 
         self.assertTrue(logger_exception.called)
         args = logger_exception.call_args.args

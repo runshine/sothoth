@@ -15,6 +15,8 @@ from app.config import get_config
 
 
 logger = logging.getLogger(__name__)
+REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 10
+REDIS_SOCKET_TIMEOUT_SECONDS = 10
 
 
 class TaskQueue:
@@ -30,14 +32,14 @@ class TaskQueue:
             "socket_connect_timeout=%s socket_timeout=%s",
             str(self.config.redis_url or "").strip() or None,
             str(self.config.task_queue_key or "").strip() or None,
-            5,
-            max(10, int(self.config.block_timeout_seconds) + 5),
+            REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
+            REDIS_SOCKET_TIMEOUT_SECONDS,
         )
         return Redis.from_url(
             self.config.redis_url,
             decode_responses=True,
-            socket_timeout=max(10, int(self.config.block_timeout_seconds) + 5),
-            socket_connect_timeout=5,
+            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
             health_check_interval=30,
             socket_keepalive=True,
         )

@@ -18,7 +18,6 @@ echo "[${SERVICE_NAME}] starting main process: $*"
 main_pid=$!
 
 printf '%s\n' "${main_pid}" > "${PID_FILE}"
-date +%s > "${STARTED_AT_FILE}"
 echo "[${SERVICE_NAME}] main pid=${main_pid} probe pid=${probe_pid}"
 
 terminate_children() {

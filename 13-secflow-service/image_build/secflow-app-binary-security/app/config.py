@@ -140,7 +140,7 @@ class SchedulerConfig(BaseModel):
 
 class QueueConfig(BaseModel):
     enabled: bool = True
-    redis_url: str = "redis://redis.sothothv2-ns.svc.cluster.local:6379/0"
+    redis_url: str = "redis://secflow-app-binary-security-redis.secflow-ns.svc.cluster.local:6379/0"
     task_queue_key: str = "secflow:binary-security:tasks"
     block_timeout_seconds: int = 5
     reconcile_interval_seconds: int = 30
