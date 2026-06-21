@@ -291,6 +291,16 @@ class TaskQueueTests(unittest.TestCase):
         self.assertIs(fake_client, queue._client)
         from_url.assert_called_once()
 
+    def test_push_task_keeps_cached_client_alive(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        queue._client = fake
+
+        asyncio.run(queue.push_task("task-1", context="startup_seed"))
+
+        self.assertIs(fake, queue._client)
+        self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
+
 
 if __name__ == "__main__":
     unittest.main()

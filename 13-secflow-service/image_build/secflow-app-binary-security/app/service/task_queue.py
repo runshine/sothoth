@@ -166,6 +166,8 @@ class TaskQueue:
                     exc.__class__.__name__,
                     exc,
                 )
+                if injected_client:
+                    await self._close_client(client)
                 return None
             except (RedisConnectionError, OSError) as exc:
                 logger.warning(
@@ -176,12 +178,15 @@ class TaskQueue:
                     exc.__class__.__name__,
                     exc,
                 )
+                if injected_client:
+                    await self._close_client(client)
                 return None
             return await self._consume_result(client, self.config.task_queue_key, result)
         finally:
-            await self._close_client(client)
             if injected_client:
                 self._client = None
+            else:
+                await self._close_client(client)
 
     async def _close_client(self, client: Redis) -> None:
         try:
@@ -257,14 +262,17 @@ class TaskQueue:
             length = int(await client.llen(queue_key) or 0)
             oldest = await client.zrange(f"{queue_key}:enqueued_at", 0, 0, withscores=True)
         except (RedisTimeoutError, RedisConnectionError, OSError):
+            if injected_client:
+                await self._close_client(client)
             return {
                 "length": 0,
                 "oldest_age_seconds": 0.0,
             }
         finally:
-            await self._close_client(client)
             if injected_client:
                 self._client = None
+            else:
+                await self._close_client(client)
         oldest_age_seconds = 0.0
         if oldest:
             _, score = oldest[0]
@@ -311,6 +319,8 @@ class TaskQueue:
                 "missing_timestamp_ids": missing_timestamps,
             }
         except (RedisTimeoutError, RedisConnectionError, OSError):
+            if injected_client:
+                await self._close_client(client)
             return {
                 "dedupe_count": 0,
                 "orphan_count": 0,
@@ -319,9 +329,10 @@ class TaskQueue:
                 "missing_timestamp_ids": [],
             }
         finally:
-            await self._close_client(client)
             if injected_client:
                 self._client = None
+            else:
+                await self._close_client(client)
 
     async def cleanup_dedupe_orphans(self, queue_key: str) -> dict[str, Any]:
         client = self._new_client()
@@ -342,6 +353,8 @@ class TaskQueue:
                 "removed_orphan_ids": removed_ids,
             }
         except (RedisTimeoutError, RedisConnectionError, OSError):
+            if injected_client:
+                await self._close_client(client)
             return {
                 "dedupe_count": 0,
                 "orphan_count": 0,
@@ -352,9 +365,10 @@ class TaskQueue:
                 "removed_orphan_ids": [],
             }
         finally:
-            await self._close_client(client)
             if injected_client:
                 self._client = None
+            else:
+                await self._close_client(client)
 
     async def close(self) -> None:
         client = self._client
