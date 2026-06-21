@@ -59,11 +59,10 @@ spec:
               mountPath: /data
           resources:
             requests:
-              memory: "256Mi"
-              cpu: "200m"
-            limits:
               memory: "1Gi"
               cpu: "1000m"
+            limits:
+              memory: "8Gi"
           startupProbe:
             httpGet:
               path: /api/app/binary-security/health
