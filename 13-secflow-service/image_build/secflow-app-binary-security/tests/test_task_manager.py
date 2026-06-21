@@ -24292,6 +24292,104 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("sat_existing", existing_item.downstream_task_id)
         self.assertEqual("success", result["status"])
 
+    def test_run_system_analysis_item_reactivates_cancelled_stage_run_before_polling(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="cancelled",
+        )
+        existing_item = BinarySecurityStageItem(
+            id="i1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr0",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            parent_key="source_project",
+            downstream_service="system_analyse",
+            downstream_task_id="sat_existing",
+            status="running",
+        )
+
+        class _SessionDb(_ModelAwareDb):
+            def __init__(self):
+                super().__init__(tasks=[task], stage_runs=[stage_run], stage_items=[existing_item])
+
+            def close(self):
+                pass
+
+        db = _SessionDb()
+        firmware = {
+            "firmware_key": "source_project",
+            "firmware_name": "source",
+            "filename": "source-project",
+            "unpacked_root": "/w/input",
+            "source_root": "/w/input",
+            "task_type": TASK_TYPE_SOURCE,
+        }
+        observed_stage_statuses: list[str] = []
+
+        class _FakeSystemAnalyseClient:
+            async def list_tasks(self, *args, **kwargs):
+                raise AssertionError("list_tasks should not be called when active payload is reused")
+
+            async def create_task(self, *args, **kwargs):
+                raise AssertionError("create_task should not be called when active payload is reused")
+
+            async def get_task(self, task_id):
+                observed_stage_statuses.append(stage_run.status)
+                if len(observed_stage_statuses) == 1:
+                    return {"task_id": task_id, "status": "running"}
+                return {"task_id": task_id, "status": "success"}
+
+            async def get_task_result(self, task_id):
+                return {"task_id": task_id}
+
+        fake_client = _FakeSystemAnalyseClient()
+        original_factory = task_manager_module.get_session_factory
+        original_client = task_manager_module.get_system_analyse_client
+        original_queue_archive = self.manager._queue_archive_and_wait
+        original_parse_modules = self.manager._parse_system_analysis_modules
+        original_is_cancelled = self.manager._is_task_cancelled
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        task_manager_module.get_system_analyse_client = lambda: fake_client
+        self.manager._is_task_cancelled = lambda task_id: False
+
+        async def fake_queue_archive_and_wait(session, task_arg, item_arg, payload, mapped_status, before_status):
+            del session, task_arg, item_arg, payload, mapped_status, before_status
+            return Path("/tmp/archive"), SimpleNamespace(error_message=None)
+
+        self.manager._queue_archive_and_wait = fake_queue_archive_and_wait
+        self.manager._parse_system_analysis_modules = lambda archive_root, firmware_arg, result_payload=None: []
+
+        try:
+            result = asyncio.run(self.manager._run_system_analysis_item(task, stage_run, firmware, retrying=False))
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            task_manager_module.get_system_analyse_client = original_client
+            self.manager._queue_archive_and_wait = original_queue_archive
+            self.manager._parse_system_analysis_modules = original_parse_modules
+            self.manager._is_task_cancelled = original_is_cancelled
+
+        self.assertEqual("success", result["status"])
+        self.assertTrue(observed_stage_statuses)
+        self.assertEqual("running", observed_stage_statuses[0])
+
     def test_stage_item_supports_identity_key_field(self):
         item = BinarySecurityStageItem(
             id="i1",

@@ -15,6 +15,15 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    def _commit_stage_item_active_state(
+        self: TaskManager,
+        session: Session,
+        task,
+        stage_run,
+    ) -> None:
+        self._refresh_stage_run_from_items(session, task, stage_run.stage_name)
+        session.commit()
+
     @staticmethod
     def _task_lease_expires_at():
         from app.service import task_manager as task_manager_module
@@ -1967,7 +1976,7 @@ class TaskRuntimeServiceMixin:
                     stage_name=stage_run.stage_name,
                     updates={"project_id": task.project_id},
                 )
-                session.commit()
+                self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success"},
@@ -2004,7 +2013,7 @@ class TaskRuntimeServiceMixin:
                     if mapped_reusable_status in {"queued", "running"}:
                         item.status = mapped_reusable_status
                         item.started_at = item.started_at or _now()
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success"},
@@ -2039,7 +2048,7 @@ class TaskRuntimeServiceMixin:
                             stage_name=stage_run.stage_name,
                             updates={"project_id": task.project_id},
                         )
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success"},
@@ -2294,7 +2303,7 @@ class TaskRuntimeServiceMixin:
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 item.started_at = item.started_at or _now()
                 item.error_message = None
-                session.commit()
+                self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, None),
                     success_statuses={"passed", "success"},
@@ -2313,7 +2322,7 @@ class TaskRuntimeServiceMixin:
                     mapped_reusable_status = self._map_downstream_status(downstream_status)
                     if mapped_reusable_status in {"queued", "running"}:
                         item.status = mapped_reusable_status
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses={"passed", "success"},
@@ -2346,7 +2355,7 @@ class TaskRuntimeServiceMixin:
                         created = dict(control.get("payload") or {})
                         item.downstream_task_id = created.get("task_id") or item.downstream_task_id
                         item.status = "running"
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses={"passed", "success"},
@@ -2358,7 +2367,7 @@ class TaskRuntimeServiceMixin:
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses={"passed", "success"},
@@ -2638,7 +2647,7 @@ class TaskRuntimeServiceMixin:
                 )
                 item.started_at = item.started_at or _now()
                 item.error_message = None
-                session.commit()
+                self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success", "partial_success", "completed"},
@@ -2653,7 +2662,7 @@ class TaskRuntimeServiceMixin:
                     mapped_reusable_status = self._map_downstream_status(downstream_status)
                     if mapped_reusable_status in {"queued", "running"}:
                         item.status = mapped_reusable_status
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "partial_success", "completed"},
@@ -2686,7 +2695,7 @@ class TaskRuntimeServiceMixin:
                         created = dict(control.get("payload") or {})
                         item.downstream_task_id = created.get("id") or item.downstream_task_id
                         item.status = "running"
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "partial_success", "completed"},
@@ -2698,7 +2707,7 @@ class TaskRuntimeServiceMixin:
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "partial_success", "completed"},
@@ -3005,7 +3014,7 @@ class TaskRuntimeServiceMixin:
                 item.downstream_task_id = (
                     active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 )
-                session.commit()
+                self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"passed", "success"},
@@ -3031,7 +3040,7 @@ class TaskRuntimeServiceMixin:
                     )
                     if mapped_reusable_status in {"pending", "queued", "dispatching", "running"}:
                         item.status = mapped_reusable_status
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"passed", "success"},
@@ -3085,7 +3094,7 @@ class TaskRuntimeServiceMixin:
                         payload = dict(control.get("payload") or {})
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"passed", "success"},
@@ -3479,7 +3488,7 @@ class TaskRuntimeServiceMixin:
             if active_payload is not None:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
-                session.commit()
+                self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, None),
                     success_statuses={"passed", "success"},
@@ -3505,7 +3514,7 @@ class TaskRuntimeServiceMixin:
                     )
                     if mapped_reusable_status in {"queued", "running"}:
                         item.status = mapped_reusable_status
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses={"passed", "success"},
@@ -3538,7 +3547,7 @@ class TaskRuntimeServiceMixin:
                         created = dict(control.get("payload") or {})
                         item.downstream_task_id = created.get("task_id") or item.downstream_task_id
                         item.status = "running"
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses={"passed", "success"},
@@ -3550,7 +3559,7 @@ class TaskRuntimeServiceMixin:
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses={"passed", "success"},
@@ -3962,7 +3971,7 @@ class TaskRuntimeServiceMixin:
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "pending"
                 self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
-                session.commit()
+                self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success", "succeeded", "completed"},
@@ -3987,7 +3996,7 @@ class TaskRuntimeServiceMixin:
                     )
                     if mapped_reusable_status in {"pending", "dispatching", "running"}:
                         item.status = mapped_reusable_status
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "succeeded", "completed"},
@@ -4017,7 +4026,7 @@ class TaskRuntimeServiceMixin:
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "dispatching"
-                        session.commit()
+                        self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "succeeded", "completed"},
@@ -4060,7 +4069,7 @@ class TaskRuntimeServiceMixin:
                             payload = dict(active_payload)
                             item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                             item.status = self._map_downstream_status(str(payload.get("status") or "")) or "dispatching"
-                            session.commit()
+                            self._commit_stage_item_active_state(session, task, stage_run)
                             status, payload = await self._poll_until_terminal(
                                 lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                                 success_statuses={"success", "succeeded", "completed"},
