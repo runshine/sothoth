@@ -4,6 +4,7 @@ import json
 import os
 import socket
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -18,6 +19,19 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
+    def _normalize_event_payload_value(self: TaskManager, value: Any) -> Any:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {str(key): self._normalize_event_payload_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._normalize_event_payload_value(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._normalize_event_payload_value(item) for item in value]
+        if isinstance(value, set):
+            return [self._normalize_event_payload_value(item) for item in sorted(value, key=lambda item: str(item))]
+        return value
+
     def _set_task_status(
         self: TaskManager,
         db: Session,
@@ -476,7 +490,7 @@ class TaskEventServiceMixin:
     ) -> dict[str, Any]:
         from app.service import task_manager as task_manager_module
 
-        normalized_payload = dict(payload or {})
+        normalized_payload = self._normalize_event_payload_value(dict(payload or {}))
         if self._json_payload_size_bytes(normalized_payload) <= task_manager_module.DB_EVENT_PAYLOAD_LIMIT_BYTES:
             return normalized_payload
         resolved_task = self._resolve_task_for_event_payload(

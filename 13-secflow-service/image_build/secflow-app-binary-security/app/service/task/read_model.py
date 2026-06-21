@@ -2756,6 +2756,13 @@ class TaskReadModelServiceMixin:
                     heartbeat_status = "healthy"
                 elif lease_expires_at is not None and (task_shared._seconds_until(lease_expires_at) or 0) > 0:
                     heartbeat_status = "degraded"
+            if (
+                remote_owner_active
+                and not has_local_owner
+                and heartbeat_status == "healthy"
+                and runtime_phase != task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+            ):
+                heartbeat_status = "degraded"
             units.append(
                 self._build_runtime_health_unit(
                     unit_key="task_heartbeat",

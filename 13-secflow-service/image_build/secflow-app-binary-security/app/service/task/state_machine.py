@@ -11,6 +11,7 @@ from app.model import (
     BinarySecurityTask,
     BinarySecurityTaskOperation,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_TYPE_SOURCE,
     normalize_stage_name,
 )

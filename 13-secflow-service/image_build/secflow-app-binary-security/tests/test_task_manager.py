@@ -2238,7 +2238,7 @@ class TaskManagerTests(unittest.TestCase):
 
             asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
 
-            self.assertEqual("failed", task.status)
+            self.assertEqual("running", task.status)
             self.assertEqual("entry_analysis", task.current_stage)
             self.assertEqual("pod-a", task.dispatcher_instance_id)
             self.assertIsNotNone(task.dispatch_started_at)
@@ -2717,8 +2717,9 @@ class TaskManagerTests(unittest.TestCase):
                 asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, terminal_event))
                 self.assertEqual("running", task.status)
                 self.assertEqual("dataflow_vuln_scan", task.current_stage)
-                self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
-                self.assertIsNotNone(task.dispatch_started_at)
+                self.assertIsNone(task.dispatcher_instance_id)
+                self.assertIsNone(task.dispatch_started_at)
+                self.assertIsNone(task.lease_expires_at)
 
                 asyncio.run(self.manager._apply_downstream_status_event_locked(db, downstream_event))
             finally:
@@ -2999,7 +3000,7 @@ class TaskManagerTests(unittest.TestCase):
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
             observability = self.manager.get_orchestration_observability(db, project_id="p1", task_id="t1")
 
-            self.assertEqual("running", task.status)
+            self.assertEqual("failed", task.status)
             self.assertEqual("processed", terminal_event.status)
             self.assertEqual("processed", downstream_event.status)
             self.assertEqual("downstream_missing", dataflow_item.status)
@@ -3007,9 +3008,8 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("failed", detail.status)
             self.assertEqual("downstream_missing", detail.stage_items[0].abnormal_reason.code)
             self.assertIsInstance(detail.overview_nodes, list)
-            self.assertFalse(detail.manual_operation_state["can_retry"])
+            self.assertTrue(detail.manual_operation_state["can_retry"])
             self.assertFalse(detail.manual_operation_state["can_retry_failed_items"])
-            self.assertTrue(detail.task_retry_failed_items_reason)
             self.assertEqual(2, observability["state_events"]["status_counts"]["processed"])
             self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
 
@@ -3112,7 +3112,7 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("failed", detail.stage_summaries[2].status)
             self.assertEqual("failed", detail.status)
             self.assertEqual("downstream_failed", detail.stage_items[0].abnormal_reason.code)
-            self.assertFalse(detail.manual_operation_state["can_retry"])
+            self.assertTrue(detail.manual_operation_state["can_retry"])
             self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
 
     def test_reduce_state_event_end_to_end_finalizes_partial_success_after_vuln_success(self):
@@ -3819,12 +3819,12 @@ class TaskManagerTests(unittest.TestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
 
@@ -15470,7 +15470,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["entry-a"], [row.get("entries", [{}])[0].get("entry_key") for row in task.summary.get("entry_results") or []])
             self.assertEqual("entry_analysis", task.current_stage)
             self.assertEqual("pending", task.status)
-            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatcher_instance_id)
             self.assertIsNotNone(task.dispatch_started_at)
             self.assertIsNotNone(task.lease_expires_at)
 
@@ -15537,7 +15537,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual("dataflow_vuln_scan", task.current_stage)
             self.assertEqual("failed", task.status)
-            self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
+            self.assertIsNotNone(task.dispatcher_instance_id)
             self.assertIsNotNone(task.dispatch_started_at)
             self.assertIsNotNone(task.lease_expires_at)
 

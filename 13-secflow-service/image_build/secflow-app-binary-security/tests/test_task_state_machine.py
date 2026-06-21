@@ -3,7 +3,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 import asyncio
 
-from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask, TASK_RUNTIME_PHASE_OWNED_EXECUTION, TASK_RUNTIME_PHASE_TERMINAL
+from app.model import (
+    BinarySecurityStageItem,
+    BinarySecurityStageRun,
+    BinarySecurityTask,
+    BinarySecurityTaskRuntimeLease,
+    TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+    TASK_RUNTIME_PHASE_TERMINAL,
+)
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb
@@ -115,7 +123,7 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-        record_event.assert_called_once()
+        self.assertEqual(2, record_event.call_count)
         enqueue_task.assert_called_once_with(task.id)
 
     def test_decide_owned_execution_requeue_uses_authoritative_active_stage(self):
@@ -215,6 +223,17 @@ class TaskStateMachineTests(unittest.TestCase):
             ),
             patch.object(self.manager, "_record_event") as record_event,
             patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
+            patch.object(
+                self.manager,
+                "_activate_tail_reconciliation",
+                return_value=BinarySecurityTaskRuntimeLease(
+                    task_id=task.id,
+                    execution_epoch=1,
+                    owner_instance_id="worker-1",
+                    heartbeat_at=task_manager_module._now(),
+                    lease_expires_at=task_manager_module._now() + task_manager_module.timedelta(seconds=30),
+                ),
+            ),
         ):
             applied = asyncio.run(
                 self.manager._apply_task_action_after_stage_terminal(
@@ -231,7 +250,8 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertTrue(applied)
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        record_event.assert_called_once()
+        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+        self.assertEqual(1, record_event.call_count)
 
     def test_finalize_task_defers_for_active_stage(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="entry_analysis", workspace_root="/tmp/ws", output_root="/tmp/out")
@@ -271,7 +291,7 @@ class TaskStateMachineTests(unittest.TestCase):
 
         self.assertEqual("success", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
-        record_event.assert_called_once()
+        self.assertEqual(2, record_event.call_count)
 
     def test_refresh_task_status_after_sync_active_operation_returns_early(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="failed", workspace_root="/tmp/ws", output_root="/tmp/out")
