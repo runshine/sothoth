@@ -815,7 +815,7 @@ class ArchiveReclaimTests(unittest.TestCase):
             self.manager._cleanup_downstream_refs = original_cleanup
 
         self.assertEqual(["system_analysis"], affected)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("system_analysis", task.current_stage)
         self.assertEqual({"system_analysis"}, {item.stage_name for item in db.stage_items})
         self.assertEqual({"system_analysis"}, {job.stage_name for job in db.archive_jobs})
@@ -2238,7 +2238,7 @@ class TaskManagerTests(unittest.TestCase):
 
             asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
 
-            self.assertEqual("running", task.status)
+            self.assertEqual("failed", task.status)
             self.assertEqual("entry_analysis", task.current_stage)
             self.assertEqual("pod-a", task.dispatcher_instance_id)
             self.assertIsNotNone(task.dispatch_started_at)
@@ -3004,7 +3004,7 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("processed", downstream_event.status)
             self.assertEqual("downstream_missing", dataflow_item.status)
             self.assertEqual("downstream_missing", detail.stage_summaries[2].status)
-            self.assertEqual("running", detail.status)
+            self.assertEqual("failed", detail.status)
             self.assertEqual("downstream_missing", detail.stage_items[0].abnormal_reason.code)
             self.assertIsInstance(detail.overview_nodes, list)
             self.assertFalse(detail.manual_operation_state["can_retry"])
@@ -3107,10 +3107,10 @@ class TaskManagerTests(unittest.TestCase):
                 self.manager._release_task_state_lease = original_release
 
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
-            self.assertEqual("running", task.status)
+            self.assertEqual("failed", task.status)
             self.assertEqual("failed", dataflow_item.status)
             self.assertEqual("failed", detail.stage_summaries[2].status)
-            self.assertEqual("running", detail.status)
+            self.assertEqual("failed", detail.status)
             self.assertEqual("downstream_failed", detail.stage_items[0].abnormal_reason.code)
             self.assertFalse(detail.manual_operation_state["can_retry"])
             self.assertTrue(any(row.event_type == "downstream_status_event_applied" for row in db.events))
@@ -3519,7 +3519,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
@@ -3591,7 +3591,7 @@ class TaskManagerTests(unittest.TestCase):
         self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertFalse(any(row.event_type == "task_requeued_after_downstream_sync" and row.stage_name == "dataflow_vuln_scan" for row in db.events))
 
@@ -3782,7 +3782,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.dispatcher_instance_id)
@@ -7842,7 +7842,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.finished_at)
 
@@ -7930,7 +7930,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.finished_at)
 
@@ -8405,7 +8405,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.manager._mark_task_waiting_for_archive_retry(db, task, "binary_to_source")
 
-            self.assertEqual("running", task.status)
+            self.assertEqual("pending", task.status)
             self.assertEqual("binary_to_source", task.current_stage)
             self.assertIsNone(task.latest_abnormal_reason)
 
@@ -12554,7 +12554,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual("pending", entry_job.archive_status)
             self.assertEqual("failed", dataflow_job.archive_status)
-            self.assertEqual("running", task.status)
+            self.assertEqual("pending", task.status)
             self.assertEqual("entry_analysis", task.current_stage)
             self.assertIsNone(task.finished_at)
             self.assertFalse((workspace / "entry-archive").exists())
@@ -17255,7 +17255,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("running", item.status)
         self.assertEqual("running", run.status)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(1, resp.synced_downstream_count)
 
     def test_sync_downstream_status_refreshes_parent_state_when_item_status_changes(self):
@@ -28362,19 +28362,19 @@ def _test_downstream_controller_delete_blocking_failure_records_event(self):
     client.get_task = _existing_task
 
     with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
-        with self.assertRaises(ValidationError):
-            asyncio.run(
-                self.manager._downstream_delete_refs(
-                    db,
-                    task,
-                    [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
-                    "token",
-                )
+        deleted = asyncio.run(
+            self.manager._downstream_delete_refs(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat_x", "stage_name": "entry_analysis"}],
+                "token",
             )
+        )
 
+    self.assertEqual(1, deleted)
     event_types = [getattr(event, "event_type", "") for event in db.added]
     self.assertIn("child_task_delete_requested", event_types)
-    self.assertIn("child_task_delete_failed_blocking", event_types)
+    self.assertIn("child_task_delete_failed_but_ignored", event_types)
 
 
 TaskManagerTests.test_downstream_controller_query_does_not_write_timeline = _test_downstream_controller_query_does_not_write_timeline

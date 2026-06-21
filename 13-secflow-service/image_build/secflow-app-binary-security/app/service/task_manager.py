@@ -9264,6 +9264,7 @@ class TaskManager(
         token: str | None,
     ) -> None:
         normalized_refs = [dict(ref) for ref in list(refs or []) if isinstance(ref, dict)]
+        operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         for ref in normalized_refs:
             event_item = self._event_item_for_downstream_ref(db, task, ref)
             self._record_event(
@@ -9274,6 +9275,7 @@ class TaskManager(
                 stage_name=ref.get("stage_name"),
                 item=event_item,
                 payload={**ref, "operation": "inactive_check", "cleanup_phase": "inactive_check"},
+                operation_id=operation_id,
             )
         try:
             await self._downstream_ensure_refs_inactive(normalized_refs, token)
@@ -9295,6 +9297,7 @@ class TaskManager(
                         "result": "blocked",
                         "error": str(exc),
                     },
+                    operation_id=operation_id,
                 )
             raise
         for ref in normalized_refs:
@@ -9312,6 +9315,7 @@ class TaskManager(
                     "cleanup_phase": "inactive_check",
                     "result": "succeeded",
                 },
+                operation_id=operation_id,
             )
 
     async def _delete_downstream_refs(
