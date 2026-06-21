@@ -981,14 +981,18 @@ class TaskControlServiceMixin:
             operation.status = "superseded"
             operation.finished_at = reset_at
             operation.superseded_by_operation_id = None
-            operation_payload = dict(getattr(operation, "result_payload", None) or {})
+            operation_payload = dict(self._operation_result_data(operation) or {})
             operation_payload["force_reset"] = {
                 "requested": True,
                 "requested_by": str(requested_by or "").strip() or None,
                 "reset_at": reset_at.isoformat(),
                 "task_status_after": "pending",
             }
-            operation.result_payload = operation_payload
+            self._persist_operation_result_payload(
+                operation,
+                operation_payload,
+                workspace_root=task.workspace_root,
+            )
             self._record_operation_event(
                 db,
                 task,

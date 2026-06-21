@@ -630,7 +630,10 @@ class TaskOperationServiceMixin:
             try:
                 yield nested
             except Exception:
-                nested.rollback()
+                # Preserve the original write failure when the DB connection has
+                # already been invalidated and savepoint cleanup cannot run.
+                with suppress(Exception):
+                    nested.rollback()
                 raise
 
         return _cm()
@@ -3641,11 +3644,11 @@ class TaskOperationServiceMixin:
                     task.current_operation_id = task_refreshed.current_operation_id
                     task.updated_at = task_refreshed.updated_at
                 if operation_refreshed is not None:
-                    operation.result_payload = dict(operation_refreshed.result_payload or {})
-                    operation.request_payload = dict(operation_refreshed.request_payload or {})
-                    operation.step_payload = dict(operation_refreshed.step_payload or {})
-                    operation.step_attempts = dict(operation_refreshed.step_attempts or {})
-                    operation.resume_cursor = dict(operation_refreshed.resume_cursor or {})
+                    operation.result_payload_json = operation_refreshed.result_payload_json
+                    operation.request_payload_json = operation_refreshed.request_payload_json
+                    operation.step_payload_json = operation_refreshed.step_payload_json
+                    operation.step_attempts_json = operation_refreshed.step_attempts_json
+                    operation.resume_cursor_json = operation_refreshed.resume_cursor_json
                     operation.current_step = operation_refreshed.current_step
 
         async def _finalize_cancelled() -> dict[str, Any]:

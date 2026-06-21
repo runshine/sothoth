@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import pymysql
 import re
 import tempfile
 import unittest
@@ -33665,6 +33666,24 @@ def _test_apply_child_state_with_savepoint_records_state_apply_failed(self):
     self.assertIn("apply boom", failed_events[-1].payload.get("apply_error", ""))
 
 
+def _test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails(self):
+    manager = TaskManager()
+
+    class _BrokenNestedTransaction:
+        def rollback(self):
+            raise pymysql.err.InterfaceError(0, "")
+
+    class _BrokenSavepointDb:
+        def begin_nested(self):
+            return _BrokenNestedTransaction()
+
+    db = _BrokenSavepointDb()
+
+    with self.assertRaisesRegex(RuntimeError, "original write failure"):
+        with manager._savepoint(db):
+            raise RuntimeError("original write failure")
+
+
 def _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending(self):
     manager = TaskManager()
     task = BinarySecurityTask(id="task-7", project_id="p1", name="demo", status="running")
@@ -35804,6 +35823,7 @@ TaskManagerTests.test_persist_child_sync_observation_skips_flush_when_observatio
 TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
 TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed
+TaskManagerTests.test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails = _test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails
 TaskManagerTests.test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending = _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending
 TaskManagerTests.test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied = _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied
 TaskManagerTests.test_sync_downstream_status_rewinds_running_entry_item_to_pending = _test_sync_downstream_status_rewinds_running_entry_item_to_pending
@@ -36976,6 +36996,71 @@ def _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state(s
     self.assertTrue(any(event.event_type == "operation_force_reset_superseded" for event in db.events))
 
 
+def _test_force_reset_task_to_pending_externalizes_large_operation_result_payload(self):
+    task = BinarySecurityTask(
+        id="task-force-reset-large-payload",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        current_operation_id="op-force-reset-large",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-force-reset-large",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry",
+        status="running",
+        target_stage="system_analysis",
+    )
+    oversized_payload = {"huge": "x" * 100000}
+    self.manager._persist_operation_result_payload(
+        operation,
+        oversized_payload,
+        workspace_root=task.workspace_root,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], events=[])
+    original_cancel = self.manager._request_local_worker_cancel
+    original_clear_runtime_lease = self.manager._clear_runtime_lease
+    original_enqueue = self.manager._enqueue_task
+    original_release_tail_owner = self.manager._release_tail_reconcile_owner
+
+    async def _fake_cancel(task_id: str, *, wait_for_runner: bool):
+        return None
+
+    try:
+        self.manager._request_local_worker_cancel = _fake_cancel
+        self.manager._clear_runtime_lease = lambda *_args, **_kwargs: None
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        self.manager._release_tail_reconcile_owner = lambda *_args, **_kwargs: None
+        response = asyncio.run(
+            self.manager.force_reset_task_to_pending(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                requested_by="tester",
+            )
+        )
+    finally:
+        self.manager._request_local_worker_cancel = original_cancel
+        self.manager._clear_runtime_lease = original_clear_runtime_lease
+        self.manager._enqueue_task = original_enqueue
+        self.manager._release_tail_reconcile_owner = original_release_tail_owner
+
+    self.assertTrue(response.accepted)
+    result_payload = dict(operation.result_payload or {})
+    self.assertEqual("tester", dict(result_payload.get("force_reset") or {}).get("requested_by"))
+    persisted_payload = json.loads(operation.result_payload_json or "{}")
+    self.assertIn("result_payload_path", persisted_payload)
+    self.assertNotIn("huge", persisted_payload)
+    self.assertLess(len(operation.result_payload_json or ""), 4096)
+
+
 def _test_force_reset_task_to_pending_rejects_terminal_success(self):
     task = BinarySecurityTask(
         id="task-force-reset-terminal",
@@ -37004,6 +37089,7 @@ def _test_force_reset_task_to_pending_rejects_terminal_success(self):
 
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
+TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
 
 
 if __name__ == "__main__":

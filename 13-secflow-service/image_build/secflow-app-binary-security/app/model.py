@@ -445,8 +445,8 @@ class BinarySecurityTaskOperation(Base, JsonMixin):
     request_source = Column(String(32), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="requested", index=True)
     operation_token = Column(String(64), nullable=False, index=True)
-    request_payload_json = Column(Text, nullable=True)
-    result_payload_json = Column(Text, nullable=True)
+    request_payload_json = Column(MEDIUMTEXT, nullable=True)
+    result_payload_json = Column(MEDIUMTEXT, nullable=True)
     error_code = Column(String(64), nullable=True, index=True)
     error_message = Column(Text, nullable=True)
     current_step = Column(String(64), nullable=True, index=True)
@@ -913,7 +913,8 @@ def _ensure_compat_columns(engine) -> None:
         _execute_compat_statements(index_statements)
     operation_table = BinarySecurityTaskOperation.__tablename__
     if inspector.has_table(operation_table):
-        columns = {column["name"] for column in inspector.get_columns(operation_table)}
+        column_defs = {column["name"]: column for column in inspector.get_columns(operation_table)}
+        columns = set(column_defs)
         statements = []
         if "current_step" not in columns:
             statements.append(
@@ -930,6 +931,16 @@ def _ensure_compat_columns(engine) -> None:
         if "resume_cursor_json" not in columns:
             statements.append(
                 f"ALTER TABLE {operation_table} ADD COLUMN resume_cursor_json TEXT NULL"
+            )
+        request_payload_json_type = str(column_defs.get("request_payload_json", {}).get("type") or "").lower()
+        if "request_payload_json" in columns and "mediumtext" not in request_payload_json_type:
+            statements.append(
+                f"ALTER TABLE {operation_table} MODIFY COLUMN request_payload_json MEDIUMTEXT NULL"
+            )
+        result_payload_json_type = str(column_defs.get("result_payload_json", {}).get("type") or "").lower()
+        if "result_payload_json" in columns and "mediumtext" not in result_payload_json_type:
+            statements.append(
+                f"ALTER TABLE {operation_table} MODIFY COLUMN result_payload_json MEDIUMTEXT NULL"
             )
         _execute_compat_statements(statements)
     else:
