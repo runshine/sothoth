@@ -3446,7 +3446,8 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[run])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("cancelled", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
@@ -3471,7 +3472,8 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("failed", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
@@ -3559,7 +3561,8 @@ class TaskManagerTests(unittest.TestCase):
             stage_items=dataflow_items,
         )
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
@@ -3630,7 +3633,8 @@ class TaskManagerTests(unittest.TestCase):
             stage_items=[entry_item],
         )
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual("pending", task.status)
@@ -3708,7 +3712,8 @@ class TaskManagerTests(unittest.TestCase):
             events=[],
         )
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("system_analysis", task.current_stage)
@@ -3778,7 +3783,8 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run, dataflow_run], stage_items=[dataflow_item])
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
@@ -3822,7 +3828,8 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[run])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
@@ -3859,7 +3866,8 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[run])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
@@ -5842,6 +5850,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             task_id="t1",
             task_type=TASK_TYPE_SOURCE,
             name="source-task",
+            schedule_user_task_id="sched-1",
             input_files=[BinarySecurityInputFile(filename="src.zip", size=12)],
         )
         row = BinarySecurityServiceConfig(config_key="global")
@@ -5875,6 +5884,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("mixed_streaming", detail.policy["pipeline_mode"])
         self.assertEqual("mixed_streaming", db.tasks[-1].policy["pipeline_mode"])
+        self.assertEqual("sched-1", db.tasks[-1].schedule_user_task_id)
 
     async def test_create_task_override_pipeline_mode_wins_after_normalization(self):
         payload = BinarySecurityTaskCreate(
@@ -7078,7 +7088,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_enqueue = self.manager._enqueue_task
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
         try:
-            self.manager._finalize_task(db, task)
+            with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+                self.manager._finalize_task(db, task)
         finally:
             self.manager._enqueue_task = original_enqueue
 
@@ -7115,7 +7126,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("failed", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
@@ -7146,7 +7158,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("running", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
@@ -7206,7 +7219,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
@@ -7251,7 +7265,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             events=[],
         )
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("running", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
@@ -7301,7 +7316,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_enqueue = self.manager._enqueue_task
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
         try:
-            self.manager._refresh_task_status_after_sync(db, task)
+            with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+                self.manager._refresh_task_status_after_sync(db, task)
         finally:
             self.manager._enqueue_task = original_enqueue
 
@@ -7348,7 +7364,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             events=[],
         )
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
@@ -7392,10 +7409,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
         self.assertIsNone(task.latest_abnormal_reason)
 
     def test_finalize_task_clears_latest_abnormal_reason_after_success(self):
@@ -7435,7 +7457,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
 
         self.assertEqual("success", task.status)
         self.assertIsNone(task.latest_abnormal_reason)
@@ -7733,7 +7756,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_enqueue = self.manager._enqueue_task
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
         try:
-            self.manager._refresh_task_status_after_sync(db, task)
+            with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+                self.manager._refresh_task_status_after_sync(db, task)
         finally:
             self.manager._enqueue_task = original_enqueue
 
@@ -7788,7 +7812,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertIn(task.status, {"running", "pending"})
         self.assertIsNone(task.last_error)
@@ -7832,7 +7857,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         ]
         db = _ModelAwareDb(tasks=[task], stage_runs=runs)
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
@@ -7882,7 +7908,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         ]
         db = _ModelAwareDb(stage_runs=runs)
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
@@ -7934,7 +7961,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[failed_run, next_run], stage_items=[])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("system_analysis", task.current_stage)
@@ -7970,7 +7998,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[failed_run], stage_items=[])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
@@ -10234,7 +10263,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], operations=[operation])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("cancelling", task.status)
         self.assertIsNone(task.finished_at)
@@ -10479,7 +10509,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], operations=[cancel_operation])
 
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual(TASK_STATUS_CANCEL_FAILED, task.status)
         self.assertEqual("op-cancel", task.current_operation_id)
@@ -24037,7 +24068,12 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertIsNone(item.claim_execution_token)
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
+        self.assertIsNone(task.last_error)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
         self.assertTrue(any(event.event_type == "streaming_stage_item_requeued_after_stale_execution" for event in fake_session.events))
 
     def test_run_stage_item_by_id_stale_execution_ignores_claim_mismatch_after_takeover(self):
@@ -29819,7 +29855,8 @@ def _test_finalize_task_requeues_owned_execution_without_active_holder(self):
     queued = []
     self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
     try:
-        self.manager._finalize_task(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._finalize_task(db, task)
     finally:
         self.manager._enqueue_task = original_enqueue
 
@@ -30282,24 +30319,30 @@ def _test_downstream_status_event_applied_uses_explicit_task_layer_reconcile(sel
             return None
 
         original_write = self.manager._write_task_metadata_async
-        original_new = self.manager._reconcile_after_item_layer_update_in_session
+        original_reconcile_stage = self.manager._reconcile_stage_domain_in_session
+        original_signal = self.manager._signal_owned_execution_takeover
         calls = []
 
-        def _capture_new(_db, _task, **kwargs):
+        def _capture_reconcile_stage(_db, _task, _stage_name):
+            return stage_run
+
+        def _capture_signal(_db, _task, **kwargs):
             calls.append(dict(kwargs))
-            return stage_run, self.manager._task_state_snapshot(task), task_manager_module._TaskLayerDecision()
+            return None
 
         self.manager._write_task_metadata_async = _noop_write
-        self.manager._reconcile_after_item_layer_update_in_session = _capture_new
+        self.manager._reconcile_stage_domain_in_session = _capture_reconcile_stage
+        self.manager._signal_owned_execution_takeover = _capture_signal
         try:
             asyncio.run(self.manager._apply_downstream_terminal_observed_locked(db, event))
         finally:
             self.manager._write_task_metadata_async = original_write
-            self.manager._reconcile_after_item_layer_update_in_session = original_new
+            self.manager._reconcile_stage_domain_in_session = original_reconcile_stage
+            self.manager._signal_owned_execution_takeover = original_signal
 
         self.assertEqual("success", item.status)
         self.assertEqual("binary_to_source", calls[0]["stage_name"])
-        self.assertEqual("downstream_status_event_applied", calls[0]["payload"]["source"])
+        self.assertEqual("downstream_status_event_applied", calls[0]["event_payload"]["source"])
 
 
 def _test_archive_apply_uses_explicit_task_layer_reconcile(self):
@@ -30503,6 +30546,50 @@ def _test_finalize_retry_failed_items_reconciles_stages_before_task_layer_decisi
     self.assertEqual(["entry_analysis", "dataflow_vuln_scan"], reconciled)
     self.assertEqual(["entry_analysis", "dataflow_vuln_scan"], payload["affected_stages"])
     self.assertTrue(applied)
+
+
+def _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-owned-requeue",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-old",
+        dispatch_started_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=30),
+    )
+    setattr(task, "_preferred_requeue_event_stage_name", "system_analysis")
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        manager._requeue_owned_execution_takeover(
+            db,
+            task,
+            stage_name="entry_analysis",
+            reason="unit_test_takeover_requeue",
+            event_type="owned_execution_takeover_requeued",
+            message="requeue",
+            event_payload={"source": "unit_test"},
+        )
+
+    self.assertEqual("pending", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, manager._task_runtime_phase(task))
+    self.assertEqual("idle", task.tail_reconcile_state)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
+    self.assertTrue(requeue_events)
+    self.assertEqual("system_analysis", requeue_events[-1].stage_name)
 
 
 def _test_retry_stage_full_cleanup_reconciles_affected_stages_in_session(self):
@@ -30969,7 +31056,8 @@ def _test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision
     self.manager._apply_task_resume_decision = _capture_apply
     self.manager._enqueue_task = lambda task_id: queued.append(task_id)
     try:
-        self.manager._refresh_task_status_after_sync(db, task)
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
     finally:
         self.manager._next_incomplete_stage = original_next
         self.manager._stage_items = original_items
@@ -31440,7 +31528,9 @@ def _test_finalize_task_prefers_furthest_active_streaming_stage(self):
     ]
     db = _AppendingModelAwareDb(tasks=[task], stage_runs=stage_runs, stage_items=stage_items, events=[])
 
-    self.manager._finalize_task(db, task)
+    manager = TaskManager()
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        manager._finalize_task(db, task)
 
     self.assertEqual("running", task.status)
     self.assertEqual("dataflow_vuln_scan", task.current_stage)
@@ -34602,7 +34692,8 @@ def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(s
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run], stage_items=[item], events=[])
 
-    manager._refresh_task_status_after_sync(db, task)
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        manager._refresh_task_status_after_sync(db, task)
 
     self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
@@ -34643,7 +34734,8 @@ def _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_fai
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[], events=[])
 
-    manager._refresh_task_status_after_sync(db, task)
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        manager._refresh_task_status_after_sync(db, task)
 
     self.assertEqual("failed", task.status)
     self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
@@ -34706,7 +34798,8 @@ def _test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable(self
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[item], events=[])
 
-    manager._refresh_task_status_after_sync(db, task)
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        manager._refresh_task_status_after_sync(db, task)
 
     self.assertEqual("pending", task.status)
     self.assertEqual("firmware_unpack", task.current_stage)
@@ -34769,7 +34862,8 @@ def _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budg
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[item], events=[])
 
-    manager._refresh_task_status_after_sync(db, task)
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        manager._refresh_task_status_after_sync(db, task)
 
     self.assertEqual("failed", task.status)
     self.assertEqual("firmware_unpack", task.current_stage)
@@ -34839,7 +34933,8 @@ def _test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_
         events=[],
     )
 
-    manager._refresh_task_status_after_sync(db, task)
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        manager._refresh_task_status_after_sync(db, task)
 
     self.assertEqual("failed", task.status)
     self.assertEqual("system_analysis", task.current_stage)
@@ -35612,6 +35707,41 @@ def _test_run_task_records_takeover_resume_event_for_streaming_tail(self):
         manager._execute_task = original_execute
 
     self.assertTrue(any(event.event_type == "downstream_reconcile_resumed_after_takeover" for event in db.events))
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+
+
+def _test_sync_task_row_lease_view_from_owner_blocks_non_owner(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-row-lease-blocked",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=False):
+        synced = manager._sync_task_row_lease_view_from_owner(
+            db,
+            task,
+            stage_name="dataflow_vuln_scan",
+            reason="unit_test_non_owner",
+        )
+
+    self.assertFalse(synced)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertTrue(any(event.event_type == "task_row_lease_sync_blocked" for event in db.events))
 
 
 def _test_confirm_entry_selection_updates_task(self):
@@ -36095,6 +36225,7 @@ TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail 
 TaskManagerTests.test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task = _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task
 TaskManagerTests.test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner = _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner
 TaskManagerTests.test_run_task_finally_preserves_tail_runtime_lease = _test_run_task_finally_preserves_tail_runtime_lease
+TaskManagerTests.test_sync_task_row_lease_view_from_owner_blocks_non_owner = _test_sync_task_row_lease_view_from_owner_blocks_non_owner
 TaskManagerTests.test_activate_tail_reconciliation_deduplicates_owner_conflict_events = _test_activate_tail_reconciliation_deduplicates_owner_conflict_events
 TaskManagerTests.test_activate_tail_reconciliation_deduplicates_handoff_started_events = _test_activate_tail_reconciliation_deduplicates_handoff_started_events
 TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed = _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed
@@ -36831,6 +36962,7 @@ def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
         name="source-task",
         status="success",
         task_type=TASK_TYPE_SOURCE,
+        schedule_user_task_id="sched-1",
         firmware_source="project_filesystem",
         firmware_path="/src",
         output_root="/o",
@@ -36911,6 +37043,7 @@ def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
 
     detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
+    self.assertEqual("sched-1", detail.schedule_user_task_id)
     self.assertEqual("dispatch-root-key", detail.root_task_key_name)
     self.assertTrue(detail.task_key_snapshot.root_task_key.used)
     self.assertTrue(detail.task_key_snapshot.root_task_key.has_secret)
@@ -36949,6 +37082,46 @@ def _test_get_task_detail_task_key_snapshot_reports_unused_without_keys(self):
     self.assertFalse(detail.task_key_snapshot.root_task_key.used)
     self.assertFalse(detail.task_key_snapshot.root_task_key.has_secret)
     self.assertEqual([], detail.task_key_snapshot.work_keys)
+
+
+def _test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source-task",
+        status="success",
+        task_type=TASK_TYPE_SOURCE,
+        task_key_source="schedule_dispatch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[], events=[])
+
+    detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+    self.assertEqual("t1", detail.schedule_user_task_id)
+
+
+def _test_get_task_detail_does_not_fallback_schedule_user_task_id_for_non_schedule_tasks(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="source-task",
+        status="success",
+        task_type=TASK_TYPE_SOURCE,
+        task_key_source="manual",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[], events=[])
+
+    detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+    self.assertIsNone(detail.schedule_user_task_id)
 
 
 def _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan(self):
@@ -37074,8 +37247,6 @@ def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
     task.summary = {
         "input_dir": "/workspace/input",
         "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
-        "knowledge_graph_entry_results": [{"entry_key": "stale"}],
-        "entry_results": [{"entries": [{"entry_key": "stale"}]}],
     }
     task.policy = {
         "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
@@ -37124,6 +37295,209 @@ def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
     self.assertEqual(0, task.metrics["entry_count"])
     self.assertEqual(0, task.metrics["candidate_entry_count"])
     self.assertEqual(0, task.metrics["selected_entry_count"])
+
+
+def _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate(self):
+    task = BinarySecurityTask(
+        id="kg-source-partial-1",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="knowledge_graph_entry_fetch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "input_dir": "/workspace/input",
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_entry_results": [
+            {
+                "entry_key": "src-existing",
+                "function_name": "existing",
+                "module_name": "source-project",
+                "source_file": "src/existing.c",
+                "definition_file": "src/existing.c",
+                "definition_line": 11,
+                "line_no": 11,
+                "module_key": "knowledge_graph_source_project",
+                "source_root_path": "/workspace/input",
+                "module_input_path": "/workspace/input",
+                "task_type": TASK_TYPE_SOURCE,
+            }
+        ],
+        "entry_results": [
+            {
+                "entry_key": "src-existing",
+                "entries": [{"entry_key": "src-existing"}],
+            }
+        ],
+    }
+    task.policy = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_upload_id": "upload-partial",
+    }
+    stage_run = BinarySecurityStageRun(
+        id="sr-kg-partial-1",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+
+    async def _fake_fetch(_task):
+        return (
+            [
+                {
+                    "entry_key": "src-existing",
+                    "function_name": "existing",
+                    "module_name": "source-project",
+                    "source_file": "src/existing.c",
+                    "definition_file": "src/existing.c",
+                    "definition_line": 11,
+                    "line_no": 11,
+                    "module_key": "knowledge_graph_source_project",
+                    "source_root_path": "/workspace/input",
+                    "module_input_path": "/workspace/input",
+                    "task_type": TASK_TYPE_SOURCE,
+                },
+                {
+                    "entry_key": "src-new",
+                    "function_name": "new_sink",
+                    "source_file": "src/new.c",
+                    "definition_file": "src/new.c",
+                    "definition_line": 42,
+                    "line_no": 42,
+                    "function_description": "demo",
+                    "function_description_source": "knowledge_graph",
+                    "entry_reason": "channel=http",
+                    "entry_reason_source": "knowledge_graph",
+                    "module_key": "knowledge_graph_source_project",
+                    "module_name": "source-project",
+                    "source_root_path": "/workspace/input",
+                    "module_input_path": "/workspace/input",
+                    "task_type": TASK_TYPE_SOURCE,
+                },
+            ],
+            {
+                "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-partial/audit/sources",
+                "lookup_mode": "upload_id",
+                "upload_id": "upload-partial",
+                "db_name": None,
+                "graph_status": "active",
+                "identification_state": "running",
+                "attack_status": "running",
+                "analysis": {"total": 4, "identified": 3, "pending": 1, "confirmed": 0, "rejected": 0},
+                "raw_entry_count": 4,
+                "selected_entry_count": 2,
+                "filtered_out_count": 2,
+                "returned_item_count": 2,
+                "duration_ms": 21,
+            },
+        )
+
+    self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+
+    status, summary = asyncio.run(
+        self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
+    )
+
+    self.assertEqual("running", status)
+    self.assertEqual("polling_partial", summary["status"])
+    self.assertEqual(2, summary["accumulated_selected_entry_count"])
+    self.assertEqual(2, task.metrics["entry_count"])
+    self.assertEqual(2, task.metrics["knowledge_graph_selected_entry_count"])
+    self.assertEqual("running", task.summary["knowledge_graph_state"]["identification_state"])
+    self.assertEqual(2, len(task.summary["knowledge_graph_entry_results"]))
+    self.assertEqual(
+        ["src-existing", "src-new"],
+        [item["entry_key"] for item in task.summary["knowledge_graph_entry_results"]],
+    )
+    self.assertEqual("knowledge_graph_entry_fetch_polling_partial", db.events[-1].event_type)
+
+
+def _test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries(self):
+    task = BinarySecurityTask(
+        id="kg-source-done-1",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="knowledge_graph_entry_fetch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "input_dir": "/workspace/input",
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_entry_results": [
+            {
+                "entry_key": "src-existing",
+                "function_name": "existing",
+                "module_name": "source-project",
+                "source_file": "src/existing.c",
+                "definition_file": "src/existing.c",
+                "definition_line": 11,
+                "line_no": 11,
+                "module_key": "knowledge_graph_source_project",
+                "source_root_path": "/workspace/input",
+                "module_input_path": "/workspace/input",
+                "task_type": TASK_TYPE_SOURCE,
+            }
+        ],
+    }
+    task.policy = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_upload_id": "upload-done",
+    }
+    stage_run = BinarySecurityStageRun(
+        id="sr-kg-done-1",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+
+    async def _fake_fetch(_task):
+        return (
+            [],
+            {
+                "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-done/audit/sources",
+                "lookup_mode": "upload_id",
+                "upload_id": "upload-done",
+                "db_name": None,
+                "graph_status": "active",
+                "identification_state": "done",
+                "attack_status": "ok",
+                "analysis": {"total": 1, "identified": 1, "pending": 0, "confirmed": 0, "rejected": 0},
+                "raw_entry_count": 1,
+                "selected_entry_count": 0,
+                "filtered_out_count": 1,
+                "returned_item_count": 0,
+                "duration_ms": 16,
+            },
+        )
+
+    self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+
+    status, summary = asyncio.run(
+        self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
+    )
+
+    self.assertEqual("success", status)
+    self.assertEqual(1, summary["accumulated_selected_entry_count"])
+    self.assertEqual(1, summary["success_count"])
+    self.assertEqual(1, len(task.summary["knowledge_graph_entry_results"]))
+    self.assertEqual("src-existing", task.summary["knowledge_graph_entry_results"][0]["entry_key"])
+    self.assertEqual("knowledge_graph_entry_fetch_succeeded", db.events[-1].event_type)
 
 
 def _test_stage_knowledge_graph_entry_fetch_waits_for_graph_building(self):
@@ -37222,12 +37596,17 @@ TaskManagerTests.test_archive_apply_repaired_stage_refresh_delegates_to_binary_t
 TaskManagerTests.test_compact_stage_success_items_delegates_to_dataflow_handler = _test_compact_stage_success_items_delegates_to_dataflow_handler
 TaskManagerTests.test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets = _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets
 TaskManagerTests.test_get_task_detail_task_key_snapshot_reports_unused_without_keys = _test_get_task_detail_task_key_snapshot_reports_unused_without_keys
+TaskManagerTests.test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks = _test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks
+TaskManagerTests.test_get_task_detail_does_not_fallback_schedule_user_task_id_for_non_schedule_tasks = _test_get_task_detail_does_not_fallback_schedule_user_task_id_for_non_schedule_tasks
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_recent_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_keeps_recent_remote_dispatch_without_runtime_lease
 TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease
 TaskManagerTests.test_upsert_runtime_lease_recovers_from_duplicate_insert_race = _test_upsert_runtime_lease_recovers_from_duplicate_insert_race
 TaskManagerTests.test_stage_sequence_uses_pipeline_profile_for_source_kg_scan = _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary = _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results = _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results
+TaskManagerTests.test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate = _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate
+TaskManagerTests.test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries = _test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries
+TaskManagerTests.test_stage_knowledge_graph_entry_fetch_waits_for_graph_building = _test_stage_knowledge_graph_entry_fetch_waits_for_graph_building
 TaskManagerTests.test_task_response_exposes_pipeline_profile = _test_task_response_exposes_pipeline_profile
 
 
@@ -37426,6 +37805,7 @@ def _test_force_reset_task_to_pending_rejects_terminal_success(self):
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
+TaskManagerTests.test_owned_execution_takeover_requeue_uses_stage_name_for_main_state = _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state
 
 
 if __name__ == "__main__":

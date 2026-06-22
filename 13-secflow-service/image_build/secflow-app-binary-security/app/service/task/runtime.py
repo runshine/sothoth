@@ -15,6 +15,36 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    def _sync_task_row_lease_view_from_owner(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        stage_name: str | None = None,
+        reason: str,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if not self._task_runtime_owner_matches_current_instance(db, task):
+            self._record_event(
+                db,
+                task,
+                "task_row_lease_sync_blocked",
+                "非 owner 路径试图同步任务 row lease 视图，已忽略",
+                level="warning",
+                stage_name=stage_name or str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "source": "runtime_worker",
+                    "reason": str(reason or "").strip() or None,
+                },
+            )
+            return False
+        now_value = task_manager_module._now()
+        task.dispatcher_instance_id = self.instance_id
+        task.dispatch_started_at = task.dispatch_started_at or now_value
+        task.lease_expires_at = task.lease_expires_at or self._task_lease_expires_at()
+        return True
+
     def _commit_stage_item_active_state(
         self: TaskManager,
         session: Session,
@@ -70,6 +100,17 @@ class TaskRuntimeServiceMixin:
                 task_manager_module.BinarySecurityTask.id == task_id
             ).first()
             if task is None:
+                return
+            if not self._task_runtime_owner_matches_current_instance(db, task):
+                self._record_main_state_write_blocked(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    attempted_stage_name="dataflow_vuln_scan",
+                    attempted_status=str(getattr(task, "status", "") or "").strip() or None,
+                    reason="tail_sync_requires_current_owner",
+                )
+                db.commit()
                 return
             tail_items = self._stage_items(db, task.id, "dataflow_vuln_scan")
             tail_runs = [
@@ -165,84 +206,119 @@ class TaskRuntimeServiceMixin:
                 )
                 db.commit()
                 return
-            if self._entry_results(task) and authoritative_tail_progress:
-                task.current_stage = "dataflow_vuln_scan"
+            entry_stage_run = (
+                db.query(task_manager_module.BinarySecurityStageRun)
+                .filter(
+                    task_manager_module.BinarySecurityStageRun.task_id == task.id,
+                    task_manager_module.BinarySecurityStageRun.stage_name == "entry_analysis",
+                )
+                .first()
+            )
+            entry_stage_ready = bool(
+                entry_stage_run is not None
+                and str(getattr(entry_stage_run, "status", "") or "").strip() in {"success", "partial_success"}
+            )
+            if self._entry_results(task) and authoritative_tail_progress and entry_stage_ready:
                 if active_tail_item:
-                    self._set_task_status(
+                    self._apply_task_main_state_update(
                         db,
                         task,
-                        "running",
-                        reason="tail 阶段存在活跃子项，任务保持运行态",
                         source="runtime_worker",
+                        reason="tail 阶段存在活跃子项，任务保持运行态",
+                        status="running",
                         stage_name="dataflow_vuln_scan",
+                        finished_at=None,
+                        last_error=None,
                     )
                 elif failed_tail_run is not None:
-                    self._set_task_status(
+                    self._apply_task_main_state_update(
                         db,
                         task,
-                        "failed"
-                        if current_stage_before_sync == "dataflow_vuln_scan"
-                        else "pending" if nonterminal_tail_run is not None and not str(getattr(failed_tail_run, "last_error", "") or "").strip() else "failed",
-                        reason="tail 阶段根据权威运行结果刷新任务状态",
                         source="runtime_worker",
+                        reason="tail 阶段根据权威运行结果刷新任务状态",
+                        status=(
+                            "failed"
+                            if current_stage_before_sync == "dataflow_vuln_scan"
+                            else "pending" if nonterminal_tail_run is not None and not str(getattr(failed_tail_run, "last_error", "") or "").strip() else "failed"
+                        ),
                         stage_name="dataflow_vuln_scan",
+                        finished_at=None,
+                        last_error=None,
                     )
                 elif nonterminal_tail_run is not None:
-                    self._set_task_status(
+                    self._apply_task_main_state_update(
                         db,
                         task,
-                        "pending",
-                        reason="tail 阶段存在未终态 stage run，任务回到待执行",
                         source="runtime_worker",
+                        reason="tail 阶段存在未终态 stage run，任务回到待执行",
+                        status="pending",
                         stage_name="dataflow_vuln_scan",
+                        finished_at=None,
+                        last_error=None,
                     )
                 else:
-                    self._set_task_status(
+                    self._apply_task_main_state_update(
                         db,
                         task,
-                        "running",
-                        reason="tail 阶段已有权威进度，任务保持运行态",
                         source="runtime_worker",
+                        reason="tail 阶段已有权威进度，任务保持运行态",
+                        status="running",
                         stage_name="dataflow_vuln_scan",
+                        finished_at=None,
+                        last_error=None,
                     )
-                task.last_error = None
-                task.finished_at = None
             elif active_tail_item or authoritative_tail_progress:
-                task.current_stage = "dataflow_vuln_scan"
-                self._set_task_status(
+                self._record_event(
                     db,
                     task,
-                    "running" if active_tail_item else "pending",
-                    reason="tail 阶段进度同步后刷新任务状态",
-                    source="runtime_worker",
-                    stage_name="dataflow_vuln_scan",
+                    "dataflow_vuln_scan_gate_blocked",
+                    "tail 阶段存在进度，但入口分析尚未形成权威完成事实，禁止推进到数据流漏洞挖掘阶段",
+                    level="warning",
+                    stage_name="entry_analysis",
+                    payload={
+                        "entry_stage_status": str(getattr(entry_stage_run, "status", "") or "").strip() or None,
+                        "has_entry_results": bool(self._entry_results(task)),
+                        "authoritative_tail_progress": bool(authoritative_tail_progress),
+                        "active_tail_item": bool(active_tail_item),
+                    },
                 )
-                task.last_error = None
-                task.finished_at = None
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    reason="入口分析未形成权威完成事实，禁止 tail 同步推进到数据流漏洞挖掘阶段",
+                    status="pending",
+                    stage_name=str(task.current_stage or "").strip() or "entry_analysis",
+                    finished_at=None,
+                    last_error=None,
+                )
             elif str(task.current_stage or "").strip() == "dataflow_vuln_scan":
-                self._set_task_status(
+                self._apply_task_main_state_update(
                     db,
                     task,
-                    "failed",
+                    source="runtime_worker",
                     reason="tail 阶段缺少权威进度且当前阶段停留在 tail，任务失败",
-                    source="runtime_worker",
+                    status="failed",
                     stage_name="dataflow_vuln_scan",
+                    finished_at=None,
                 )
-                task.finished_at = None
             else:
-                self._set_task_status(
+                self._apply_task_main_state_update(
                     db,
                     task,
-                    "pending",
-                    reason="tail 阶段无权威进度，任务回到待执行",
                     source="runtime_worker",
-                    stage_name=task.current_stage,
+                    reason="tail 阶段无权威进度，任务回到待执行",
+                    status="pending",
+                    stage_name=str(task.current_stage or "").strip() or None,
+                    finished_at=None,
                 )
-                task.finished_at = None
             if str(task.current_stage or "").strip() == "dataflow_vuln_scan":
-                task.dispatcher_instance_id = self.instance_id
-                task.dispatch_started_at = task.dispatch_started_at or task_manager_module._now()
-                task.lease_expires_at = task.lease_expires_at or self._task_lease_expires_at()
+                self._sync_task_row_lease_view_from_owner(
+                    db,
+                    task,
+                    stage_name="dataflow_vuln_scan",
+                    reason="tail_sync_row_lease_view",
+                )
             await self._write_task_metadata_async(
                 task,
                 Path(task.workspace_root) / "input" / "task-metadata.json",
@@ -593,11 +669,17 @@ class TaskRuntimeServiceMixin:
             self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             and self._tail_requires_execution_takeover(db, task)
         ):
-            self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+            if not self._apply_task_main_state_update(
+                db,
+                task,
+                source="runtime_worker",
+                reason="tail 收口需回到 owned execution 继续推进",
+                stage_name=task.current_stage,
+                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                clear_runtime_owner=True,
+            ):
+                return None
             task.tail_reconcile_state = "idle"
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
             self._release_tail_reconcile_owner(task.id)
             db.flush()
         if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
@@ -903,18 +985,16 @@ class TaskRuntimeServiceMixin:
             dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip() or None
             dispatch_started_at = task.dispatch_started_at
             task_lease_expires_at = task.lease_expires_at
-            self._set_task_status(
+            self._apply_task_main_state_update(
                 db,
                 task,
-                "pending",
-                reason="调度超时，任务回收并重新进入队列",
                 source="runtime_worker",
+                reason="调度超时，任务回收并重新进入队列",
+                status="pending",
                 stage_name=task.current_stage,
+                clear_runtime_owner=True,
+                last_error=None,
             )
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            task.last_error = None
             task_manager_module.observe_dispatch_reclaim("dispatch_timeout")
             self._record_event(
                 db,
@@ -1062,16 +1142,16 @@ class TaskRuntimeServiceMixin:
             has_downstream_refs = any(str(item.downstream_task_id or "").strip() for item in active_items)
             if active_items or has_downstream_refs:
                 continue
-            self._set_task_status(
+            self._apply_task_main_state_update(
                 db,
                 task,
-                "pending",
-                reason="释放后的运行任务重新纳入待调度队列",
                 source="runtime_worker",
+                reason="释放后的运行任务重新纳入待调度队列",
+                status="pending",
                 stage_name=stage_name,
+                last_error=None,
             )
             task.updated_at = task_manager_module._now()
-            task.last_error = None
             task_manager_module.observe_running_requeue("released_without_owner")
             self._record_event(
                 db,
@@ -1195,20 +1275,18 @@ class TaskRuntimeServiceMixin:
                     item.status = "failed"
                     item.finished_at = item.finished_at or task_manager_module._now()
                     item.error_message = item.error_message or "任务运行心跳超时"
-            self._set_task_status(
+            self._apply_task_main_state_update(
                 db,
                 task,
-                "failed",
-                reason="任务运行心跳超时，任务失败",
                 source="runtime_worker",
+                reason="任务运行心跳超时，任务失败",
+                status="failed",
                 stage_name=current_stage_name or None,
+                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
+                finished_at=task.finished_at or task_manager_module._now(),
+                last_error=task.last_error or "任务运行心跳超时",
+                clear_runtime_owner=True,
             )
-            task.finished_at = task.finished_at or task_manager_module._now()
-            task.last_error = task.last_error or "任务运行心跳超时"
-            self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_TERMINAL)
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
             self._record_event(
                 db,
                 task,
@@ -1277,19 +1355,33 @@ class TaskRuntimeServiceMixin:
             )
             if task.started_at is None:
                 task.started_at = task_manager_module._now()
-            started_at = task.dispatch_started_at or task_manager_module._now()
-            task.dispatch_started_at = started_at
-            task.lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
-            execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
-            self._set_task_status(
+            started_at = task_manager_module._now()
+            execution_token = started_at.isoformat()
+            self._apply_task_main_state_update(
                 db,
                 task,
-                "running",
-                reason="任务进入调度执行",
                 source="runtime_worker",
+                reason="任务进入调度执行",
+                status="running",
                 stage_name=task.current_stage,
             )
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
+            self._sync_task_row_lease_view_from_owner(
+                db,
+                task,
+                stage_name=task.current_stage,
+                reason="run_task_dispatch_row_lease_view",
+            )
+            if self._task_runtime_transition_guard_active(task):
+                self._clear_task_runtime_transition_guard(task)
+                self._record_event(
+                    db,
+                    task,
+                    "runtime_transition_guard_cleared",
+                    "owner worker 已接管任务，阶段切换保护窗口已关闭",
+                    stage_name=task.current_stage,
+                    payload={"dispatcher_instance_id": self.instance_id},
+                )
             self._clear_task_abnormal_reason_snapshot(db, task)
             self._bind_execution_token(task)
             self._register_task_execution_owner(task.id, "primary_task_worker")
@@ -1736,20 +1828,18 @@ class TaskRuntimeServiceMixin:
                 ).first()
             if requeued and item is not None:
                 if task is not None and self._should_hold_task_on_stage_after_requeue(db, task, item.stage_name):
-                    self._set_task_status(
+                    self._apply_task_main_state_update(
                         db,
                         task,
-                        "running",
-                        reason="阶段子项重排队后任务保持在当前阶段运行",
                         source="runtime_worker",
+                        reason="阶段子项重排队后任务保持在当前阶段运行",
                         stage_name=item.stage_name,
+                        status="running",
+                        runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                        finished_at=None,
+                        last_error=None,
+                        clear_runtime_owner=True,
                     )
-                    task.current_stage = item.stage_name
-                    task.finished_at = None
-                    task.last_error = None
-                    task.dispatcher_instance_id = None
-                    task.dispatch_started_at = None
-                    task.lease_expires_at = None
                 db.commit()
                 if task is not None:
                     self._record_event(
