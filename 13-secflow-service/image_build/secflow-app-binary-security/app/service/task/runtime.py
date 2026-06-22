@@ -936,15 +936,17 @@ class TaskRuntimeServiceMixin:
         )
         if not stale_rows:
             return False
-        local_workers = {
-            task_id for task_id, worker in self._workers.items()
-            if not worker.done()
-        }
         reclaimed = False
         for task in stale_rows:
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
                 continue
-            if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
+            if (
+                str(task.dispatcher_instance_id or "").strip() == self.instance_id
+                and self._local_runtime_handle_protects_dispatching_reclaim(
+                    task.id,
+                    dispatch_started_at=getattr(task, "dispatch_started_at", None),
+                )
+            ):
                 continue
             if self._task_runtime_transition_guard_active(task):
                 continue
@@ -971,7 +973,11 @@ class TaskRuntimeServiceMixin:
             protected_dispatching_window = bool(
                 active_item_count > 0
                 and (
-                    self._has_local_task_execution_owner(task.id)
+                    self._local_runtime_handle_protects_dispatching_reclaim(
+                        task.id,
+                        dispatch_started_at=getattr(task, "dispatch_started_at", None),
+                    )
+                    or self._has_local_task_execution_owner(task.id)
                     or self._task_has_active_streaming_stage_workers(task.id)
                     or (
                         row_owner_matches_runtime_lease
@@ -991,6 +997,40 @@ class TaskRuntimeServiceMixin:
                     continue
             elif lease_remaining > 0:
                 continue
+            handle_state = self._local_runtime_handle_state(task.id)
+            if (
+                str(task.dispatcher_instance_id or "").strip()
+                and not self._runtime_lease_is_active(lease)
+                and dispatch_elapsed_seconds is not None
+                and dispatch_elapsed_seconds > startup_window_seconds
+            ):
+                if active_item_count > 0 and self._release_streaming_parent_for_takeover_locked(
+                    db,
+                    task,
+                    runtime_lease_owner=runtime_lease_owner,
+                    runtime_lease_expires_at=runtime_lease_expires_at,
+                    reason="dispatching_runtime_lease_missing_with_active_tail",
+                    signal_takeover=True,
+                ):
+                    self._record_event(
+                        db,
+                        task,
+                        "dispatching_runtime_lease_missing_released",
+                        "dispatching owner 缺少有效 runtime lease，父任务已释放并重新排队等待接管",
+                        level="warning",
+                        stage_name=task.current_stage,
+                        payload={
+                            "dispatcher_instance_id": str(task.dispatcher_instance_id or "").strip() or None,
+                            "runtime_lease_owner": runtime_lease_owner,
+                            "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
+                            "local_handle_state": handle_state,
+                            "active_item_count": active_item_count,
+                            "has_downstream_refs": has_downstream_refs,
+                            "reclaim_reason": "dispatching_runtime_lease_missing_with_active_tail",
+                        },
+                    )
+                    reclaimed = True
+                    continue
             if active_item_count > 0 and self._release_streaming_parent_for_takeover_locked(
                 db,
                 task,
@@ -1387,6 +1427,7 @@ class TaskRuntimeServiceMixin:
         db = session_factory()
         execution_token: str | None = None
         owner_registered = False
+        active_commit_succeeded = False
         try:
             task = db.query(task_manager_module.BinarySecurityTask).filter(
                 task_manager_module.BinarySecurityTask.id == task_id
@@ -1496,6 +1537,13 @@ class TaskRuntimeServiceMixin:
                     },
                 )
             db.commit()
+            active_commit_succeeded = True
+            async with self._worker_lock:
+                handle = self._workers.get(task.id)
+                if handle is not None:
+                    handle.active_commit_completed_at = started_at
+                    handle.active_commit_succeeded = True
+                    handle.lease_established = True
             task_manager_module.logger.info(
                 "binary-security run_task committed active execution state: "
                 "task_id=%s status=%s runtime_phase=%s current_operation_id=%s execution_token=%s",
@@ -1569,10 +1617,50 @@ class TaskRuntimeServiceMixin:
         except Exception as exc:
             with suppress(Exception):
                 db.rollback()
+            async with self._worker_lock:
+                handle = self._workers.get(task_id)
+                if handle is not None:
+                    handle.cancel_requested = True
+                    handle.cancel_requested_reason = "active_commit_failed" if not active_commit_succeeded else "runtime_execution_failed"
             task = db.query(task_manager_module.BinarySecurityTask).filter(
                 task_manager_module.BinarySecurityTask.id == task_id
             ).first()
             if task:
+                if (
+                    not active_commit_succeeded
+                    and task.dispatcher_instance_id == self.instance_id
+                    and str(task.status or "").strip().lower() in {"dispatching", "running"}
+                ):
+                    self._apply_task_main_state_update(
+                        db,
+                        task,
+                        source="runtime_worker",
+                        reason="owner active commit 失败，释放假活 dispatching owner 等待重新接管",
+                        status="pending",
+                        stage_name=task.current_stage,
+                        clear_runtime_owner=True,
+                        last_error=None,
+                    )
+                    self._clear_runtime_lease(
+                        db,
+                        task.id,
+                        owner_instance_id=self.instance_id,
+                        swallow_lock_error=True,
+                    )
+                    self._signal_owned_execution_takeover(
+                        db,
+                        task,
+                        stage_name=task.current_stage,
+                        reason="dispatching_active_commit_failed_without_runtime_lease",
+                        message="owner active commit 失败，任务已重新排队等待新的 worker 接管",
+                        event_payload={
+                            "dispatcher_instance_id": self.instance_id,
+                            "execution_token": execution_token,
+                            "error": str(exc),
+                        },
+                    )
+                    db.commit()
+                    return
                 current_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
                 same_execution = (
                     task.dispatcher_instance_id == self.instance_id
@@ -1622,9 +1710,23 @@ class TaskRuntimeServiceMixin:
                         and not self._should_preserve_tail_runtime_lease(cleanup_db, task)
                     )
                 ):
-                    self._clear_runtime_lease(cleanup_db, task_id, owner_instance_id=self.instance_id)
+                    clear_result = self._clear_runtime_lease(
+                        cleanup_db,
+                        task_id,
+                        owner_instance_id=self.instance_id,
+                        swallow_lock_error=True,
+                    )
                     self._release_tail_reconcile_owner(task_id)
-                    cleanup_db.commit()
+                    if clear_result.status != "lease_locked_retry_later":
+                        cleanup_db.commit()
+                    else:
+                        cleanup_db.rollback()
+                        task_manager_module.logger.warning(
+                            "binary-security runtime lease cleanup deferred due to lock: task_id=%s owner_instance_id=%s result=%s",
+                            task_id,
+                            self.instance_id,
+                            clear_result.status,
+                        )
                 elif self._should_preserve_tail_runtime_lease(cleanup_db, task):
                     task_manager_module.observe_tail_reconcile_heartbeat("preserved_on_worker_exit")
             except Exception:

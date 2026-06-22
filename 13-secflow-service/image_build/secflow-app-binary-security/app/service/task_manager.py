@@ -597,17 +597,31 @@ class TaskRuntimeHandle:
     execution_token: str | None
     lease_owner_instance_id: str | None
     cancel_requested: bool = False
+    cancel_requested_reason: str | None = None
     last_progress_at: datetime | None = None
+    active_commit_completed_at: datetime | None = None
+    active_commit_succeeded: bool = False
+    lease_established: bool = False
 
     def done(self) -> bool:
         return self.runner_task.done()
 
-    def cancel(self) -> None:
+    def cancel(self, reason: str | None = None) -> None:
         self.cancel_requested = True
+        self.cancel_requested_reason = str(reason or "").strip() or self.cancel_requested_reason
         if self.heartbeat_task is not None and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
         if not self.runner_task.done():
             self.runner_task.cancel()
+
+
+@dataclass(frozen=True)
+class RuntimeLeaseClearResult:
+    status: str
+    deleted_count: int = 0
+    owner_instance_id: str | None = None
+    task_id: str | None = None
+    error_message: str | None = None
 
 
 class TaskManager(
@@ -1975,17 +1989,48 @@ class TaskManager(
             .first()
         )
 
-    def _clear_runtime_lease(self, db: Session, task_id: str, *, owner_instance_id: str | None = None) -> None:
+    def _clear_runtime_lease(
+        self,
+        db: Session,
+        task_id: str,
+        *,
+        owner_instance_id: str | None = None,
+        swallow_lock_error: bool = False,
+    ) -> RuntimeLeaseClearResult:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
-            return
+            return RuntimeLeaseClearResult(status="lease_missing", task_id=None)
         query = db.query(BinarySecurityTaskRuntimeLease).filter(
             BinarySecurityTaskRuntimeLease.task_id == normalized_task_id
         )
         normalized_owner = str(owner_instance_id or "").strip()
         if normalized_owner:
             query = query.filter(BinarySecurityTaskRuntimeLease.owner_instance_id == normalized_owner)
-        query.delete(synchronize_session=False)
+        try:
+            deleted = int(query.delete(synchronize_session=False) or 0)
+        except OperationalError as exc:
+            if swallow_lock_error and self._is_retryable_lock_error(exc):
+                return RuntimeLeaseClearResult(
+                    status="lease_locked_retry_later",
+                    deleted_count=0,
+                    owner_instance_id=normalized_owner or None,
+                    task_id=normalized_task_id,
+                    error_message=str(exc),
+                )
+            raise
+        if deleted > 0:
+            return RuntimeLeaseClearResult(
+                status="lease_cleared",
+                deleted_count=deleted,
+                owner_instance_id=normalized_owner or None,
+                task_id=normalized_task_id,
+            )
+        return RuntimeLeaseClearResult(
+            status="lease_owner_mismatch_skipped" if normalized_owner else "lease_missing",
+            deleted_count=0,
+            owner_instance_id=normalized_owner or None,
+            task_id=normalized_task_id,
+        )
 
     def _upsert_runtime_lease(
         self,
@@ -2114,6 +2159,34 @@ class TaskManager(
             owner = str(lease.owner_instance_id or "").strip() or None
         expires_at = lease.lease_expires_at if lease is not None else task.lease_expires_at
         return lease, owner, expires_at
+
+    def _local_runtime_handle_state(self, task_id: str) -> str:
+        handle = self._workers.get(str(task_id or "").strip())
+        if handle is None:
+            return "missing"
+        if handle.done():
+            return "done"
+        if handle.cancel_requested:
+            return "cancel_requested"
+        if handle.active_commit_succeeded and handle.lease_established:
+            return "active_with_runtime_lease"
+        return "started_but_not_committed"
+
+    def _local_runtime_handle_protects_dispatching_reclaim(
+        self,
+        task_id: str,
+        *,
+        dispatch_started_at: datetime | None,
+    ) -> bool:
+        handle = self._workers.get(str(task_id or "").strip())
+        if handle is None or handle.done() or handle.cancel_requested:
+            return False
+        if handle.active_commit_succeeded and handle.lease_established:
+            return True
+        reference_time = dispatch_started_at or handle.claimed_at
+        elapsed_seconds = _elapsed_seconds_since(reference_time)
+        startup_window_seconds = max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
+        return elapsed_seconds is not None and elapsed_seconds <= startup_window_seconds
 
     def _tail_reconcile_context_active(self, db: Session, task: BinarySecurityTask) -> bool:
         active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
@@ -3648,7 +3721,7 @@ class TaskManager(
         task.lease_expires_at = None
         task.finished_at = None
         task.last_error = None
-        self._clear_runtime_lease(db, task.id)
+        lease_clear_result = self._clear_runtime_lease(db, task.id, swallow_lock_error=True)
         self._clear_task_abnormal_reason_snapshot(db, task)
         release_event_type = "dispatching_execution_released_for_takeover" if previous_status == "dispatching" else "running_execution_released_for_takeover"
         release_message = (
@@ -3673,6 +3746,7 @@ class TaskManager(
                 "has_downstream_refs": has_downstream_refs,
                 "tail_control_mode": summary.get("tail_control_mode"),
                 "requeue_reason": reason,
+                "runtime_lease_clear_status": lease_clear_result.status,
             },
         )
         if signal_takeover:
