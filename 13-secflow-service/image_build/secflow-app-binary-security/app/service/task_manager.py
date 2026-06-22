@@ -235,7 +235,7 @@ from app.service.task.shared import (
 from app.service.task_queue import get_task_queue
 from app.service.http_client import get_shared_async_client
 from app.service.stages.registry import get_binary_security_stage_registry
-from app.service.knowledge_graph_entries import get_knowledge_graph_entries_client
+from app.service.knowledge_graph_audit import get_knowledge_graph_audit_client
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
@@ -2591,13 +2591,28 @@ class TaskManager(
             return normalized
         raise ValidationError(f"不支持的流程模式: {pipeline_profile}")
 
-    def _knowledge_graph_entries_url(self, task: BinarySecurityTask | dict[str, Any] | None) -> str | None:
+    def _knowledge_graph_policy(self, task: BinarySecurityTask | dict[str, Any] | None) -> dict[str, Any]:
         if isinstance(task, dict):
             policy = dict(task.get("policy") or {})
         else:
             policy = dict(getattr(task, "policy", {}) or {})
-        value = str(policy.get("knowledge_graph_entries_url") or "").strip()
-        return value or None
+        return policy
+
+    def _knowledge_graph_locator(self, task: BinarySecurityTask | dict[str, Any] | None) -> tuple[str | None, str | None]:
+        policy = self._knowledge_graph_policy(task)
+        upload_id = str(policy.get("knowledge_graph_upload_id") or "").strip() or None
+        db_name = str(policy.get("knowledge_graph_db_name") or "").strip() or None
+        return upload_id, db_name
+
+    def _knowledge_graph_request_options(self, task: BinarySecurityTask | dict[str, Any] | None) -> dict[str, Any]:
+        policy = self._knowledge_graph_policy(task)
+        cfg = self.cfg.services.knowledge_graph_audit
+        return {
+            "status_filter": str(policy.get("knowledge_graph_status_filter") or cfg.default_status_filter or "identified").strip() or "identified",
+            "include_excluded": bool(cfg.default_include_excluded if policy.get("knowledge_graph_include_excluded") is None else policy.get("knowledge_graph_include_excluded")),
+            "kind": str(policy.get("knowledge_graph_kind") or "").strip() or None,
+            "module": policy.get("knowledge_graph_module"),
+        }
 
     async def complete_uploads(
         self,
@@ -3968,12 +3983,14 @@ class TaskManager(
         line_hint = str(raw.get("start_line") or "").strip()
         function_name = str(raw.get("name") or "").strip()
         entry_key = str(raw.get("source_id") or "").strip()
+        module_name = str(raw.get("module") or "").strip() or "source-project"
+        taint_params = list(raw.get("taint_params") or [])
         return {
             "entry_key": entry_key,
             "firmware_key": SOURCE_TASK_INPUT_KEY,
             "firmware_name": task.name,
             "module_key": "knowledge_graph_source_project",
-            "module_name": "source-project",
+            "module_name": module_name,
             "module_dir": input_dir,
             "descriptor_root": input_dir,
             "source_dir": input_dir,
@@ -3988,11 +4005,11 @@ class TaskManager(
             "definition_line": line_hint,
             "definition_kind": "unknown",
             "function_description": str(raw.get("function_purpose") or "").strip(),
-            "function_description_source": "knowledge_graph",
-            "entry_reason": self._knowledge_graph_entry_reason(raw),
-            "entry_reason_source": "knowledge_graph",
-            "taint_params": [],
-            "taint_details": [],
+            "function_description_source": "knowledge_graph_audit_sources",
+            "entry_reason": str(raw.get("entry_evidence") or "").strip() or self._knowledge_graph_entry_reason(raw),
+            "entry_reason_source": "knowledge_graph_audit_sources",
+            "taint_params": taint_params,
+            "taint_details": self._build_knowledge_graph_taint_details(raw, taint_params),
             "signature": str(raw.get("signature") or "").strip(),
             "channel": str(raw.get("channel") or "").strip(),
             "subkind": str(raw.get("subkind") or "").strip(),
@@ -4000,9 +4017,48 @@ class TaskManager(
             "is_promoted_root": bool(raw.get("is_promoted_root")),
             "covers": list(raw.get("covers") or []),
             "dominated_by": str(raw.get("dominated_by") or "").strip(),
-            "source_provider": "knowledge_graph",
+            "source_provider": "knowledge_graph_audit_sources",
             "source_id": entry_key,
+            "function_id": str(raw.get("function_id") or "").strip() or None,
+            "knowledge_graph_status": str(raw.get("status") or "").strip() or None,
+            "review_status": str(raw.get("review_status") or "").strip() or None,
+            "judgments": [dict(item) for item in list(raw.get("judgments") or []) if isinstance(item, dict)],
+            "taint_locals": list(raw.get("taint_locals") or []),
+            "taint_evidence": raw.get("taint_evidence"),
+            "callees": [dict(item) for item in list(raw.get("callees") or []) if isinstance(item, dict)],
             "task_type": TASK_TYPE_SOURCE,
+        }
+
+    def _knowledge_graph_source_endpoint(self, *, upload_id: str | None, db_name: str | None) -> str:
+        cfg = self.cfg.services.knowledge_graph_audit
+        if upload_id:
+            return f"{cfg.base_url.rstrip('/')}{cfg.upload_sources_path_template.format(upload_id=upload_id)}"
+        return f"{cfg.base_url.rstrip('/')}{cfg.project_sources_path_template.format(db_name=db_name or '')}"
+
+    def _build_knowledge_graph_taint_details(self, raw: dict[str, Any], taint_params: list[Any]) -> list[dict[str, Any]]:
+        details: list[dict[str, Any]] = []
+        evidence = raw.get("taint_evidence")
+        if isinstance(evidence, str) and evidence.strip():
+            try:
+                parsed = json.loads(evidence)
+            except Exception:
+                parsed = []
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict):
+                        details.append(dict(item))
+        if details:
+            return details
+        return self._normalize_entry_taint_details({"taint_details": [], "taint_params": taint_params}, [str(v).strip() for v in taint_params if str(v).strip()])
+
+    def _knowledge_graph_analysis_metrics(self, meta: dict[str, Any]) -> dict[str, int]:
+        analysis = dict(meta.get("analysis") or {})
+        return {
+            "knowledge_graph_analysis_total": int(analysis.get("total") or 0),
+            "knowledge_graph_analysis_identified": int(analysis.get("identified") or 0),
+            "knowledge_graph_analysis_pending": int(analysis.get("pending") or 0),
+            "knowledge_graph_analysis_confirmed": int(analysis.get("confirmed") or 0),
+            "knowledge_graph_analysis_rejected": int(analysis.get("rejected") or 0),
         }
 
     async def _fetch_knowledge_graph_entry_results(
@@ -4010,22 +4066,40 @@ class TaskManager(
         task: BinarySecurityTask,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         started = time.perf_counter()
-        payload = await get_knowledge_graph_entries_client().list_entries(
-            override_url=self._knowledge_graph_entries_url(task),
+        upload_id, db_name = self._knowledge_graph_locator(task)
+        if not upload_id and not db_name:
+            raise ValidationError("知识图谱源码任务缺少 upload_id/db_name，无法获取 audit sources")
+        request_options = self._knowledge_graph_request_options(task)
+        payload = await get_knowledge_graph_audit_client().get_sources(
+            upload_id=upload_id,
+            db_name=db_name,
+            **request_options,
         )
-        entries = payload.get("entries")
+        entries = payload.get("items")
         if not isinstance(entries, list):
-            raise ValidationError("知识图谱入口响应格式非法: 缺少 entries 列表")
+            raise ValidationError("知识图谱入口响应格式非法: 缺少 items 列表")
         raw_entries = [dict(item) for item in entries if isinstance(item, dict)]
         selected_raw = [item for item in raw_entries if bool(item.get("is_entry"))]
         normalized_entries = [self._normalize_knowledge_graph_entry(task, item) for item in selected_raw]
         deduped = _deduplicate_entry_keys(normalized_entries)
+        analysis = dict(payload.get("analysis") or {})
+        graph_status = str(payload.get("graph_status") or "").strip() or None
+        identification = dict(payload.get("identification") or {})
+        identification_state = str(identification.get("state") or "").strip() or None
+        attack_status = str(identification.get("attack_status") or "").strip() or None
         return deduped, {
-            "entries_url": self._knowledge_graph_entries_url(task)
-            or f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}{self.cfg.services.knowledge_graph_entries.entries_path}",
-            "raw_entry_count": len(raw_entries),
+            "entries_url": self._knowledge_graph_source_endpoint(upload_id=upload_id, db_name=db_name),
+            "lookup_mode": "upload_id" if upload_id else "db_name",
+            "upload_id": upload_id,
+            "db_name": db_name,
+            "graph_status": graph_status,
+            "identification_state": identification_state,
+            "attack_status": attack_status,
+            "analysis": analysis,
+            "raw_entry_count": int(analysis.get("total") or payload.get("total") or len(raw_entries)),
             "selected_entry_count": len(deduped),
-            "filtered_out_count": max(0, len(raw_entries) - len(selected_raw)),
+            "filtered_out_count": max(0, int(analysis.get("total") or len(raw_entries)) - len(deduped)),
+            "returned_item_count": len(raw_entries),
             "duration_ms": int((time.perf_counter() - started) * 1000),
         }
 
@@ -9983,10 +10057,8 @@ class TaskManager(
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         del token, retry_existing
-        entries_url = self._knowledge_graph_entries_url(task) or (
-            f"{self.cfg.services.knowledge_graph_entries.base_url.rstrip('/')}"
-            f"{self.cfg.services.knowledge_graph_entries.entries_path}"
-        )
+        upload_id, db_name = self._knowledge_graph_locator(task)
+        entries_url = self._knowledge_graph_source_endpoint(upload_id=upload_id, db_name=db_name)
         self._record_event(
             db,
             task,
@@ -9994,8 +10066,11 @@ class TaskManager(
             "开始拉取知识图谱源码入口",
             stage_name=stage_run.stage_name,
             payload={
-                "provider": "knowledge_graph",
+                "provider": "knowledge_graph_audit_sources",
                 "entries_url": entries_url,
+                "lookup_mode": "upload_id" if upload_id else "db_name",
+                "upload_id": upload_id,
+                "db_name": db_name,
             },
         )
         try:
@@ -10009,7 +10084,7 @@ class TaskManager(
                 level="error",
                 stage_name=stage_run.stage_name,
                 payload={
-                    "provider": "knowledge_graph",
+                    "provider": "knowledge_graph_audit_sources",
                     "entries_url": entries_url,
                     "raw_entry_count": 0,
                     "selected_entry_count": 0,
@@ -10022,6 +10097,7 @@ class TaskManager(
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": [],
                 "entry_results": [],
+                "knowledge_graph_state": {},
             }
             task.metrics = {
                 **(task.metrics or {}),
@@ -10043,16 +10119,29 @@ class TaskManager(
             }
             self._persist_stage_run_output_summary(task, stage_run, failure_summary)
             return "failed", failure_summary
-        if not entries:
+        graph_status = str(meta.get("graph_status") or "").strip()
+        identification_state = str(meta.get("identification_state") or "").strip()
+        attack_status = str(meta.get("attack_status") or "").strip()
+        analysis_metrics = self._knowledge_graph_analysis_metrics(meta)
+        state_summary = {
+            "graph_status": graph_status or None,
+            "identification_state": identification_state or None,
+            "attack_status": attack_status or None,
+            **analysis_metrics,
+        }
+        if graph_status == "failed" or identification_state == "failed" or graph_status == "superseded":
+            reason = "知识图谱入口识别失败"
+            if graph_status == "superseded":
+                reason = "知识图谱图谱已被替换，当前结果不可用"
             self._record_event(
                 db,
                 task,
-                "knowledge_graph_entry_fetch_empty",
-                "知识图谱入口结果为空",
-                level="warning",
+                "knowledge_graph_entry_fetch_failed",
+                reason,
+                level="error",
                 stage_name=stage_run.stage_name,
                 payload={
-                    "provider": "knowledge_graph",
+                    "provider": "knowledge_graph_audit_sources",
                     **meta,
                 },
             )
@@ -10060,18 +10149,18 @@ class TaskManager(
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": [],
                 "entry_results": [],
+                "knowledge_graph_state": state_summary,
             }
             task.metrics = {
                 **(task.metrics or {}),
+                **STAGE_METRIC_RESETTERS["knowledge_graph_entry_fetch"],
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": 0,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": 0,
-                "selected_entry_count": 0,
-                "entry_count": 0,
+                **analysis_metrics,
             }
             failure_summary = {
-                "error": "知识图谱入口结果为空",
+                "error": reason,
                 "items": [],
                 "success_count": 0,
                 "failed_count": 1,
@@ -10081,6 +10170,118 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": 0,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **state_summary,
+                **meta,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, failure_summary)
+            return "failed", failure_summary
+        if not entries and graph_status == "building":
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_waiting_for_graph",
+                "知识图谱图谱仍在构建，等待入口结果就绪",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph_audit_sources",
+                    **meta,
+                },
+            )
+            task.summary = {**(task.summary or {}), "knowledge_graph_state": state_summary}
+            task.metrics = {
+                **(task.metrics or {}),
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **analysis_metrics,
+            }
+            waiting_summary = {
+                "status": "waiting_for_graph",
+                "items": [],
+                "success_count": 0,
+                "failed_count": 0,
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                **state_summary,
+                **meta,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
+            return "running", waiting_summary
+        if not entries and identification_state == "running":
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_waiting_for_identification",
+                "知识图谱入口识别仍在进行，等待入口结果就绪",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph_audit_sources",
+                    **meta,
+                },
+            )
+            task.summary = {**(task.summary or {}), "knowledge_graph_state": state_summary}
+            task.metrics = {
+                **(task.metrics or {}),
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **analysis_metrics,
+            }
+            waiting_summary = {
+                "status": "waiting_for_identification",
+                "items": [],
+                "success_count": 0,
+                "failed_count": 0,
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                **state_summary,
+                **meta,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
+            return "running", waiting_summary
+        if not entries:
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_empty_after_done",
+                "知识图谱入口识别完成，但没有可用入口",
+                level="warning",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph_audit_sources",
+                    **meta,
+                },
+            )
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": [],
+                "entry_results": [],
+                "knowledge_graph_state": state_summary,
+            }
+            task.metrics = {
+                **(task.metrics or {}),
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                **analysis_metrics,
+            }
+            failure_summary = {
+                "error": "知识图谱入口识别完成，但没有可用入口",
+                "items": [],
+                "success_count": 0,
+                "failed_count": 1,
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **state_summary,
                 **meta,
             }
             self._persist_stage_run_output_summary(task, stage_run, failure_summary)
@@ -10096,6 +10297,7 @@ class TaskManager(
             **(task.summary or {}),
             "knowledge_graph_entry_results": entries,
             "entry_results": compact_entries,
+            "knowledge_graph_state": state_summary,
         }
         task.metrics = {
             **(task.metrics or {}),
@@ -10105,6 +10307,7 @@ class TaskManager(
             "candidate_entry_count": int(meta.get("selected_entry_count") or 0),
             "selected_entry_count": int(meta.get("selected_entry_count") or 0),
             "entry_count": int(meta.get("selected_entry_count") or 0),
+            **analysis_metrics,
         }
         self._record_event(
             db,
@@ -10113,7 +10316,7 @@ class TaskManager(
             "知识图谱入口获取成功",
             stage_name=stage_run.stage_name,
             payload={
-                "provider": "knowledge_graph",
+                "provider": "knowledge_graph_audit_sources",
                 **meta,
             },
         )
@@ -10128,6 +10331,7 @@ class TaskManager(
             "knowledge_graph_selected_entry_count": int(meta.get("selected_entry_count") or 0),
             "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
             "entry_results": compact_entries,
+            **state_summary,
             **meta,
         }
         self._persist_stage_run_output_summary(task, stage_run, success_summary)

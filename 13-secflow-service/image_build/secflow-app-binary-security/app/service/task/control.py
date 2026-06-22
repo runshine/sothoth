@@ -342,9 +342,21 @@ class TaskControlServiceMixin:
                 policy[key] = override_payload.get(key)
         if override_payload.get("module_risk_levels") is not None:
             policy["module_risk_levels"] = task_manager_module._normalize_module_risk_levels(override_payload.get("module_risk_levels"))
-        if "knowledge_graph_entries_url" in override_payload:
-            value = str(override_payload.get("knowledge_graph_entries_url") or "").strip()
-            policy["knowledge_graph_entries_url"] = value or None
+        for key in (
+            "knowledge_graph_upload_id",
+            "knowledge_graph_db_name",
+            "knowledge_graph_status_filter",
+            "knowledge_graph_kind",
+        ):
+            if key in override_payload:
+                value = str(override_payload.get(key) or "").strip()
+                policy[key] = value or None
+        if "knowledge_graph_module" in override_payload:
+            value = override_payload.get("knowledge_graph_module")
+            policy["knowledge_graph_module"] = None if value is None else str(value)
+        if "knowledge_graph_include_excluded" in override_payload:
+            include_excluded = override_payload.get("knowledge_graph_include_excluded")
+            policy["knowledge_graph_include_excluded"] = None if include_excluded is None else bool(include_excluded)
         if policy.get("pipeline_profile") == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
             policy["entry_selection_mode"] = "auto"
         return policy

@@ -1896,6 +1896,7 @@ class TaskReadModelServiceMixin:
         workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_terminalization_ready = self._workflow_ready_for_finalization(workflow_snapshots)
         workflow_blocked_by_stage = self._workflow_blocked_on_stage(task, workflow_snapshots)
+        kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
         active_operation = self._active_operation(db, task.id)
         if (
             active_operation is not None
@@ -1977,6 +1978,17 @@ class TaskReadModelServiceMixin:
             if self._entry_selection_mode(task) == task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM
             else len(self._entry_candidates(task)),
             entry_count=int(metrics.get("entry_count", 0)),
+            knowledge_graph_raw_entry_count=int(metrics.get("knowledge_graph_raw_entry_count", 0)),
+            knowledge_graph_selected_entry_count=int(metrics.get("knowledge_graph_selected_entry_count", 0)),
+            knowledge_graph_filtered_out_count=int(metrics.get("knowledge_graph_filtered_out_count", 0)),
+            knowledge_graph_graph_status=self._string_or_none(kg_state.get("graph_status")),
+            knowledge_graph_identification_state=self._string_or_none(kg_state.get("identification_state")),
+            knowledge_graph_attack_status=self._string_or_none(kg_state.get("attack_status")),
+            knowledge_graph_analysis_total=int(kg_state.get("knowledge_graph_analysis_total") or 0),
+            knowledge_graph_analysis_identified=int(kg_state.get("knowledge_graph_analysis_identified") or 0),
+            knowledge_graph_analysis_pending=int(kg_state.get("knowledge_graph_analysis_pending") or 0),
+            knowledge_graph_analysis_confirmed=int(kg_state.get("knowledge_graph_analysis_confirmed") or 0),
+            knowledge_graph_analysis_rejected=int(kg_state.get("knowledge_graph_analysis_rejected") or 0),
             vuln_result_count=int(metrics.get("vuln_result_count", 0)),
             firmware_item_count=int(metrics.get("firmware_item_count", 0)),
             unpacked_firmware_count=int(metrics.get("unpacked_firmware_count", 0)),
@@ -3335,6 +3347,7 @@ class TaskReadModelServiceMixin:
             stage_summaries=stage_summaries,
             active_operation=active_operation,
         )
+        kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
         failure_snapshot = self._stage_failure_snapshot(
             task,
             next(
@@ -3414,6 +3427,17 @@ class TaskReadModelServiceMixin:
             candidate_entry_count=len(self._entry_candidates(task)),
             selected_entry_count=len(self._effective_entry_inputs(task)) if self._entry_selection_mode(task) == task_shared.ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task)),
             entry_count=int(metrics.get("entry_count", 0)),
+            knowledge_graph_raw_entry_count=int(metrics.get("knowledge_graph_raw_entry_count", 0)),
+            knowledge_graph_selected_entry_count=int(metrics.get("knowledge_graph_selected_entry_count", 0)),
+            knowledge_graph_filtered_out_count=int(metrics.get("knowledge_graph_filtered_out_count", 0)),
+            knowledge_graph_graph_status=self._string_or_none(kg_state.get("graph_status")),
+            knowledge_graph_identification_state=self._string_or_none(kg_state.get("identification_state")),
+            knowledge_graph_attack_status=self._string_or_none(kg_state.get("attack_status")),
+            knowledge_graph_analysis_total=int(kg_state.get("knowledge_graph_analysis_total") or 0),
+            knowledge_graph_analysis_identified=int(kg_state.get("knowledge_graph_analysis_identified") or 0),
+            knowledge_graph_analysis_pending=int(kg_state.get("knowledge_graph_analysis_pending") or 0),
+            knowledge_graph_analysis_confirmed=int(kg_state.get("knowledge_graph_analysis_confirmed") or 0),
+            knowledge_graph_analysis_rejected=int(kg_state.get("knowledge_graph_analysis_rejected") or 0),
             vuln_result_count=int(metrics.get("vuln_result_count", 0)),
             firmware_item_count=int(metrics.get("firmware_item_count", 0)),
             unpacked_firmware_count=int(metrics.get("unpacked_firmware_count", 0)),

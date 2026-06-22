@@ -27673,8 +27673,8 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 return _FakeWorkspace(self.parts + (str(part),), shared=self.shared)
 
             def exists(self):
-                self.calls += 1
-                return self.calls < 4
+                self.shared["calls"] += 1
+                return self.shared["calls"] < 4
 
         fake_workspace = _FakeWorkspace()
         sleeps = []
@@ -35837,8 +35837,8 @@ def _test_cleanup_task_workspace_retries_transient_residual_directory(self):
             return _FakeWorkspace(self.parts + (str(part),), shared=self.shared)
 
         def exists(self):
-            self.calls += 1
-            return self.calls < 4
+            self.shared["calls"] += 1
+            return self.shared["calls"] < 4
 
     fake_workspace = _FakeWorkspace()
     sleeps = []
@@ -36988,7 +36988,10 @@ def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
         "input_dir": "/workspace/input",
         "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
     }
-    task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+    task.policy = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_upload_id": "upload-1",
+    }
     stage_run = BinarySecurityStageRun(
         id="sr-kg-1",
         task_id=task.id,
@@ -37021,10 +37024,18 @@ def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
                 }
             ],
             {
-                "entries_url": "http://172.31.30.88:10001/api/v1/sources/entries",
+                "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-1/audit/sources",
+                "lookup_mode": "upload_id",
+                "upload_id": "upload-1",
+                "db_name": None,
+                "graph_status": "active",
+                "identification_state": "done",
+                "attack_status": "ok",
+                "analysis": {"total": 3, "identified": 2, "pending": 1, "confirmed": 0, "rejected": 0},
                 "raw_entry_count": 3,
                 "selected_entry_count": 1,
                 "filtered_out_count": 2,
+                "returned_item_count": 1,
                 "duration_ms": 55,
             },
         )
@@ -37039,10 +37050,12 @@ def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
     self.assertEqual(1, summary["success_count"])
     self.assertEqual(1, task.metrics["entry_count"])
     self.assertEqual(1, task.metrics["knowledge_graph_selected_entry_count"])
+    self.assertEqual("active", task.summary["knowledge_graph_state"]["graph_status"])
+    self.assertEqual(3, task.summary["knowledge_graph_state"]["knowledge_graph_analysis_total"])
     self.assertEqual(1, len(task.summary["knowledge_graph_entry_results"]))
     self.assertEqual(1, len(task.summary["entry_results"]))
     self.assertEqual("src-1", task.summary["entry_results"][0]["entries"][0]["entry_key"])
-    self.assertEqual("http://172.31.30.88:10001/api/v1/sources/entries", summary["entries_url"])
+    self.assertEqual("http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-1/audit/sources", summary["entries_url"])
 
 
 def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
@@ -37064,7 +37077,10 @@ def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
         "knowledge_graph_entry_results": [{"entry_key": "stale"}],
         "entry_results": [{"entries": [{"entry_key": "stale"}]}],
     }
-    task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+    task.policy = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_db_name": "codemap-lite-demo",
+    }
     stage_run = BinarySecurityStageRun(
         id="sr-kg-2",
         task_id=task.id,
@@ -37079,10 +37095,18 @@ def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
         return (
             [],
             {
-                "entries_url": "http://172.31.30.88:10001/api/v1/sources/entries",
+                "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/projects/codemap-lite-demo/audit/sources",
+                "lookup_mode": "db_name",
+                "upload_id": None,
+                "db_name": "codemap-lite-demo",
+                "graph_status": "active",
+                "identification_state": "done",
+                "attack_status": "ok",
+                "analysis": {"total": 2, "identified": 0, "pending": 0, "confirmed": 0, "rejected": 0},
                 "raw_entry_count": 2,
                 "selected_entry_count": 0,
                 "filtered_out_count": 2,
+                "returned_item_count": 0,
                 "duration_ms": 31,
             },
         )
@@ -37094,12 +37118,67 @@ def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
     )
 
     self.assertEqual("failed", status)
-    self.assertEqual("知识图谱入口结果为空", summary["error"])
+    self.assertEqual("知识图谱入口识别完成，但没有可用入口", summary["error"])
     self.assertEqual([], task.summary["knowledge_graph_entry_results"])
     self.assertEqual([], task.summary["entry_results"])
     self.assertEqual(0, task.metrics["entry_count"])
     self.assertEqual(0, task.metrics["candidate_entry_count"])
     self.assertEqual(0, task.metrics["selected_entry_count"])
+
+
+def _test_stage_knowledge_graph_entry_fetch_waits_for_graph_building(self):
+    task = BinarySecurityTask(
+        id="kg-source-wait-1",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="knowledge_graph_entry_fetch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {"input_dir": "/workspace/input", "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+    task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN, "knowledge_graph_upload_id": "upload-wait"}
+    stage_run = BinarySecurityStageRun(
+        id="sr-kg-wait-1",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+
+    async def _fake_fetch(_task):
+        return (
+            [],
+            {
+                "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-wait/audit/sources",
+                "lookup_mode": "upload_id",
+                "upload_id": "upload-wait",
+                "db_name": None,
+                "graph_status": "building",
+                "identification_state": "running",
+                "attack_status": "running",
+                "analysis": {"total": 0, "identified": 0, "pending": 0, "confirmed": 0, "rejected": 0},
+                "raw_entry_count": 0,
+                "selected_entry_count": 0,
+                "filtered_out_count": 0,
+                "returned_item_count": 0,
+                "duration_ms": 8,
+            },
+        )
+
+    self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+    status, summary = asyncio.run(
+        self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
+    )
+
+    self.assertEqual("running", status)
+    self.assertEqual("waiting_for_graph", summary["status"])
+    self.assertEqual("building", task.summary["knowledge_graph_state"]["graph_status"])
 
 
 def _test_task_response_exposes_pipeline_profile(self):

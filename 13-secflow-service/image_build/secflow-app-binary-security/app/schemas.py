@@ -41,7 +41,12 @@ class TaskPolicyOverrides(BaseModel):
     module_selection_mode: Optional[str] = None
     module_risk_levels: Optional[list[str]] = None
     entry_selection_mode: Optional[str] = None
-    knowledge_graph_entries_url: Optional[str] = None
+    knowledge_graph_upload_id: Optional[str] = None
+    knowledge_graph_db_name: Optional[str] = None
+    knowledge_graph_include_excluded: Optional[bool] = None
+    knowledge_graph_status_filter: Optional[str] = None
+    knowledge_graph_kind: Optional[str] = None
+    knowledge_graph_module: Optional[str] = None
 
 
 class BinarySecurityTaskCreate(BaseModel):
@@ -227,6 +232,17 @@ class BinarySecurityTaskResponse(BaseModel):
     candidate_entry_count: int = 0
     selected_entry_count: int = 0
     entry_count: int = 0
+    knowledge_graph_raw_entry_count: int = 0
+    knowledge_graph_selected_entry_count: int = 0
+    knowledge_graph_filtered_out_count: int = 0
+    knowledge_graph_graph_status: Optional[str] = None
+    knowledge_graph_identification_state: Optional[str] = None
+    knowledge_graph_attack_status: Optional[str] = None
+    knowledge_graph_analysis_total: int = 0
+    knowledge_graph_analysis_identified: int = 0
+    knowledge_graph_analysis_pending: int = 0
+    knowledge_graph_analysis_confirmed: int = 0
+    knowledge_graph_analysis_rejected: int = 0
     vuln_result_count: int = 0
     firmware_item_count: int = 0
     unpacked_firmware_count: int = 0

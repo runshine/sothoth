@@ -185,10 +185,13 @@ class VulnerabilityServiceConfig(BaseModel):
     timeout: int = 60
 
 
-class KnowledgeGraphEntriesConfig(BaseModel):
-    base_url: str = "http://172.31.30.88:10001"
-    entries_path: str = "/api/v1/sources/entries"
+class KnowledgeGraphAuditConfig(BaseModel):
+    base_url: str = "http://codemap-manager.secflow-ns.svc.cluster.local:8090"
+    upload_sources_path_template: str = "/uploads/{upload_id}/audit/sources"
+    project_sources_path_template: str = "/projects/{db_name}/audit/sources"
     timeout_seconds: int = 60
+    default_status_filter: str = "identified"
+    default_include_excluded: bool = False
 
 
 class ServicesConfig(BaseModel):
@@ -207,8 +210,8 @@ class ServicesConfig(BaseModel):
     dataflow_vuln_scan: VulnerabilityServiceConfig = Field(
         default_factory=VulnerabilityServiceConfig
     )
-    knowledge_graph_entries: KnowledgeGraphEntriesConfig = Field(
-        default_factory=KnowledgeGraphEntriesConfig
+    knowledge_graph_audit: KnowledgeGraphAuditConfig = Field(
+        default_factory=KnowledgeGraphAuditConfig
     )
     fileserver: FileserverServiceConfig = Field(default_factory=FileserverServiceConfig)
 
