@@ -989,6 +989,56 @@ class TaskRuntimeStateServiceMixin:
         )
         self._enqueue_task(task.id)
 
+    def _request_task_layer_reconcile(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str | None,
+        source_event_type: str,
+        state_event_id: str | None,
+        reconcile_reason: str,
+        message: str,
+        event_type: str = "owned_execution_takeover_requeued",
+        event_level: str = "warning",
+        event_payload: dict[str, Any] | None = None,
+    ) -> None:
+        signal_stage_name = str(stage_name or task.current_stage or "").strip() or None
+        self._merge_task_runtime_signal(
+            task,
+            "pending_task_layer_reconcile",
+            source="state_reducer",
+            reason=reconcile_reason,
+            stage_name=signal_stage_name,
+            extra={
+                "state_event_id": str(state_event_id or "").strip() or None,
+                "source_event_type": str(source_event_type or "").strip() or None,
+                "fact_applied": True,
+                "reconcile_reason": reconcile_reason,
+                **dict(event_payload or {}),
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            level=event_level,
+            stage_name=signal_stage_name,
+            payload={
+                "next_stage": signal_stage_name,
+                "reason": reconcile_reason,
+                "takeover_reason": reconcile_reason,
+                "takeover_action": "request_task_layer_reconcile",
+                "source_event_type": str(source_event_type or "").strip() or None,
+                "state_event_id": str(state_event_id or "").strip() or None,
+                "fact_applied": True,
+                "reconcile_reason": reconcile_reason,
+                **dict(event_payload or {}),
+            },
+        )
+        self._enqueue_task(task.id)
+
     def _reconcile_lease_view(
         self: TaskManager,
         db: Session,

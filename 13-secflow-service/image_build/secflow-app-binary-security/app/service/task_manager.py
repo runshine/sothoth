@@ -299,6 +299,17 @@ class _StageTerminalTaskDecision:
 
 
 @dataclass
+class _TaskLayerReconcileDecision:
+    action: str = "noop"
+    stage_name: str | None = None
+    stage_status: str | None = None
+    summary: dict[str, Any] | None = None
+    payload: dict[str, Any] | None = None
+    source_event_type: str | None = None
+    reconcile_reason: str | None = None
+
+
+@dataclass
 class _TaskResumeDecision:
     should_resume: bool = False
     next_stage: str | None = None
@@ -3355,6 +3366,7 @@ class TaskManager(
         workset = summary.get("runtime_workset")
         normalized = dict(workset) if isinstance(workset, dict) else {}
         for signal_name in (
+            "pending_task_layer_reconcile",
             "pending_downstream_sync",
             "pending_archive_rebuild",
             "pending_cleanup_retry",

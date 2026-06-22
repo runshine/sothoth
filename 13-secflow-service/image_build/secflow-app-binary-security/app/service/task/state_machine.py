@@ -10,6 +10,7 @@ from app.model import (
     BinarySecurityStageRun,
     BinarySecurityTask,
     BinarySecurityTaskOperation,
+    TASK_TERMINAL_STATUSES,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_TYPE_SOURCE,
@@ -868,6 +869,17 @@ class TaskStateMachineMixin:
         self._refresh_task_status_after_sync(db, task)
         return self._task_state_snapshot(task)
 
+    def _reconcile_item_layer_facts_in_session(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str,
+    ):
+        stage_run = self._reconcile_stage_domain_in_session(db, task, stage_name)
+        snapshot = self._reconcile_task_summary_in_session(db, task)
+        return stage_run, snapshot
+
     def _reconcile_after_item_layer_update_in_session(
         self: TaskManager,
         db: Session,
@@ -880,8 +892,11 @@ class TaskStateMachineMixin:
         payload: dict[str, Any] | None = None,
         event_type: str = "owned_execution_takeover_requeued",
     ):
-        stage_run = self._reconcile_stage_domain_in_session(db, task, stage_name)
-        snapshot = self._reconcile_task_summary_in_session(db, task)
+        stage_run, snapshot = self._reconcile_item_layer_facts_in_session(
+            db,
+            task,
+            stage_name=stage_name,
+        )
         decision = self._decide_owned_execution_requeue(
             db,
             task,
@@ -1590,6 +1605,168 @@ class TaskStateMachineMixin:
             await self._write_task_metadata_async(task, metadata_path, status=task.status)
             return True
         return False
+
+    def _decide_task_layer_reconcile(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        signal: dict[str, Any],
+    ):
+        from app.service import task_manager as task_manager_module
+
+        source_event_type = str(signal.get("source_event_type") or "").strip() or None
+        reconcile_reason = str(signal.get("reconcile_reason") or signal.get("reason") or "").strip() or "task_layer_reconcile"
+        stage_name = str(signal.get("stage_name") or task.current_stage or "").strip() or None
+        decision = task_manager_module._TaskLayerReconcileDecision(
+            action="noop",
+            stage_name=stage_name,
+            payload={},
+            source_event_type=source_event_type,
+            reconcile_reason=reconcile_reason,
+        )
+        if source_event_type in {"stage_worker_start_requested", "downstream_status_observed"}:
+            decision.action = "refresh_only"
+            return decision
+        if source_event_type in {"task_execution_failed", "archive_job_copy_failed"}:
+            failure_ctx = self._current_stage_authoritative_failure_context(db, task)
+            if failure_ctx is None:
+                failure_ctx = self._earlier_stage_authoritative_failure_context(db, task)
+            if failure_ctx is not None:
+                decision.action = "failure_finalize"
+                decision.stage_name = str(failure_ctx.get("stage_name") or stage_name or task.current_stage or "").strip() or None
+                decision.payload = {"failure_ctx": dict(failure_ctx)}
+                return decision
+            if str(task.status or "").strip() in TASK_TERMINAL_STATUSES:
+                decision.action = "finalize_task"
+            else:
+                decision.action = "refresh_only"
+            return decision
+        if source_event_type in {"stage_worker_terminal_observed", "archive_job_copied", "downstream_terminal_observed"}:
+            resolved_stage_name = stage_name or str(task.current_stage or "").strip() or None
+            if str(task.status or "").strip() in TASK_TERMINAL_STATUSES:
+                decision.action = "finalize_task"
+                decision.stage_name = resolved_stage_name
+                return decision
+            if not resolved_stage_name:
+                decision.action = "refresh_only"
+                return decision
+            stage_run = (
+                db.query(BinarySecurityStageRun)
+                .filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.stage_name == resolved_stage_name,
+                )
+                .first()
+            )
+            if stage_run is None:
+                decision.action = "refresh_only"
+                return decision
+            stage_status = str(getattr(stage_run, "status", "") or "").strip()
+            if stage_status in TASK_TERMINAL_STATUSES:
+                decision.action = "stage_terminal_apply"
+                decision.stage_name = resolved_stage_name
+                decision.stage_status = stage_status
+                decision.summary = dict(getattr(stage_run, "output_summary", None) or {})
+                return decision
+            decision.action = "refresh_only"
+            return decision
+        return decision
+
+    async def _apply_task_layer_reconcile_decision(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        decision,
+        signal: dict[str, Any],
+    ) -> bool:
+        state_event_id = str(signal.get("state_event_id") or "").strip() or None
+        metadata_path = Path(task.workspace_root) / "input" / "task-metadata.json"
+        if decision.action in {"noop", "refresh_only"}:
+            return False
+        if decision.action == "stage_terminal_apply" and decision.stage_name and decision.stage_status:
+            return await self._apply_task_action_after_stage_terminal(
+                db,
+                task,
+                stage_name=decision.stage_name,
+                status=decision.stage_status,
+                summary=dict(decision.summary or {}),
+                payload=dict(decision.payload or {}),
+                state_event_id=state_event_id,
+            )
+        if decision.action == "failure_finalize":
+            failure_ctx = dict((decision.payload or {}).get("failure_ctx") or {})
+            if not failure_ctx:
+                return False
+            self._finalize_task_after_authoritative_failure(
+                db,
+                task,
+                failure_ctx=failure_ctx,
+                previous_status=str(signal.get("previous_status") or task.status or "").strip() or None,
+            )
+            await self._write_task_metadata_async(task, metadata_path, status=task.status)
+            return True
+        if decision.action == "finalize_task":
+            self._finalize_task(db, task)
+            await self._write_task_metadata_async(task, metadata_path, status=task.status)
+            return True
+        return False
+
+    async def _run_task_layer_reconcile_signal(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        signal: dict[str, Any],
+    ) -> bool:
+        source_event_type = str(signal.get("source_event_type") or "").strip()
+        reconcile_reason = str(signal.get("reconcile_reason") or signal.get("reason") or "").strip() or "task_layer_reconcile"
+        stage_name = str(signal.get("stage_name") or task.current_stage or "").strip() or None
+        state_event_id = str(signal.get("state_event_id") or "").strip() or None
+
+        before_status = str(task.status or "").strip()
+        before_stage = str(task.current_stage or "").strip()
+        before_phase = str(getattr(task, "runtime_phase", "") or "").strip()
+
+        self._refresh_task_status_after_sync(db, task)
+        decision = self._decide_task_layer_reconcile(
+            db,
+            task,
+            signal=signal,
+        )
+        applied = await self._apply_task_layer_reconcile_decision(
+            db,
+            task,
+            decision=decision,
+            signal=signal,
+        )
+
+        after_status = str(task.status or "").strip()
+        after_stage = str(task.current_stage or "").strip()
+        after_phase = str(getattr(task, "runtime_phase", "") or "").strip()
+        changed = applied or (before_status, before_stage, before_phase) != (after_status, after_stage, after_phase)
+        self._record_event(
+            db,
+            task,
+            "task_layer_reconcile_completed" if changed else "task_layer_reconcile_noop",
+            "事实层更新已由 owner worker 串行收口任务主状态" if changed else "事实层更新已检查，未产生新的任务层变更",
+            stage_name=stage_name or str(task.current_stage or "").strip() or None,
+            payload={
+                "source_event_type": source_event_type or None,
+                "state_event_id": state_event_id,
+                "reconcile_reason": reconcile_reason,
+                "fact_applied": bool(signal.get("fact_applied")),
+                "decision_action": getattr(decision, "action", None),
+                "before_status": before_status,
+                "before_stage": before_stage or None,
+                "before_runtime_phase": before_phase or None,
+                "after_status": after_status,
+                "after_stage": after_stage or None,
+                "after_runtime_phase": after_phase or None,
+            },
+        )
+        return changed
 
     def _refresh_task_status_after_sync(self: TaskManager, db: Session, task: BinarySecurityTask) -> None:
         current_status = str(task.status or "").strip()

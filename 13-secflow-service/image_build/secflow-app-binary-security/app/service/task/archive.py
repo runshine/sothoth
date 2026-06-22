@@ -1296,20 +1296,27 @@ class TaskArchiveServiceMixin:
                     mapped_status=normalized_mapped_status,
                     archived_dir=Path(effective_archive_root) if effective_archive_root else None,
                 )
-            self._reconcile_after_item_layer_update_in_session(
+            stage_run, _snapshot = self._reconcile_item_layer_facts_in_session(
                 db,
                 task,
                 stage_name=item.stage_name,
-                preferred_stage_name=item.stage_name,
-                reason="archive_apply_without_active_holder",
-                message="检测到归档回写后阶段已推进但当前无 active holder，已重新排队等待 worker 接管",
-                payload={
-                    "source": "archive_apply",
-                    "item_id": item.id,
-                    "archive_job_id": job.id,
-                    "downstream_task_id": item.downstream_task_id,
-                },
             )
+            if str(task.status or "").strip() not in task_manager_module.TASK_TERMINAL_STATUSES:
+                self._request_task_layer_reconcile(
+                    db,
+                    task,
+                    stage_name=item.stage_name,
+                    source_event_type="archive_job_copied",
+                    state_event_id=state_event_id,
+                    reconcile_reason="archive_apply",
+                    message="归档事实已更新，等待 owner worker 串行收口任务层决策",
+                    event_payload={
+                        "item_id": item.id,
+                        "archive_job_id": job.id,
+                        "downstream_task_id": item.downstream_task_id,
+                        "stage_status": str(getattr(stage_run, "status", "") or "").strip() or None,
+                    },
+                )
             if effective_archive_root:
                 job.archive_root = effective_archive_root
             job.archive_status = "success"

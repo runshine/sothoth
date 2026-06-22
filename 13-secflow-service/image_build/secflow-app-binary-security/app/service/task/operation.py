@@ -2556,6 +2556,29 @@ class TaskOperationServiceMixin:
                 finally:
                     finalize_db.close()
                 return True
+            if workset.get("pending_task_layer_reconcile"):
+                signal = dict(workset.get("pending_task_layer_reconcile") or {})
+                self._clear_task_runtime_signal(task, "pending_task_layer_reconcile")
+                db.commit()
+                reconcile_db = session_factory()
+                try:
+                    reconcile_task = (
+                        reconcile_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task.id)
+                        .first()
+                    )
+                    if reconcile_task is None:
+                        return False
+                    self._ensure_task_write_ownership(reconcile_task, db=reconcile_db, allow_dispatching=True)
+                    changed = await self._run_task_layer_reconcile_signal(
+                        reconcile_db,
+                        reconcile_task,
+                        signal=signal,
+                    )
+                    reconcile_db.commit()
+                    return changed
+                finally:
+                    reconcile_db.close()
             if workset.get("pending_binding_repair") or workset.get("pending_downstream_sync"):
                 signal = dict(workset.get("pending_binding_repair") or workset.get("pending_downstream_sync") or {})
                 stage_name = str(signal.get("stage_name") or "").strip() or None

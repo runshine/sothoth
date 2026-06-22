@@ -866,6 +866,18 @@ class TaskRuntimeServiceMixin:
             stage_name = str(task.current_stage or "").strip() or None
             if not stage_name:
                 continue
+            if self._task_runtime_transition_guard_active(task):
+                continue
+            if str(task.status or "").strip() == "dispatching":
+                continue
+            dispatch_started_at = getattr(task, "dispatch_started_at", None)
+            dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+            if (
+                dispatcher_instance_id
+                and dispatch_started_at is not None
+                and (task_manager_module._elapsed_seconds_since(dispatch_started_at) or 0) <= max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
+            ):
+                continue
             if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
                 continue
             lease = self._runtime_lease_for_task(db, task.id)

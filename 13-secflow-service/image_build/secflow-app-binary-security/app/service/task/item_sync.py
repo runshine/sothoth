@@ -2480,22 +2480,18 @@ class TaskItemSyncServiceMixin:
                 self._refresh_system_analysis_stage_from_synced_items(db, task)
             else:
                 self._refresh_stage_run_from_items(db, task, current_stage)
-        task_layer_decision = task_manager_module._TaskLayerDecision()
         if touched_stages:
-            self._refresh_task_status_after_sync(db, task)
-            task_layer_decision = self._decide_owned_execution_requeue(
+            await self._run_task_layer_reconcile_signal(
                 db,
                 task,
-                preferred_stage_name="system_analysis" if "system_analysis" in stage_takeover_candidates else None,
-                reason="system_analysis_sync_next_stage_active_without_owner",
-                message="系统分析同步完成，检测到后续阶段已处于活跃态，任务已重新排队等待 worker 接管",
-                payload={"source": "system_analysis_sync_success"} if "system_analysis" in stage_takeover_candidates else {"source": "downstream_sync"},
-            )
-            self._apply_task_layer_decision(
-                db,
-                task,
-                task_layer_decision,
-                event_type="owned_execution_takeover_requeued",
+                signal={
+                    "source_event_type": "downstream_status_observed",
+                    "reconcile_reason": "system_analysis_sync_next_stage_active_without_owner"
+                    if "system_analysis" in stage_takeover_candidates
+                    else "downstream_sync",
+                    "stage_name": "system_analysis" if "system_analysis" in stage_takeover_candidates else str(task.current_stage or "").strip() or None,
+                    "fact_applied": True,
+                },
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
         db.commit()
