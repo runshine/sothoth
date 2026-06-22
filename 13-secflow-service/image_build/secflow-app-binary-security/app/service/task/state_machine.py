@@ -1071,6 +1071,14 @@ class TaskStateMachineMixin:
     ) -> bool:
         if not decision.should_resume or not decision.next_stage:
             return False
+        if (
+            self._streaming_mode_enabled(task)
+            and str(getattr(task, "status", "") or "").strip() in {"running", "dispatching"}
+            and str(getattr(task, "current_stage", "") or "").strip()
+            and not self._is_streaming_tail_stage(task, task.current_stage)
+            and self._is_streaming_tail_stage(task, decision.next_stage)
+        ):
+            return False
         previous_stage = str(getattr(task, "current_stage", "") or "").strip() or None
         self._set_task_runtime_transition_guard(
             task,
@@ -1628,6 +1636,9 @@ class TaskStateMachineMixin:
         if source_event_type in {"stage_worker_start_requested", "downstream_status_observed"}:
             decision.action = "refresh_only"
             return decision
+        if source_event_type == "stale_execution_requeue_requested":
+            decision.action = "refresh_only"
+            return decision
         if source_event_type in {"task_execution_failed", "archive_job_copy_failed"}:
             failure_ctx = self._current_stage_authoritative_failure_context(db, task)
             if failure_ctx is None:
@@ -1660,6 +1671,14 @@ class TaskStateMachineMixin:
                 .first()
             )
             if stage_run is None:
+                decision.action = "refresh_only"
+                return decision
+            if (
+                source_event_type == "archive_job_copied"
+                and self._streaming_mode_enabled(task)
+                and resolved_stage_name == "entry_analysis"
+                and self._is_streaming_tail_stage(task, "dataflow_vuln_scan")
+            ):
                 decision.action = "refresh_only"
                 return decision
             stage_status = str(getattr(stage_run, "status", "") or "").strip()

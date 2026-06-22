@@ -18395,6 +18395,79 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("archive_apply_triggered_input_repair", [event.event_type for event in db.events])
         self.assertIn("task_requeued_after_archive_input_repair", [event.event_type for event in db.events])
 
+    def test_archive_input_repair_skips_streaming_dataflow_descendants_for_entry_analysis(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+        )
+        dataflow_item = BinarySecurityStageItem(
+            id="si-dataflow",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-tail",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-a",
+            item_name="entry-a",
+            status="pending",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa-1",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[entry_item, dataflow_item], events=[])
+
+        original_descendants = self.manager._descendant_stages_for_stage
+        original_refresh = self.manager._archive_apply_repaired_stage_refresh
+        original_signature = self.manager._archive_apply_downstream_input_signature
+        original_contamination = self.manager._archive_apply_descendant_contamination
+        original_forced = self.manager._archive_apply_forced_descendant_contamination
+        refresh_calls = []
+        contamination_calls = []
+
+        self.manager._descendant_stages_for_stage = lambda *_args, **_kwargs: ["dataflow_vuln_scan"]
+        self.manager._archive_apply_repaired_stage_refresh = lambda *_args, **_kwargs: refresh_calls.append("refresh")
+        self.manager._archive_apply_downstream_input_signature = lambda *_args, **_kwargs: {"stage_name": "entry_analysis"}
+        self.manager._archive_apply_descendant_contamination = lambda *_args, **_kwargs: contamination_calls.append("contamination") or []
+        self.manager._archive_apply_forced_descendant_contamination = lambda *_args, **_kwargs: contamination_calls.append("forced") or []
+        try:
+            repaired = self.manager._repair_descendants_after_archive_apply_if_needed(
+                db,
+                task,
+                entry_item,
+                state_event_id="sev-streaming-archive",
+            )
+        finally:
+            self.manager._descendant_stages_for_stage = original_descendants
+            self.manager._archive_apply_repaired_stage_refresh = original_refresh
+            self.manager._archive_apply_downstream_input_signature = original_signature
+            self.manager._archive_apply_descendant_contamination = original_contamination
+            self.manager._archive_apply_forced_descendant_contamination = original_forced
+
+        self.assertFalse(repaired)
+        self.assertEqual([], refresh_calls)
+        self.assertEqual([], contamination_calls)
+        self.assertFalse(any(event.event_type == "archive_apply_triggered_input_repair" for event in db.events))
+        self.assertFalse(any(event.event_type == "task_requeued_after_archive_input_repair" for event in db.events))
+
     def test_archive_input_repair_reopens_failed_binary_to_source_stage_after_inputs_restored(self):
         task = BinarySecurityTask(
             id="t1",
@@ -24075,6 +24148,8 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
         self.assertTrue(any(event.event_type == "streaming_stage_item_requeued_after_stale_execution" for event in fake_session.events))
+        self.assertTrue(any(event.event_type == "owned_execution_takeover_requeued" and (event.payload or {}).get("takeover_action") == "request_task_layer_reconcile" for event in fake_session.events))
+        self.assertFalse(any(event.event_type == "main_state_write_blocked" and (event.payload or {}).get("attempted_stage_name") == "entry_analysis" for event in fake_session.events))
 
     def test_run_stage_item_by_id_stale_execution_ignores_claim_mismatch_after_takeover(self):
         now = _now()
@@ -31660,6 +31735,99 @@ def _test_run_task_layer_reconcile_signal_archive_apply_advances_system_analysis
 TaskManagerTests.test_run_task_layer_reconcile_signal_archive_apply_advances_system_analysis_only_via_owner = _test_run_task_layer_reconcile_signal_archive_apply_advances_system_analysis_only_via_owner
 
 
+def _test_run_task_layer_reconcile_signal_archive_apply_keeps_streaming_entry_parent_running(self):
+    task = BinarySecurityTask(
+        id="task-archive-streaming-entry",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        summary={
+            "entry_results": [
+                {
+                    "module_key": "mod-a",
+                    "module_name": "mod-a",
+                    "entries": [{"entry_key": "entry-a", "function_name": "f"}],
+                }
+            ]
+        },
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry-streaming",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="running",
+        output_summary={"success_count": 1, "entry_count": 1},
+    )
+    tail_run = BinarySecurityStageRun(
+        id="sr-tail-streaming",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="pending",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run, tail_run], events=[])
+
+    original_refresh = self.manager._refresh_task_status_after_sync
+    original_apply = self.manager._apply_task_action_after_stage_terminal
+    original_write = self.manager._write_task_metadata_async
+    calls = []
+
+    def _capture_refresh(_db, _task):
+        calls.append(("refresh", str(_task.current_stage or ""), str(_task.status or "")))
+        return None
+
+    async def _capture_apply(_db, _task, **kwargs):
+        calls.append(("apply", dict(kwargs)))
+        return True
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    self.manager._refresh_task_status_after_sync = _capture_refresh
+    self.manager._apply_task_action_after_stage_terminal = _capture_apply
+    self.manager._write_task_metadata_async = _noop_write
+    try:
+        changed = asyncio.run(
+            self.manager._run_task_layer_reconcile_signal(
+                db,
+                task,
+                signal={
+                    "source_event_type": "archive_job_copied",
+                    "state_event_id": "sev-archive-streaming-entry",
+                    "reconcile_reason": "archive_apply",
+                    "stage_name": "entry_analysis",
+                    "fact_applied": True,
+                    "archive_job_id": "aj-entry-1",
+                },
+            )
+        )
+    finally:
+        self.manager._refresh_task_status_after_sync = original_refresh
+        self.manager._apply_task_action_after_stage_terminal = original_apply
+        self.manager._write_task_metadata_async = original_write
+
+    self.assertFalse(changed)
+    self.assertEqual("running", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual([("refresh", "entry_analysis", "running")], calls)
+    self.assertTrue(any(event.event_type == "task_layer_reconcile_noop" for event in db.events))
+    self.assertFalse(any(event.event_type == "task_requeued_after_stage_completion" for event in db.events))
+
+
+TaskManagerTests.test_run_task_layer_reconcile_signal_archive_apply_keeps_streaming_entry_parent_running = _test_run_task_layer_reconcile_signal_archive_apply_keeps_streaming_entry_parent_running
+
+
 def _test_stage_item_response_falls_back_to_downstream_payload_status(self):
     item = BinarySecurityStageItem(
         id="si-entry",
@@ -35540,8 +35708,10 @@ def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[], events=[])
 
-    with patch.object(manager, "_runtime_lease_context", return_value=(None, None, None)), patch.object(
-        manager, "_streaming_tail_active_context", return_value=(None, 0, False)
+    with (
+        patch.object(manager, "_runtime_lease_context", return_value=(None, None, None)),
+        patch.object(manager, "_streaming_tail_active_context", return_value=(None, 0, False)),
+        patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True),
     ):
         reclaimed = manager._reclaim_stale_dispatching_locked(db)
 
@@ -35554,6 +35724,95 @@ def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
     event_types = [event.event_type for event in db.events]
     self.assertIn("dispatching_state_force_terminalized", event_types)
     self.assertIn("task_finalized_after_child_failure", event_types)
+
+
+def _test_reclaim_stale_dispatching_protects_active_tail_with_live_owner(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-dispatching-protected-tail",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-live",
+        dispatch_started_at=_now() - timedelta(seconds=10),
+        lease_expires_at=_now() - timedelta(seconds=1),
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[], events=[])
+    lease = SimpleNamespace(owner_instance_id="worker-live", lease_expires_at=_now() + timedelta(minutes=2))
+
+    with (
+        patch.object(manager, "_runtime_lease_context", return_value=(lease, "worker-live", lease.lease_expires_at)),
+        patch.object(manager, "_runtime_lease_is_active", return_value=True),
+        patch.object(manager, "_streaming_tail_active_context", return_value=("entry_analysis", 3, True)),
+    ):
+        reclaimed = manager._reclaim_stale_dispatching_locked(db)
+
+    self.assertFalse(reclaimed)
+    self.assertEqual("dispatching", task.status)
+    self.assertEqual("worker-live", task.dispatcher_instance_id)
+    self.assertFalse(any(event.event_type in {"dispatching_execution_released_for_takeover", "owned_execution_takeover_requeued", "dispatch_reclaimed"} for event in db.events))
+
+
+def _test_reclaim_stale_dispatching_releases_owner_lost_active_tail(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-dispatching-owner-lost-tail",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-dead",
+        dispatch_started_at=_now() - timedelta(minutes=10),
+        lease_expires_at=_now() - timedelta(minutes=5),
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    tail_item = BinarySecurityStageItem(
+        id="si-tail-live",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[tail_item], events=[])
+
+    with (
+        patch.object(manager, "_runtime_lease_context", return_value=(None, "worker-old-runtime", _now() - timedelta(minutes=4))),
+        patch.object(manager, "_runtime_lease_is_active", return_value=False),
+        patch.object(manager, "_streaming_tail_active_context", return_value=("entry_analysis", 2, True)),
+    ):
+        reclaimed = manager._reclaim_stale_dispatching_locked(db)
+
+    self.assertTrue(reclaimed)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    release_event = next(event for event in db.events if event.event_type == "dispatching_execution_released_for_takeover")
+    self.assertEqual("dispatching", (release_event.payload or {}).get("previous_status"))
+    self.assertEqual("dispatching_owner_lost_with_active_tail", (release_event.payload or {}).get("requeue_reason"))
+    takeover_event = next(event for event in db.events if event.event_type == "owned_execution_takeover_requeued")
+    self.assertEqual("signal_owned_execution", (takeover_event.payload or {}).get("takeover_action"))
+    self.assertEqual("dispatching_owner_lost_with_active_tail", (takeover_event.payload or {}).get("takeover_reason"))
 
 
 def _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child(self):
@@ -36796,6 +37055,8 @@ TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_p
 TaskManagerTests.test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable = _test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable
 TaskManagerTests.test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted = _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted
 TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
+TaskManagerTests.test_reclaim_stale_dispatching_protects_active_tail_with_live_owner = _test_reclaim_stale_dispatching_protects_active_tail_with_live_owner
+TaskManagerTests.test_reclaim_stale_dispatching_releases_owner_lost_active_tail = _test_reclaim_stale_dispatching_releases_owner_lost_active_tail
 TaskManagerTests.test_dispatch_task_by_id_releases_fake_local_owner_without_runtime = _test_dispatch_task_by_id_releases_fake_local_owner_without_runtime
 TaskManagerTests.test_dispatch_task_by_id_claims_ownerless_active_operation = _test_dispatch_task_by_id_claims_ownerless_active_operation
 TaskManagerTests.test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle = _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle

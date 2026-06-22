@@ -218,7 +218,13 @@ class TaskRuntimeServiceMixin:
                 entry_stage_run is not None
                 and str(getattr(entry_stage_run, "status", "") or "").strip() in {"success", "partial_success"}
             )
-            if self._entry_results(task) and authoritative_tail_progress and entry_stage_ready:
+            entry_results_ready = bool(self._entry_results(task))
+            streaming_tail_allowed = bool(
+                self._streaming_mode_enabled(task)
+                and self._is_streaming_tail_stage(task, "dataflow_vuln_scan")
+                and entry_results_ready
+            )
+            if entry_results_ready and authoritative_tail_progress and (entry_stage_ready or streaming_tail_allowed):
                 if active_tail_item:
                     self._apply_task_main_state_update(
                         db,
@@ -268,30 +274,46 @@ class TaskRuntimeServiceMixin:
                         last_error=None,
                     )
             elif active_tail_item or authoritative_tail_progress:
-                self._record_event(
-                    db,
-                    task,
-                    "dataflow_vuln_scan_gate_blocked",
-                    "tail 阶段存在进度，但入口分析尚未形成权威完成事实，禁止推进到数据流漏洞挖掘阶段",
-                    level="warning",
-                    stage_name="entry_analysis",
-                    payload={
-                        "entry_stage_status": str(getattr(entry_stage_run, "status", "") or "").strip() or None,
-                        "has_entry_results": bool(self._entry_results(task)),
-                        "authoritative_tail_progress": bool(authoritative_tail_progress),
-                        "active_tail_item": bool(active_tail_item),
-                    },
-                )
-                self._apply_task_main_state_update(
-                    db,
-                    task,
-                    source="runtime_worker",
-                    reason="入口分析未形成权威完成事实，禁止 tail 同步推进到数据流漏洞挖掘阶段",
-                    status="pending",
-                    stage_name=str(task.current_stage or "").strip() or "entry_analysis",
-                    finished_at=None,
-                    last_error=None,
-                )
+                if streaming_tail_allowed:
+                    self._record_event(
+                        db,
+                        task,
+                        "dataflow_vuln_scan_streaming_progress_observed",
+                        "检测到流式 tail 已有权威进度，保持上游阶段 owner 运行语义",
+                        level="info",
+                        stage_name="entry_analysis",
+                        payload={
+                            "entry_stage_status": str(getattr(entry_stage_run, "status", "") or "").strip() or None,
+                            "has_entry_results": entry_results_ready,
+                            "authoritative_tail_progress": bool(authoritative_tail_progress),
+                            "active_tail_item": bool(active_tail_item),
+                        },
+                    )
+                else:
+                    self._record_event(
+                        db,
+                        task,
+                        "dataflow_vuln_scan_gate_blocked",
+                        "tail 阶段存在进度，但入口分析尚未形成权威完成事实，禁止推进到数据流漏洞挖掘阶段",
+                        level="warning",
+                        stage_name="entry_analysis",
+                        payload={
+                            "entry_stage_status": str(getattr(entry_stage_run, "status", "") or "").strip() or None,
+                            "has_entry_results": entry_results_ready,
+                            "authoritative_tail_progress": bool(authoritative_tail_progress),
+                            "active_tail_item": bool(active_tail_item),
+                        },
+                    )
+                    self._apply_task_main_state_update(
+                        db,
+                        task,
+                        source="runtime_worker",
+                        reason="入口分析未形成权威完成事实，禁止 tail 同步推进到数据流漏洞挖掘阶段",
+                        status="pending",
+                        stage_name=str(task.current_stage or "").strip() or "entry_analysis",
+                        finished_at=None,
+                        last_error=None,
+                    )
             elif str(task.current_stage or "").strip() == "dataflow_vuln_scan":
                 self._apply_task_main_state_update(
                     db,
@@ -924,6 +946,8 @@ class TaskRuntimeServiceMixin:
                 continue
             if task.id in local_workers and str(task.dispatcher_instance_id or "").strip() == self.instance_id:
                 continue
+            if self._task_runtime_transition_guard_active(task):
+                continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
             if self._runtime_lease_is_active(lease):
                 if (
@@ -935,14 +959,48 @@ class TaskRuntimeServiceMixin:
                     continue
                 continue
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
-            if active_item_count > 0:
-                continue
             lease_remaining = task_manager_module._seconds_until(task.lease_expires_at)
+            dispatch_elapsed_seconds = task_manager_module._elapsed_seconds_since(task.dispatch_started_at)
+            startup_window_seconds = max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
+            row_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+            row_owner_matches_runtime_lease = bool(
+                row_owner
+                and runtime_lease_owner
+                and row_owner == runtime_lease_owner
+            )
+            protected_dispatching_window = bool(
+                active_item_count > 0
+                and (
+                    self._has_local_task_execution_owner(task.id)
+                    or self._task_has_active_streaming_stage_workers(task.id)
+                    or (
+                        row_owner_matches_runtime_lease
+                        and runtime_lease_expires_at is not None
+                        and (task_manager_module._seconds_until(runtime_lease_expires_at) or 0) > 0
+                    )
+                    or (
+                        dispatch_elapsed_seconds is not None
+                        and dispatch_elapsed_seconds <= startup_window_seconds
+                    )
+                )
+            )
+            if protected_dispatching_window:
+                continue
             if lease_remaining is None:
-                elapsed_seconds = task_manager_module._elapsed_seconds_since(task.dispatch_started_at)
-                if elapsed_seconds is None or elapsed_seconds < service_config.dispatch_timeout_seconds:
+                if dispatch_elapsed_seconds is None or dispatch_elapsed_seconds < service_config.dispatch_timeout_seconds:
                     continue
             elif lease_remaining > 0:
+                continue
+            if active_item_count > 0 and self._release_streaming_parent_for_takeover_locked(
+                db,
+                task,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                reason="dispatching_owner_lost_with_active_tail",
+                signal_takeover=True,
+            ):
+                task_manager_module.observe_runtime_lease_owner_mismatch("dispatching_with_active_tail_owner_lost")
+                reclaimed = True
                 continue
             failure_ctx = self._current_stage_authoritative_failure_context(db, task)
             if failure_ctx is None:
@@ -1839,21 +1897,22 @@ class TaskRuntimeServiceMixin:
                     task_manager_module.BinarySecurityStageItem.id == item_id
                 ).first()
             if requeued and item is not None:
-                if task is not None and self._should_hold_task_on_stage_after_requeue(db, task, item.stage_name):
-                    self._apply_task_main_state_update(
-                        db,
-                        task,
-                        source="runtime_worker",
-                        reason="阶段子项重排队后任务保持在当前阶段运行",
-                        stage_name=item.stage_name,
-                        status="running",
-                        runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                        finished_at=None,
-                        last_error=None,
-                        clear_runtime_owner=True,
-                    )
                 db.commit()
                 if task is not None:
+                    self._request_task_layer_reconcile(
+                        db,
+                        task,
+                        stage_name=item.stage_name,
+                        source_event_type="stale_execution_requeue_requested",
+                        reconcile_reason="stale_execution_requeue",
+                        message="流式子项 stale repair 已完成，等待 owner worker 刷新任务层事实",
+                        event_payload={
+                            "item_id": item.id,
+                            "item_key": item.item_key,
+                            "claim_owner_instance_id": expected_claim_owner_instance_id,
+                            "claim_execution_token": expected_claim_execution_token,
+                        },
+                    )
                     self._record_event(
                         db,
                         task,

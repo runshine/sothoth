@@ -3624,6 +3624,7 @@ class TaskManager(
         runtime_lease_owner: str | None,
         runtime_lease_expires_at: datetime | None,
         reason: str,
+        signal_takeover: bool = False,
     ) -> bool:
         summary = self._tail_stage_work_summary(db, task)
         active_stage_name = summary.get("active_stage_name")
@@ -3631,6 +3632,7 @@ class TaskManager(
         has_downstream_refs = bool(summary.get("has_downstream_refs"))
         if active_item_count <= 0:
             return False
+        previous_status = str(task.status or "").strip() or "running"
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
         self._set_task_status(
             db,
@@ -3648,14 +3650,21 @@ class TaskManager(
         task.last_error = None
         self._clear_runtime_lease(db, task.id)
         self._clear_task_abnormal_reason_snapshot(db, task)
+        release_event_type = "dispatching_execution_released_for_takeover" if previous_status == "dispatching" else "running_execution_released_for_takeover"
+        release_message = (
+            "调度实例租约已失效，父任务已释放并重新排队，等待新的 worker 继续推进尾段执行"
+            if previous_status == "dispatching"
+            else "运行实例租约已失效，父任务已释放并重新排队，等待新的 worker 继续推进尾段执行"
+        )
         self._record_event(
             db,
             task,
-            "running_execution_released_for_takeover",
-            "运行实例租约已失效，父任务已释放并重新排队，等待新的 worker 继续推进尾段执行",
+            release_event_type,
+            release_message,
             level="warning",
             stage_name=task.current_stage,
             payload={
+                "previous_status": previous_status,
                 "stage_name": task.current_stage,
                 "previous_dispatcher_instance_id": previous_dispatcher,
                 "runtime_lease_owner": runtime_lease_owner,
@@ -3666,6 +3675,23 @@ class TaskManager(
                 "requeue_reason": reason,
             },
         )
+        if signal_takeover:
+            self._signal_owned_execution_takeover(
+                db,
+                task,
+                stage_name=task.current_stage,
+                reason=reason,
+                message="检测到 dispatching owner 已失效，已重新排队等待新的 worker 接管尾段执行",
+                event_payload={
+                    "previous_status": previous_status,
+                    "previous_dispatcher_instance_id": previous_dispatcher,
+                    "runtime_lease_owner": runtime_lease_owner,
+                    "runtime_lease_expires_at": _isoformat_or_none(runtime_lease_expires_at),
+                    "active_item_count": active_item_count,
+                    "has_downstream_refs": has_downstream_refs,
+                    "tail_control_mode": summary.get("tail_control_mode"),
+                },
+            )
         return True
 
     def _delete_stage_items_for_stages(

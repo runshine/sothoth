@@ -1377,6 +1377,12 @@ class TaskArchiveServiceMixin:
         descendant_stages = self._descendant_stages_for_stage(task, repaired_stage)
         if not descendant_stages:
             return False
+        if (
+            self._streaming_mode_enabled(task)
+            and repaired_stage == "entry_analysis"
+            and any(self._is_streaming_tail_stage(task, stage_name) for stage_name in descendant_stages)
+        ):
+            return False
         before_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
         self._archive_apply_repaired_stage_refresh(db, task, repaired_stage)
         after_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
