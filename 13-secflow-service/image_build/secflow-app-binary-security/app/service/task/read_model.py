@@ -24,6 +24,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _schedule_user_task_id_value(task) -> str | None:
+    explicit = str(getattr(task, "schedule_user_task_id", "") or "").strip()
+    if explicit:
+        return explicit
+    task_key_source = str(getattr(task, "task_key_source", "") or "").strip()
+    if task_key_source == "schedule_dispatch":
+        return str(getattr(task, "id", "") or "").strip() or None
+    return None
+
+
 class TaskReadModelServiceMixin:
     def _manual_operation_state_from_active_operation(
         self: TaskManager,
@@ -1911,6 +1921,7 @@ class TaskReadModelServiceMixin:
             task_type=self._task_type(task),
             pipeline_profile=self._pipeline_profile(task),
             name=task.name,
+            schedule_user_task_id=_schedule_user_task_id_value(task),
             status=task.status,
             runtime_phase=runtime_phase,
             task_control_mode=task_control_mode,
@@ -3365,6 +3376,7 @@ class TaskReadModelServiceMixin:
             project_id=task.project_id,
             task_type=self._task_type(task),
             name=task.name,
+            schedule_user_task_id=_schedule_user_task_id_value(task),
             status=task.status,
             runtime_phase=runtime_phase,
             task_control_mode=task_control_mode,

@@ -3901,6 +3901,38 @@ class TaskManager(
     def _knowledge_graph_entry_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         return [dict(item) for item in (task.summary.get("knowledge_graph_entry_results") or []) if isinstance(item, dict)]
 
+    def _merge_knowledge_graph_entry_results(
+        self,
+        task: BinarySecurityTask,
+        entries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for entry in [*self._knowledge_graph_entry_results(task), *entries]:
+            if not isinstance(entry, dict):
+                continue
+            current = dict(entry)
+            stable_key = (
+                str(current.get("entry_key") or "").strip(),
+                str(current.get("source_id") or "").strip(),
+                str(current.get("function_id") or "").strip(),
+            )
+            if stable_key in seen:
+                continue
+            seen.add(stable_key)
+            merged.append(current)
+        return merged
+
+    def _compact_knowledge_graph_entry_results(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                **dict(entry),
+                "entries": [dict(entry)],
+            }
+            for entry in entries
+            if isinstance(entry, dict)
+        ]
+
     def _entry_candidates(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         snapshot = self._entry_selection_snapshot(task)
         candidate_entries = snapshot.get("candidate_entries")
@@ -4101,6 +4133,23 @@ class TaskManager(
             "filtered_out_count": max(0, int(analysis.get("total") or len(raw_entries)) - len(deduped)),
             "returned_item_count": len(raw_entries),
             "duration_ms": int((time.perf_counter() - started) * 1000),
+        }
+
+    def _knowledge_graph_poll_state_summary(
+        self,
+        meta: dict[str, Any],
+        *,
+        accumulated_selected_entry_count: int,
+    ) -> dict[str, Any]:
+        analysis_metrics = self._knowledge_graph_analysis_metrics(meta)
+        return {
+            "graph_status": str(meta.get("graph_status") or "").strip() or None,
+            "identification_state": str(meta.get("identification_state") or "").strip() or None,
+            "attack_status": str(meta.get("attack_status") or "").strip() or None,
+            "last_polled_at": _now().isoformat(),
+            "next_poll_after_seconds": max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)),
+            "accumulated_selected_entry_count": accumulated_selected_entry_count,
+            **analysis_metrics,
         }
 
     def _filter_candidate_modules(self, modules: list[dict[str, Any]], risk_levels: list[str]) -> list[dict[str, Any]]:
@@ -10121,14 +10170,14 @@ class TaskManager(
             return "failed", failure_summary
         graph_status = str(meta.get("graph_status") or "").strip()
         identification_state = str(meta.get("identification_state") or "").strip()
-        attack_status = str(meta.get("attack_status") or "").strip()
-        analysis_metrics = self._knowledge_graph_analysis_metrics(meta)
-        state_summary = {
-            "graph_status": graph_status or None,
-            "identification_state": identification_state or None,
-            "attack_status": attack_status or None,
-            **analysis_metrics,
-        }
+        accumulated_entries = self._merge_knowledge_graph_entry_results(task, entries)
+        accumulated_compact_entries = self._compact_knowledge_graph_entry_results(accumulated_entries)
+        accumulated_selected_entry_count = len(accumulated_entries)
+        current_poll_selected_entry_count = len(entries)
+        state_summary = self._knowledge_graph_poll_state_summary(
+            meta,
+            accumulated_selected_entry_count=accumulated_selected_entry_count,
+        )
         if graph_status == "failed" or identification_state == "failed" or graph_status == "superseded":
             reason = "知识图谱入口识别失败"
             if graph_status == "superseded":
@@ -10155,27 +10204,32 @@ class TaskManager(
                 **(task.metrics or {}),
                 **STAGE_METRIC_RESETTERS["knowledge_graph_entry_fetch"],
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                **analysis_metrics,
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
+                **self._knowledge_graph_analysis_metrics(meta),
             }
             failure_summary = {
                 "error": reason,
-                "items": [],
+                "items": accumulated_compact_entries,
                 "success_count": 0,
                 "failed_count": 1,
-                "candidate_entry_count": 0,
-                "selected_entry_count": 0,
-                "entry_count": 0,
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
                 **meta,
             }
             self._persist_stage_run_output_summary(task, stage_run, failure_summary)
             return "failed", failure_summary
-        if not entries and graph_status == "building":
+        if identification_state != "done" and graph_status == "building" and not accumulated_entries:
             self._record_event(
                 db,
                 task,
@@ -10187,28 +10241,38 @@ class TaskManager(
                     **meta,
                 },
             )
-            task.summary = {**(task.summary or {}), "knowledge_graph_state": state_summary}
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": accumulated_compact_entries,
+                "knowledge_graph_state": state_summary,
+            }
             task.metrics = {
                 **(task.metrics or {}),
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                **analysis_metrics,
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
+                **self._knowledge_graph_analysis_metrics(meta),
             }
             waiting_summary = {
                 "status": "waiting_for_graph",
-                "items": [],
+                "items": accumulated_compact_entries,
                 "success_count": 0,
                 "failed_count": 0,
-                "candidate_entry_count": 0,
-                "selected_entry_count": 0,
-                "entry_count": 0,
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
+                "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
                 **meta,
             }
             self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
             return "running", waiting_summary
-        if not entries and identification_state == "running":
+        if identification_state != "done" and not accumulated_entries:
             self._record_event(
                 db,
                 task,
@@ -10220,28 +10284,87 @@ class TaskManager(
                     **meta,
                 },
             )
-            task.summary = {**(task.summary or {}), "knowledge_graph_state": state_summary}
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": accumulated_compact_entries,
+                "knowledge_graph_state": state_summary,
+            }
             task.metrics = {
                 **(task.metrics or {}),
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                **analysis_metrics,
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
+                **self._knowledge_graph_analysis_metrics(meta),
             }
             waiting_summary = {
                 "status": "waiting_for_identification",
-                "items": [],
+                "items": accumulated_compact_entries,
                 "success_count": 0,
                 "failed_count": 0,
-                "candidate_entry_count": 0,
-                "selected_entry_count": 0,
-                "entry_count": 0,
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
+                "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
                 **meta,
             }
             self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
             return "running", waiting_summary
-        if not entries:
+        if identification_state != "done":
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_polling_partial",
+                "知识图谱入口识别仍在进行，已累计部分入口",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph_audit_sources",
+                    "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                    "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                    **meta,
+                },
+            )
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": accumulated_compact_entries,
+                "knowledge_graph_state": state_summary,
+            }
+            task.metrics = {
+                **(task.metrics or {}),
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
+                **self._knowledge_graph_analysis_metrics(meta),
+            }
+            waiting_summary = {
+                "status": "polling_partial",
+                "items": accumulated_compact_entries,
+                "success_count": accumulated_selected_entry_count,
+                "failed_count": 0,
+                "candidate_entry_count": accumulated_selected_entry_count,
+                "selected_entry_count": accumulated_selected_entry_count,
+                "entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "entry_results": accumulated_compact_entries,
+                **state_summary,
+                **meta,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
+            return "running", waiting_summary
+        if not accumulated_entries:
             self._record_event(
                 db,
                 task,
@@ -10268,7 +10391,7 @@ class TaskManager(
                 "candidate_entry_count": 0,
                 "selected_entry_count": 0,
                 "entry_count": 0,
-                **analysis_metrics,
+                **self._knowledge_graph_analysis_metrics(meta),
             }
             failure_summary = {
                 "error": "知识图谱入口识别完成，但没有可用入口",
@@ -10286,28 +10409,21 @@ class TaskManager(
             }
             self._persist_stage_run_output_summary(task, stage_run, failure_summary)
             return "failed", failure_summary
-        compact_entries = [
-            {
-                **entry,
-                "entries": [dict(entry)],
-            }
-            for entry in entries
-        ]
         task.summary = {
             **(task.summary or {}),
-            "knowledge_graph_entry_results": entries,
-            "entry_results": compact_entries,
+            "knowledge_graph_entry_results": accumulated_entries,
+            "entry_results": accumulated_compact_entries,
             "knowledge_graph_state": state_summary,
         }
         task.metrics = {
             **(task.metrics or {}),
             "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-            "knowledge_graph_selected_entry_count": int(meta.get("selected_entry_count") or 0),
+            "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
             "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-            "candidate_entry_count": int(meta.get("selected_entry_count") or 0),
-            "selected_entry_count": int(meta.get("selected_entry_count") or 0),
-            "entry_count": int(meta.get("selected_entry_count") or 0),
-            **analysis_metrics,
+            "candidate_entry_count": accumulated_selected_entry_count,
+            "selected_entry_count": accumulated_selected_entry_count,
+            "entry_count": accumulated_selected_entry_count,
+            **self._knowledge_graph_analysis_metrics(meta),
         }
         self._record_event(
             db,
@@ -10317,20 +10433,24 @@ class TaskManager(
             stage_name=stage_run.stage_name,
             payload={
                 "provider": "knowledge_graph_audit_sources",
+                "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **meta,
             },
         )
         success_summary = {
-            "items": compact_entries,
-            "success_count": len(entries),
+            "items": accumulated_compact_entries,
+            "success_count": accumulated_selected_entry_count,
             "failed_count": 0,
-            "candidate_entry_count": len(entries),
-            "selected_entry_count": len(entries),
-            "entry_count": len(entries),
+            "candidate_entry_count": accumulated_selected_entry_count,
+            "selected_entry_count": accumulated_selected_entry_count,
+            "entry_count": accumulated_selected_entry_count,
             "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-            "knowledge_graph_selected_entry_count": int(meta.get("selected_entry_count") or 0),
+            "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
             "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-            "entry_results": compact_entries,
+            "current_poll_selected_entry_count": current_poll_selected_entry_count,
+            "accumulated_selected_entry_count": accumulated_selected_entry_count,
+            "entry_results": accumulated_compact_entries,
             **state_summary,
             **meta,
         }

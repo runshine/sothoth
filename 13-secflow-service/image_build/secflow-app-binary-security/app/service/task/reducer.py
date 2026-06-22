@@ -66,22 +66,8 @@ class TaskReducerServiceMixin:
         stage_run.finished_at = None
         stage_run.updated_at = now_value
         stage_run.counts = self._stage_counts(db, stage_run)
-        task.current_stage = stage_name
-        if str(task.status or "").strip() != "cancelled":
-            self._set_task_status(
-                db,
-                task,
-                "running",
-                reason="阶段启动事件触发任务进入运行态",
-                source="state_reducer",
-                stage_name=stage_name,
-            )
         task.started_at = task.started_at or now_value
-        task.finished_at = None
         task.updated_at = now_value
-        if self._is_streaming_tail_stage(task, stage_name):
-            self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
-            task.tail_reconcile_state = "idle"
         stage_summary = dict(task.stage_summary or {})
         stage_summary[stage_name] = {
             **dict(stage_summary.get(stage_name) or {}),
@@ -98,6 +84,28 @@ class TaskReducerServiceMixin:
             f"阶段开始执行: {stage_name}",
             stage_name=stage_name,
             payload={
+                "state_event_id": event.id,
+                "stage_retry_mode": bool(payload.get("stage_retry_mode")),
+                "task_retry_mode": bool(payload.get("task_retry_mode")),
+                "target_stage_name": payload.get("target_stage_name"),
+            },
+        )
+        self._record_main_state_write_blocked(
+            db,
+            task,
+            source="state_reducer",
+            attempted_stage_name=stage_name,
+            attempted_status="running",
+            reason="stage_worker_start_requested_requires_owner_worker",
+        )
+        self._signal_owned_execution_takeover(
+            db,
+            task,
+            stage_name=stage_name,
+            reason="stage_worker_start_requested_without_owner",
+            message="阶段启动事实已落库，等待 owner worker 接管并推进任务主状态",
+            event_payload={
+                "source": "stage_worker_start_requested",
                 "state_event_id": event.id,
                 "stage_retry_mode": bool(payload.get("stage_retry_mode")),
                 "task_retry_mode": bool(payload.get("task_retry_mode")),
@@ -624,33 +632,20 @@ class TaskReducerServiceMixin:
             state_event_id=event.id,
             extra_payload={"downstream_payload": self._lightweight_downstream_payload(downstream_payload)},
         )
-        self._reconcile_after_item_layer_update_in_session(
+        stage_run = self._reconcile_stage_domain_in_session(db, task, item.stage_name)
+        self._signal_owned_execution_takeover(
             db,
             task,
             stage_name=item.stage_name,
-            preferred_stage_name=item.stage_name,
             reason="downstream_status_event_without_active_holder",
             message="检测到下游状态已推进但当前无 active holder，已重新排队等待 worker 接管",
-            payload={
+            event_payload={
                 "source": "downstream_status_event_applied",
                 "item_id": item.id,
                 "downstream_task_id": item.downstream_task_id,
+                "stage_status": str(getattr(stage_run, "status", "") or "").strip() or None,
             },
         )
-        if self._is_streaming_tail_stage(task, item.stage_name) and mapped_status in {"failed", "downstream_missing", "cancelled"}:
-            task.current_stage = item.stage_name
-            task.finished_at = None
-            self._repair_running_lease_invariant(
-                db,
-                task,
-                reason="downstream_status_event_without_active_holder",
-                stage_name=item.stage_name,
-                event_payload={
-                    "source": "downstream_status_event_applied",
-                    "item_id": item.id,
-                    "downstream_task_id": item.downstream_task_id,
-                },
-            )
         self._record_event(
             db,
             task,
@@ -926,7 +921,6 @@ class TaskReducerServiceMixin:
                         ),
                     },
                 )
-        task.current_stage = stage_name
         if stage_name == "firmware_unpack":
             task.metrics = {**task.metrics, "unpacked_firmware_count": int(summary.get("success_count", 0)), "failed_firmware_count": int(summary.get("failed_count", 0))}
         elif stage_name == "system_analysis":
@@ -974,17 +968,14 @@ class TaskReducerServiceMixin:
             stage_run.finished_at = stage_run.finished_at or task_shared._now()
             stage_run.last_error = summary.get("failure_message") or summary.get("error") or stage_run.last_error
         if active_stage_status:
-            self._set_task_status(
+            self._record_main_state_write_blocked(
                 db,
                 task,
-                "running",
-                reason="阶段仍等待下游明确状态，任务保持运行态",
                 source="state_reducer",
-                stage_name=stage_name,
+                attempted_stage_name=stage_name,
+                attempted_status="running",
+                reason="stage_waiting_downstream_progress_requires_owner_worker",
             )
-            task.current_stage = stage_name
-            task.last_error = None
-            task.finished_at = None
             self._record_event(
                 db,
                 task,
@@ -995,6 +986,18 @@ class TaskReducerServiceMixin:
                     "state_event_id": event.id,
                     "stage_status": status,
                     "deferred_mode": "redispatch" if status == "pending" else "reconcile",
+                },
+            )
+            self._signal_owned_execution_takeover(
+                db,
+                task,
+                stage_name=stage_name,
+                reason="stage_waiting_downstream_progress_without_owner",
+                message="阶段事实已更新，等待 owner worker 接管并继续推进",
+                event_payload={
+                    "source": "stage_worker_terminal_observed",
+                    "state_event_id": event.id,
+                    "stage_status": status,
                 },
             )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
@@ -1036,7 +1039,27 @@ class TaskReducerServiceMixin:
                     ),
                 },
             )
-            self._finalize_task(db, task)
+            self._record_main_state_write_blocked(
+                db,
+                task,
+                source="state_reducer",
+                attempted_stage_name=stage_name,
+                attempted_status="failed",
+                reason="stage_terminal_failure_requires_owner_worker",
+            )
+            self._signal_owned_execution_takeover(
+                db,
+                task,
+                stage_name=stage_name,
+                reason="stage_terminal_failure_without_owner",
+                message="阶段失败事实已落库，等待 owner worker 统一收口任务主状态",
+                event_payload={
+                    "source": "stage_worker_terminal_observed",
+                    "state_event_id": event.id,
+                    "stage_status": status,
+                    "failure_message": summary.get("failure_message") or summary.get("error"),
+                },
+            )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
             return
         if bool(payload.get("stage_retry_mode")) or bool(payload.get("task_retry_mode")):
@@ -1092,30 +1115,13 @@ class TaskReducerServiceMixin:
             )
             return
         error_message = str(payload.get("error") or "任务执行失败")
-        self._set_task_status(
+        self._record_main_state_write_blocked(
             db,
             task,
-            "failed",
-            reason="任务执行失败事件触发任务失败",
             source="state_reducer",
-            stage_name=task.current_stage,
-        )
-        task.last_error = error_message
-        self._invalidate_task_execution(task)
-        task.finished_at = task_shared._now()
-        observe_task_error("execution_error", stage=str(task.current_stage or "unknown"), result="failed")
-        observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
-        observe_task_duration(
-            phase="execution",
-            duration_seconds=task_shared._elapsed_seconds_since(task.started_at),
-            status=task.status,
-            task_type=self._task_type(task),
-        )
-        observe_task_duration(
-            phase="total",
-            duration_seconds=task_shared._elapsed_seconds_since(task.created_at),
-            status=task.status,
-            task_type=self._task_type(task),
+            attempted_stage_name=str(task.current_stage or "").strip() or None,
+            attempted_status="failed",
+            reason="task_execution_failed_requires_owner_worker",
         )
         self._record_event(
             db,
@@ -1124,7 +1130,15 @@ class TaskReducerServiceMixin:
             f"任务执行失败: {error_message}",
             level="error",
             stage_name=task.current_stage,
-            payload={"state_event_id": event.id},
+            payload={"state_event_id": event.id, "error": error_message},
+        )
+        self._signal_owned_execution_takeover(
+            db,
+            task,
+            stage_name=str(task.current_stage or "").strip() or None,
+            reason="task_execution_failed_without_owner",
+            message="任务执行失败事实已落库，等待 owner worker 统一收口任务主状态",
+            event_payload={"source": "task_execution_failed", "state_event_id": event.id, "error": error_message},
         )
         await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
 
@@ -1187,20 +1201,14 @@ class TaskReducerServiceMixin:
         job.completed_at = job.completed_at or task_shared._now()
         job.updated_at = task_shared._now()
         if task.status not in TASK_TERMINAL_STATUSES:
-            self._set_task_status(
+            self._record_main_state_write_blocked(
                 db,
                 task,
-                "failed",
-                reason="下游产物归档复制失败，任务标记失败",
                 source="state_reducer",
-                stage_name=job.stage_name,
+                attempted_stage_name=job.stage_name,
+                attempted_status="failed",
+                reason="archive_job_copy_failed_requires_owner_worker",
             )
-            task.current_stage = job.stage_name
-            task.last_error = job.error_message
-            task.finished_at = task_shared._now()
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
         self._record_event(
             db,
             task,
@@ -1211,6 +1219,20 @@ class TaskReducerServiceMixin:
             item=item,
             payload={"state_event_id": event.id, "archive_job_id": job.id, "archive_status": job.archive_status, "error": job.error_message},
         )
+        if task.status not in TASK_TERMINAL_STATUSES:
+            self._signal_owned_execution_takeover(
+                db,
+                task,
+                stage_name=job.stage_name,
+                reason="archive_job_copy_failed_without_owner",
+                message="下游产物归档失败事实已落库，等待 owner worker 统一收口任务主状态",
+                event_payload={
+                    "source": "archive_job_copy_failed",
+                    "state_event_id": event.id,
+                    "archive_job_id": job.id,
+                    "error": job.error_message,
+                },
+            )
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
 
     def _repair_retryable_state_events(self: TaskManager, db: Session) -> int:

@@ -137,6 +137,7 @@ class BinarySecurityTask(Base, JsonMixin):
     summary_json = Column(Text, nullable=True)
     metrics_json = Column(Text, nullable=True)
     stage_summary_json = Column(Text, nullable=True)
+    schedule_user_task_id = Column(String(64), nullable=True, index=True)
     task_key_source = Column(String(32), nullable=True, index=True)
     root_task_key_id = Column(String(64), nullable=True, index=True)
     root_task_key_name = Column(String(255), nullable=True)
@@ -710,6 +711,10 @@ def _ensure_compat_columns(engine) -> None:
         if "runtime_override_version" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN runtime_override_version INTEGER NOT NULL DEFAULT 0"
+            )
+        if "schedule_user_task_id" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN schedule_user_task_id VARCHAR(64) NULL"
             )
         if "task_key_source" not in columns:
             statements.append(

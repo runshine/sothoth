@@ -55,6 +55,7 @@ class BinarySecurityTaskCreate(BaseModel):
     name: str = Field(..., min_length=1)
     description: Optional[str] = None
     module_name: Optional[str] = None
+    schedule_user_task_id: Optional[str] = None
     input_files: list[BinarySecurityInputFile] = Field(default_factory=list)
     output_root: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
@@ -168,6 +169,7 @@ class BinarySecurityTaskResponse(BaseModel):
     task_type: str = TASK_TYPE_BINARY
     pipeline_profile: str = PIPELINE_PROFILE_DEFAULT
     name: str
+    schedule_user_task_id: Optional[str] = None
     status: str
     runtime_phase: str = "owned_execution"
     tail_reconcile_state: str = "idle"

@@ -764,6 +764,7 @@ class TaskControlServiceMixin:
             task_type=task_type,
             name=payload.name,
             description=payload.description,
+            schedule_user_task_id=str(payload.schedule_user_task_id or "").strip() or None,
             created_by=created_by,
             status="pending_upload",
             current_stage=None,

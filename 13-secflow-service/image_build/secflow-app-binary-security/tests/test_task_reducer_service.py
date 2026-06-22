@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from app.model import BinarySecurityStateEvent, BinarySecurityTask
+from app.model import BinarySecurityArchiveJob, BinarySecurityStateEvent, BinarySecurityTask
 from app.service.task.reducer import TaskReducerServiceMixin
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb
@@ -25,7 +25,7 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
 
-    def test_apply_stage_worker_start_requested_locked_marks_task_and_stage_running(self):
+    def test_apply_stage_worker_start_requested_locked_updates_stage_fact_and_signals_takeover(self):
         task = BinarySecurityTask(
             id="task-1",
             project_id="project-1",
@@ -47,13 +47,117 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], state_events=[event], stage_runs=[], events=[])
 
-        self.manager._apply_stage_worker_start_requested_locked(db, event)
+        queued = []
+        original_enqueue = self.manager._enqueue_task
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        try:
+            self.manager._apply_stage_worker_start_requested_locked(db, event)
+        finally:
+            self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual("running", task.status)
-        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual("pending", task.status)
+        self.assertEqual("binary_to_source", task.current_stage)
         self.assertEqual(1, len(db.stage_runs))
         self.assertEqual("running", db.stage_runs[0].status)
-        self.assertIn("stage_started", [row.event_type for row in db.events])
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("stage_started", event_types)
+        self.assertIn("main_state_write_blocked", event_types)
+        self.assertIn("owned_execution_takeover_requeued", event_types)
+        self.assertEqual(["task-1"], queued)
+
+    def test_task_execution_failed_locked_records_fact_and_signals_takeover(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type="binary",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_path="/tmp/fw.bin",
+        )
+        event = BinarySecurityStateEvent(
+            id="evt-fail",
+            task_id=task.id,
+            project_id=task.project_id,
+            event_type="task_execution_failed",
+            payload={"error": "boom"},
+        )
+        db = _ModelAwareDb(tasks=[task], state_events=[event], events=[])
+
+        queued = []
+        original_enqueue = self.manager._enqueue_task
+        original_write = self.manager._write_task_metadata_async
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            import asyncio
+
+            asyncio.run(self.manager._apply_task_execution_failed_locked(db, event))
+        finally:
+            self.manager._enqueue_task = original_enqueue
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("running", task.status)
+        self.assertEqual(["task-1"], queued)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("main_state_write_blocked", event_types)
+        self.assertIn("task_failed", event_types)
+        self.assertIn("owned_execution_takeover_requeued", event_types)
+
+    def test_archive_job_copy_failed_locked_records_fact_and_signals_takeover(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="firmware_unpack",
+            task_type="binary",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_path="/tmp/fw.bin",
+        )
+        job = BinarySecurityArchiveJob(
+            id="job-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="firmware_unpack",
+            item_id="item-1",
+            item_key="item-1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="child-1",
+            archive_status="running",
+        )
+        event = BinarySecurityStateEvent(
+            id="evt-archive-fail",
+            task_id=task.id,
+            project_id=task.project_id,
+            event_type="archive_job_copy_failed",
+            archive_job_id=job.id,
+            payload={"error": "copy failed"},
+        )
+        db = _ModelAwareDb(tasks=[task], archive_jobs=[job], state_events=[event], events=[])
+
+        queued = []
+        original_enqueue = self.manager._enqueue_task
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        try:
+            self.manager._apply_archive_job_copy_failed_locked(db, event)
+        finally:
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("running", task.status)
+        self.assertEqual("failed", job.archive_status)
+        self.assertEqual(["task-1"], queued)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("main_state_write_blocked", event_types)
+        self.assertIn("downstream_archive_job_copy_failed", event_types)
+        self.assertIn("owned_execution_takeover_requeued", event_types)
 
     def test_publish_reducer_metrics_snapshot_lightweight_skips_full_render(self):
         store = AsyncMock()

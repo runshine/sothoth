@@ -35,6 +35,8 @@ from app.schemas import (
     BinarySecurityTimelineResponse,
 )
 
+from . import read_model
+
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager
 
