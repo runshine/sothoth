@@ -1686,6 +1686,184 @@ class TaskManager(
         with self._task_execution_owner_lock:
             return sorted(task_id for task_id, owners in self._task_execution_owners.items() if owners)
 
+    def _task_delete_snapshot(self, task: BinarySecurityTask) -> dict[str, Any]:
+        snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def _is_task_delete_in_progress(self, task: BinarySecurityTask | None) -> bool:
+        if task is None:
+            return False
+        snapshot = self._task_delete_snapshot(task)
+        return bool(snapshot.get("delete_in_progress"))
+
+    def _mark_task_delete_in_progress(
+        self,
+        task: BinarySecurityTask,
+        *,
+        operation_id: str | None = None,
+        reason: str | None = None,
+    ) -> None:
+        snapshot = self._task_delete_snapshot(task)
+        snapshot["delete_in_progress"] = True
+        snapshot["delete_started_at"] = _now().isoformat()
+        if operation_id:
+            snapshot["delete_operation_id"] = str(operation_id).strip() or None
+        if reason:
+            snapshot["delete_reason"] = str(reason).strip() or None
+        task.cleanup_snapshot = snapshot
+
+    def _clear_task_delete_in_progress(self, task: BinarySecurityTask) -> None:
+        snapshot = self._task_delete_snapshot(task)
+        if not snapshot:
+            return
+        if "delete_in_progress" in snapshot:
+            snapshot["delete_in_progress"] = False
+        task.cleanup_snapshot = snapshot
+
+    def _guard_task_workspace_write(
+        self,
+        task: BinarySecurityTask | None,
+        *,
+        purpose: str,
+        path: Path | None = None,
+    ) -> bool:
+        if task is None:
+            return True
+        if not self._is_task_delete_in_progress(task):
+            return True
+        logger.info(
+            "binary-security workspace write skipped during delete: task_id=%s purpose=%s path=%s",
+            str(getattr(task, "id", "") or "").strip() or None,
+            str(purpose or "").strip() or "unknown",
+            str(path) if path is not None else None,
+        )
+        return False
+
+    def _has_active_task_workspace_writers(self, db: Session, task: BinarySecurityTask) -> bool:
+        task_id = str(getattr(task, "id", "") or "").strip()
+        if not task_id:
+            return False
+        if self._task_execution_owner_count(task_id) > 0:
+            return True
+        now_value = _now()
+        runtime_lease = (
+            db.query(BinarySecurityTaskRuntimeLease)
+            .filter(BinarySecurityTaskRuntimeLease.task_id == task_id)
+            .first()
+        )
+        if runtime_lease is not None and getattr(runtime_lease, "lease_expires_at", None) and runtime_lease.lease_expires_at > now_value:
+            return True
+        active_operation = None
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+        if current_operation_id:
+            active_operation = (
+                db.query(BinarySecurityTaskOperation)
+                .filter(BinarySecurityTaskOperation.id == current_operation_id)
+                .first()
+            )
+        if active_operation is not None:
+            operation_type = str(getattr(active_operation, "operation_type", "") or "").strip()
+            operation_status = str(getattr(active_operation, "status", "") or "").strip()
+            if operation_type != TASK_ACTION_DELETE and operation_status in {"pending", "queued", "running"}:
+                return True
+        return False
+
+    async def _wait_for_task_workspace_quiesce(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        timeout_seconds: int = 15,
+        poll_interval_seconds: float = 1.0,
+    ) -> bool:
+        deadline = time.monotonic() + max(1, int(timeout_seconds))
+        while time.monotonic() < deadline:
+            db.expire_all()
+            refreshed = (
+                db.query(BinarySecurityTask)
+                .filter(BinarySecurityTask.id == task.id, BinarySecurityTask.project_id == task.project_id)
+                .first()
+            )
+            if refreshed is None:
+                return True
+            task.cleanup_snapshot = refreshed.cleanup_snapshot
+            if not self._has_active_task_workspace_writers(db, refreshed):
+                return True
+            await asyncio.sleep(max(0.1, poll_interval_seconds))
+        return False
+
+    def _release_task_delete_runtime_state(self, db: Session, task: BinarySecurityTask) -> None:
+        task_id = str(getattr(task, "id", "") or "").strip()
+        if not task_id:
+            return
+        self._invalidate_task_execution(task, force=True)
+        task.operation_lock_owner = None
+        task.operation_lock_token = None
+        task.operation_lock_type = None
+        task.operation_lock_acquired_at = None
+        task.operation_lock_heartbeat_at = None
+        task.operation_lock_expires_at = None
+        db.query(BinarySecurityTaskRuntimeLease).filter(
+            BinarySecurityTaskRuntimeLease.task_id == task_id
+        ).delete(synchronize_session=False)
+        db.query(BinarySecurityTaskStateLease).filter(
+            BinarySecurityTaskStateLease.task_id == task_id
+        ).delete(synchronize_session=False)
+        with self._task_execution_owner_lock:
+            self._task_execution_owners.pop(task_id, None)
+
+    def _orphan_workspace_scan_roots(self) -> list[Path]:
+        base = Path(self.cfg.storage.project_root_template.format(project_id="__placeholder__"))
+        files_root = base.parent if base.name == "__placeholder__" else base
+        app_root_name = str(getattr(self.cfg.storage, "app_root_name", "app/secflow-app-binary-security") or "").strip().strip("/")
+        if not app_root_name:
+            return []
+        if not files_root.exists():
+            return []
+        roots: list[Path] = []
+        for project_root in files_root.iterdir():
+            if not project_root.is_dir():
+                continue
+            roots.append(project_root / app_root_name)
+        return roots
+
+    def _reconcile_orphan_task_workspaces_once(self, db: Session) -> int:
+        repaired = 0
+        now_value = _now()
+        for app_root in self._orphan_workspace_scan_roots():
+            if not app_root.is_dir():
+                continue
+            for task_root in app_root.iterdir():
+                if not task_root.is_dir():
+                    continue
+                task_id = str(task_root.name or "").strip()
+                if not task_id:
+                    continue
+                try:
+                    validate_task_id(task_id)
+                except Exception:
+                    continue
+                if (now_value - datetime.fromtimestamp(task_root.stat().st_mtime)).total_seconds() < 60:
+                    continue
+                existing = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+                if existing is not None:
+                    continue
+                try:
+                    shutil.rmtree(task_root, ignore_errors=True)
+                    logger.info(
+                        "binary-security orphan workspace deleted: task_id=%s workspace_root=%s",
+                        task_id,
+                        str(task_root),
+                    )
+                    repaired += 1
+                except Exception:
+                    logger.exception(
+                        "binary-security orphan workspace delete failed: task_id=%s workspace_root=%s",
+                        task_id,
+                        str(task_root),
+                    )
+        return repaired
+
     def _write_task_metadata(
         self,
         task: BinarySecurityTask,
@@ -1706,6 +1884,8 @@ class TaskManager(
                 "output_root": str(task.output_root or "").strip() or None,
             }
         )
+        if not self._guard_task_workspace_write(task, purpose="task_metadata", path=path):
+            return
         _write_json(path, payload)
 
     async def _write_task_metadata_async(

@@ -708,8 +708,11 @@ class TaskLifecycleServiceMixin:
         while self._running:
             try:
                 self._mark_loop_heartbeat("state_repair_reconcile")
-                # Retryable state repair has been collapsed into owner-owned task
-                # runtime signals. The reducer-side loop remains passive only.
+                db = task_manager_module.get_session_factory()()
+                try:
+                    await asyncio.to_thread(self._reconcile_orphan_task_workspaces_once, db)
+                finally:
+                    db.close()
                 self._mark_loop_heartbeat("state_repair_reconcile")
             except asyncio.CancelledError:
                 raise

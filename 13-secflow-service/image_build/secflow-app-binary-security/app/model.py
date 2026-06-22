@@ -201,7 +201,9 @@ class BinarySecurityTask(Base, JsonMixin):
         payload = value or {}
         self._summary_cache = dict(payload)
         path = self._summary_file_path()
-        if path and path.parent.exists():
+        cleanup_snapshot = self.cleanup_snapshot
+        delete_in_progress = bool(cleanup_snapshot.get("delete_in_progress"))
+        if path and path.parent.exists() and not delete_in_progress:
             tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
             started = time.perf_counter()
             try:

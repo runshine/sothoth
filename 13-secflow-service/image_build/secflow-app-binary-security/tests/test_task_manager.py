@@ -1279,6 +1279,28 @@ class TaskManagerTests(unittest.TestCase):
             self.assertIsNone(task.summary_json)
             self.assertEqual({"selected_modules": [{"module_key": "m1"}]}, task.summary)
 
+    def test_task_summary_is_not_written_when_delete_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            task.cleanup_snapshot = {"delete_in_progress": True}
+
+            task.summary = {"selected_modules": [{"module_key": "m1"}]}
+
+            summary_path = Path(tmp) / BinarySecurityTask.SUMMARY_FILENAME
+            self.assertFalse(summary_path.exists())
+            self.assertIsNotNone(task.summary_json)
+            self.assertEqual({"selected_modules": [{"module_key": "m1"}]}, task.summary)
+
     def test_task_summary_concurrent_file_writes_use_unique_temp_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             tasks = [
@@ -1306,6 +1328,25 @@ class TaskManagerTests(unittest.TestCase):
             payload = json.loads(summary_path.read_text("utf-8"))
             self.assertIn("writer", payload)
             self.assertFalse(list(Path(tmp).glob(f".{BinarySecurityTask.SUMMARY_FILENAME}.*.tmp")))
+
+    def test_write_task_metadata_is_skipped_when_delete_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            task.cleanup_snapshot = {"delete_in_progress": True}
+
+            self.manager._write_task_metadata(task, Path(tmp) / "input" / "task-metadata.json", status="pending")
+
+            self.assertFalse((Path(tmp) / "input" / "task-metadata.json").exists())
 
     def test_deduplicate_entry_keys_handles_long_duplicate_suffixes(self):
         long_signature = (
@@ -27624,8 +27665,12 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 return None
 
         class _FakeWorkspace:
-            def __init__(self):
-                self.calls = 0
+            def __init__(self, parts=(), shared=None):
+                self.shared = shared if shared is not None else {"calls": 0}
+                self.parts = tuple(parts)
+
+            def __truediv__(self, part):
+                return _FakeWorkspace(self.parts + (str(part),), shared=self.shared)
 
             def exists(self):
                 self.calls += 1
@@ -27650,6 +27695,55 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertEqual("deleted", cleanup_status)
         self.assertEqual([5, 5, 5], sleeps)
+
+    def test_cleanup_task_workspace_reports_recreated_during_delete(self):
+        task = BinarySecurityTask(
+            id="t-cleanup-recreated",
+            project_id="p1",
+            name="cleanup-recreated",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/out",
+            workspace_root="/tmp/ws-cleanup-recreated",
+        )
+
+        class _FakeClient:
+            async def delete_project_path(self, project_id, path, token, recursive=True):
+                return None
+
+        class _FakePath:
+            def __init__(self, parts=()):
+                self.parts = tuple(parts)
+
+            def __truediv__(self, part):
+                return _FakePath(self.parts + (str(part),))
+
+            def exists(self):
+                return True
+
+            def __str__(self):
+                return "/".join(("root", *self.parts))
+
+        sleeps = []
+
+        async def _fake_sleep(seconds):
+            sleeps.append(seconds)
+
+        async def _run():
+            with (
+                patch.object(task_manager_module, "get_fileserver_client", return_value=_FakeClient()),
+                patch.object(task_manager_module, "Path", return_value=_FakePath()),
+                patch.object(task_manager_module.asyncio, "to_thread", AsyncMock(return_value=None)),
+                patch.object(task_manager_module.asyncio, "sleep", _fake_sleep),
+            ):
+                return await self.manager._cleanup_task_workspace(task, token="tok")
+
+        cleanup_status = asyncio.run(_run())
+
+        self.assertEqual("recreated_during_delete", cleanup_status)
+        self.assertEqual([5, 5, 5, 5, 5, 5], sleeps)
 
     def test_manual_delete_force_ignores_downstream_delete_failure_and_removes_parent(self):
         task = BinarySecurityTask(
@@ -27778,6 +27872,67 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual(1, len(cleanup_result.get("downstream_cleanup_deferred_refs") or []))
         event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
         self.assertIn("task_delete_failed", event_types)
+
+    def test_prepare_delete_task_fails_when_workspace_writers_do_not_quiesce(self):
+        task = BinarySecurityTask(
+            id="t-delete-quiesce",
+            project_id="p1",
+            name="delete-quiesce",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/out",
+            workspace_root="/tmp/ws-delete-quiesce",
+            current_stage="entry_analysis",
+            current_operation_id="op-delete-quiesce",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-delete-quiesce",
+            task_id=task.id,
+            project_id="p1",
+            operation_type="delete",
+            target_stage="entry_analysis",
+            status="running",
+            request_payload={"force_delete": False},
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], state_events=[], events=[])
+
+        async def _run():
+            with (
+                patch.object(self.manager, "_request_local_worker_cancel", AsyncMock()) as cancel_mock,
+                patch.object(self.manager, "_cancel_downstream_refs", AsyncMock()),
+                patch.object(self.manager, "_delete_downstream_refs", AsyncMock(return_value=0)),
+                patch.object(self.manager, "_wait_for_task_workspace_quiesce", AsyncMock(return_value=False)),
+                patch.object(self.manager, "_cleanup_task_workspace", AsyncMock()),
+            ):
+                with self.assertRaises(ValidationError):
+                    await self.manager._prepare_delete_task(db, task)
+                cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
+
+        asyncio.run(_run())
+
+        self.assertEqual("delete_failed", task.status)
+        self.assertEqual("删除前静默收敛失败", task.last_error)
+        self.assertFalse(task.cleanup_snapshot.get("delete_in_progress"))
+        event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_delete_quiesce_failed", event_types)
+
+    def test_reconcile_orphan_task_workspaces_once_removes_missing_task_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.manager.cfg.storage.project_root_template = f"{tmp}/{{project_id}}"
+            orphan_root = Path(tmp) / "p1" / "app" / "secflow-app-binary-security" / "task-orphan"
+            orphan_root.mkdir(parents=True, exist_ok=True)
+            (orphan_root / "input").mkdir(parents=True, exist_ok=True)
+            (orphan_root / "input" / "task-metadata.json").write_text("{}", encoding="utf-8")
+            stale_ts = time.time() - 120
+            os.utime(orphan_root, (stale_ts, stale_ts))
+            db = _ModelAwareDb(tasks=[])
+
+            repaired = self.manager._reconcile_orphan_task_workspaces_once(db)
+
+            self.assertEqual(1, repaired)
+            self.assertFalse(orphan_root.exists())
 
     def test_build_manual_operation_state_exposes_cleanup_warning(self):
         task = BinarySecurityTask(
@@ -35674,8 +35829,12 @@ def _test_cleanup_task_workspace_retries_transient_residual_directory(self):
             return None
 
     class _FakeWorkspace:
-        def __init__(self):
-            self.calls = 0
+        def __init__(self, parts=(), shared=None):
+            self.shared = shared if shared is not None else {"calls": 0}
+            self.parts = tuple(parts)
+
+        def __truediv__(self, part):
+            return _FakeWorkspace(self.parts + (str(part),), shared=self.shared)
 
         def exists(self):
             self.calls += 1

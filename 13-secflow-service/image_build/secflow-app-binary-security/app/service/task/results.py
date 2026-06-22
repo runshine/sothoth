@@ -181,6 +181,12 @@ class TaskResultServiceMixin:
         workspace_root = task_manager_module.Path(task.workspace_root)
         client = task_manager_module.get_fileserver_client()
         cleanup_status = "deleted"
+        check_paths = [
+            workspace_root,
+            workspace_root / "input",
+            workspace_root / "run",
+            workspace_root / "input" / "task-metadata.json",
+        ]
         try:
             await client.delete_project_path(task.project_id, str(workspace_root), token, recursive=True)
         except Exception:
@@ -189,13 +195,17 @@ class TaskResultServiceMixin:
             await task_manager_module.asyncio.to_thread(shutil.rmtree, workspace_root, True)
         except Exception:
             cleanup_status = "partial_failed"
-        if workspace_root.exists():
+        recreated = False
+        if any(path.exists() for path in check_paths):
             cleanup_status = "partial_failed"
-            for _attempt in range(5):
+            for _attempt in range(6):
                 await task_manager_module.asyncio.sleep(5)
-                if not workspace_root.exists():
+                if not any(path.exists() for path in check_paths):
                     cleanup_status = "deleted" if cleanup_status != "fallback" else "fallback"
                     break
+                recreated = True
+            else:
+                cleanup_status = "recreated_during_delete" if recreated else "partial_failed"
         return cleanup_status
 
     def _delete_task_event_payload_dirs(self: TaskManager, task: BinarySecurityTask) -> None:

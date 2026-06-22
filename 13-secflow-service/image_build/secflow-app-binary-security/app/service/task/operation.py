@@ -2172,10 +2172,58 @@ class TaskOperationServiceMixin:
                 "cleanup_counts": cleanup_counts,
             },
         )
+        self._mark_task_delete_in_progress(
+            task,
+            operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+            reason="删除任务时封禁工作目录写入",
+        )
+        self._release_task_delete_runtime_state(db, task)
+        db.commit()
+
+        quiesced = await self._wait_for_task_workspace_quiesce(db, task)
+        if not quiesced:
+            self._clear_task_delete_in_progress(task)
+            self._set_task_status(
+                db,
+                task,
+                task_manager_module.TASK_STATUS_DELETE_FAILED,
+                reason="删除任务前等待后台工作目录写入静默失败",
+                source="task_operation",
+                stage_name=task.current_stage,
+            )
+            task.finished_at = task_manager_module._now()
+            task.last_error = "删除前静默收敛失败"
+            self._record_event(
+                db,
+                task,
+                "task_delete_quiesce_failed",
+                "删除失败，任务目录写入尚未静默收敛",
+                stage_name=task.current_stage,
+                level="error",
+                payload={
+                    "force_delete": force_delete,
+                    "workspace_root": str(task.workspace_root or "").strip() or None,
+                },
+            )
+            db.commit()
+            raise ValidationError("删除失败，任务目录写入尚未静默收敛")
+
+        self._record_event(
+            db,
+            task,
+            "task_delete_workspace_cleanup_started",
+            "任务目录清理已开始",
+            stage_name=task.current_stage,
+            payload={
+                "force_delete": force_delete,
+                "workspace_root": str(task.workspace_root or "").strip() or None,
+            },
+        )
         db.commit()
 
         cleanup_status = await self._cleanup_task_workspace(task, token=token)
         if cleanup_status != "deleted":
+            self._clear_task_delete_in_progress(task)
             self._set_task_status(
                 db,
                 task,
@@ -2195,9 +2243,24 @@ class TaskOperationServiceMixin:
                 level="error",
                 payload={
                     "force_delete": force_delete,
+                    "workspace_root": str(task.workspace_root or "").strip() or None,
                     "workspace_cleanup_status": cleanup_status,
                 },
             )
+            if cleanup_status == "recreated_during_delete":
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_workspace_recreated_during_cleanup",
+                    "删除期间任务目录被并发重建",
+                    stage_name=task.current_stage,
+                    level="warning",
+                    payload={
+                        "force_delete": force_delete,
+                        "workspace_root": str(task.workspace_root or "").strip() or None,
+                        "workspace_cleanup_status": cleanup_status,
+                    },
+                )
             db.commit()
             raise ValidationError("任务目录清理失败")
 
@@ -2224,6 +2287,7 @@ class TaskOperationServiceMixin:
             )
 
         if downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs:
+            self._clear_task_delete_in_progress(task)
             cleanup_error = next(
                 (
                     str(row.get("error") or row.get("deferred_reason") or "").strip()

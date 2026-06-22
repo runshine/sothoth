@@ -134,6 +134,27 @@ class TaskOperationEventServiceMixin:
         if path is None:
             assign(payload_data)
             return
+        task = None
+        session_factory = getattr(self, "_session_factory", None)
+        try:
+            from app.service import task_manager as task_manager_module
+
+            session_factory = session_factory or task_manager_module.get_session_factory
+            db = session_factory() if callable(session_factory) else None
+            if db is not None:
+                try:
+                    task = (
+                        db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == str(operation.task_id or "").strip())
+                        .first()
+                    )
+                finally:
+                    db.close()
+        except Exception:
+            task = None
+        if task is not None and not self._guard_task_workspace_write(task, purpose=f"operation_payload:{path_key}", path=path):
+            assign(payload_data)
+            return
         try:
             task_shared._write_json(path, payload_data)
             assign({path_key: str(path)})

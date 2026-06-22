@@ -508,8 +508,13 @@ class TaskEventServiceMixin:
                     event_type=event_type,
                     state_event=state_event,
                 )
-                task_shared._write_json(path, normalized_payload)
-                payload_file = str(path)
+                if self._guard_task_workspace_write(
+                    resolved_task,
+                    purpose="event_payload" if not state_event else "state_event_payload",
+                    path=path,
+                ):
+                    task_shared._write_json(path, normalized_payload)
+                    payload_file = str(path)
             except Exception:
                 payload_file = None
         if state_event and event_type == "stage_worker_terminal_observed" and resolved_task is not None:

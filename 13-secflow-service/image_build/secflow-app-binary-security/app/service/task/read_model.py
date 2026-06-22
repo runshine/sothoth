@@ -782,8 +782,9 @@ class TaskReadModelServiceMixin:
         summary_file: str | None = None
         try:
             path = self._stage_run_summary_path(task, stage_run)
-            task_shared._write_json(path, summary_payload)
-            summary_file = str(path)
+            if self._guard_task_workspace_write(task, purpose="stage_run_summary", path=path):
+                task_shared._write_json(path, summary_payload)
+                summary_file = str(path)
         except Exception:
             summary_file = None
         compact = self._compact_stage_output_summary_for_db(task, stage_run, summary_payload, summary_file=summary_file)
@@ -826,8 +827,9 @@ class TaskReadModelServiceMixin:
         summary_file: str | None = None
         try:
             path = self._stage_run_summary_path(task, stage_run)
-            await asyncio.to_thread(task_shared._write_json, path, summary_payload)
-            summary_file = str(path)
+            if self._guard_task_workspace_write(task, purpose="stage_run_summary", path=path):
+                await asyncio.to_thread(task_shared._write_json, path, summary_payload)
+                summary_file = str(path)
         except Exception:
             summary_file = None
         compact = self._compact_stage_output_summary_for_db(task, stage_run, summary_payload, summary_file=summary_file)

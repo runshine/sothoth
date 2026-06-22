@@ -140,7 +140,7 @@ class FileserverClient:
                 return
             resp.raise_for_status()
         except Exception:
-            local_path = self.project_files_root(project_id) / normalized.lstrip("/")
+            local_path = target_path
             if local_path.is_dir():
                 shutil.rmtree(local_path, ignore_errors=True)
                 return
