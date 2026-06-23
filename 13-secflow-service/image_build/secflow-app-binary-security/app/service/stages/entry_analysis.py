@@ -42,7 +42,8 @@ class EntryAnalysisStageHandler(BinarySecurityStageHandler):
         return None
 
     def refresh_summary_from_items(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> None:
-        manager._refresh_stage_run_from_items(db, task, self.stage_name)
+        stage_run = manager._refresh_stage_run_from_items(db, task, self.stage_name)
+        manager._rebuild_entry_results_from_stage_items(db, task, stage_run)
 
     def compact_success_items(
         self,

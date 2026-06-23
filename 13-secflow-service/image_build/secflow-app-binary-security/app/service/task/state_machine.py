@@ -346,7 +346,8 @@ class TaskStateMachineMixin:
             return None
         if self._task_type(task) != TASK_TYPE_SOURCE:
             return None
-        if self._entry_results(task):
+        module_state = self._entry_module_completion_state(task, db)
+        if self._entry_results(task) or not bool(module_state.get("complete")):
             return None
         stage_run = self._ensure_stage_run(db, task, stage_name)
         failure_message = "entry_analysis 未产出 entry_results，无法继续进入 dataflow_vuln_scan"
@@ -521,7 +522,11 @@ class TaskStateMachineMixin:
             if not self._streaming_mode_enabled(task):
                 return False
             gate = self._build_streaming_dataflow_completion_gate(db, task)
-            return bool(gate.get("missing_entry_count") or 0) > 0 or not bool(gate.get("counts_aligned"))
+            return (
+                not bool(gate.get("module_counts_aligned"))
+                or bool(gate.get("missing_entry_count") or 0) > 0
+                or not bool(gate.get("counts_aligned"))
+            )
         if stage_run is not None and self._task_status_is_terminal(self._normalize_stage_terminal_status(stage_run.status)):
             return False
         if (
@@ -1295,6 +1300,9 @@ class TaskStateMachineMixin:
         if normalized_stage == "entry_analysis":
             return not bool(self._entry_analysis_inputs(db, task))
         if normalized_stage == "dataflow_vuln_scan":
+            module_state = self._entry_module_completion_state(task, db)
+            if not bool(module_state.get("complete")):
+                return False
             if self._task_type(task) == TASK_TYPE_SOURCE and not bool(self._effective_entry_inputs(task)):
                 return True
             return not bool(self._entry_results(task))

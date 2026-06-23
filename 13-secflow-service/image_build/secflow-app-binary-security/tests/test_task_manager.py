@@ -34462,6 +34462,47 @@ def _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_ope
     self.assertEqual(operation.id, task.current_operation_id)
 
 
+def _test_dispatch_task_by_id_claims_foreign_owner_delete_operation_without_runtime_lease(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-foreign-owner-delete",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="old-worker",
+        current_operation_id="op-foreign-delete",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-foreign-delete",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_DELETE,
+        status="queued",
+        current_step=None,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+    manager._enqueue_task = lambda task_id: None
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertEqual(task.id, claimed)
+    self.assertEqual("dispatching", task.status)
+    self.assertEqual("local-worker", task.dispatcher_instance_id)
+    self.assertEqual(operation.id, task.current_operation_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("owned_execution_takeover_requeued", event_types)
+
+
 def _test_release_unsupported_task_row_owner_repairs_stale_active_operations(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -38801,6 +38842,7 @@ TaskManagerTests.test_dispatch_task_by_id_claims_ownerless_active_operation = _t
 TaskManagerTests.test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle = _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle
 TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _test_refresh_task_status_after_sync_clears_fake_local_owner
 TaskManagerTests.test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation = _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation
+TaskManagerTests.test_dispatch_task_by_id_claims_foreign_owner_delete_operation_without_runtime_lease = _test_dispatch_task_by_id_claims_foreign_owner_delete_operation_without_runtime_lease
 TaskManagerTests.test_release_unsupported_task_row_owner_repairs_stale_active_operations = _test_release_unsupported_task_row_owner_repairs_stale_active_operations
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel = _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel
@@ -39946,7 +39988,9 @@ def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
     self.assertEqual("failed", status)
     self.assertEqual("知识图谱入口识别完成，但没有可用入口", summary["error"])
     self.assertEqual([], task.summary["knowledge_graph_entry_results"])
-    self.assertEqual([], task.summary["entry_results"])
+    self.assertEqual(1, len(task.summary["entry_results"]))
+    self.assertEqual("failed", task.summary["entry_results"][0]["completion_state"])
+    self.assertEqual(0, task.summary["entry_results"][0]["entry_count"])
     self.assertEqual(0, task.metrics["entry_count"])
     self.assertEqual(0, task.metrics["candidate_entry_count"])
     self.assertEqual(0, task.metrics["selected_entry_count"])
@@ -40029,7 +40073,9 @@ def _test_stage_knowledge_graph_entry_fetch_skips_missing_source_files(self):
     self.assertEqual("failed", status)
     self.assertEqual("知识图谱入口识别完成，但没有可访问的源码入口文件", summary["error"])
     self.assertEqual(1, len(task.summary["knowledge_graph_entry_results"]))
-    self.assertEqual([], task.summary["entry_results"])
+    self.assertEqual(1, len(task.summary["entry_results"]))
+    self.assertEqual("failed", task.summary["entry_results"][0]["completion_state"])
+    self.assertEqual(0, task.summary["entry_results"][0]["entry_count"])
     self.assertEqual(0, task.metrics["entry_count"])
     self.assertEqual(0, task.metrics["selected_entry_count"])
     self.assertEqual(0, task.metrics["candidate_entry_count"])

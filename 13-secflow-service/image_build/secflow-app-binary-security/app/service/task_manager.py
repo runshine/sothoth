@@ -2350,13 +2350,9 @@ class TaskManager(
             return False
         if not self._task_row_owner_is_supported_locally(task):
             return False
-        if str(task.status or "").strip().lower() != "running":
-            return False
-        if str(task.status or "").strip() == TASK_STATUS_CANCELLING:
-            return False
         if task.finished_at is not None:
             return False
-        if self._task_has_active_cancel_operation(db, task):
+        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
             return False
         if not self._has_local_task_execution_owner(task.id) and not self._task_has_active_streaming_stage_workers(task.id):
             return False
@@ -2525,8 +2521,6 @@ class TaskManager(
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id != str(self.instance_id or "").strip():
             return True
-        if str(getattr(task, "status", "") or "").strip().lower() not in {"dispatching", "running"}:
-            return True
         return self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
 
     def _task_row_owner_is_runtime_supported(
@@ -2658,7 +2652,6 @@ class TaskManager(
     def _write_task_heartbeat(self, session: Session, task_id: str, *, now_value: datetime, source: str) -> bool:
         task = session.query(BinarySecurityTask).filter(
             BinarySecurityTask.id == task_id,
-            BinarySecurityTask.status == "running",
         ).first()
         if task is not None:
             self._upsert_runtime_lease(
@@ -3516,7 +3509,6 @@ class TaskManager(
             current_token = row.dispatch_started_at.isoformat() if row and row.dispatch_started_at else None
             if (
                 row is None
-                or row.status not in {"dispatching", "running"}
                 or row.dispatcher_instance_id != expected_dispatcher_id
                 or current_token != expected_token
                 or not self._lease_is_active(row)
@@ -4344,6 +4336,234 @@ class TaskManager(
     def _entry_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         return [dict(item) for item in (task.summary.get("entry_results") or []) if isinstance(item, dict)]
 
+    def _entry_result_module_kind(self, task: BinarySecurityTask) -> str:
+        return "knowledge_graph_module" if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN else "source_module"
+
+    def _entry_result_module_key(self, task: BinarySecurityTask, module: dict[str, Any] | None = None) -> str:
+        payload = dict(module or {})
+        key = str(payload.get("module_key") or payload.get("source_project_key") or "").strip()
+        if key:
+            return key
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return "knowledge-graph-source-project"
+        return ""
+
+    def _entry_result_module_name(self, task: BinarySecurityTask, module: dict[str, Any] | None = None) -> str:
+        payload = dict(module or {})
+        name = str(payload.get("module_name") or payload.get("source_project_name") or "").strip()
+        if name:
+            return name
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return "source-project"
+        return ""
+
+    def _entry_result_source_stage(self, task: BinarySecurityTask) -> str:
+        return "knowledge_graph_entry_fetch" if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN else "entry_analysis"
+
+    def _entry_result_execution_epoch(self, task: BinarySecurityTask) -> int:
+        return int((task.summary or {}).get("execution_epoch") or getattr(task, "execution_epoch", 0) or 0)
+
+    def _normalize_entry_result_module(
+        self,
+        task: BinarySecurityTask,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = dict(row or {})
+        entries = [dict(entry) for entry in list(payload.get("entries") or []) if isinstance(entry, dict)]
+        if not entries:
+            entries = [dict(entry) for entry in list(payload.get("entries_preview") or []) if isinstance(entry, dict)]
+        module_key = self._entry_result_module_key(task, payload)
+        module_name = self._entry_result_module_name(task, payload)
+        if not module_key and entries:
+            first_entry = dict(entries[0])
+            module_key = (
+                str(first_entry.get("module_key") or "").strip()
+                or str(first_entry.get("entry_key") or "").strip()
+            )
+        if not module_name and entries:
+            first_entry = dict(entries[0])
+            module_name = (
+                str(first_entry.get("module_name") or "").strip()
+                or str(first_entry.get("function_name") or "").strip()
+            )
+        completion_state = str(payload.get("completion_state") or "").strip() or (
+            "success" if entries else "pending"
+        )
+        normalized = {
+            **payload,
+            "module_key": module_key,
+            "module_name": module_name,
+            "module_kind": str(payload.get("module_kind") or self._entry_result_module_kind(task)).strip(),
+            "source_stage": str(payload.get("source_stage") or self._entry_result_source_stage(task)).strip(),
+            "execution_epoch": int(payload.get("execution_epoch") or self._entry_result_execution_epoch(task)),
+            "completion_state": completion_state,
+            "completion_ready": bool(payload.get("completion_ready")) if "completion_ready" in payload else completion_state in {"success", "failed", "orchestration_failed", "cancelled"},
+            "entries": entries,
+            "entry_count": int(payload.get("entry_count") or len(entries)),
+            "error_message": str(payload.get("error_message") or "").strip() or None,
+            "downstream_task_id": str(payload.get("downstream_task_id") or "").strip() or None,
+            "artifact_ready": bool(payload.get("artifact_ready")) if "artifact_ready" in payload else bool(entries),
+        }
+        return normalized
+
+    def _normalized_entry_result_modules(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        modules: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for row in self._entry_results(task):
+            normalized = self._normalize_entry_result_module(task, row)
+            key = (
+                str(normalized.get("module_key") or "").strip(),
+                int(normalized.get("execution_epoch") or 0),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            modules.append(normalized)
+        return modules
+
+    def _entry_result_modules_for_current_epoch(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        current_epoch = self._entry_result_execution_epoch(task)
+        return [
+            module
+            for module in self._normalized_entry_result_modules(task)
+            if int(module.get("execution_epoch") or 0) == current_epoch
+        ]
+
+    def _entry_result_success_modules(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        return [
+            module
+            for module in self._entry_result_modules_for_current_epoch(task)
+            if str(module.get("completion_state") or "").strip() == "success"
+            and bool(module.get("completion_ready"))
+        ]
+
+    def _entry_result_terminal_modules(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        terminal_states = {"success", "failed", "orchestration_failed", "cancelled"}
+        return [
+            module
+            for module in self._entry_result_modules_for_current_epoch(task)
+            if str(module.get("completion_state") or "").strip() in terminal_states
+            and bool(module.get("completion_ready"))
+        ]
+
+    def _expected_entry_modules(self, task: BinarySecurityTask, db: Session) -> list[dict[str, Any]]:
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            source_dir = str((task.summary or {}).get("input_dir") or "").strip()
+            if not source_dir:
+                return []
+            kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
+            return [
+                {
+                    "module_key": "knowledge-graph-source-project",
+                    "module_name": "source-project",
+                    "module_kind": "knowledge_graph_module",
+                    "source_stage": "knowledge_graph_entry_fetch",
+                    "execution_epoch": self._entry_result_execution_epoch(task),
+                    "completion_expected": bool(kg_state),
+                }
+            ]
+        return [
+            {
+                "module_key": self._entry_result_module_key(task, module),
+                "module_name": self._entry_result_module_name(task, module),
+                "module_kind": "source_module",
+                "source_stage": "entry_analysis",
+                "execution_epoch": self._entry_result_execution_epoch(task),
+            }
+            for module in self._entry_analysis_inputs(db, task)
+            if self._entry_result_module_key(task, module)
+        ]
+
+    def _entry_module_completion_state(self, task: BinarySecurityTask, db: Session | None) -> dict[str, Any]:
+        expected = self._expected_entry_modules(task, db) if db is not None else (
+            [
+                {
+                    "module_key": self._entry_result_module_key(task, module),
+                    "module_name": self._entry_result_module_name(task, module),
+                    "module_kind": "source_module",
+                    "source_stage": "entry_analysis",
+                    "execution_epoch": self._entry_result_execution_epoch(task),
+                }
+                for module in list((task.summary or {}).get("selected_modules") or [])
+                if isinstance(module, dict) and self._entry_result_module_key(task, module)
+            ]
+            if self._pipeline_profile(task) != PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN
+            else (
+                [
+                    {
+                        "module_key": "knowledge-graph-source-project",
+                        "module_name": "source-project",
+                        "module_kind": "knowledge_graph_module",
+                        "source_stage": "knowledge_graph_entry_fetch",
+                        "execution_epoch": self._entry_result_execution_epoch(task),
+                    }
+                ]
+                if str((task.summary or {}).get("input_dir") or "").strip()
+                else []
+            )
+        )
+        materialized = self._entry_result_terminal_modules(task)
+        expected_keys = {str(module.get("module_key") or "").strip() for module in expected if str(module.get("module_key") or "").strip()}
+        materialized_keys = {str(module.get("module_key") or "").strip() for module in materialized if str(module.get("module_key") or "").strip()}
+        missing = sorted(key for key in expected_keys if key not in materialized_keys)
+        return {
+            "expected_modules": expected,
+            "materialized_modules": materialized,
+            "expected_module_count": len(expected_keys),
+            "materialized_module_count": len(materialized_keys),
+            "successful_module_count": len(
+                [module for module in materialized if str(module.get("completion_state") or "").strip() == "success"]
+            ),
+            "failed_module_count": len(
+                [module for module in materialized if str(module.get("completion_state") or "").strip() in {"failed", "orchestration_failed", "cancelled"}]
+            ),
+            "missing_module_keys": missing,
+            "complete": bool(expected_keys) and len(expected_keys) == len(materialized_keys),
+        }
+
+    def _entry_module_completion_gate(self, task: BinarySecurityTask, db: Session) -> bool:
+        return bool(self._entry_module_completion_state(task, db).get("complete"))
+
+    def _entry_module_flow_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for module in self._entry_result_success_modules(task):
+            module_key = str(module.get("module_key") or "").strip()
+            module_name = str(module.get("module_name") or "").strip()
+            module_kind = str(module.get("module_kind") or "").strip()
+            execution_epoch = int(module.get("execution_epoch") or 0)
+            for entry in list(module.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                entries.append(
+                    {
+                        **dict(entry),
+                        "module_key": module_key or str(entry.get("module_key") or "").strip(),
+                        "module_name": module_name or str(entry.get("module_name") or "").strip(),
+                        "module_kind": module_kind or str(entry.get("module_kind") or "").strip(),
+                        "execution_epoch": execution_epoch,
+                    }
+                )
+        return entries
+
+    def _clear_entry_result_state(self, task: BinarySecurityTask) -> None:
+        summary = dict(task.summary or {})
+        summary["entry_results"] = []
+        summary["entry_selection"] = {}
+        task.summary = summary
+        metrics = dict(task.metrics or {})
+        metrics.update(
+            {
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                "expected_entry_module_count": 0,
+                "materialized_entry_module_count": 0,
+                "successful_entry_module_count": 0,
+                "failed_entry_module_count": 0,
+            }
+        )
+        task.metrics = metrics
+
     def _knowledge_graph_entry_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         return [dict(item) for item in (task.summary.get("knowledge_graph_entry_results") or []) if isinstance(item, dict)]
 
@@ -4383,8 +4603,11 @@ class TaskManager(
         snapshot = self._entry_selection_snapshot(task)
         candidate_entries = snapshot.get("candidate_entries")
         if isinstance(candidate_entries, list) and candidate_entries:
-            return [dict(item) for item in candidate_entries if isinstance(item, dict)]
-        return self._entry_results(task)
+            return self._materialized_flow_entries(
+                task,
+                [dict(item) for item in candidate_entries if isinstance(item, dict)],
+            )
+        return self._entry_module_flow_inputs(task)
 
     def _selected_entry_keys(self, task: BinarySecurityTask) -> list[str]:
         snapshot = self._entry_selection_snapshot(task)
@@ -4396,7 +4619,10 @@ class TaskManager(
 
     def _selected_entries(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         snapshot = self._entry_selection_snapshot(task)
-        return [dict(item) for item in (snapshot.get("selected_entries") or []) if isinstance(item, dict)]
+        return self._materialized_flow_entries(
+            task,
+            [dict(item) for item in (snapshot.get("selected_entries") or []) if isinstance(item, dict)],
+        )
 
     def _mark_selected_entries(self, entries: list[dict[str, Any]], *, selected_by: str, selected_at: str | None = None) -> list[dict[str, Any]]:
         timestamp = selected_at or _now().isoformat()
@@ -4425,10 +4651,159 @@ class TaskManager(
         ]
 
     def _entry_selection_metrics(self, task: BinarySecurityTask) -> dict[str, int]:
+        module_state = self._entry_module_completion_state(task, None)
         return {
             "candidate_entry_count": len(self._entry_candidates(task)),
             "selected_entry_count": len(self._effective_entry_inputs(task)) if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task)),
+            "expected_entry_module_count": int(module_state.get("expected_module_count") or 0),
+            "materialized_entry_module_count": int(module_state.get("materialized_module_count") or 0),
+            "successful_entry_module_count": int(module_state.get("successful_module_count") or 0),
+            "failed_entry_module_count": int(module_state.get("failed_module_count") or 0),
         }
+
+    def _entry_module_result_from_stage_item(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> dict[str, Any]:
+        payload = {
+            **dict(item.input_ref or {}),
+            **dict(item.output_ref or {}),
+            **self._load_stage_item_result_payload(item),
+        }
+        normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        completion_state = {
+            "success": "success",
+            "partial_success": "success",
+            "failed": "failed",
+            "downstream_missing": "failed",
+            "cancelled": "cancelled",
+        }.get(normalized_status, "orchestration_failed")
+        normalized = self._normalize_entry_result_module(
+            task,
+            {
+                **payload,
+                "module_key": self._entry_result_module_key(task, payload) or str(item.item_key or "").strip(),
+                "module_name": self._entry_result_module_name(task, payload) or str(item.item_name or "").strip(),
+                "source_dir": self._resolve_entry_source_dir(payload) or str(task.firmware_path or "").strip() or None,
+                "completion_state": completion_state,
+                "completion_ready": self._is_terminal_item_status(item.status),
+                "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                "error_message": str(item.error_message or "").strip() or None,
+                "artifact_ready": bool(self._stage_item_artifact_root(item)),
+            },
+        )
+        if completion_state == "success":
+            module_payload = dict(normalized)
+            artifact_root_value = self._stage_item_artifact_root(item)
+            entries = [dict(entry) for entry in payload.get("entries") or [] if isinstance(entry, dict)]
+            if artifact_root_value:
+                artifact_root = Path(str(artifact_root_value))
+                parsed_entries = self._parse_entries(artifact_root, module_payload)
+                if parsed_entries:
+                    entries = parsed_entries
+                    normalized["artifact_root"] = str(artifact_root)
+            if not entries:
+                entries = [dict(entry) for entry in payload.get("entries_preview") or [] if isinstance(entry, dict)]
+            normalized_entries: list[dict[str, Any]] = []
+            for entry in entries:
+                row = dict(entry)
+                row["source_dir"] = self._resolve_entry_source_dir({**module_payload, **row}) or module_payload.get("source_dir")
+                normalized_entries.append(row)
+            normalized["entries"] = _deduplicate_entry_keys(normalized_entries)
+            normalized["entry_count"] = len(normalized["entries"])
+            normalized["artifact_ready"] = bool(self._stage_item_artifact_root(item))
+        else:
+            normalized["entries"] = []
+            normalized["entry_count"] = 0
+        return normalized
+
+    def _materialized_flow_entries(self, task: BinarySecurityTask, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        flattened: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            entry_key = str(row.get("entry_key") or "").strip()
+            if entry_key:
+                flattened.append(dict(row))
+                continue
+            module_key = str(row.get("module_key") or "").strip()
+            module_name = str(row.get("module_name") or "").strip()
+            module_kind = str(row.get("module_kind") or "").strip()
+            execution_epoch = int(row.get("execution_epoch") or self._entry_result_execution_epoch(task))
+            for entry in list(row.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                flattened.append(
+                    {
+                        **dict(entry),
+                        "module_key": str(entry.get("module_key") or "").strip() or module_key,
+                        "module_name": str(entry.get("module_name") or "").strip() or module_name,
+                        "module_kind": str(entry.get("module_kind") or "").strip() or module_kind,
+                        "execution_epoch": int(entry.get("execution_epoch") or execution_epoch),
+                    }
+                )
+        return _deduplicate_entry_keys(flattened)
+
+    def _rebuild_entry_result_modules_from_stage_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> list[dict[str, Any]]:
+        modules: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in self._stage_items(db, task.id, "entry_analysis"):
+            module_key = str(item.item_key or "").strip()
+            if not module_key or module_key in seen:
+                continue
+            seen.add(module_key)
+            modules.append(self._entry_module_result_from_stage_item(task, item))
+        task.summary = {**(task.summary or {}), "entry_results": modules}
+        metrics = dict(task.metrics or {})
+        metrics.update(self._entry_selection_metrics(task))
+        metrics["entry_count"] = sum(int(module.get("entry_count") or 0) for module in modules)
+        task.metrics = metrics
+        if stage_run is not None:
+            self._persist_stage_run_output_summary(
+                task,
+                stage_run,
+                {
+                    "items": self._compact_stage_success_items_for_db("entry_results", modules),
+                    "entry_count": metrics["entry_count"],
+                    "expected_entry_module_count": int(metrics.get("expected_entry_module_count") or 0),
+                    "materialized_entry_module_count": int(metrics.get("materialized_entry_module_count") or 0),
+                    "successful_entry_module_count": int(metrics.get("successful_entry_module_count") or 0),
+                    "failed_entry_module_count": int(metrics.get("failed_entry_module_count") or 0),
+                },
+            )
+        return modules
+
+    def _build_knowledge_graph_entry_result_module(
+        self,
+        task: BinarySecurityTask,
+        *,
+        entries: list[dict[str, Any]],
+        completion_state: str,
+        completion_ready: bool,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+        return self._normalize_entry_result_module(
+            task,
+            {
+                "module_key": "knowledge-graph-source-project",
+                "module_name": "source-project",
+                "module_kind": "knowledge_graph_module",
+                "source_stage": "knowledge_graph_entry_fetch",
+                "execution_epoch": self._entry_result_execution_epoch(task),
+                "completion_state": completion_state,
+                "completion_ready": completion_ready,
+                "entries": [dict(entry) for entry in entries if isinstance(entry, dict)] if completion_state == "success" else [],
+                "entry_count": len(entries) if completion_state == "success" else 0,
+                "error_message": error_message,
+                "artifact_ready": completion_state == "success",
+            },
+        )
 
     def _knowledge_graph_entry_reason(self, entry: dict[str, Any]) -> str:
         parts: list[str] = []
@@ -7457,79 +7832,7 @@ class TaskManager(
         task: BinarySecurityTask,
         stage_run: BinarySecurityStageRun | None = None,
     ) -> list[dict[str, Any]]:
-        """Rebuild full entry_results after downstream sync only updated stage items.
-
-        Stage item result_json intentionally stores only entries_preview to keep DB rows
-        small, so the authoritative source for full entries is the archived artifact.
-        """
-        items = [
-            item
-            for item in self._stage_items(db, task.id, "entry_analysis")
-            if item.status == "success"
-        ]
-        rebuilt: list[dict[str, Any]] = []
-        for item in items:
-            result = self._load_stage_item_result_payload(item)
-            input_ref = dict(item.input_ref or {})
-            output_ref = dict(item.output_ref or {})
-            module = {
-                **input_ref,
-                **result,
-                "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
-                "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
-                "source_dir": self._resolve_entry_source_dir({**input_ref, **result}) or str(task.firmware_path or ""),
-            }
-            if not module["module_key"] or not module["module_name"]:
-                continue
-            artifact_root_value = self._stage_item_artifact_root(item)
-            entries = [dict(entry) for entry in result.get("entries") or [] if isinstance(entry, dict)]
-            if artifact_root_value:
-                artifact_root = Path(str(artifact_root_value))
-                parsed_entries = self._parse_entries(artifact_root, module)
-                if parsed_entries:
-                    entries = parsed_entries
-                    module["artifact_root"] = str(artifact_root)
-            if not entries:
-                entries = [dict(entry) for entry in result.get("entries_preview") or [] if isinstance(entry, dict)]
-            if not entries:
-                continue
-            normalized_entries = []
-            for entry in entries:
-                row = dict(entry)
-                row["source_dir"] = self._resolve_entry_source_dir({**module, **row}) or module["source_dir"]
-                normalized_entries.append(row)
-            rebuilt.append(self._compact_entry_summary_item({**module, "entries": normalized_entries}))
-
-        summary = {**(task.summary or {}), "entry_results": rebuilt}
-        task.summary = summary
-        entry_count = self._entry_count_for_summary("entry_results", rebuilt)
-        task.metrics = {**(task.metrics or {}), "entry_count": entry_count}
-        if stage_run is not None:
-            stage_summary = {
-                "items": self._compact_stage_success_items_for_db("entry_results", rebuilt),
-                "failed_items": [
-                    self._lightweight_stage_failure(
-                        {
-                            "item": {
-                                **dict(item.input_ref or {}),
-                                **self._load_stage_item_result_payload(item),
-                            },
-                            "error": item.error_message,
-                        }
-                    )
-                    for item in self._stage_items(db, task.id, "entry_analysis")
-                    if item.status in {"failed", "cancelled", "downstream_missing"}
-                ],
-                "success_count": len(rebuilt),
-                "failed_count": int((stage_run.counts or {}).get("failed_items") or 0),
-                "cancelled_count": int((stage_run.counts or {}).get("cancelled_items") or 0),
-                "entry_count": entry_count,
-                "status_synced": True,
-                "sync_status": stage_run.status,
-                **(stage_run.counts or {}),
-            }
-            self._persist_stage_run_output_summary(task, stage_run, stage_summary)
-        return rebuilt
+        return self._rebuild_entry_result_modules_from_stage_items(db, task, stage_run)
 
     def _refresh_system_analysis_stage_from_synced_items(self, db: Session, task: BinarySecurityTask) -> None:
         handler = self._stage_handler("system_analysis")
@@ -10475,6 +10778,7 @@ class TaskManager(
             "selected_modules": selected_modules,
             "high_risk_modules": selected_modules,
         }
+        self._clear_entry_result_state(task)
         task.metrics = {
             **task.metrics,
             **self._module_metrics(all_modules, candidate_modules, selected_modules),
@@ -10600,10 +10904,18 @@ class TaskManager(
             initial_retry=retry_existing,
         )
         status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
+        entry_results = self._rebuild_entry_result_modules_from_stage_items(db, task, stage_run)
         entry_mode = self._entry_selection_mode(task)
-        entry_results = self._entry_results(task)
         candidate_entries = self._entry_candidates(task)
         selected_entries = candidate_entries if entry_mode == ENTRY_SELECTION_MODE_AUTO else self._effective_entry_inputs(task)
+        summary = {
+            **summary,
+            "entry_results": entry_results,
+            "candidate_entry_count": len(candidate_entries),
+            "selected_entry_count": len(selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
+            "entry_count": sum(1 for _entry in selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
+            **self._entry_selection_metrics(task),
+        }
         if entry_mode == ENTRY_SELECTION_MODE_MANUAL_CONFIRM and status in {"success", "partial_success"}:
             task.summary = {
                 **(task.summary or {}),
@@ -10621,6 +10933,7 @@ class TaskManager(
                 "candidate_entry_count": len(candidate_entries),
                 "selected_entry_count": 0,
                 "entry_count": 0,
+                **self._entry_selection_metrics(task),
             }
             self._set_task_status(
                 db,
@@ -10673,7 +10986,14 @@ class TaskManager(
                 **(task.metrics or {}),
                 "candidate_entry_count": len(candidate_entries),
                 "selected_entry_count": len(selected_entries),
-                "entry_count": sum(len(entry.get("entries") or []) for entry in selected_entries if isinstance(entry, dict)),
+                "entry_count": len(selected_entries),
+                **self._entry_selection_metrics(task),
+            }
+            summary = {
+                **summary,
+                "entry_selection": dict((task.summary or {}).get("entry_selection") or {}),
+                "selected_entry_count": len(selected_entries),
+                "entry_count": len(selected_entries),
             }
         return status, summary
 
@@ -10722,15 +11042,23 @@ class TaskManager(
                     "error_message": str(exc),
                 },
             )
+            failed_module = self._build_knowledge_graph_entry_result_module(
+                task,
+                entries=[],
+                completion_state="failed",
+                completion_ready=True,
+                error_message=str(exc),
+            )
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": [],
-                "entry_results": [],
+                "entry_results": [failed_module],
                 "knowledge_graph_state": {},
             }
             task.metrics = {
                 **(task.metrics or {}),
                 **STAGE_METRIC_RESETTERS["knowledge_graph_entry_fetch"],
+                **self._entry_selection_metrics(task),
             }
             failure_summary = {
                 "error": str(exc),
@@ -10761,6 +11089,18 @@ class TaskManager(
             accumulated_selected_entry_count=accumulated_selected_entry_count,
         )
         execution_metrics = self._knowledge_graph_entry_execution_metrics(accumulated_entries)
+        success_module = self._build_knowledge_graph_entry_result_module(
+            task,
+            entries=executable_entries,
+            completion_state="success",
+            completion_ready=True,
+        )
+        pending_module = self._build_knowledge_graph_entry_result_module(
+            task,
+            entries=executable_entries,
+            completion_state="success",
+            completion_ready=False,
+        )
         if graph_status == "failed" or identification_state == "failed" or graph_status == "superseded":
             reason = "知识图谱入口识别失败"
             if graph_status == "superseded":
@@ -10777,10 +11117,17 @@ class TaskManager(
                     **meta,
                 },
             )
+            failed_module = self._build_knowledge_graph_entry_result_module(
+                task,
+                entries=[],
+                completion_state="failed",
+                completion_ready=True,
+                error_message=reason,
+            )
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": executable_compact_entries,
+                "entry_results": [failed_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10794,10 +11141,11 @@ class TaskManager(
                 "entry_count": executable_entry_count,
                 **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             failure_summary = {
                 "error": reason,
-                "items": executable_compact_entries,
+                "items": [failed_module],
                 "success_count": 0,
                 "failed_count": 1,
                 "candidate_entry_count": executable_entry_count,
@@ -10829,7 +11177,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": executable_compact_entries,
+                "entry_results": [pending_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10842,10 +11190,11 @@ class TaskManager(
                 "entry_count": executable_entry_count,
                 **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             waiting_summary = {
                 "status": "waiting_for_graph",
-                "items": executable_compact_entries,
+                "items": [pending_module],
                 "success_count": 0,
                 "failed_count": 0,
                 "candidate_entry_count": executable_entry_count,
@@ -10874,7 +11223,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": executable_compact_entries,
+                "entry_results": [pending_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10887,10 +11236,11 @@ class TaskManager(
                 "entry_count": executable_entry_count,
                 **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             waiting_summary = {
                 "status": "waiting_for_identification",
-                "items": executable_compact_entries,
+                "items": [pending_module],
                 "success_count": 0,
                 "failed_count": 0,
                 "candidate_entry_count": executable_entry_count,
@@ -10921,7 +11271,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": executable_compact_entries,
+                "entry_results": [pending_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10934,10 +11284,11 @@ class TaskManager(
                 "entry_count": executable_entry_count,
                 **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             waiting_summary = {
                 "status": "polling_partial",
-                "items": executable_compact_entries,
+                "items": [pending_module],
                 "success_count": executable_entry_count,
                 "failed_count": 0,
                 "candidate_entry_count": executable_entry_count,
@@ -10949,7 +11300,7 @@ class TaskManager(
                 **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
-                "entry_results": executable_compact_entries,
+                "entry_results": [pending_module],
                 **state_summary,
                 **meta,
             }
@@ -10989,10 +11340,17 @@ class TaskManager(
                     **meta,
                 },
             )
+            failed_module = self._build_knowledge_graph_entry_result_module(
+                task,
+                entries=[],
+                completion_state="failed",
+                completion_ready=True,
+                error_message=error_message,
+            )
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": [],
+                "entry_results": [failed_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -11005,10 +11363,11 @@ class TaskManager(
                 "selected_entry_count": 0,
                 "entry_count": 0,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             failure_summary = {
                 "error": error_message,
-                "items": [],
+                "items": [failed_module],
                 "success_count": 0,
                 "failed_count": 1,
                 "candidate_entry_count": 0,
@@ -11026,7 +11385,7 @@ class TaskManager(
         task.summary = {
             **(task.summary or {}),
             "knowledge_graph_entry_results": accumulated_entries,
-            "entry_results": executable_compact_entries,
+            "entry_results": [success_module],
             "knowledge_graph_state": state_summary,
         }
         task.metrics = {
@@ -11039,6 +11398,7 @@ class TaskManager(
             "entry_count": executable_entry_count,
             **execution_metrics,
             **self._knowledge_graph_analysis_metrics(meta),
+            **self._entry_selection_metrics(task),
         }
         self._record_event(
             db,
@@ -11077,7 +11437,7 @@ class TaskManager(
                 },
             )
         success_summary = {
-            "items": executable_compact_entries,
+            "items": [success_module],
             "success_count": executable_entry_count,
             "failed_count": 0,
             "candidate_entry_count": executable_entry_count,
@@ -11089,7 +11449,7 @@ class TaskManager(
             **execution_metrics,
             "current_poll_selected_entry_count": current_poll_selected_entry_count,
             "accumulated_selected_entry_count": accumulated_selected_entry_count,
-            "entry_results": executable_compact_entries,
+            "entry_results": [success_module],
             **state_summary,
             **meta,
         }
@@ -11104,15 +11464,39 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        entry_results = self._effective_entry_inputs(task)
-        if not entry_results:
+        flow_inputs = self._effective_entry_inputs(task)
+        if not flow_inputs:
             self._rebuild_entry_results_from_stage_items(db, task)
-            entry_results = self._effective_entry_inputs(task)
-        entries: list[dict[str, Any]] = []
-        for result in entry_results:
-            entries.extend(result.get("entries", []))
-        entries = _deduplicate_entry_keys(entries)
+            flow_inputs = self._effective_entry_inputs(task)
+        entries = _deduplicate_entry_keys(flow_inputs)
         if not entries:
+            module_state = self._entry_module_completion_state(task, db)
+            if not bool(module_state.get("complete")):
+                payload = {
+                    "expected_entry_module_count": int(module_state.get("expected_module_count") or 0),
+                    "materialized_entry_module_count": int(module_state.get("materialized_module_count") or 0),
+                    "missing_module_keys": list(module_state.get("missing_module_keys") or []),
+                }
+                self._record_event(
+                    db,
+                    task,
+                    "dataflow_waiting_for_entry_modules_complete",
+                    "入口模块尚未收敛完成，等待更多模块结果",
+                    stage_name=stage_run.stage_name,
+                    payload=payload,
+                )
+                waiting_summary = {
+                    "status": "waiting_for_entry_modules_complete",
+                    "items": [],
+                    "success_count": 0,
+                    "failed_count": 0,
+                    "candidate_entry_count": 0,
+                    "selected_entry_count": 0,
+                    "entry_count": 0,
+                    **payload,
+                }
+                self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
+                return "running", waiting_summary
             return "failed", {"error": "没有可用于数据流漏洞挖掘的入口"}
         executable_inputs = self._prepare_stage_items_for_execution(
             db,

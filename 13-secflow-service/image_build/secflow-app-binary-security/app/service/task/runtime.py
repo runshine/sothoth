@@ -625,6 +625,10 @@ class TaskRuntimeServiceMixin:
             has_active_operation and self._operation_allows_runtime_resume(current_operation)
         )
         operation_requires_runtime_handle = bool(has_active_operation and operation_allows_runtime_resume)
+        active_operation_type = str(getattr(current_operation, "operation_type", "") or "").strip()
+        owner_guarded_control_operation = bool(
+            has_active_operation and active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES
+        )
         if operation_requires_runtime_handle and self._release_unsupported_task_row_owner(
             db,
             task,
@@ -634,7 +638,21 @@ class TaskRuntimeServiceMixin:
             db.commit()
             self._enqueue_task(task.id)
             return None
-        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if owner_guarded_control_operation and not self._task_row_owner_is_runtime_supported(
+            db,
+            task,
+            active_operation=current_operation,
+        ):
+            self._release_unsupported_task_row_owner(
+                db,
+                task,
+                active_operation=current_operation,
+                reason="dispatch_attempt_owner_guarded_control_takeover",
+            )
+            db.flush()
+            current_status = str(getattr(task, "status", "") or "").strip().lower()
+        else:
+            current_status = str(getattr(task, "status", "") or "").strip().lower()
         if has_active_operation and current_status:
             if current_status != "pending" and operation_allows_runtime_resume:
                 task_manager_module.logger.info(
@@ -695,7 +713,6 @@ class TaskRuntimeServiceMixin:
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
         next_task_status = "dispatching"
-        active_operation_type = str(getattr(current_operation, "operation_type", "") or "").strip()
         if has_active_operation and active_operation_type == task_manager_module.TASK_ACTION_CANCEL:
             next_task_status = task_manager_module.TASK_STATUS_CANCELLING
         elif has_active_operation and active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES and current_status and current_status != "pending":
@@ -1917,7 +1934,8 @@ class TaskRuntimeServiceMixin:
                             execution_token=execution_token,
                         )
                         db.commit()
-                db.refresh(task)
+                if hasattr(db, "refresh"):
+                    db.refresh(task)
                 if str(task.status or "").strip() in task_manager_module.TASK_TERMINAL_STATUSES:
                     return
         finally:
