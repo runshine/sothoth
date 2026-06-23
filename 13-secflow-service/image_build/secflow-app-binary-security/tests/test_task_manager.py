@@ -3,6 +3,7 @@ import json
 import os
 import pymysql
 import re
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -26768,12 +26769,71 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_find_reusable_dataflow_payload", return_value=None),
+            patch.object(downstream_tasks_module, "get_dataflow_vuln_scan_client", return_value=SimpleNamespace(create_task=AsyncMock(return_value={"task_id": "dfa-live"}), get_task=lambda *args, **kwargs: None)),
+            patch.object(self.manager, "_poll_until_terminal", return_value=("success", {"task_id": "dfa-live", "status": "passed"})),
+            patch.object(self.manager, "_service_output_dir", return_value=Path("/tmp")),
+            patch.object(self.manager, "_materialize_stage_artifact", return_value=Path("/tmp")),
+            patch.object(self.manager, "_resolve_dataflow_directory", return_value=Path("/tmp/dataflow")),
+            patch.object(self.manager, "_find_first", return_value=Path("/tmp/dataflow.md")),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_lightweight_downstream_payload", side_effect=lambda payload: {"status": payload.get("status")}),
             patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+            patch.object(self.manager, "_normalize_dfa_source_file", return_value="demo.h"),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token=None, retrying=False))
+
+        self.assertEqual("success", result["status"])
+
+    def test_run_dataflow_item_rejects_missing_source_file(self):
+        task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="PullImage",
+            parent_key="module-1",
+            downstream_service="dataflow_vuln_scan",
+            status="pending",
+            output_ref={},
+        )
+        entry = {
+            "entry_key": "entry-1",
+            "function_name": "PullImage",
+            "file_name": "demo.h",
+            "module_key": "module-1",
+            "module_name": "module-1",
+            "source_dir": "/tmp/repo/src",
+            "is_definition_found": False,
+            "definition_kind": "unknown",
+            "definition_file": "demo.h",
+            "definition_line": "10",
+            "taint_params": ["request"],
+            "module_input_path": "/tmp/repo/modules/module-1",
+            "source_root_path": "/tmp/repo/src",
+        }
+        fake_session = _ModelAwareDb()
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+            patch.object(self.manager, "_normalize_dfa_source_file", return_value=""),
         ):
             result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token=None, retrying=False))
 
         self.assertEqual("failed", result["status"])
-        self.assertIn("声明", result["error"])
+        self.assertIn("源码入口文件", result["error"])
 
     def test_run_dataflow_item_rejects_incomplete_entry_contract(self):
         task = BinarySecurityTask(id="t1", name="source-task", project_id="p1", workspace_root="/tmp/ws")
@@ -39549,90 +39609,113 @@ def _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan(self):
 
 
 def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
-    task = BinarySecurityTask(
-        id="kg-source-2",
-        project_id="p1",
-        name="source",
-        task_type=TASK_TYPE_SOURCE,
-        status="running",
-        current_stage="knowledge_graph_entry_fetch",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-    )
-    task.summary = {
-        "input_dir": "/workspace/input",
-        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
-    }
-    task.policy = {
-        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
-        "knowledge_graph_upload_id": "upload-1",
-    }
-    stage_run = BinarySecurityStageRun(
-        id="sr-kg-1",
-        task_id=task.id,
-        project_id="p1",
-        stage_name="knowledge_graph_entry_fetch",
-        sequence_no=1,
-        status="running",
-    )
-    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+    workspace_root = Path(tempfile.mkdtemp(prefix="kg-fetch-success-"))
+    try:
+        input_dir = workspace_root / "input"
+        (input_dir / "src").mkdir(parents=True, exist_ok=True)
+        (input_dir / "src" / "main.c").write_text("int sink(void) { return 0; }\n", encoding="utf-8")
+        task = BinarySecurityTask(
+            id="kg-source-2",
+            project_id="p1",
+            name="source",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="knowledge_graph_entry_fetch",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "input_dir": str(input_dir),
+            "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        }
+        task.policy = {
+            "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+            "knowledge_graph_upload_id": "upload-1",
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-kg-1",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="knowledge_graph_entry_fetch",
+            sequence_no=1,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
 
-    async def _fake_fetch(_task):
-        return (
-            [
+        async def _fake_fetch(_task):
+            return (
+                [
+                    {
+                        "entry_key": "src-1",
+                        "source_id": "src-1",
+                        "function_name": "sink",
+                        "raw_function_name": "sink",
+                        "source_file": "src/main.c",
+                        "definition_file": "src/main.c",
+                        "definition_line": 42,
+                        "line_no": 42,
+                        "definition_kind": "unknown",
+                        "is_definition_found": True,
+                        "source_file_exists": True,
+                        "entry_execution_status": "ready",
+                        "entry_execution_reason": "source file is accessible",
+                        "function_description": "demo",
+                        "function_description_source": "knowledge_graph_audit_sources",
+                        "entry_reason": "channel=http",
+                        "entry_reason_source": "knowledge_graph_audit_sources",
+                        "module_key": "knowledge_graph_source_project",
+                        "module_name": "source-project",
+                        "source_root_path": str(input_dir),
+                        "source_root": str(input_dir),
+                        "source_dir": str(input_dir),
+                        "module_input_path": str(input_dir),
+                        "module_dir": str(input_dir),
+                        "descriptor_root": str(input_dir),
+                        "task_type": TASK_TYPE_SOURCE,
+                        "taint_params": [],
+                        "taint_details": [],
+                    }
+                ],
                 {
-                    "entry_key": "src-1",
-                    "function_name": "sink",
-                    "source_file": "src/main.c",
-                    "definition_file": "src/main.c",
-                    "definition_line": 42,
-                    "line_no": 42,
-                    "function_description": "demo",
-                    "function_description_source": "knowledge_graph",
-                    "entry_reason": "channel=http",
-                    "entry_reason_source": "knowledge_graph",
-                    "module_key": "knowledge_graph_source_project",
-                    "module_name": "source-project",
-                    "source_root_path": "/workspace/input",
-                    "module_input_path": "/workspace/input",
-                    "task_type": TASK_TYPE_SOURCE,
-                }
-            ],
-            {
-                "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-1/audit/sources",
-                "lookup_mode": "upload_id",
-                "upload_id": "upload-1",
-                "db_name": None,
-                "graph_status": "active",
-                "identification_state": "done",
-                "attack_status": "ok",
-                "analysis": {"total": 3, "identified": 2, "pending": 1, "confirmed": 0, "rejected": 0},
-                "raw_entry_count": 3,
-                "selected_entry_count": 1,
-                "filtered_out_count": 2,
-                "returned_item_count": 1,
-                "duration_ms": 55,
-            },
+                    "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-1/audit/sources",
+                    "lookup_mode": "upload_id",
+                    "upload_id": "upload-1",
+                    "db_name": None,
+                    "graph_status": "active",
+                    "identification_state": "done",
+                    "attack_status": "ok",
+                    "analysis": {"total": 3, "identified": 2, "pending": 1, "confirmed": 0, "rejected": 0},
+                    "raw_entry_count": 3,
+                    "selected_entry_count": 1,
+                    "filtered_out_count": 2,
+                    "returned_item_count": 1,
+                    "duration_ms": 55,
+                },
+            )
+
+        self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+
+        status, summary = asyncio.run(
+            self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
         )
 
-    self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
-
-    status, summary = asyncio.run(
-        self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
-    )
-
-    self.assertEqual("success", status)
-    self.assertEqual(1, summary["success_count"])
-    self.assertEqual(1, task.metrics["entry_count"])
-    self.assertEqual(1, task.metrics["knowledge_graph_selected_entry_count"])
-    self.assertEqual("active", task.summary["knowledge_graph_state"]["graph_status"])
-    self.assertEqual(3, task.summary["knowledge_graph_state"]["knowledge_graph_analysis_total"])
-    self.assertEqual(1, len(task.summary["knowledge_graph_entry_results"]))
-    self.assertEqual(1, len(task.summary["entry_results"]))
-    self.assertEqual("src-1", task.summary["entry_results"][0]["entries"][0]["entry_key"])
-    self.assertEqual("http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-1/audit/sources", summary["entries_url"])
+        self.assertEqual("success", status)
+        self.assertEqual(1, summary["success_count"])
+        self.assertEqual(1, task.metrics["entry_count"])
+        self.assertEqual(1, task.metrics["knowledge_graph_selected_entry_count"])
+        self.assertEqual(1, task.metrics["knowledge_graph_executable_entry_count"])
+        self.assertEqual(0, task.metrics["knowledge_graph_missing_source_file_count"])
+        self.assertEqual("active", task.summary["knowledge_graph_state"]["graph_status"])
+        self.assertEqual(3, task.summary["knowledge_graph_state"]["knowledge_graph_analysis_total"])
+        self.assertEqual(1, len(task.summary["knowledge_graph_entry_results"]))
+        self.assertEqual(1, len(task.summary["entry_results"]))
+        self.assertTrue(task.summary["knowledge_graph_entry_results"][0]["source_file_exists"])
+        self.assertEqual("src-1", task.summary["entry_results"][0]["entries"][0]["entry_key"])
+        self.assertEqual("http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-1/audit/sources", summary["entries_url"])
+    finally:
+        shutil.rmtree(workspace_root, ignore_errors=True)
 
 
 def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
@@ -39701,6 +39784,92 @@ def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
     self.assertEqual(0, task.metrics["selected_entry_count"])
 
 
+def _test_stage_knowledge_graph_entry_fetch_skips_missing_source_files(self):
+    task = BinarySecurityTask(
+        id="kg-source-missing-1",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="knowledge_graph_entry_fetch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "input_dir": "/workspace/input",
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+    }
+    task.policy = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_upload_id": "upload-missing",
+    }
+    stage_run = BinarySecurityStageRun(
+        id="sr-kg-missing-1",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+
+    async def _fake_fetch(_task):
+        return (
+            [
+                {
+                    "entry_key": "src-missing",
+                    "function_name": "missing_sink",
+                    "source_file": "src/missing.c",
+                    "definition_file": "src/missing.c",
+                    "definition_line": 42,
+                    "line_no": 42,
+                    "module_key": "knowledge_graph_source_project",
+                    "module_name": "source-project",
+                    "source_root_path": "/workspace/input",
+                    "module_input_path": "/workspace/input",
+                    "source_file_exists": False,
+                    "entry_execution_status": "source_file_missing",
+                    "entry_execution_reason": "source file is missing under source_root_path",
+                    "task_type": TASK_TYPE_SOURCE,
+                }
+            ],
+            {
+                "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-missing/audit/sources",
+                "lookup_mode": "upload_id",
+                "upload_id": "upload-missing",
+                "db_name": None,
+                "graph_status": "active",
+                "identification_state": "done",
+                "attack_status": "ok",
+                "analysis": {"total": 1, "identified": 1, "pending": 0, "confirmed": 0, "rejected": 0},
+                "raw_entry_count": 1,
+                "selected_entry_count": 1,
+                "filtered_out_count": 0,
+                "returned_item_count": 1,
+                "duration_ms": 12,
+            },
+        )
+
+    self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+
+    status, summary = asyncio.run(
+        self.manager._stage_knowledge_graph_entry_fetch(db, task, stage_run, token=None, retry_existing=False)
+    )
+
+    self.assertEqual("failed", status)
+    self.assertEqual("知识图谱入口识别完成，但没有可访问的源码入口文件", summary["error"])
+    self.assertEqual(1, len(task.summary["knowledge_graph_entry_results"]))
+    self.assertEqual([], task.summary["entry_results"])
+    self.assertEqual(0, task.metrics["entry_count"])
+    self.assertEqual(0, task.metrics["selected_entry_count"])
+    self.assertEqual(0, task.metrics["candidate_entry_count"])
+    self.assertEqual(0, task.metrics["knowledge_graph_executable_entry_count"])
+    self.assertEqual(1, task.metrics["knowledge_graph_missing_source_file_count"])
+    self.assertIn("knowledge_graph_entry_dispatch_skipped", [event.event_type for event in db.events])
+
+
 def _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate(self):
     task = BinarySecurityTask(
         id="kg-source-partial-1",
@@ -39729,6 +39898,7 @@ def _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and
                 "module_key": "knowledge_graph_source_project",
                 "source_root_path": "/workspace/input",
                 "module_input_path": "/workspace/input",
+                "source_file_exists": True,
                 "task_type": TASK_TYPE_SOURCE,
             }
         ],
@@ -39762,14 +39932,15 @@ def _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and
                     "module_name": "source-project",
                     "source_file": "src/existing.c",
                     "definition_file": "src/existing.c",
-                    "definition_line": 11,
-                    "line_no": 11,
-                    "module_key": "knowledge_graph_source_project",
-                    "source_root_path": "/workspace/input",
-                    "module_input_path": "/workspace/input",
-                    "task_type": TASK_TYPE_SOURCE,
-                },
-                {
+                        "definition_line": 11,
+                        "line_no": 11,
+                        "module_key": "knowledge_graph_source_project",
+                        "source_root_path": "/workspace/input",
+                        "module_input_path": "/workspace/input",
+                        "source_file_exists": True,
+                        "task_type": TASK_TYPE_SOURCE,
+                    },
+                    {
                     "entry_key": "src-new",
                     "function_name": "new_sink",
                     "source_file": "src/new.c",
@@ -39778,15 +39949,16 @@ def _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and
                     "line_no": 42,
                     "function_description": "demo",
                     "function_description_source": "knowledge_graph",
-                    "entry_reason": "channel=http",
-                    "entry_reason_source": "knowledge_graph",
-                    "module_key": "knowledge_graph_source_project",
-                    "module_name": "source-project",
-                    "source_root_path": "/workspace/input",
-                    "module_input_path": "/workspace/input",
-                    "task_type": TASK_TYPE_SOURCE,
-                },
-            ],
+                        "entry_reason": "channel=http",
+                        "entry_reason_source": "knowledge_graph",
+                        "module_key": "knowledge_graph_source_project",
+                        "module_name": "source-project",
+                        "source_root_path": "/workspace/input",
+                        "module_input_path": "/workspace/input",
+                        "source_file_exists": True,
+                        "task_type": TASK_TYPE_SOURCE,
+                    },
+                ],
             {
                 "entries_url": "http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-partial/audit/sources",
                 "lookup_mode": "upload_id",
@@ -39852,6 +40024,7 @@ def _test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries(self
                 "module_key": "knowledge_graph_source_project",
                 "source_root_path": "/workspace/input",
                 "module_input_path": "/workspace/input",
+                "source_file_exists": True,
                 "task_type": TASK_TYPE_SOURCE,
             }
         ],
@@ -40012,6 +40185,7 @@ TaskManagerTests.test_stage_knowledge_graph_entry_fetch_empty_clears_previous_re
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate = _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries = _test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_waits_for_graph_building = _test_stage_knowledge_graph_entry_fetch_waits_for_graph_building
+TaskManagerTests.test_stage_knowledge_graph_entry_fetch_skips_missing_source_files = _test_stage_knowledge_graph_entry_fetch_skips_missing_source_files
 TaskManagerTests.test_task_response_exposes_pipeline_profile = _test_task_response_exposes_pipeline_profile
 
 

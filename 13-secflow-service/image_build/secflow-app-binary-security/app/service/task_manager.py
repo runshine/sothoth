@@ -4406,6 +4406,7 @@ class TaskManager(
     ) -> dict[str, Any]:
         input_dir = str((task.summary or {}).get("input_dir") or "").strip()
         source_file = str(raw.get("file_path") or "").strip().replace("\\", "/")
+        source_file_exists = self._knowledge_graph_source_file_exists(input_dir, source_file)
         line_hint = str(raw.get("start_line") or "").strip()
         function_name = str(raw.get("name") or "").strip()
         entry_key = str(raw.get("source_id") or "").strip()
@@ -4430,6 +4431,10 @@ class TaskManager(
             "line_no": line_hint,
             "definition_line": line_hint,
             "definition_kind": "unknown",
+            "is_definition_found": source_file_exists,
+            "source_file_exists": source_file_exists,
+            "entry_execution_status": "ready" if source_file_exists else "source_file_missing",
+            "entry_execution_reason": "source file is accessible" if source_file_exists else "source file is missing under source_root_path",
             "function_description": str(raw.get("function_purpose") or "").strip(),
             "function_description_source": "knowledge_graph_audit_sources",
             "entry_reason": str(raw.get("entry_evidence") or "").strip() or self._knowledge_graph_entry_reason(raw),
@@ -4454,6 +4459,41 @@ class TaskManager(
             "callees": [dict(item) for item in list(raw.get("callees") or []) if isinstance(item, dict)],
             "task_type": TASK_TYPE_SOURCE,
         }
+
+    def _knowledge_graph_source_file_exists(self, source_root_path: str, source_file: str) -> bool:
+        normalized_root = str(source_root_path or "").strip()
+        normalized_file = str(source_file or "").strip().replace("\\", "/")
+        if not normalized_root or not normalized_file:
+            return False
+        try:
+            root_path = Path(normalized_root).resolve()
+            candidate = (root_path / normalized_file).resolve()
+            candidate.relative_to(root_path)
+        except Exception:
+            return False
+        return candidate.is_file()
+
+    def _filter_executable_knowledge_graph_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            dict(entry)
+            for entry in entries
+            if isinstance(entry, dict) and self._is_executable_knowledge_graph_entry(entry)
+        ]
+
+    def _knowledge_graph_entry_execution_metrics(self, entries: list[dict[str, Any]]) -> dict[str, int]:
+        total = len([entry for entry in entries if isinstance(entry, dict)])
+        executable = len([entry for entry in entries if isinstance(entry, dict) and self._is_executable_knowledge_graph_entry(entry)])
+        return {
+            "knowledge_graph_executable_entry_count": executable,
+            "knowledge_graph_missing_source_file_count": max(0, total - executable),
+        }
+
+    def _is_executable_knowledge_graph_entry(self, entry: dict[str, Any] | None) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        if "source_file_exists" not in entry:
+            return True
+        return bool(entry.get("source_file_exists"))
 
     def _knowledge_graph_source_endpoint(self, *, upload_id: str | None, db_name: str | None) -> str:
         cfg = self.cfg.services.knowledge_graph_audit
@@ -10642,13 +10682,16 @@ class TaskManager(
         graph_status = str(meta.get("graph_status") or "").strip()
         identification_state = str(meta.get("identification_state") or "").strip()
         accumulated_entries = self._merge_knowledge_graph_entry_results(task, entries)
-        accumulated_compact_entries = self._compact_knowledge_graph_entry_results(accumulated_entries)
         accumulated_selected_entry_count = len(accumulated_entries)
+        executable_entries = self._filter_executable_knowledge_graph_entries(accumulated_entries)
+        executable_compact_entries = self._compact_knowledge_graph_entry_results(executable_entries)
+        executable_entry_count = len(executable_entries)
         current_poll_selected_entry_count = len(entries)
         state_summary = self._knowledge_graph_poll_state_summary(
             meta,
             accumulated_selected_entry_count=accumulated_selected_entry_count,
         )
+        execution_metrics = self._knowledge_graph_entry_execution_metrics(accumulated_entries)
         if graph_status == "failed" or identification_state == "failed" or graph_status == "superseded":
             reason = "知识图谱入口识别失败"
             if graph_status == "superseded":
@@ -10667,8 +10710,8 @@ class TaskManager(
             )
             task.summary = {
                 **(task.summary or {}),
-                "knowledge_graph_entry_results": [],
-                "entry_results": [],
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": executable_compact_entries,
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10677,22 +10720,24 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
             }
             failure_summary = {
                 "error": reason,
-                "items": accumulated_compact_entries,
+                "items": executable_compact_entries,
                 "success_count": 0,
                 "failed_count": 1,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
@@ -10715,7 +10760,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": executable_compact_entries,
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10723,19 +10768,21 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
             }
             waiting_summary = {
                 "status": "waiting_for_graph",
-                "items": accumulated_compact_entries,
+                "items": executable_compact_entries,
                 "success_count": 0,
                 "failed_count": 0,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
@@ -10758,7 +10805,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": executable_compact_entries,
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10766,19 +10813,21 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
             }
             waiting_summary = {
                 "status": "waiting_for_identification",
-                "items": accumulated_compact_entries,
+                "items": executable_compact_entries,
                 "success_count": 0,
                 "failed_count": 0,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
@@ -10803,7 +10852,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": executable_compact_entries,
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10811,36 +10860,59 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
             }
             waiting_summary = {
                 "status": "polling_partial",
-                "items": accumulated_compact_entries,
-                "success_count": accumulated_selected_entry_count,
+                "items": executable_compact_entries,
+                "success_count": executable_entry_count,
                 "failed_count": 0,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": executable_compact_entries,
                 **state_summary,
                 **meta,
             }
             self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
             return "running", waiting_summary
-        if not accumulated_entries:
+        if not accumulated_entries or not executable_entries:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                self._record_event(
+                    db,
+                    task,
+                    "knowledge_graph_entry_dispatch_skipped",
+                    "知识图谱入口文件不存在，跳过数据流任务创建",
+                    stage_name=stage_run.stage_name,
+                    payload={
+                        "source_id": str(entry.get("source_id") or entry.get("entry_key") or "").strip() or None,
+                        "function_id": str(entry.get("function_id") or "").strip() or None,
+                        "function_name": str(entry.get("function_name") or "").strip() or None,
+                        "source_file": str(entry.get("source_file") or "").strip() or None,
+                        "start_line": str(entry.get("definition_line") or entry.get("line_no") or "").strip() or None,
+                        "source_file_exists": bool(entry.get("source_file_exists")),
+                        "entry_execution_status": str(entry.get("entry_execution_status") or "").strip() or None,
+                        "entry_execution_reason": str(entry.get("entry_execution_reason") or "").strip() or None,
+                    },
+                )
+            error_message = "知识图谱入口识别完成，但没有可访问的源码入口文件" if accumulated_entries else "知识图谱入口识别完成，但没有可用入口"
             self._record_event(
                 db,
                 task,
                 "knowledge_graph_entry_fetch_empty_after_done",
-                "知识图谱入口识别完成，但没有可用入口",
+                error_message,
                 level="warning",
                 stage_name=stage_run.stage_name,
                 payload={
@@ -10850,22 +10922,23 @@ class TaskManager(
             )
             task.summary = {
                 **(task.summary or {}),
-                "knowledge_graph_entry_results": [],
+                "knowledge_graph_entry_results": accumulated_entries,
                 "entry_results": [],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
                 **(task.metrics or {}),
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 "candidate_entry_count": 0,
                 "selected_entry_count": 0,
                 "entry_count": 0,
                 **self._knowledge_graph_analysis_metrics(meta),
             }
             failure_summary = {
-                "error": "知识图谱入口识别完成，但没有可用入口",
+                "error": error_message,
                 "items": [],
                 "success_count": 0,
                 "failed_count": 1,
@@ -10873,8 +10946,9 @@ class TaskManager(
                 "selected_entry_count": 0,
                 "entry_count": 0,
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 **state_summary,
                 **meta,
             }
@@ -10883,7 +10957,7 @@ class TaskManager(
         task.summary = {
             **(task.summary or {}),
             "knowledge_graph_entry_results": accumulated_entries,
-            "entry_results": accumulated_compact_entries,
+            "entry_results": executable_compact_entries,
             "knowledge_graph_state": state_summary,
         }
         task.metrics = {
@@ -10891,9 +10965,10 @@ class TaskManager(
             "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
             "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
             "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-            "candidate_entry_count": accumulated_selected_entry_count,
-            "selected_entry_count": accumulated_selected_entry_count,
-            "entry_count": accumulated_selected_entry_count,
+            "candidate_entry_count": executable_entry_count,
+            "selected_entry_count": executable_entry_count,
+            "entry_count": executable_entry_count,
+            **execution_metrics,
             **self._knowledge_graph_analysis_metrics(meta),
         }
         self._record_event(
@@ -10906,22 +10981,46 @@ class TaskManager(
                 "provider": "knowledge_graph_audit_sources",
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_executable_entry_count": executable_entry_count,
                 **meta,
             },
         )
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            event_type = "knowledge_graph_entry_dispatch_ready" if bool(entry.get("source_file_exists")) else "knowledge_graph_entry_dispatch_skipped"
+            message = "知识图谱入口文件可访问，准备创建数据流任务" if bool(entry.get("source_file_exists")) else "知识图谱入口文件不存在，跳过数据流任务创建"
+            self._record_event(
+                db,
+                task,
+                event_type,
+                message,
+                stage_name=stage_run.stage_name,
+                payload={
+                    "source_id": str(entry.get("source_id") or entry.get("entry_key") or "").strip() or None,
+                    "function_id": str(entry.get("function_id") or "").strip() or None,
+                    "function_name": str(entry.get("function_name") or "").strip() or None,
+                    "source_file": str(entry.get("source_file") or "").strip() or None,
+                    "start_line": str(entry.get("definition_line") or entry.get("line_no") or "").strip() or None,
+                    "source_file_exists": bool(entry.get("source_file_exists")),
+                    "entry_execution_status": str(entry.get("entry_execution_status") or "").strip() or None,
+                    "entry_execution_reason": str(entry.get("entry_execution_reason") or "").strip() or None,
+                },
+            )
         success_summary = {
-            "items": accumulated_compact_entries,
-            "success_count": accumulated_selected_entry_count,
+            "items": executable_compact_entries,
+            "success_count": executable_entry_count,
             "failed_count": 0,
-            "candidate_entry_count": accumulated_selected_entry_count,
-            "selected_entry_count": accumulated_selected_entry_count,
-            "entry_count": accumulated_selected_entry_count,
+            "candidate_entry_count": executable_entry_count,
+            "selected_entry_count": executable_entry_count,
+            "entry_count": executable_entry_count,
             "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
             "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
             "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+            **execution_metrics,
             "current_poll_selected_entry_count": current_poll_selected_entry_count,
             "accumulated_selected_entry_count": accumulated_selected_entry_count,
-            "entry_results": accumulated_compact_entries,
+            "entry_results": executable_compact_entries,
             **state_summary,
             **meta,
         }

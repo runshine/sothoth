@@ -3707,7 +3707,6 @@ class TaskRuntimeServiceMixin:
             taint_params = [str(value).strip() for value in (entry.get("taint_params") or []) if str(value).strip()]
             if not taint_params:
                 taint_params = _entry_signature_params(entry)
-            definition_found = bool(entry.get("is_definition_found", True))
             definition_kind = self._resolve_entry_definition_kind(entry)
             definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
@@ -3719,35 +3718,6 @@ class TaskRuntimeServiceMixin:
                     entry = {**recovered_entry, **entry}
                     module_input_path = module_input_path or str(entry.get("module_input_path") or "").strip()
                     source_root_path = source_root_path or str(entry.get("source_root_path") or "").strip()
-            if not definition_found:
-                item.status = "failed"
-                item.finished_at = _now()
-                item.error_message = "未找到函数定义，无法执行数据流分析"
-                self._persist_stage_item_result(
-                    task,
-                    item,
-                    stage_name=stage_run.stage_name,
-                    result={**entry, "failed": True, "failure_reason": item.error_message},
-                )
-                session.commit()
-                return {"status": "failed", "error": item.error_message, "item": entry}
-            if definition_kind != "definition":
-                item.status = "failed"
-                item.finished_at = _now()
-                item.error_message = "入口仅定位到声明，无法执行数据流分析"
-                self._persist_stage_item_result(
-                    task,
-                    item,
-                    stage_name=stage_run.stage_name,
-                    result={
-                        **entry,
-                        "failed": True,
-                        "failure_reason": item.error_message,
-                        "definition_kind": definition_kind,
-                    },
-                )
-                session.commit()
-                return {"status": "failed", "error": item.error_message, "item": entry}
             if not module_input_path:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -3773,6 +3743,18 @@ class TaskRuntimeServiceMixin:
                 session.commit()
                 return {"status": "failed", "error": item.error_message, "item": entry}
             normalized_source_file = self._normalize_dfa_source_file(source_root_path, entry)
+            if not normalized_source_file:
+                item.status = "failed"
+                item.finished_at = _now()
+                item.error_message = "未找到可访问的源码入口文件，无法执行数据流分析"
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={**entry, "failed": True, "failure_reason": item.error_message},
+                )
+                session.commit()
+                return {"status": "failed", "error": item.error_message, "item": entry}
             prompt = f"分析文件 {definition_file or entry['file_name']} 中函数 {entry['function_name']} 的外部输入数据流"
             line_hint = ""
             if definition_line:
