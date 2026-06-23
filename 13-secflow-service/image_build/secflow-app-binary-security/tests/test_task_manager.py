@@ -28454,17 +28454,16 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 patch.object(self.manager, "_cleanup_task_workspace", unittest.mock.AsyncMock(return_value="partial_failed")),
                 patch.object(self.manager, "_write_task_metadata_async", unittest.mock.AsyncMock()),
             ):
-                with self.assertRaises(ValidationError):
-                    await self.manager._prepare_delete_task(db, task)
+                await self.manager._prepare_delete_task(db, task)
                 cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
 
         asyncio.run(_run())
 
-        self.assertEqual("delete_failed", task.status)
-        self.assertIn("任务目录清理失败", str(task.last_error or ""))
-        self.assertEqual(1, len(db.tasks))
-        failed_events = [row for row in db.added if isinstance(row, BinarySecurityEvent) and row.event_type == "task_delete_failed"]
-        self.assertTrue(failed_events)
+        self.assertEqual([], db.tasks)
+        event_types = [row.event_type for row in db.added if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_delete_auto_force_delete_fallback", event_types)
+        self.assertIn("task_delete_failed", event_types)
+        self.assertIn("task_force_delete_completed", event_types)
 
     def test_cleanup_task_workspace_retries_transient_residual_directory(self):
         task = BinarySecurityTask(
@@ -28675,22 +28674,22 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                         }
                     ],
                 )
-                with self.assertRaises(ValidationError):
-                    await self.manager._prepare_delete_task(db, task)
+                await self.manager._prepare_delete_task(db, task)
                 cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
 
         asyncio.run(_run())
 
-        self.assertEqual(1, len(db.tasks))
-        self.assertEqual("delete_failed", task.status)
-        self.assertIn("无法连接下游服务", str(task.last_error or ""))
-        self.assertEqual("op-delete-deferred", task.current_operation_id)
-        self.assertFalse(bool(task.cleanup_snapshot))
+        self.assertEqual([], db.tasks)
         cleanup_result = dict(operation.result_payload or {}).get("cleanup_result") or {}
         self.assertTrue(cleanup_result.get("cleanup_partial_failed"))
         self.assertEqual(1, len(cleanup_result.get("downstream_cleanup_deferred_refs") or []))
+        fallback = dict(operation.result_payload or {}).get("force_delete_fallback") or {}
+        self.assertTrue(fallback.get("applied"))
+        self.assertEqual("downstream_cleanup_incomplete", fallback.get("reason"))
         event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_delete_auto_force_delete_fallback", event_types)
         self.assertIn("task_delete_failed", event_types)
+        self.assertIn("task_force_delete_completed", event_types)
 
     def test_prepare_delete_task_fails_when_workspace_writers_do_not_quiesce(self):
         task = BinarySecurityTask(
@@ -28725,17 +28724,16 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 patch.object(self.manager, "_wait_for_task_workspace_quiesce", AsyncMock(return_value=False)),
                 patch.object(self.manager, "_cleanup_task_workspace", AsyncMock()),
             ):
-                with self.assertRaises(ValidationError):
-                    await self.manager._prepare_delete_task(db, task)
+                await self.manager._prepare_delete_task(db, task)
                 cancel_mock.assert_awaited_once_with(task.id, wait_for_runner=False)
 
         asyncio.run(_run())
 
-        self.assertEqual("delete_failed", task.status)
-        self.assertEqual("删除前静默收敛失败", task.last_error)
-        self.assertFalse(task.cleanup_snapshot.get("delete_in_progress"))
+        self.assertEqual([], db.tasks)
         event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+        self.assertIn("task_delete_auto_force_delete_fallback", event_types)
         self.assertIn("task_delete_quiesce_failed", event_types)
+        self.assertIn("task_force_delete_completed", event_types)
 
     def test_reconcile_orphan_task_workspaces_once_removes_missing_task_workspace(self):
         with tempfile.TemporaryDirectory() as tmp:

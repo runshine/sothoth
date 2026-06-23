@@ -25,6 +25,17 @@ if TYPE_CHECKING:
 
 
 class TaskOperationServiceMixin:
+    def _operation_uses_task_state_snapshot(
+        self: TaskManager,
+        operation: BinarySecurityTaskOperation | None,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if operation is None:
+            return False
+        operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+        return operation_type in task_manager_module.TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES
+
     def _blocking_operation_task_snapshot_payload(
         self: TaskManager,
         task: BinarySecurityTask,
@@ -44,7 +55,7 @@ class TaskOperationServiceMixin:
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
     ) -> None:
-        if not self._operation_blocks_runtime_resume(operation):
+        if not self._operation_uses_task_state_snapshot(operation):
             return
         payload = dict(getattr(operation, "request_payload", None) or {})
         if isinstance(payload.get("task_state_snapshot"), dict):
@@ -59,7 +70,7 @@ class TaskOperationServiceMixin:
     ) -> None:
         from app.service import task_manager as task_manager_module
 
-        if not self._operation_blocks_runtime_resume(operation):
+        if not self._operation_uses_task_state_snapshot(operation):
             return
         payload = dict(getattr(operation, "request_payload", None) or {})
         snapshot = dict(payload.get("task_state_snapshot") or {})
@@ -354,7 +365,7 @@ class TaskOperationServiceMixin:
             updated_at=task_manager_module._now(),
         )
         payload = dict(request_payload or {})
-        if self._operation_blocks_runtime_resume(operation) and not isinstance(payload.get("task_state_snapshot"), dict):
+        if self._operation_uses_task_state_snapshot(operation) and not isinstance(payload.get("task_state_snapshot"), dict):
             payload["task_state_snapshot"] = self._blocking_operation_task_snapshot_payload(task)
         self._persist_operation_request_payload(
             operation,
