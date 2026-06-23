@@ -2102,6 +2102,63 @@ class TaskOperationServiceMixin:
     async def _prepare_delete_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> None:
         from app.service import task_manager as task_manager_module
 
+        def _ensure_force_delete_fallback(
+            *,
+            failure_reason: str,
+            failure_message: str,
+            payload: dict[str, Any] | None = None,
+        ) -> bool:
+            nonlocal force_delete, event_prefix, request_payload
+            if force_delete:
+                return False
+            force_delete = True
+            event_prefix = "task_force_delete"
+            request_payload = {**request_payload, "force": True, "force_delete": True, "auto_force_delete_fallback": True}
+            if operation is not None:
+                merged_request_payload = dict(getattr(operation, "request_payload", None) or {})
+                merged_request_payload.update(
+                    {
+                        "force": True,
+                        "force_delete": True,
+                        "auto_force_delete_fallback": True,
+                        "force_delete_fallback_reason": failure_reason,
+                    }
+                )
+                operation.request_payload = merged_request_payload
+                self._update_operation_result_payload(
+                    operation,
+                    {
+                        "force_delete_fallback": {
+                            "applied": True,
+                            "reason": failure_reason,
+                            "message": failure_message,
+                        }
+                    },
+                    workspace_root=task.workspace_root,
+                )
+            self._record_event(
+                db,
+                task,
+                "task_delete_auto_force_delete_fallback",
+                f"普通删除失败，已自动降级为强制删除: {failure_message}",
+                stage_name=task.current_stage,
+                level="warning",
+                payload={
+                    "failure_reason": failure_reason,
+                    "failure_message": failure_message,
+                    "source_force_delete": False,
+                    "fallback_force_delete": True,
+                    **dict(payload or {}),
+                },
+            )
+            task_manager_module.logger.warning(
+                "binary-security delete fell back to force delete: task_id=%s reason=%s message=%s",
+                task.id,
+                failure_reason,
+                failure_message,
+            )
+            return True
+
         operation = None
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
         if current_operation_id:
@@ -2202,31 +2259,52 @@ class TaskOperationServiceMixin:
 
         quiesced = await self._wait_for_task_workspace_quiesce(db, task)
         if not quiesced:
-            self._clear_task_delete_in_progress(task)
-            self._set_task_status(
-                db,
-                task,
-                task_manager_module.TASK_STATUS_DELETE_FAILED,
-                reason="删除任务前等待后台工作目录写入静默失败",
-                source="task_operation",
-                stage_name=task.current_stage,
-            )
-            task.finished_at = task_manager_module._now()
-            task.last_error = "删除前静默收敛失败"
-            self._record_event(
-                db,
-                task,
-                "task_delete_quiesce_failed",
-                "删除失败，任务目录写入尚未静默收敛",
-                stage_name=task.current_stage,
-                level="error",
-                payload={
-                    "force_delete": force_delete,
-                    "workspace_root": str(task.workspace_root or "").strip() or None,
-                },
-            )
-            db.commit()
-            raise ValidationError("删除失败，任务目录写入尚未静默收敛")
+            if _ensure_force_delete_fallback(
+                failure_reason="workspace_quiesce_failed",
+                failure_message="删除前静默收敛失败",
+                payload={"workspace_root": str(task.workspace_root or "").strip() or None},
+            ):
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_quiesce_failed",
+                    "普通删除等待静默收敛失败，已自动降级为强制删除",
+                    stage_name=task.current_stage,
+                    level="warning",
+                    payload={
+                        "force_delete": False,
+                        "auto_force_delete_fallback": True,
+                        "workspace_root": str(task.workspace_root or "").strip() or None,
+                    },
+                )
+                db.commit()
+                quiesced = True
+            else:
+                self._clear_task_delete_in_progress(task)
+                self._set_task_status(
+                    db,
+                    task,
+                    task_manager_module.TASK_STATUS_DELETE_FAILED,
+                    reason="删除任务前等待后台工作目录写入静默失败",
+                    source="task_operation",
+                    stage_name=task.current_stage,
+                )
+                task.finished_at = task_manager_module._now()
+                task.last_error = "删除前静默收敛失败"
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_quiesce_failed",
+                    "删除失败，任务目录写入尚未静默收敛",
+                    stage_name=task.current_stage,
+                    level="error",
+                    payload={
+                        "force_delete": force_delete,
+                        "workspace_root": str(task.workspace_root or "").strip() or None,
+                    },
+                )
+                db.commit()
+                raise ValidationError("删除失败，任务目录写入尚未静默收敛")
 
         self._record_event(
             db,
@@ -2243,46 +2321,86 @@ class TaskOperationServiceMixin:
 
         cleanup_status = await self._cleanup_task_workspace(task, token=token)
         if cleanup_status != "deleted":
-            self._clear_task_delete_in_progress(task)
-            self._set_task_status(
-                db,
-                task,
-                task_manager_module.TASK_STATUS_DELETE_FAILED,
-                reason="删除任务时任务目录清理失败",
-                source="task_operation",
-                stage_name=task.current_stage,
-            )
-            task.finished_at = task_manager_module._now()
-            task.last_error = "任务目录清理失败"
-            self._record_event(
-                db,
-                task,
-                "task_delete_failed",
-                "删除失败，任务目录清理失败",
-                stage_name=task.current_stage,
-                level="error",
+            if _ensure_force_delete_fallback(
+                failure_reason="workspace_cleanup_failed",
+                failure_message="任务目录清理失败",
                 payload={
-                    "force_delete": force_delete,
                     "workspace_root": str(task.workspace_root or "").strip() or None,
                     "workspace_cleanup_status": cleanup_status,
                 },
-            )
-            if cleanup_status == "recreated_during_delete":
+            ):
                 self._record_event(
                     db,
                     task,
-                    "task_delete_workspace_recreated_during_cleanup",
-                    "删除期间任务目录被并发重建",
+                    "task_delete_failed",
+                    "普通删除任务目录清理失败，已自动降级为强制删除",
                     stage_name=task.current_stage,
                     level="warning",
+                    payload={
+                        "force_delete": False,
+                        "auto_force_delete_fallback": True,
+                        "workspace_root": str(task.workspace_root or "").strip() or None,
+                        "workspace_cleanup_status": cleanup_status,
+                    },
+                )
+                if cleanup_status == "recreated_during_delete":
+                    self._record_event(
+                        db,
+                        task,
+                        "task_delete_workspace_recreated_during_cleanup",
+                        "删除期间任务目录被并发重建，已自动降级为强制删除",
+                        stage_name=task.current_stage,
+                        level="warning",
+                        payload={
+                            "force_delete": False,
+                            "auto_force_delete_fallback": True,
+                            "workspace_root": str(task.workspace_root or "").strip() or None,
+                            "workspace_cleanup_status": cleanup_status,
+                        },
+                    )
+                cleanup_status = f"force_deleted_after_{cleanup_status}"
+                db.commit()
+            else:
+                self._clear_task_delete_in_progress(task)
+                self._set_task_status(
+                    db,
+                    task,
+                    task_manager_module.TASK_STATUS_DELETE_FAILED,
+                    reason="删除任务时任务目录清理失败",
+                    source="task_operation",
+                    stage_name=task.current_stage,
+                )
+                task.finished_at = task_manager_module._now()
+                task.last_error = "任务目录清理失败"
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_failed",
+                    "删除失败，任务目录清理失败",
+                    stage_name=task.current_stage,
+                    level="error",
                     payload={
                         "force_delete": force_delete,
                         "workspace_root": str(task.workspace_root or "").strip() or None,
                         "workspace_cleanup_status": cleanup_status,
                     },
                 )
-            db.commit()
-            raise ValidationError("任务目录清理失败")
+                if cleanup_status == "recreated_during_delete":
+                    self._record_event(
+                        db,
+                        task,
+                        "task_delete_workspace_recreated_during_cleanup",
+                        "删除期间任务目录被并发重建",
+                        stage_name=task.current_stage,
+                        level="warning",
+                        payload={
+                            "force_delete": force_delete,
+                            "workspace_root": str(task.workspace_root or "").strip() or None,
+                            "workspace_cleanup_status": cleanup_status,
+                        },
+                    )
+                db.commit()
+                raise ValidationError("任务目录清理失败")
 
         deleted_downstream_count = sum(
             1
@@ -2307,7 +2425,6 @@ class TaskOperationServiceMixin:
             )
 
         if downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs:
-            self._clear_task_delete_in_progress(task)
             cleanup_error = next(
                 (
                     str(row.get("error") or row.get("deferred_reason") or "").strip()
@@ -2316,27 +2433,48 @@ class TaskOperationServiceMixin:
                 ),
                 None,
             ) or "下游删除未完成"
-            self._set_task_status(
-                db,
-                task,
-                task_manager_module.TASK_STATUS_DELETE_FAILED,
-                reason="删除任务时下游子任务尚未完成删除确认",
-                source="task_operation",
-                stage_name=task.current_stage,
-            )
-            task.finished_at = task_manager_module._now()
-            task.last_error = cleanup_error
-            self._record_event(
-                db,
-                task,
-                "task_delete_failed",
-                "删除失败，下游子任务尚未完成删除确认",
-                stage_name=task.current_stage,
-                level="error",
+            if _ensure_force_delete_fallback(
+                failure_reason="downstream_cleanup_incomplete",
+                failure_message=cleanup_error,
                 payload=cleanup_result,
-            )
-            db.commit()
-            raise ValidationError("删除失败，下游子任务尚未完成删除确认")
+            ):
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_failed",
+                    "普通删除下游清理未完成，已自动降级为强制删除",
+                    stage_name=task.current_stage,
+                    level="warning",
+                    payload={
+                        **cleanup_result,
+                        "force_delete": False,
+                        "auto_force_delete_fallback": True,
+                    },
+                )
+                db.commit()
+            else:
+                self._clear_task_delete_in_progress(task)
+                self._set_task_status(
+                    db,
+                    task,
+                    task_manager_module.TASK_STATUS_DELETE_FAILED,
+                    reason="删除任务时下游子任务尚未完成删除确认",
+                    source="task_operation",
+                    stage_name=task.current_stage,
+                )
+                task.finished_at = task_manager_module._now()
+                task.last_error = cleanup_error
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_failed",
+                    "删除失败，下游子任务尚未完成删除确认",
+                    stage_name=task.current_stage,
+                    level="error",
+                    payload=cleanup_result,
+                )
+                db.commit()
+                raise ValidationError("删除失败，下游子任务尚未完成删除确认")
 
         db.delete(task)
         self._record_event(
