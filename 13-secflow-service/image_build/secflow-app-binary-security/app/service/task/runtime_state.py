@@ -537,14 +537,7 @@ class TaskRuntimeStateServiceMixin:
                 lease.owner_boot_id,
                 lease.generation,
             )
-        return (
-            str(task.dispatcher_instance_id or "").strip() or None,
-            task.lease_expires_at,
-            "legacy_task_row" if task.lease_expires_at is not None else None,
-            None,
-            None,
-            None,
-        )
+        return (None, None, None, None, None, None)
 
     def _is_terminal_tail_item_with_only_residual_binding(self: TaskManager, item) -> bool:
         normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()

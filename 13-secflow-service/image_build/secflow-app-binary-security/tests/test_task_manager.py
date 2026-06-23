@@ -37052,6 +37052,27 @@ def _test_task_list_response_exposes_runtime_lease_and_sync_view(self):
     self.assertEqual("temporary timeout", response.last_sync_error_message)
 
 
+def _test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease(self):
+    manager = TaskManager()
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-lease-row-only",
+        project_id="p1",
+        name="demo",
+        status="running",
+        firmware_path="/tmp/fw.bin",
+        dispatcher_instance_id="row-owner-only",
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[])
+
+    response = manager._task_list_response(db, task, stage_items=[])
+
+    self.assertIsNone(response.task_lease_owner_instance_id)
+    self.assertIsNone(response.task_lease_expires_at)
+    self.assertIsNone(response.task_lease_source)
+
+
 def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -42211,6 +42232,7 @@ TaskManagerTests.test_drain_task_sync_queue_retries_failed_entry = _test_drain_t
 TaskManagerTests.test_migrate_legacy_pending_downstream_sync_to_redis_queue = _test_migrate_legacy_pending_downstream_sync_to_redis_queue
 TaskManagerTests.test_migrate_legacy_pending_binding_repair_to_redis_queue = _test_migrate_legacy_pending_binding_repair_to_redis_queue
 TaskManagerTests.test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task = _test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task
+TaskManagerTests.test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease = _test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease
 
 
 if __name__ == "__main__":
