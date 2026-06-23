@@ -1974,6 +1974,12 @@ class TaskRuntimeServiceMixin:
                         task,
                         stage_run=stage_run,
                     )
+                self._set_task_runtime_transition_guard(
+                    task,
+                    from_stage=str(getattr(task, "current_stage", "") or "").strip() or None,
+                    to_stage=stage_name,
+                    reason="stage_worker_start_requested",
+                )
                 start_event = self._enqueue_state_event(
                     db,
                     task=task,

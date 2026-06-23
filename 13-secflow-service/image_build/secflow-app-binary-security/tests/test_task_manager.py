@@ -42481,6 +42481,31 @@ def _test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task(sel
     self.assertEqual(["si-stale-entry"], refs[0]["item_ids"])
 
 
+def _test_control_operation_runtime_lease_coverage_matches_supported_operation_set(self):
+    expected_control_operations = {
+        TASK_ACTION_CONTINUE,
+        TASK_ACTION_RETRY,
+        task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
+        task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+        task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
+        task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+        task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+        task_manager_module.TASK_ACTION_CANCEL,
+        task_manager_module.TASK_ACTION_DELETE,
+        "force_reset_to_pending",
+    }
+
+    self.assertSetEqual(
+        expected_control_operations,
+        set(task_manager_module.TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES),
+    )
+    self.assertTrue(
+        set(task_manager_module.TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES).issubset(
+            set(task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES)
+        )
+    )
+
+
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
@@ -42516,6 +42541,7 @@ TaskManagerTests.test_drain_task_sync_queue_retries_failed_entry = _test_drain_t
 TaskManagerTests.test_migrate_legacy_pending_downstream_sync_to_redis_queue = _test_migrate_legacy_pending_downstream_sync_to_redis_queue
 TaskManagerTests.test_migrate_legacy_pending_binding_repair_to_redis_queue = _test_migrate_legacy_pending_binding_repair_to_redis_queue
 TaskManagerTests.test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task = _test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task
+TaskManagerTests.test_control_operation_runtime_lease_coverage_matches_supported_operation_set = _test_control_operation_runtime_lease_coverage_matches_supported_operation_set
 TaskManagerTests.test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease = _test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease
 
 

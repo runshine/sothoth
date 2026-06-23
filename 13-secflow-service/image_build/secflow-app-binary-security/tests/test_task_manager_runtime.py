@@ -993,6 +993,79 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(authoritative_context_checks["count"], 1)
         self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
 
+    async def test_run_task_keeps_runtime_alive_for_stage_start_transition_guard(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-stage-start-guard",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="firmware_unpack",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+            dispatch_started_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        order: list[str] = []
+
+        async def _run_current_task_operation(_task_id):
+            order.append("operation")
+            return False
+
+        signal_calls = {"count": 0}
+
+        async def _run_task_runtime_signals(_task_id):
+            order.append("signal")
+            signal_calls["count"] += 1
+            if signal_calls["count"] >= 2:
+                task.status = "success"
+            return False
+
+        async def _execute_task(_task_id):
+            order.append("execute")
+            task.status = "running"
+            manager._set_task_runtime_transition_guard(
+                task,
+                from_stage="firmware_unpack",
+                to_stage="firmware_unpack",
+                reason="stage_worker_start_requested",
+            )
+            return None
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager.cfg.scheduler.stage_poll_interval_seconds = 0
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task(task.id)
+
+        self.assertEqual(
+            ["operation", "signal", "execute", "signal"],
+            order,
+        )
+        self.assertTrue(manager._task_runtime_transition_guard_active(task))
+        self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+
 
 class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
