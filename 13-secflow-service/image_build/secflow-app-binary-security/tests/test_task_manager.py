@@ -36932,6 +36932,26 @@ def _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal(self
         workspace_root="/w",
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
     )
+    task.summary = {
+        "selected_modules": [
+            {
+                "module_key": "mod-a",
+                "module_name": "mod-a",
+                "source_dir": "/src/mod-a",
+                "module_dir": "/src/mod-a",
+            }
+        ],
+        "entry_results": [
+            {
+                "module_key": "mod-a",
+                "module_name": "mod-a",
+                "completion_state": "success",
+                "completion_ready": True,
+                "entries": [{"entry_key": "entry-a", "function_name": "entry-a", "module_key": "mod-a"}],
+                "entry_count": 1,
+            }
+        ]
+    }
     system_run = BinarySecurityStageRun(
         id="sr-sys-success-3",
         task_id=task.id,
@@ -36973,13 +36993,26 @@ def _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal(self
         downstream_task_id="dfvs-1",
         error_message="business failed",
     )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run, vuln_run], stage_items=[vuln_item], events=[])
+    system_item = BinarySecurityStageItem(
+        id="si-sys-success-3",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=system_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-1",
+        result={"modules": [{"module_key": "mod-a"}], "system_analysis_result": {"available": True}},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run, vuln_run], stage_items=[system_item, vuln_item], events=[])
 
     decision = manager._evaluate_task_finalization_gate(
         db,
         task,
         stage_runs=[system_run, entry_run, vuln_run],
-        stage_items=[vuln_item],
+        stage_items=[system_item, vuln_item],
     )
 
     self.assertTrue(decision.allowed)
@@ -37041,8 +37074,8 @@ def _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_m
 
     self.assertNotEqual("failed", task.status)
     self.assertIsNone(task.finished_at)
-    self.assertEqual("pending", task.status)
-    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual("running", task.status)
+    self.assertEqual("system_analysis", task.current_stage)
 
 
 def _test_refresh_task_status_after_sync_does_not_terminalize_failed_stage_when_finalize_gate_blocks(self):
@@ -39525,6 +39558,29 @@ def _test_archive_apply_stage_has_authoritative_success_payload_delegates_to_han
     self.assertIs(handler.called[2], task)
 
 
+def _test_virtual_archive_stage_status_delegates_to_handler(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
+    db = _ModelAwareDb(tasks=[task])
+
+    class _Handler:
+        def archive_virtual_status(self, manager, current_db, current_task):
+            self.called = (manager, current_db, current_task)
+            return "success"
+
+    handler = _Handler()
+    original_registry = self.manager._stage_registry
+    self.manager._stage_registry = SimpleNamespace(get=lambda stage_name: handler if stage_name == "knowledge_graph_entry_fetch" else None)
+    try:
+        result = self.manager._virtual_archive_stage_status(db, task, "knowledge_graph_entry_fetch")
+    finally:
+        self.manager._stage_registry = original_registry
+
+    self.assertEqual("success", result)
+    self.assertIs(handler.called[0], self.manager)
+    self.assertIs(handler.called[1], db)
+    self.assertIs(handler.called[2], task)
+
+
 def _test_descendant_stages_for_stage_delegates_to_handler(self):
     task = BinarySecurityTask(
         id="t1",
@@ -39925,6 +39981,174 @@ def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
         self.assertEqual("http://codemap-manager.secflow-ns.svc.cluster.local:8090/uploads/upload-1/audit/sources", summary["entries_url"])
     finally:
         shutil.rmtree(workspace_root, ignore_errors=True)
+
+
+def _test_build_stage_overview_nodes_marks_knowledge_graph_virtual_archive_success(self):
+    task = BinarySecurityTask(
+        id="kg-archive-1",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+        "knowledge_graph_entry_results": [
+            {
+                "entry_key": "src-1",
+                "source_file": "src/main.c",
+            }
+        ],
+        "entry_results": [
+            {
+                "module_key": "knowledge_graph_source_project",
+                "module_name": "source-project",
+                "entries": [
+                    {
+                        "entry_key": "src-1",
+                        "function_name": "sink",
+                    }
+                ],
+            }
+        ],
+    }
+    task.policy = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+    }
+    stage_run = BinarySecurityStageRun(
+        id="sr-kg-archive-1",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="success",
+    )
+    stage_item = BinarySecurityStageItem(
+        id="si-kg-archive-1",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id=stage_run.id,
+        stage_name="knowledge_graph_entry_fetch",
+        item_key="knowledge_graph_source_project",
+        status="success",
+        downstream_service="knowledge_graph_audit_sources",
+        downstream_task_id="kg-entry-1",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[stage_item])
+    summaries = self.manager._build_stage_summaries(
+        db,
+        task,
+        ["knowledge_graph_entry_fetch", "dataflow_vuln_scan"],
+        [stage_run],
+        [stage_item],
+    )
+
+    nodes = self.manager._build_stage_overview_nodes(db, task, summaries, [], [stage_item])
+
+    archive_node = next(node for node in nodes if node.node_id == "archive:knowledge_graph_entry_fetch")
+    self.assertEqual("success", archive_node.status)
+    self.assertEqual(0, archive_node.detail.job_count)
+
+
+def _test_workflow_ready_for_finalization_supports_knowledge_graph_virtual_archive_stage(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="kg-finalize-1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.policy = {
+        "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+    }
+    task.summary = {
+        "knowledge_graph_entry_results": [
+            {"entry_key": "src-1", "source_file": "src/main.c"}
+        ],
+        "entry_results": [
+            {
+                "module_key": "knowledge_graph_source_project",
+                "module_name": "source-project",
+                "completion_state": "success",
+                "completion_ready": True,
+                "entries": [
+                    {"entry_key": "src-1", "function_name": "sink", "module_key": "knowledge_graph_source_project"}
+                ],
+                "entry_count": 1,
+            }
+        ],
+        "dataflow_results": [
+            {"entry_key": "src-1", "module_key": "knowledge_graph_source_project", "verdict": "clean"}
+        ],
+        "vuln_results": [
+            {"entry_key": "src-1", "module_key": "knowledge_graph_source_project", "verdict": "clean"}
+        ],
+    }
+    kg_run = BinarySecurityStageRun(
+        id="sr-kg-finalize-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    kg_item = BinarySecurityStageItem(
+        id="si-kg-finalize-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=kg_run.id,
+        stage_name="knowledge_graph_entry_fetch",
+        item_key="knowledge_graph_source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="knowledge_graph_audit_sources",
+        downstream_task_id="kg-entry-1",
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-df-finalize-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=2,
+        status="success",
+        finished_at=_now(),
+    )
+    dataflow_item = BinarySecurityStageItem(
+        id="si-df-finalize-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=dataflow_run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="src-1",
+        item_name="sink",
+        status="success",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dfvs-1",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[kg_run, dataflow_run],
+        stage_items=[kg_item, dataflow_item],
+        events=[],
+    )
+
+    snapshots = manager._build_workflow_stage_snapshots(db, task, stage_runs=[kg_run, dataflow_run])
+
+    self.assertEqual(["knowledge_graph_entry_fetch", "dataflow_vuln_scan"], [snapshot["stage_name"] for snapshot in snapshots])
+    self.assertTrue(snapshots[0]["ready_for_terminalization"])
+    self.assertTrue(snapshots[1]["ready_for_terminalization"])
+    self.assertTrue(manager._workflow_ready_for_finalization(snapshots))
 
 
 def _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results(self):
@@ -40393,7 +40617,10 @@ TaskManagerTests.test_task_row_owner_runtime_supported_rejects_recent_remote_dis
 TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease
 TaskManagerTests.test_upsert_runtime_lease_recovers_from_duplicate_insert_race = _test_upsert_runtime_lease_recovers_from_duplicate_insert_race
 TaskManagerTests.test_stage_sequence_uses_pipeline_profile_for_source_kg_scan = _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan
+TaskManagerTests.test_virtual_archive_stage_status_delegates_to_handler = _test_virtual_archive_stage_status_delegates_to_handler
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary = _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary
+TaskManagerTests.test_build_stage_overview_nodes_marks_knowledge_graph_virtual_archive_success = _test_build_stage_overview_nodes_marks_knowledge_graph_virtual_archive_success
+TaskManagerTests.test_workflow_ready_for_finalization_supports_knowledge_graph_virtual_archive_stage = _test_workflow_ready_for_finalization_supports_knowledge_graph_virtual_archive_stage
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results = _test_stage_knowledge_graph_entry_fetch_empty_clears_previous_results
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate = _test_stage_knowledge_graph_entry_fetch_partial_entries_continue_polling_and_accumulate
 TaskManagerTests.test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries = _test_stage_knowledge_graph_entry_fetch_done_reuses_accumulated_entries

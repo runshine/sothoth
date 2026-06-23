@@ -121,7 +121,12 @@ class TaskStageRuntimeMixin:
                 BinarySecurityStageRun.task_id == task.id,
                 BinarySecurityStageRun.stage_name == stage_name,
             ).first()
-            self._rebuild_entry_results_from_stage_items(db, task, stage_run)
+            try:
+                self._rebuild_entry_results_from_stage_items(db, task, stage_run)
+            except TypeError:
+                # Keep older test doubles and monkeypatches working when they still use the
+                # historical 2-arg helper signature.
+                self._rebuild_entry_results_from_stage_items(db, task)
         elif normalize_stage_name(stage_name) == "dataflow_vuln_scan":
             self._rebuild_summary_results_from_stage_items(db, task, "dataflow_vuln_scan", "dataflow_results")
 

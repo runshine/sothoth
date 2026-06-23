@@ -3846,7 +3846,8 @@ class TaskReadModelServiceMixin:
                 latest_error=next((job.error_message for job in reversed(stage_jobs) if job.archive_status == "failed" and job.error_message), None),
                 jobs=stage_jobs,
             )
-            archive_status = self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
+            virtual_archive_status = self._virtual_archive_stage_status(db, task, stage_name)
+            archive_status = virtual_archive_status or self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
             terminal_item_count = sum(
                 1 for item in current_stage_items if (self._normalize_downstream_status(item.status) or item.status) in {"success", "failed", "partial_success", "cancelled"}
             )
@@ -3854,7 +3855,7 @@ class TaskReadModelServiceMixin:
                 (self._normalize_downstream_status(item.status) or item.status) not in {"success", "failed", "partial_success", "cancelled"}
                 for item in current_stage_items
             )
-            if archive_status == "success" and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
+            if archive_status == "success" and not virtual_archive_status and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
                 archive_status = "pending"
             if stage_name == "system_analysis" and summary.status == "waiting_confirmation":
                 archive_status = "pending"

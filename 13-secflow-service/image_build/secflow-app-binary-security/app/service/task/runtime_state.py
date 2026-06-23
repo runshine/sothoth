@@ -480,7 +480,14 @@ class TaskRuntimeStateServiceMixin:
                 lease = self._runtime_lease_for_task(session, task_id)
             finally:
                 session.close()
-        return self._runtime_lease_is_active(lease)
+        if lease is not None:
+            return self._runtime_lease_is_active(lease)
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        lease_expires_at = getattr(task, "lease_expires_at", None)
+        if not dispatcher_instance_id or lease_expires_at is None:
+            return False
+        remaining = task_shared._seconds_until(lease_expires_at)
+        return remaining is not None and remaining > 0
 
     def _next_lease_expiry(
         self: TaskManager,

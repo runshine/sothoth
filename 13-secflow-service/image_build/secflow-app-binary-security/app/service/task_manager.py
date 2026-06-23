@@ -9502,11 +9502,11 @@ class TaskManager(
 
     def _continue_stage_input_error(self, db: Session, task: BinarySecurityTask, stage_name: str) -> str | None:
         self._ensure_stage_inputs_available(db, task, stage_name)
+        summary = dict(task.summary or {})
         handler = self._stage_handler(stage_name)
         if handler is not None and normalize_stage_name(stage_name) in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "knowledge_graph_entry_fetch", "dataflow_vuln_scan"}:
             handler_reason = handler.continue_stage_input_error(self, db, task)
             return handler_reason
-        summary = dict(task.summary or {})
         if stage_name == "binary_to_source":
             inputs = list(summary.get("selected_modules") or [])
             if not inputs:
@@ -9533,7 +9533,7 @@ class TaskManager(
                 return "源码任务缺少输入目录，不能继续知识图谱入口获取阶段"
             return None
         if normalize_stage_name(stage_name) == "dataflow_vuln_scan":
-            inputs = list(summary.get("entry_results") or [])
+            inputs = list(self._entry_results(task) or [])
             if not inputs:
                 if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
                     return "知识图谱入口获取尚未产出可用入口结果，不能继续数据流漏洞挖掘阶段"
@@ -9671,6 +9671,18 @@ class TaskManager(
         if handler is not None:
             return handler.has_authoritative_success_payload(self, db, task)
         return False
+
+    def _virtual_archive_stage_status(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> str | None:
+        normalized_stage = normalize_stage_name(stage_name)
+        handler = self._stage_handler(normalized_stage)
+        if handler is None:
+            return None
+        return handler.archive_virtual_status(self, db, task)
 
     def _descendant_stages_for_stage(self, task: BinarySecurityTask, stage_name: str) -> list[str]:
         normalized_stage_name = str(stage_name or "").strip()
