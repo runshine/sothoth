@@ -369,6 +369,7 @@ class TaskResultServiceMixin:
             "stage_item_count",
             "stage_run_count",
             "archive_job_count",
+            "state_event_count",
         }
         non_zero = {key: value for key, value in checks.items() if key in blocking_keys and int(value or 0) > 0}
         if non_zero:
