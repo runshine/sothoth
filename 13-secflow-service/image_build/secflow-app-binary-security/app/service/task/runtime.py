@@ -1762,15 +1762,59 @@ class TaskRuntimeServiceMixin:
                     await handle.heartbeat_task
             cleanup_db = session_factory()
             try:
+                cleanup_completed = False
                 task = cleanup_db.query(task_manager_module.BinarySecurityTask).filter(
                     task_manager_module.BinarySecurityTask.id == task_id
                 ).first()
+                has_local_runtime_holder = bool(
+                    self._has_local_task_execution_owner(task_id)
+                    or self._task_has_active_streaming_stage_workers(task_id)
+                )
                 if (
-                    task is None
-                    or str(task.status or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES
-                    or (
-                        not self._has_local_task_execution_owner(task_id)
-                        and not self._task_has_active_streaming_stage_workers(task_id)
+                    task is not None
+                    and not has_local_runtime_holder
+                    and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+                    and str(task.status or "").strip().lower() not in task_manager_module.TASK_TERMINAL_STATUSES
+                ):
+                    active_operation = self._task_active_operation(cleanup_db, task)
+                    active_operation_status = (
+                        str(getattr(active_operation, "status", "") or "").strip().lower()
+                        if active_operation is not None else ""
+                    )
+                    if (
+                        active_operation_status in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+                        or str(task.status or "").strip().lower() in {"running", "dispatching", task_manager_module.TASK_STATUS_CANCELLING}
+                    ):
+                        self._requeue_owned_execution_takeover(
+                            cleanup_db,
+                            task,
+                            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                            reason=(
+                                "runtime_worker_exited_with_active_operation"
+                                if active_operation_status in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+                                else "runtime_worker_exited_without_active_holder"
+                            ),
+                            event_type="owned_execution_takeover_requeued",
+                            message=(
+                                "owner runtime 已退出，后台操作将由新的 worker 重新接管"
+                                if active_operation_status in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+                                else "owner runtime 已退出，任务已重新排队等待新的 worker 接管"
+                            ),
+                            event_payload={
+                                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                                "operation_type": str(getattr(active_operation, "operation_type", "") or "").strip() or None,
+                                "runtime_exit_after_active_commit": bool(active_commit_succeeded),
+                            },
+                        )
+                        cleanup_db.commit()
+                        cleanup_completed = True
+                if (
+                    not cleanup_completed
+                    and (
+                        task is None
+                        or str(task.status or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES
+                        or not has_local_runtime_holder
                     )
                 ):
                     clear_result = self._clear_runtime_lease(

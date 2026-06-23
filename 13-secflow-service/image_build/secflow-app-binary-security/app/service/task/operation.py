@@ -3177,13 +3177,7 @@ class TaskOperationServiceMixin:
     def _operation_requeue_family_types(self: TaskManager) -> set[str]:
         from app.service import task_manager as task_manager_module
 
-        return {
-            task_manager_module.TASK_ACTION_CONTINUE,
-            task_manager_module.TASK_ACTION_RETRY,
-            task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
-            task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
-            task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
-        }
+        return set(task_manager_module.TASK_OPERATION_REQUEUE_APPLIED_TYPES)
 
     def _operation_stale_threshold_seconds(self: TaskManager) -> int:
         configured = int(getattr(self.cfg.scheduler, "stale_operation_requeue_interval_seconds", 30) or 30)
@@ -4057,7 +4051,7 @@ class TaskOperationServiceMixin:
                     task_manager_module.BinarySecurityTaskOperation.id == operation.id
                 ).first()
                 if task_refreshed is not None:
-                    task.status = task_refreshed.status
+                    setattr(task, "status", task_refreshed.status)
                     task.current_operation_id = task_refreshed.current_operation_id
                     task.updated_at = task_refreshed.updated_at
                 if operation_refreshed is not None:
