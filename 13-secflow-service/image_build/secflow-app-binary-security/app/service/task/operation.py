@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy.orm.exc import ObjectDeletedError
 from sqlalchemy.orm import Session
 
 from app.exception import ValidationError
@@ -2761,6 +2762,8 @@ class TaskOperationServiceMixin:
 
         session_factory = task_manager_module.get_session_factory()
         db = session_factory()
+        operation_worker_registered = False
+        local_operation_worker = asyncio.current_task()
         started = time.perf_counter()
         operation_type = "unknown"
         task_deleted = False
@@ -2823,6 +2826,20 @@ class TaskOperationServiceMixin:
                 return False
 
             operation_type = operation.operation_type
+            normalized_operation_id = str(getattr(operation, "id", "") or "").strip()
+            async with self._operation_worker_lock:
+                existing_worker = self._operation_workers.get(normalized_operation_id)
+                if existing_worker is not None and existing_worker is not local_operation_worker and not existing_worker.done():
+                    task_manager_module.logger.info(
+                        "binary-security task owner skipped duplicate operation execution because a local worker is already active: "
+                        "task_id=%s operation_id=%s operation_type=%s",
+                        task_id,
+                        normalized_operation_id or None,
+                        str(operation.operation_type or "").strip() or None,
+                    )
+                    return False
+                self._operation_workers[normalized_operation_id] = local_operation_worker
+                operation_worker_registered = True
             should_record_start = str(getattr(operation, "status", "") or "").strip().lower() != "running"
             now_value = task_manager_module._now()
             self._capture_blocking_operation_task_snapshot(task, operation)
@@ -2853,6 +2870,28 @@ class TaskOperationServiceMixin:
             )
 
             await self._run_task_operation_steps(db, task, operation)
+            if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
+                task_deleted = (
+                    db.query(task_manager_module.BinarySecurityTask.id)
+                    .filter(task_manager_module.BinarySecurityTask.id == operation.task_id)
+                    .first()
+                    is None
+                )
+                if task_deleted:
+                    operation.status = "succeeded"
+                    operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+                    operation.finished_at = task_manager_module._now()
+                    operation.updated_at = operation.finished_at
+                    db.commit()
+                    task_manager_module.logger.info(
+                        "binary-security task owner finalized delete operation after task row disappeared: "
+                        "task_id=%s operation_id=%s operation_type=%s",
+                        task_id,
+                        operation.id,
+                        str(operation.operation_type or "").strip(),
+                    )
+                    task_manager_module.observe_control_operation(operation_type, "succeeded")
+                    return True
             if self._can_finalize_requeue_applied_operation_inline(db, task, operation):
                 finalized_inline = self._finalize_task_operation_after_requeue(
                     db,
@@ -2895,14 +2934,6 @@ class TaskOperationServiceMixin:
                     task_manager_module.observe_control_operation(operation_type, "succeeded")
                     return True
                 raise
-
-            if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
-                task_deleted = (
-                    db.query(task_manager_module.BinarySecurityTask.id)
-                    .filter(task_manager_module.BinarySecurityTask.id == operation.task_id)
-                    .first()
-                    is None
-                )
 
             operation.status = "succeeded"
             operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
@@ -2989,7 +3020,32 @@ class TaskOperationServiceMixin:
             )
             task_manager_module.observe_control_operation(operation_type, "succeeded")
             return True
-        except task_manager_module.StaleTaskExecution:
+        except (task_manager_module.StaleTaskExecution, ObjectDeletedError):
+            if (
+                "operation" in locals()
+                and operation is not None
+                and str(getattr(operation, "operation_type", "") or "").strip() == task_manager_module.TASK_ACTION_DELETE
+            ):
+                task_row_exists = (
+                    db.query(task_manager_module.BinarySecurityTask.id)
+                    .filter(task_manager_module.BinarySecurityTask.id == getattr(operation, "task_id", task_id))
+                    .first()
+                    is not None
+                )
+                if not task_row_exists:
+                    operation.status = "succeeded"
+                    operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+                    operation.finished_at = task_manager_module._now()
+                    operation.updated_at = operation.finished_at
+                    db.commit()
+                    task_manager_module.logger.info(
+                        "binary-security task owner treated delete operation as succeeded after task row was already removed: "
+                        "task_id=%s current_operation_id=%s",
+                        task_id,
+                        str(current_operation_id if "current_operation_id" in locals() else "") or None,
+                    )
+                    task_manager_module.observe_control_operation(operation_type, "succeeded")
+                    return True
             task_manager_module.logger.warning(
                 "binary-security task owner stopped operation consumption because task ownership became stale: "
                 "task_id=%s current_operation_id=%s",
@@ -3070,6 +3126,12 @@ class TaskOperationServiceMixin:
             task_manager_module.observe_control_operation(operation_type, "failed")
             return True
         finally:
+            if operation_worker_registered:
+                normalized_operation_id = str(getattr(operation, "id", "") or "").strip() if "operation" in locals() and operation is not None else ""
+                if normalized_operation_id:
+                    existing_worker = self._operation_workers.get(normalized_operation_id)
+                    if existing_worker is local_operation_worker:
+                        self._operation_workers.pop(normalized_operation_id, None)
             task_manager_module.observe_control_operation_duration(
                 operation_type=operation_type,
                 status="finished",

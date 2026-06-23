@@ -113,6 +113,7 @@ class BinarySecurityStageSummary(BinarySecurityBaseModel):
     stage_name: str
     sequence_no: int
     status: str
+    status_label: Optional[str] = None
     stage_terminalization_ready: bool = False
     stage_failure_escalation_ready: bool = False
     previous_stages_terminal: bool = False
@@ -136,6 +137,10 @@ class BinarySecurityStageSummary(BinarySecurityBaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     last_error: Optional[str] = None
+    authoritative_items_missing: bool = False
+    authoritative_rebuild_required: bool = False
+    authoritative_rebuild_reason: Optional[str] = None
+    historical_child_count: int = 0
     abnormal_reason: Optional["BinarySecurityAbnormalReason"] = None
 
 

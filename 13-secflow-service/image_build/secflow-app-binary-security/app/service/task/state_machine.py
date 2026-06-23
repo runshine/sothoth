@@ -1614,6 +1614,15 @@ class TaskStateMachineMixin:
             BinarySecurityStageRun.stage_name == normalized_stage,
         ).first()
         if existing_run is not None:
+            if normalized_stage == "entry_analysis":
+                rebuild_state = self._entry_analysis_authoritative_rebuild_required(
+                    db,
+                    task,
+                    stage_run=existing_run,
+                )
+                self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
+                if rebuild_state.get("required"):
+                    return False
             normalized_status = self._normalize_downstream_status(existing_run.status) or str(existing_run.status or "").strip()
             if normalized_status in {"pending", "queued", "running", "dispatching", "applying"}:
                 return True

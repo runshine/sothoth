@@ -9418,6 +9418,202 @@ class TaskManager(
             else:
                 self._rebuild_entry_results_from_stage_items(db, task)
 
+    def _entry_analysis_historical_child_count(self, db: Session, task: BinarySecurityTask) -> int:
+        if hasattr(db, "ea_tasks") and isinstance(getattr(db, "ea_tasks"), list):
+            return len(
+                [
+                    row
+                    for row in list(getattr(db, "ea_tasks") or [])
+                    if str(getattr(row, "parent_task_id", "") or "").strip() == str(task.id or "").strip()
+                    and str(getattr(row, "parent_stage_name", "") or "").strip() == "entry_analysis"
+                ]
+            )
+        try:
+            result = db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM secflow_app_ea_tasks
+                    WHERE parent_task_id = :parent_task_id
+                      AND parent_stage_name = :parent_stage_name
+                    """
+                ),
+                {"parent_task_id": task.id, "parent_stage_name": "entry_analysis"},
+            )
+            scalar = result.scalar() if result is not None else 0
+            return max(0, int(scalar or 0))
+        except Exception:
+            return 0
+
+    def _entry_analysis_authoritative_rebuild_required(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> dict[str, Any]:
+        stage_name = "entry_analysis"
+        normalized_stage_name = normalize_stage_name(stage_name)
+        current_items = self._stage_items(db, task.id, normalized_stage_name)
+        current_stage_item_count = len(current_items)
+        resolved_stage_run = stage_run
+        if resolved_stage_run is None:
+            resolved_stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == normalized_stage_name,
+            ).first()
+        stage_run_status = str(getattr(resolved_stage_run, "status", "") or "").strip() or None
+        inputs = self._entry_analysis_inputs(db, task)
+        input_count = len(inputs)
+        active_operation = self._task_active_operation(db, task)
+        historical_child_count = self._entry_analysis_historical_child_count(db, task)
+        reason = None
+        required = False
+        if resolved_stage_run is None:
+            reason = "stage_run_missing"
+        elif stage_run_status not in {"pending", "queued"}:
+            reason = "stage_run_not_pending"
+        elif current_stage_item_count > 0:
+            reason = "authoritative_items_present"
+        elif input_count <= 0:
+            reason = "missing_entry_analysis_inputs"
+        elif active_operation is not None:
+            reason = "active_operation_in_progress"
+        elif historical_child_count <= 0:
+            reason = "no_historical_entry_analysis_children"
+        else:
+            reason = "historical_children_exist_but_authoritative_items_missing"
+            required = True
+        return {
+            "required": required,
+            "reason": reason,
+            "stage_name": normalized_stage_name,
+            "input_count": input_count,
+            "historical_child_count": historical_child_count,
+            "current_stage_item_count": current_stage_item_count,
+            "stage_run_status": stage_run_status,
+        }
+
+    def _mark_entry_analysis_authoritative_rebuild_summary(
+        self,
+        task: BinarySecurityTask,
+        rebuild_state: dict[str, Any],
+    ) -> None:
+        stage_name = "entry_analysis"
+        stage_summary = dict(task.stage_summary or {})
+        current_summary = dict(stage_summary.get(stage_name) or {})
+        current_summary.update(
+            {
+                "authoritative_items_missing": bool(rebuild_state.get("current_stage_item_count", 0) == 0),
+                "authoritative_rebuild_required": bool(rebuild_state.get("required")),
+                "authoritative_rebuild_reason": rebuild_state.get("reason"),
+                "historical_child_count": int(rebuild_state.get("historical_child_count") or 0),
+            }
+        )
+        if rebuild_state.get("required"):
+            current_summary["status_label"] = "待补建"
+        stage_summary[stage_name] = current_summary
+        task.stage_summary = stage_summary
+
+    def _rebuild_missing_entry_analysis_stage_items_from_inputs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> dict[str, Any]:
+        rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
+        self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
+        if not rebuild_state.get("required"):
+            if rebuild_state.get("reason") not in {
+                "authoritative_items_present",
+                "missing_entry_analysis_inputs",
+                "stage_run_missing",
+            }:
+                self._record_event(
+                    db,
+                    task,
+                    "entry_analysis_authoritative_items_rebuild_skipped",
+                    "入口分析 authoritative item 补建已跳过",
+                    stage_name="entry_analysis",
+                    payload=dict(rebuild_state),
+                )
+            return {"rebuilt": False, "rebuilt_item_count": 0, **rebuild_state}
+        resolved_stage_run = stage_run or self._ensure_stage_run(db, task, "entry_analysis")
+        self._record_event(
+            db,
+            task,
+            "entry_analysis_authoritative_items_missing_detected",
+            "检测到入口分析 authoritative item 丢失，准备补建",
+            stage_name="entry_analysis",
+            level="warning",
+            payload=dict(rebuild_state),
+        )
+        self._record_event(
+            db,
+            task,
+            "entry_analysis_authoritative_items_rebuild_started",
+            "入口分析 authoritative item 补建开始",
+            stage_name="entry_analysis",
+            payload=dict(rebuild_state),
+        )
+        rebuilt_item_count = 0
+        try:
+            for module in self._entry_analysis_inputs(db, task):
+                item = self._upsert_stage_item(
+                    db,
+                    task=task,
+                    stage_run=resolved_stage_run,
+                    stage_name="entry_analysis",
+                    item_key=module["module_key"],
+                    item_name=module["module_name"],
+                    parent_key=module.get("firmware_key"),
+                    downstream_service="entry_analyse",
+                    input_ref=module,
+                    retrying=False,
+                    auto_retrying=False,
+                )
+                item.status = "pending"
+                item.downstream_task_id = None
+                item.started_at = None
+                item.finished_at = None
+                item.error_message = None
+                rebuilt_item_count += 1
+            resolved_stage_run.counts = self._stage_counts(db, resolved_stage_run)
+            completed_state = {
+                **rebuild_state,
+                "required": False,
+                "reason": "authoritative_items_rebuilt",
+                "current_stage_item_count": rebuilt_item_count,
+                "rebuilt_item_count": rebuilt_item_count,
+            }
+            self._mark_entry_analysis_authoritative_rebuild_summary(task, completed_state)
+            self._record_event(
+                db,
+                task,
+                "entry_analysis_authoritative_items_rebuild_finished",
+                "入口分析 authoritative item 补建完成",
+                stage_name="entry_analysis",
+                payload=dict(completed_state),
+            )
+            return {"rebuilt": True, **completed_state}
+        except Exception as exc:
+            failed_state = {
+                **rebuild_state,
+                "rebuilt_item_count": rebuilt_item_count,
+                "error": str(exc),
+            }
+            self._record_event(
+                db,
+                task,
+                "entry_analysis_authoritative_items_rebuild_failed",
+                "入口分析 authoritative item 补建失败",
+                stage_name="entry_analysis",
+                level="error",
+                payload=failed_state,
+            )
+            raise
+
     def _rebuild_summary_results_from_stage_items(
         self,
         db: Session,
@@ -10889,6 +11085,7 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
+        self._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task, stage_run=stage_run)
         b2s_success = self._entry_analysis_inputs(db, task)
         if not b2s_success:
             return "failed", {"error": self._missing_entry_analysis_input_reason(db, task)}

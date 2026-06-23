@@ -204,6 +204,7 @@ class _ModelAwareDb:
         operations=None,
         project_configs=None,
         service_configs=None,
+        ea_tasks=None,
     ):
         self.tasks = list(tasks or [])
         self.stage_runs = list(stage_runs or [])
@@ -217,6 +218,7 @@ class _ModelAwareDb:
         self.operations = list(operations or [])
         self.project_configs = list(project_configs or [])
         self.service_configs = list(service_configs or [])
+        self.ea_tasks = list(ea_tasks or [])
         self.added = []
 
     def query(self, model, *args, **kwargs):
@@ -5845,6 +5847,164 @@ class TaskManagerTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             with self.manager._task_operation_lock(db, "task-1", operation="unit_test"):
                 pass
+
+    def test_entry_analysis_authoritative_rebuild_required_when_historical_children_exist(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            summary={
+                "selected_modules": [
+                    {"module_key": "m1", "module_name": "mod1", "firmware_key": "fw1"},
+                ]
+            },
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        historical_child = SimpleNamespace(parent_task_id=task.id, parent_stage_name="entry_analysis")
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[], ea_tasks=[historical_child])
+
+        with patch.object(
+            self.manager,
+            "_entry_analysis_inputs",
+            return_value=[{"module_key": "m1", "module_name": "mod1", "firmware_key": "fw1"}],
+        ):
+            rebuild_state = self.manager._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
+
+        self.assertTrue(rebuild_state["required"])
+        self.assertEqual("historical_children_exist_but_authoritative_items_missing", rebuild_state["reason"])
+        self.assertEqual(1, rebuild_state["historical_child_count"])
+
+    def test_entry_analysis_authoritative_rebuild_skips_without_historical_children(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            summary={
+                "selected_modules": [
+                    {"module_key": "m1", "module_name": "mod1", "firmware_key": "fw1"},
+                ]
+            },
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        with patch.object(
+            self.manager,
+            "_entry_analysis_inputs",
+            return_value=[{"module_key": "m1", "module_name": "mod1", "firmware_key": "fw1"}],
+        ):
+            rebuild_state = self.manager._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
+
+        self.assertFalse(rebuild_state["required"])
+        self.assertEqual("no_historical_entry_analysis_children", rebuild_state["reason"])
+
+    def test_rebuild_missing_entry_analysis_stage_items_from_inputs_creates_pending_authoritative_items(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            summary={
+                "selected_modules": [
+                    {"module_key": "m1", "module_name": "mod1", "firmware_key": "fw1"},
+                    {"module_key": "m2", "module_name": "mod2", "firmware_key": "fw2"},
+                ]
+            },
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        historical_child = SimpleNamespace(parent_task_id=task.id, parent_stage_name="entry_analysis")
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[], ea_tasks=[historical_child])
+
+        with patch.object(
+            self.manager,
+            "_entry_analysis_inputs",
+            return_value=[
+                {"module_key": "m1", "module_name": "mod1", "firmware_key": "fw1"},
+                {"module_key": "m2", "module_name": "mod2", "firmware_key": "fw2"},
+            ],
+        ):
+            result = self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task, stage_run=stage_run)
+
+        self.assertTrue(result["rebuilt"])
+        self.assertEqual(2, result["rebuilt_item_count"])
+        self.assertEqual(["m1", "m2"], [item.item_key for item in db.stage_items])
+        self.assertTrue(all(item.status == "pending" for item in db.stage_items))
+        self.assertTrue(all(not item.downstream_task_id for item in db.stage_items))
+        self.assertEqual("待补建", task.stage_summary["entry_analysis"]["status_label"])
+
+    def test_stage_entry_analysis_rebuilds_missing_authoritative_items_before_execution(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+        with (
+            patch.object(
+                self.manager,
+                "_rebuild_missing_entry_analysis_stage_items_from_inputs",
+                wraps=self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs,
+            ) as rebuild_missing,
+            patch.object(
+                self.manager,
+                "_entry_analysis_inputs",
+                return_value=[{"module_key": "m2", "module_name": "mod2", "firmware_key": "fw2"}],
+            ),
+            patch.object(
+                self.manager,
+                "_prepare_stage_items_for_execution",
+                return_value=[{"module_key": "m2", "module_name": "mod2", "firmware_key": "fw2"}],
+            ),
+            patch.object(
+                self.manager,
+                "_run_stage_pool",
+                new=AsyncMock(return_value=[{"status": "success", "item": {"module_key": "m2"}, "entries": [{"entry_key": "e1", "function_name": "main"}]}]),
+            ),
+        ):
+            task.stage_summary = {"entry_analysis": {"status": "pending"}}
+            db.ea_tasks = [SimpleNamespace(parent_task_id=task.id, parent_stage_name="entry_analysis")]
+            status, summary = asyncio.run(self.manager._stage_entry_analysis(db, task, stage_run, token=None, retry_existing=False))
+
+        self.assertEqual("success", status)
+        self.assertEqual(["m2"], [item.item_key for item in db.stage_items])
+        rebuild_missing.assert_called()
+        self.assertEqual(1, summary["success_count"])
 
     def test_runtime_status_reports_dispatch_loops(self):
         self.manager._running = True
@@ -34843,6 +35003,111 @@ def _test_run_current_task_operation_stops_on_stale_task_ownership(self):
     self.assertFalse(result)
 
 
+def _test_run_current_task_operation_skips_duplicate_local_operation_worker(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-duplicate-op-worker",
+        project_id="p1",
+        name="source",
+        status="running",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        current_operation_id="op-duplicate",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-duplicate",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="delete",
+        status="accepted",
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    original_ensure = manager._ensure_task_write_ownership
+    original_run_steps = manager._run_task_operation_steps
+
+    async def _should_not_run(_db, _task, _operation):
+        raise AssertionError("duplicate local operation worker should skip execution")
+
+    class _ActiveWorker:
+        @staticmethod
+        def done():
+            return False
+
+    duplicate_worker = _ActiveWorker()
+    manager._operation_workers[operation.id] = duplicate_worker
+    task_manager_module.get_session_factory = lambda: (lambda: db)
+    manager._ensure_task_write_ownership = lambda *args, **kwargs: None
+    manager._run_task_operation_steps = _should_not_run
+    try:
+        result = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        manager._operation_workers.clear()
+        task_manager_module.get_session_factory = original_factory
+        manager._ensure_task_write_ownership = original_ensure
+        manager._run_task_operation_steps = original_run_steps
+
+    self.assertFalse(result)
+    self.assertEqual("accepted", operation.status)
+
+
+def _test_run_current_task_operation_treats_delete_as_succeeded_when_task_row_removed(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-delete-row-removed",
+        project_id="p1",
+        name="source",
+        status="running",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        current_operation_id="op-delete-row-removed",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-delete-row-removed",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="delete",
+        status="accepted",
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    original_ensure = manager._ensure_task_write_ownership
+    original_run_steps = manager._run_task_operation_steps
+
+    async def _delete_task_row(_db, _task, _operation):
+        db.delete(task)
+
+    task_manager_module.get_session_factory = lambda: (lambda: db)
+    manager._ensure_task_write_ownership = lambda *args, **kwargs: None
+    manager._run_task_operation_steps = _delete_task_row
+    try:
+        result = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._ensure_task_write_ownership = original_ensure
+        manager._run_task_operation_steps = original_run_steps
+
+    self.assertTrue(result)
+    self.assertEqual("succeeded", operation.status)
+    self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+
+
 def _test_run_current_task_operation_finalizes_after_requeue_owner_handoff(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -41662,6 +41927,8 @@ TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _te
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
 TaskManagerTests.test_run_current_task_operation_finalizes_requeue_applied_operation_inline = _test_run_current_task_operation_finalizes_requeue_applied_operation_inline
 TaskManagerTests.test_run_current_task_operation_restores_preaccept_snapshot_on_retry_failure = _test_run_current_task_operation_restores_preaccept_snapshot_on_retry_failure
+TaskManagerTests.test_run_current_task_operation_skips_duplicate_local_operation_worker = _test_run_current_task_operation_skips_duplicate_local_operation_worker
+TaskManagerTests.test_run_current_task_operation_treats_delete_as_succeeded_when_task_row_removed = _test_run_current_task_operation_treats_delete_as_succeeded_when_task_row_removed
 TaskManagerTests.test_owned_execution_takeover_requeue_uses_stage_name_for_main_state = _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state
 TaskManagerTests.test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window = _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window
 TaskManagerTests.test_repair_running_lease_invariant_requeues_without_owner_write_block = _test_repair_running_lease_invariant_requeues_without_owner_write_block

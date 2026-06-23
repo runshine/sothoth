@@ -67,6 +67,36 @@ class TaskStateMachineTests(unittest.TestCase):
 
         self.assertTrue(should_advance)
 
+    def test_should_auto_advance_to_stage_blocks_entry_analysis_pending_shell_when_rebuild_required(self):
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_stage_items", return_value=[]),
+            patch.object(
+                self.manager,
+                "_entry_analysis_authoritative_rebuild_required",
+                return_value={
+                    "required": True,
+                    "reason": "historical_children_exist_but_authoritative_items_missing",
+                    "historical_child_count": 1,
+                    "current_stage_item_count": 0,
+                },
+            ),
+            patch.object(self.manager, "_mark_entry_analysis_authoritative_rebuild_summary"),
+        ):
+            should_advance = self.manager._should_auto_advance_to_stage(db, task, "entry_analysis")
+
+        self.assertFalse(should_advance)
+
     def test_decide_task_resume_after_stage_reset_reports_blocked_reason(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
         db = _ModelAwareDb(tasks=[task])

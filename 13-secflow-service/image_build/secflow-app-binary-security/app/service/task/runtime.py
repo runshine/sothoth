@@ -1866,6 +1866,13 @@ class TaskRuntimeServiceMixin:
                     )
                     db.commit()
                     continue
+                stage_run = self._ensure_stage_run(db, task, stage_name)
+                if stage_name == "entry_analysis":
+                    self._rebuild_missing_entry_analysis_stage_items_from_inputs(
+                        db,
+                        task,
+                        stage_run=stage_run,
+                    )
                 start_event = self._enqueue_state_event(
                     db,
                     task=task,
@@ -1885,7 +1892,6 @@ class TaskRuntimeServiceMixin:
                     },
                 )
                 handler = self._run_stage_executor
-                stage_run = self._ensure_stage_run(db, task, stage_name)
                 existing_stage_items = self._stage_items(db, task.id, stage_name) if task_retry_mode else []
                 db.commit()
                 retry_existing = False

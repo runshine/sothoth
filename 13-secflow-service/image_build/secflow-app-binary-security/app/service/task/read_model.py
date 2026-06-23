@@ -3668,6 +3668,18 @@ class TaskReadModelServiceMixin:
             run = runs_by_stage.get(stage_name)
             stage_items = items_by_stage.get(stage_name, [])
             stage_snapshot = workflow_snapshots.get(stage_name, {})
+            rebuild_state = (
+                self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=run)
+                if stage_name == "entry_analysis"
+                else {
+                    "required": False,
+                    "reason": None,
+                    "historical_child_count": 0,
+                    "current_stage_item_count": len(stage_items),
+                }
+            )
+            if stage_name == "entry_analysis":
+                self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
             current_downstream_status_counts = dict((downstream_status_counts or {}).get(stage_name, {}))
             if not current_downstream_status_counts:
                 for item in stage_items:
@@ -3699,6 +3711,7 @@ class TaskReadModelServiceMixin:
                 stage_name=stage_name,
                 sequence_no=run.sequence_no if run else index,
                 status=self._business_stage_status(task, stage_name, run, stage_items, db=db),
+                status_label="待补建" if rebuild_state.get("required") else None,
                 stage_terminalization_ready=bool(stage_snapshot.get("ready_for_terminalization")),
                 stage_failure_escalation_ready=bool(stage_snapshot.get("ready_for_failure_escalation")),
                 previous_stages_terminal=bool(stage_snapshot.get("previous_stages_terminal")),
@@ -3721,6 +3734,10 @@ class TaskReadModelServiceMixin:
                 downstream_status_counts=current_downstream_status_counts,
                 started_at=run.started_at if run else None,
                 finished_at=run.finished_at if run else None,
+                authoritative_items_missing=bool(stage_name == "entry_analysis" and not stage_items and rebuild_state.get("historical_child_count", 0) > 0),
+                authoritative_rebuild_required=bool(rebuild_state.get("required")),
+                authoritative_rebuild_reason=self._string_or_none(rebuild_state.get("reason")),
+                historical_child_count=int(rebuild_state.get("historical_child_count") or 0),
                 last_error=(
                     run.last_error
                     if run and run.last_error
