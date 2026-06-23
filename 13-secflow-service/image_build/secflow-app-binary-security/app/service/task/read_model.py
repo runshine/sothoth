@@ -37,6 +37,7 @@ def _schedule_user_task_id_value(task) -> str | None:
 class TaskReadModelServiceMixin:
     def _manual_operation_state_from_active_operation(
         self: TaskManager,
+        db: Session,
         task,
         active_operation,
     ) -> dict[str, Any]:
@@ -67,7 +68,7 @@ class TaskReadModelServiceMixin:
         task_owner = str(task.dispatcher_instance_id or "").strip() or None
         age_seconds = self._task_operation_age_seconds(active_operation)
         is_stale = bool(age_seconds is not None and age_seconds >= float(self._operation_stale_threshold_seconds()))
-        requeue_applied = bool(self._operation_requeue_applied(task, active_operation))
+        requeue_applied = bool(self._operation_requeue_applied(task, active_operation, db=db))
         auto_reconcile_candidate = bool(
             is_stale
             and str(getattr(active_operation, "operation_type", "") or "").strip() in self._operation_requeue_family_types()
@@ -3051,6 +3052,7 @@ class TaskReadModelServiceMixin:
 
     def _build_task_list_manual_operation_state(
         self: TaskManager,
+        db: Session,
         task,
         *,
         stage_summaries,
@@ -3059,7 +3061,7 @@ class TaskReadModelServiceMixin:
         from app.service import task_manager as task_manager_module
 
         if active_operation is not None:
-            return self._manual_operation_state_from_active_operation(task, active_operation)
+            return self._manual_operation_state_from_active_operation(db, task, active_operation)
         running_statuses = {"pending", "dispatching", "running"}
         running = str(task.status or "").strip() in running_statuses
         has_failed_stage = any(summary.status in {"failed", "downstream_missing", "cancelled"} for summary in stage_summaries)
@@ -3183,7 +3185,7 @@ class TaskReadModelServiceMixin:
 
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
-            return self._manual_operation_state_from_active_operation(task, active_operation)
+            return self._manual_operation_state_from_active_operation(db, task, active_operation)
         has_stage_retry = any(bool(summary.retry_full_supported) for summary in stage_summaries)
         has_stage_retry_failed = any(bool(summary.retry_failed_supported) for summary in stage_summaries)
         has_item_level_stage_retry_failed = self._has_retryable_failed_stage_items(db, task)
@@ -3325,6 +3327,7 @@ class TaskReadModelServiceMixin:
             stale_synced_item_count,
         ) = self._task_sync_status_view(stage_items)
         manual_operation_state = self._build_task_list_manual_operation_state(
+            db,
             task,
             stage_summaries=stage_summaries,
             active_operation=active_operation,

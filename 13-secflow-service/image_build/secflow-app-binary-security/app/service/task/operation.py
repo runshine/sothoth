@@ -3262,6 +3262,8 @@ class TaskOperationServiceMixin:
         self: TaskManager,
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
+        *,
+        db: Session | None = None,
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
@@ -3283,7 +3285,15 @@ class TaskOperationServiceMixin:
             if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
                 return False
         elif task_status != "pending":
-            return False
+            # Requeue-family operations may already have resumed normal owned execution
+            # before the operation row itself is finalized. Treat that takeover window as
+            # "requeue applied" when a live runtime lease proves healthy progress.
+            if task_status not in {"running", "dispatching"}:
+                return False
+            if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                return False
+            if not self._lease_is_active(task, db=db):
+                return False
         if target_stage and str(task.current_stage or "").strip() != target_stage:
             return False
         if task.last_error not in {None, ""}:
@@ -3298,7 +3308,7 @@ class TaskOperationServiceMixin:
     ) -> bool:
         if str(getattr(operation, "operation_type", "") or "").strip() not in self._operation_requeue_family_types():
             return False
-        if not self._operation_requeue_applied(task, operation):
+        if not self._operation_requeue_applied(task, operation, db=db):
             return False
         if str(getattr(task, "current_operation_id", "") or "").strip() != str(getattr(operation, "id", "") or "").strip():
             return False
@@ -3341,7 +3351,7 @@ class TaskOperationServiceMixin:
             return False
         if str(getattr(refreshed_task, "current_operation_id", "") or "").strip() not in {"", operation_id}:
             return False
-        if not self._operation_requeue_applied(refreshed_task, refreshed_operation) and str(getattr(refreshed_operation, "current_step", "") or "").strip() != task_manager_module.TASK_OPERATION_STEP_SUCCEEDED:
+        if not self._operation_requeue_applied(refreshed_task, refreshed_operation, db=db) and str(getattr(refreshed_operation, "current_step", "") or "").strip() != task_manager_module.TASK_OPERATION_STEP_SUCCEEDED:
             return False
         refreshed_operation.status = "succeeded"
         refreshed_operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
@@ -3396,7 +3406,7 @@ class TaskOperationServiceMixin:
         if age_seconds is None or age_seconds < float(self._operation_stale_threshold_seconds()):
             return False
         task_manager_module.observe_control_operation_stale(operation_type, age_seconds=age_seconds)
-        if self._operation_requeue_applied(task, operation):
+        if self._operation_requeue_applied(task, operation, db=db):
             finalized = self._finalize_task_operation_after_requeue(
                 db,
                 task_id=task.id,
@@ -3698,8 +3708,10 @@ class TaskOperationServiceMixin:
         self: TaskManager,
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
+        *,
+        db: Session | None = None,
     ) -> bool:
-        return self._operation_requeue_applied(task, operation)
+        return self._operation_requeue_applied(task, operation, db=db)
 
     def _can_resume_retry_operation_in_place(
         self: TaskManager,
