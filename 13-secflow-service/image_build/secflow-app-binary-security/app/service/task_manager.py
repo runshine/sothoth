@@ -357,7 +357,7 @@ __all__ = [
 
 
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
-STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
+STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading"}
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 TASK_STATUS_PENDING_ENTRY_CONFIRMATION = "pending_entry_confirmation"
 TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
@@ -391,6 +391,10 @@ TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
     TASK_ACTION_CANCEL,
     TASK_ACTION_DELETE,
     "force_reset_to_pending",
+}
+TASK_OPERATION_OWNER_GUARDED_TYPES = {
+    TASK_ACTION_CANCEL,
+    TASK_ACTION_DELETE,
 }
 TASK_OPERATION_ACTIVE_STATUSES = {"requested", "accepted", "queued", "claimed", "running"}
 TASK_OPERATION_TERMINAL_STATUSES = {"succeeded", "failed", "superseded", "cancelled"}
@@ -2305,6 +2309,43 @@ class TaskManager(
             "recent_progress": recent_progress,
         }
 
+    def _control_operation_takeover_window_active(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> bool:
+        if task is None:
+            return False
+        operation = active_operation
+        if operation is None:
+            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            if current_operation_id:
+                operation = (
+                    db.query(BinarySecurityTaskOperation)
+                    .filter(BinarySecurityTaskOperation.id == current_operation_id)
+                    .first()
+                )
+        snapshot = self._operation_runtime_snapshot(operation)
+        if snapshot["operation_status"] not in TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        if snapshot["operation_id"] != str(getattr(task, "current_operation_id", "") or "").strip():
+            return False
+        if snapshot["operation_type"] not in TASK_OPERATION_OWNER_GUARDED_TYPES:
+            return False
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
+            return False
+        takeover_window_seconds = max(30, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
+        dispatch_started_at = getattr(task, "dispatch_started_at", None)
+        dispatch_age_seconds = _elapsed_seconds_since(dispatch_started_at)
+        if dispatch_age_seconds is not None and dispatch_age_seconds <= takeover_window_seconds:
+            return True
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        return False
+
     def _task_has_supported_control_operation_runtime(
         self,
         db: Session,
@@ -2328,9 +2369,27 @@ class TaskManager(
             return False
         if snapshot["operation_id"] != str(getattr(task, "current_operation_id", "") or "").strip():
             return False
+        if snapshot["operation_type"] not in TASK_OPERATION_OWNER_GUARDED_TYPES:
+            return False
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        if self._control_operation_takeover_window_active(
+            db,
+            task,
+            active_operation=operation,
+        ):
+            return True
+        runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        if (
+            self._runtime_lease_is_active(runtime_lease)
+            and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+        ):
+            return True
+        if self._task_owner_runtime_supported_locally(task, active_operation=operation):
+            return True
         if not snapshot["local_operation_worker_alive"]:
             return False
         if not snapshot["recent_progress"]:
@@ -2465,6 +2524,28 @@ class TaskManager(
             else None
         )
         if previous_dispatcher_instance_id is None and active_runtime_lease_owner is None:
+            return False
+        if self._task_has_supported_control_operation_runtime(db, task, active_operation=active_operation):
+            self._record_event(
+                db,
+                task,
+                "task_owner_release_deferred_for_control_operation_takeover",
+                "检测到控制操作仍处于合法接管窗口，本次不释放 owner",
+                level="info",
+                stage_name=task.current_stage,
+                payload={
+                    "reason": reason,
+                    "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    "dispatcher_instance_id": previous_dispatcher_instance_id,
+                    "active_runtime_lease_owner": active_runtime_lease_owner,
+                    "takeover_window_active": self._control_operation_takeover_window_active(
+                        db,
+                        task,
+                        active_operation=active_operation,
+                    ),
+                    "operation_runtime": self._operation_runtime_snapshot(active_operation),
+                },
+            )
             return False
         if self._task_row_owner_is_runtime_supported(db, task, active_operation=active_operation):
             return False
@@ -2681,7 +2762,7 @@ class TaskManager(
     ) -> BinarySecurityTaskDetailResponse:
         del updated_by, authorization_token
         task = self._task_or_404(db, project_id, task_id)
-        if task.status not in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status not in {"pending_upload", "uploading", "pending"}:
             raise ValidationError(f"当前状态不允许确认上传完成: {task.status}")
         declared = self._normalize_input_files(
             payload.files or [BinarySecurityInputFile(**item) for item in task.summary.get("input_files") or []],
@@ -2755,10 +2836,12 @@ class TaskManager(
         self._set_task_status(
             db,
             task,
-            "ready_to_start",
-            reason="输入文件上传完成，任务已就绪",
+            "pending",
+            reason="输入文件上传完成，任务已进入调度队列",
             source="task_manager",
+            stage_name=self._stage_sequence_for_task(task)[0],
         )
+        task.current_stage = self._stage_sequence_for_task(task)[0]
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
@@ -2786,15 +2869,16 @@ class TaskManager(
                 else {}
             ),
         }
-        await self._write_task_metadata_async(task, input_dir / "task-metadata.json", status="ready_to_start")
+        await self._write_task_metadata_async(task, input_dir / "task-metadata.json", status="pending")
         self._record_event(db, task, "task_upload_completed", "输入文件上传完成", payload={"uploaded_files": len(actual_files)})
-        self._record_event(db, task, "task_ready_to_start", "任务已就绪，准备自动启动")
+        self._record_event(db, task, "task_start_requested", "输入文件已就绪，任务已自动进入调度队列")
         db.commit()
-        return self.start_task(db, project_id=project_id, task_id=task_id)
+        self._enqueue_task(task.id)
+        return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def start_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
         task = self._task_or_404(db, project_id, task_id)
-        if task.status not in {"ready_to_start", "failed", "partial_success"}:
+        if task.status not in {"failed", "partial_success"}:
             if task.status in {"pending", "running"}:
                 return self.get_task_detail(db, project_id=project_id, task_id=task_id)
             raise ValidationError(f"当前状态不允许启动任务: {task.status}")
@@ -6269,7 +6353,6 @@ class TaskManager(
             "running",
             "pending_upload",
             "uploading",
-            "ready_to_start",
             TASK_STATUS_PENDING_MODULE_CONFIRMATION,
         }
         stats = BinarySecurityProjectStats(total=len(tasks))
@@ -7066,7 +7149,7 @@ class TaskManager(
         normalized = (status or "").lower()
         if normalized in {"downstream_missing", "not_found", "missing", "task_not_found"}:
             return "downstream_missing"
-        if normalized in {"pending", "queued", "created", "ready", "ready_to_start", "awaiting_takeover", "retry_preparing"}:
+        if normalized in {"pending", "queued", "created", "ready", "awaiting_takeover", "retry_preparing"}:
             return "pending"
         if normalized == "dispatching":
             return "dispatching"
@@ -7840,10 +7923,11 @@ class TaskManager(
         observed_payload: dict[str, Any] | None = None,
     ) -> tuple[str, str | None]:
         hard_reset_verified = bool(task is not None and self._retry_cleanup_is_hard_reset_verified(task))
+        bound_downstream_task_id = str(item.downstream_task_id or "").strip() or None
         if active_payload is not None:
             status = self._map_downstream_status(str(active_payload.get("status") or ""))
             if status in {"pending", "queued", "dispatching", "running"}:
-                if hard_reset_verified:
+                if hard_reset_verified or not bound_downstream_task_id:
                     return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, status
                 return RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, status
         payload = observed_payload if isinstance(observed_payload, dict) else None
@@ -7852,6 +7936,8 @@ class TaskManager(
             raw_status = self._status_from_downstream_payload(payload, success_statuses={"success", "partial_success", "completed", "passed", "succeeded"})
         mapped_status = raw_status or self._latest_observed_downstream_status(item) or str(item.status or "").strip().lower() or None
         mapped_status = self._map_downstream_status(str(mapped_status or "")) or (str(mapped_status or "").strip().lower() or None)
+        if not bound_downstream_task_id and mapped_status in {"success", "pending", "queued", "dispatching", "running"}:
+            return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, mapped_status
         if mapped_status == "success":
             return RETRY_CHILD_STRATEGY_REUSE_SUCCESS, mapped_status
         if mapped_status in {"pending", "queued", "dispatching", "running"}:
@@ -8882,7 +8968,7 @@ class TaskManager(
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status in {"pending_upload", "uploading"}:
             return False, "当前任务尚未完成输入准备，不能重试", None
         blocked_statuses = {"pending", "dispatching", "running"}
         if task.status in blocked_statuses:

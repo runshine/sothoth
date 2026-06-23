@@ -923,12 +923,13 @@ class TaskControlServiceMixin:
             if task_type == task_manager_module.TASK_TYPE_BINARY_MODULE
             else "firmware_files"
         )
-        task_status = "ready_to_start" if path_input is not None else "pending_upload"
+        task_status = "pending" if path_input is not None else "pending_upload"
         firmware_path = (
             str(path_input["firmware_path"])
             if path_input is not None
             else str(input_dir)
         )
+        initial_stage_name = self._stage_sequence_for_task_type(task_type)[0]
         task = task_manager_module.BinarySecurityTask(
             id=task_id,
             project_id=project_id,
@@ -938,7 +939,7 @@ class TaskControlServiceMixin:
             schedule_user_task_id=str(payload.schedule_user_task_id or "").strip() or None,
             created_by=created_by,
             status=task_status,
-            current_stage=None,
+            current_stage=initial_stage_name if path_input is not None else None,
             firmware_name=f"{len(input_files)} files",
             firmware_source="project_filesystem",
             firmware_path=firmware_path,
@@ -1020,11 +1021,17 @@ class TaskControlServiceMixin:
         await self._write_task_metadata_async(task, metadata_path, status=task_status)
         self._record_event(db, task, "task_created", f"创建任务 {task.id}", payload={"input_files": input_files})
         if path_input is not None:
-            self._record_event(db, task, "task_ready_to_start", "共享路径输入校验完成，任务已就绪")
+            self._record_event(db, task, "task_start_requested", "共享路径输入校验完成，任务已自动进入调度队列")
+            if task_type == task_manager_module.TASK_TYPE_BINARY:
+                self._record_event(db, task, "firmware_items_initialized", f"已初始化 {len(input_files)} 个固件输入")
+            else:
+                self._record_event(db, task, "source_tree_initialized", f"已初始化源码工程输入，共 {len(input_files)} 个文件")
         else:
             self._record_event(db, task, "task_upload_pending", "任务创建完成，等待上传文件")
         task_manager_module.observe_task_lifecycle("created", status=task.status, task_type=self._task_type(task))
         db.commit()
+        if path_input is not None:
+            self._enqueue_task(task.id)
         return self.get_task_detail(db, project_id=project_id, task_id=task.id)
 
     async def cancel_task(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:

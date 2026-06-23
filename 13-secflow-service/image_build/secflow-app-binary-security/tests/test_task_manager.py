@@ -8615,8 +8615,92 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
         self.assertEqual("local-worker", task.dispatcher_instance_id)
         self.assertEqual([], queued)
-        self.assertIn("task_owner_release_deferred_for_active_cancel_finalize", events)
+        self.assertIn("control_operation_reclaim_deferred_for_supported_runtime", events)
         self.assertNotIn("task_row_owner_released_without_local_runtime", events)
+
+    def test_task_row_owner_is_runtime_supported_accepts_active_delete_with_local_operation_runtime(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="local-worker",
+            dispatch_started_at=_now() - timedelta(seconds=5),
+            lease_expires_at=_now() + timedelta(seconds=60),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            target_stage="system_analysis",
+            status="running",
+            current_step=task_manager_module.TASK_OPERATION_STEP_DELETE_DOWNSTREAM,
+            updated_at=_now(),
+        )
+        operation.step_payload = {
+            task_manager_module.TASK_OPERATION_STEP_DELETE_DOWNSTREAM: {
+                "status": "running",
+                "updated_at": _now().isoformat(),
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+        self.manager.instance_id = "local-worker"
+        self.manager._operation_workers["op1"] = SimpleNamespace(done=lambda: False)
+
+        try:
+            supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        finally:
+            self.manager._operation_workers.pop("op1", None)
+
+        self.assertTrue(supported)
+
+    def test_lease_is_active_accepts_stale_runtime_lease_during_local_control_takeover_window(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status=task_manager_module.TASK_STATUS_CANCELLING,
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="local-worker",
+            dispatch_started_at=_now() - timedelta(seconds=5),
+            lease_expires_at=_now() + timedelta(seconds=60),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_CANCEL,
+            target_stage="system_analysis",
+            status="queued",
+            updated_at=_now(),
+        )
+        stale_lease = BinarySecurityTaskRuntimeLease(
+            task_id="t1",
+            execution_epoch=1,
+            owner_instance_id="local-worker",
+            heartbeat_at=_now() - timedelta(minutes=2),
+            lease_expires_at=_now() - timedelta(seconds=1),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[stale_lease])
+        self.manager.instance_id = "local-worker"
+
+        active = self.manager._lease_is_active(task, db=db)
+
+        self.assertTrue(active)
 
     def test_task_row_owner_is_runtime_supported_rejects_active_operation_without_owner_support(self):
         task = BinarySecurityTask(
@@ -26950,6 +27034,27 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("adopt_active", strategy)
         self.assertEqual("running", observed)
 
+    def test_classify_retry_downstream_strategy_does_not_adopt_active_without_bound_child(self):
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            status="running",
+            result={"downstream_status": "running"},
+        )
+
+        strategy, observed = self.manager._classify_retry_downstream_strategy(
+            item,
+            active_payload={"task_id": "eat-running", "status": "running"},
+        )
+
+        self.assertEqual("recreate_from_abnormal", strategy)
+        self.assertEqual("running", observed)
+
     def test_classify_retry_downstream_strategy_recreates_abnormal_status(self):
         item = BinarySecurityStageItem(
             id="si1",
@@ -34010,7 +34115,7 @@ def _test_dispatch_task_by_id_claims_ownerless_active_operation(self):
     claimed = manager._dispatch_task_by_id(db, task.id)
 
     self.assertEqual(task.id, claimed)
-    self.assertEqual("dispatching", task.status)
+    self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
     self.assertEqual("local-worker", task.dispatcher_instance_id)
     self.assertIsNotNone(task.lease_expires_at)
 
@@ -34046,7 +34151,7 @@ def _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_han
     claimed = manager._dispatch_task_by_id(db, task.id)
 
     self.assertEqual(task.id, claimed)
-    self.assertEqual("dispatching", task.status)
+    self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
     self.assertEqual("local-worker", task.dispatcher_instance_id)
     self.assertEqual(operation.id, task.current_operation_id)
     self.assertIsNotNone(task.dispatch_started_at)
@@ -37827,6 +37932,120 @@ def _test_run_task_active_commit_failure_releases_fake_dispatching_owner(self):
     self.assertEqual("dispatching_active_commit_failed_without_runtime_lease", (takeover_event.payload or {}).get("takeover_reason"))
 
 
+def _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-cancel-runtime",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        current_stage="dataflow_vuln_scan",
+        current_operation_id="op-cancel",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now()
+    task.lease_expires_at = _now() + timedelta(seconds=120)
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        target_stage="dataflow_vuln_scan",
+        status="queued",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    original_run_current_task_operation = manager._run_current_task_operation
+    original_execute = manager._execute_task
+    run_statuses: list[str] = []
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+
+        async def _fake_run_current_task_operation(_task_id: str) -> bool:
+            run_statuses.append(str(task.status or ""))
+            task.current_operation_id = None
+            task.status = "cancelled"
+            return False
+
+        async def _unexpected_execute(_task_id: str):
+            raise AssertionError("business execution should not run while cancel operation is active")
+
+        manager._run_current_task_operation = _fake_run_current_task_operation
+        manager._execute_task = _unexpected_execute
+        asyncio.run(manager._run_task(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._run_current_task_operation = original_run_current_task_operation
+        manager._execute_task = original_execute
+
+    self.assertEqual([task_manager_module.TASK_STATUS_CANCELLING], run_statuses)
+
+
+def _test_run_current_task_operation_cancel_success_repairs_reopened_running_task(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-cancel-repair",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        current_operation_id="op-cancel-repair",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now()
+    task.lease_expires_at = _now() + timedelta(seconds=120)
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-repair",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        target_stage="dataflow_vuln_scan",
+        status="running",
+        current_step=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+    )
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
+    original_factory = task_manager_module.get_session_factory
+    original_runner = manager._run_task_operation_steps
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+
+        async def _fake_run_task_operation_steps(_db, current_task, current_operation):
+            current_task.status = "running"
+            current_task.current_operation_id = current_operation.id
+            current_task.finished_at = _now()
+            return None
+
+        manager._run_task_operation_steps = _fake_run_task_operation_steps
+        changed = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._run_task_operation_steps = original_runner
+
+    self.assertTrue(changed)
+    self.assertEqual("cancelled", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+    self.assertIsNone(task.current_operation_id)
+    self.assertIsNone(task.dispatcher_instance_id)
+
+
 def _test_sync_task_row_lease_view_from_owner_blocks_non_owner(self):
     manager = TaskManager()
     manager.instance_id = "worker-a"
@@ -38358,6 +38577,8 @@ TaskManagerTests.test_release_unsupported_task_row_owner_repairs_stale_active_op
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel = _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
+TaskManagerTests.test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption = _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption
+TaskManagerTests.test_run_current_task_operation_cancel_success_repairs_reopened_running_task = _test_run_current_task_operation_cancel_success_repairs_reopened_running_task
 TaskManagerTests.test_run_current_task_operation_stops_on_stale_task_ownership = _test_run_current_task_operation_stops_on_stale_task_ownership
 TaskManagerTests.test_run_current_task_operation_finalizes_after_requeue_owner_handoff = _test_run_current_task_operation_finalizes_after_requeue_owner_handoff
 TaskManagerTests.test_run_current_task_operation_finalizes_after_requeue_owner_handoff_for_retry_family = _test_run_current_task_operation_finalizes_after_requeue_owner_handoff_for_retry_family

@@ -28,7 +28,7 @@ class TaskLifecycleServiceMixin:
 
         if operation is None:
             return False
-        if str(getattr(operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_CANCEL:
+        if str(getattr(operation, "operation_type", "") or "").strip() not in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES:
             return False
         if str(getattr(task, "current_operation_id", "") or "").strip() != str(getattr(operation, "id", "") or "").strip():
             return False
@@ -67,12 +67,12 @@ class TaskLifecycleServiceMixin:
                 self._record_event(
                     db,
                     task,
-                    "task_owner_release_deferred_for_active_cancel_finalize",
-                    "检测到取消收尾窗口仍由当前 control operation 正常推进，本次不释放 owner",
+                    "control_operation_reclaim_deferred_for_supported_runtime",
+                    "检测到控制操作仍由当前 authoritative runtime 正常推进，本次不释放 owner",
                     level="info",
                     stage_name=task.current_stage,
                     payload={
-                        "reason_code": "cancel_finalize_window_runtime_supported",
+                        "reason_code": "control_operation_runtime_supported_by_takeover_window",
                         "current_operation_id": str(getattr(operation, "id", "") or "").strip() or None,
                         "operation_runtime": self._operation_runtime_snapshot(operation),
                     },

@@ -694,6 +694,12 @@ class TaskRuntimeServiceMixin:
             return None
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
+        next_task_status = "dispatching"
+        active_operation_type = str(getattr(current_operation, "operation_type", "") or "").strip()
+        if has_active_operation and active_operation_type == task_manager_module.TASK_ACTION_CANCEL:
+            next_task_status = task_manager_module.TASK_STATUS_CANCELLING
+        elif has_active_operation and active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES and current_status and current_status != "pending":
+            next_task_status = current_status
         updated = (
             db.query(task_manager_module.BinarySecurityTask)
             .filter(
@@ -702,7 +708,7 @@ class TaskRuntimeServiceMixin:
             )
             .update(
                 {
-                    task_manager_module.BinarySecurityTask.status: "dispatching",
+                    task_manager_module.BinarySecurityTask.status: next_task_status,
                     task_manager_module.BinarySecurityTask.runtime_phase: task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     task_manager_module.BinarySecurityTask.dispatcher_instance_id: self.instance_id,
                     task_manager_module.BinarySecurityTask.dispatch_started_at: started_at,
@@ -1410,9 +1416,42 @@ class TaskRuntimeServiceMixin:
                     "binary-security run_task aborted before execution because task row is missing: task_id=%s",
                     task_id,
                 )
+            active_operation = self._task_active_operation(db, task)
+            active_operation_type = str(getattr(active_operation, "operation_type", "") or "").strip()
+            control_operation_takeover = (
+                active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES
+                and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+            )
+            if control_operation_takeover:
+                try:
+                    self._upsert_runtime_lease(
+                        db,
+                        task,
+                        now_value=task_manager_module._now(),
+                        owner_instance_id=self.instance_id,
+                    )
+                except task_manager_module.StaleTaskExecution:
+                    task_manager_module.logger.warning(
+                        "binary-security run_task abandoned control operation takeover because runtime lease is owned by another live instance: "
+                        "task_id=%s current_operation_id=%s dispatcher_instance_id=%s",
+                        task_id,
+                        str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                        str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    )
+                    return
             if (
                 task is None
-                or task.status != "dispatching"
+                or (
+                    task.status != "dispatching"
+                    and not (
+                        str(getattr(task, "status", "") or "").strip() == task_manager_module.TASK_STATUS_CANCELLING
+                        and self._task_has_active_cancel_operation(db, task)
+                    )
+                    and not (
+                        control_operation_takeover
+                        and str(getattr(task, "current_operation_id", "") or "").strip()
+                    )
+                )
                 or task.dispatcher_instance_id != self.instance_id
                 or not self._lease_is_active(task, db=db)
             ):
@@ -1441,14 +1480,37 @@ class TaskRuntimeServiceMixin:
                 task.started_at = task_manager_module._now()
             started_at = task_manager_module._now()
             execution_token = started_at.isoformat()
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="runtime_worker",
-                reason="任务进入调度执行",
-                status="running",
-                stage_name=task.current_stage,
-            )
+            if active_operation_type == task_manager_module.TASK_ACTION_CANCEL:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    reason="取消控制操作接管 owner 执行",
+                    status=task_manager_module.TASK_STATUS_CANCELLING,
+                    stage_name=task.current_stage,
+                    finished_at=None,
+                    last_error=None,
+                )
+            elif active_operation_type == task_manager_module.TASK_ACTION_DELETE:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    reason="删除控制操作接管 owner 执行",
+                    status=str(getattr(task, "status", "") or "").strip() or "running",
+                    stage_name=task.current_stage,
+                    finished_at=None,
+                    last_error=None,
+                )
+            else:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    reason="任务进入调度执行",
+                    status="running",
+                    stage_name=task.current_stage,
+                )
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
             self._sync_task_row_lease_view_from_owner(
                 db,

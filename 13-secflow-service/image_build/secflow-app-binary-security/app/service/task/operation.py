@@ -2915,6 +2915,48 @@ class TaskOperationServiceMixin:
                 )
                 if refreshed_task is not None and str(getattr(refreshed_task, "current_operation_id", "") or "").strip() == operation.id:
                     refreshed_task.current_operation_id = None
+                if (
+                    refreshed_task is not None
+                    and operation.operation_type in {
+                        task_manager_module.TASK_ACTION_CANCEL,
+                        task_manager_module.TASK_ACTION_DELETE,
+                    }
+                    and (
+                        (
+                            operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                            and str(getattr(refreshed_task, "status", "") or "").strip() != "cancelled"
+                        )
+                        or (
+                            operation.operation_type == task_manager_module.TASK_ACTION_DELETE
+                            and str(getattr(refreshed_task, "status", "") or "").strip().lower() in {"running", "dispatching"}
+                        )
+                        or self._task_runtime_phase(refreshed_task) != task_manager_module.TASK_RUNTIME_PHASE_TERMINAL
+                        or getattr(refreshed_task, "dispatcher_instance_id", None) is not None
+                        or getattr(refreshed_task, "dispatch_started_at", None) is not None
+                        or getattr(refreshed_task, "lease_expires_at", None) is not None
+                    )
+                ):
+                    self._apply_task_main_state_update(
+                        db,
+                        refreshed_task,
+                        source="task_operation",
+                        reason=(
+                            "取消操作完成后统一收敛任务到取消终态"
+                            if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                            else "删除操作完成后统一清理控制面 owner 与 lease"
+                        ),
+                        status=(
+                            "cancelled"
+                            if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                            else str(getattr(refreshed_task, "status", "") or "").strip() or None
+                        ),
+                        stage_name=operation.target_stage or refreshed_task.current_stage,
+                        runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
+                        finished_at=getattr(refreshed_task, "finished_at", None) or task_manager_module._now(),
+                        last_error=None,
+                        clear_runtime_owner=True,
+                    )
+                    self._invalidate_task_execution(refreshed_task)
                 if refreshed_task is not None:
                     if operation.operation_type in self._operation_requeue_family_types():
                         self._record_operation_event(

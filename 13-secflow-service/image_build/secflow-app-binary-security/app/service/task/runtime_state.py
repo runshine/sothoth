@@ -478,7 +478,14 @@ class TaskRuntimeStateServiceMixin:
             finally:
                 session.close()
         if lease is not None:
-            return self._runtime_lease_is_active(lease)
+            if self._runtime_lease_is_active(lease):
+                return True
+            if db is not None and self._control_operation_takeover_window_active(db, task):
+                lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip()
+                dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+                if dispatcher_instance_id and dispatcher_instance_id == str(self.instance_id or "").strip():
+                    if not lease_owner or lease_owner == dispatcher_instance_id:
+                        return True
         remaining = task_manager_module._seconds_until(task.lease_expires_at)
         return remaining is not None and remaining > 0
 

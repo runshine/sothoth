@@ -46,7 +46,7 @@ from app.service.task_manager import get_task_manager
 from app.time_utils import UTC_PLUS_8
 
 
-def _utc_plus_8_log_converter(timestamp: float):
+def _utc_plus_8_log_converter(timestamp: float, *_unused):
     return datetime.fromtimestamp(timestamp, UTC_PLUS_8).timetuple()
 
 
