@@ -60,7 +60,8 @@ class EntryAnalysisStageHandler(BinarySecurityStageHandler):
         ]
 
     def archive_input_signature(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
-        entry_results = manager._effective_entry_inputs(task)
+        del db
+        entry_results = manager._entry_results(task)
         entries: list[dict[str, Any]] = []
         for row in entry_results:
             if isinstance(row, dict):

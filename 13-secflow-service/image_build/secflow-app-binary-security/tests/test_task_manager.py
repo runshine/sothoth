@@ -34656,6 +34656,41 @@ def _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without
     self.assertFalse(supported)
 
 
+def _test_dispatch_task_by_id_skips_non_pending_task_when_active_runtime_lease_matches_owner(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-active-lease-owned",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        dispatch_started_at=now_value - timedelta(seconds=5),
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=1,
+        owner_instance_id="remote-worker",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], runtime_leases=[lease])
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertIsNone(claimed)
+    self.assertEqual("running", task.status)
+    self.assertEqual("remote-worker", task.dispatcher_instance_id)
+
+
 def _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -38880,6 +38915,7 @@ TaskManagerTests.test_dispatch_task_by_id_claims_foreign_owner_delete_operation_
 TaskManagerTests.test_release_unsupported_task_row_owner_repairs_stale_active_operations = _test_release_unsupported_task_row_owner_repairs_stale_active_operations
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel = _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel
+TaskManagerTests.test_dispatch_task_by_id_skips_non_pending_task_when_active_runtime_lease_matches_owner = _test_dispatch_task_by_id_skips_non_pending_task_when_active_runtime_lease_matches_owner
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
 TaskManagerTests.test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption = _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption
 TaskManagerTests.test_run_current_task_operation_cancel_success_repairs_reopened_running_task = _test_run_current_task_operation_cancel_success_repairs_reopened_running_task

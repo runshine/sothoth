@@ -507,7 +507,7 @@ class TaskRuntimeServiceMixin:
         queue = task_manager_module.get_task_queue()
         seed_batch_size = max(1, int(getattr(self.cfg.queue, "seed_batch_size", 20) or 20))
         task_rows = (
-            db.query(task_manager_module.BinarySecurityTask.id)
+            db.query(task_manager_module.BinarySecurityTask)
             .filter(task_manager_module.BinarySecurityTask.status.in_(["pending", "dispatching", "running"]))
             .order_by(
                 task_manager_module.BinarySecurityTask.updated_at.asc(),
@@ -517,8 +517,11 @@ class TaskRuntimeServiceMixin:
             .limit(seed_batch_size)
             .all()
         )
-        for (task_id,) in task_rows:
-            await queue.push_task(str(task_id))
+        for task in task_rows:
+            current_status = str(getattr(task, "status", "") or "").strip().lower()
+            if current_status != "pending" and self._task_row_owner_is_runtime_supported(db, task):
+                continue
+            await queue.push_task(str(task.id))
         operation_rows = (
             db.query(task_manager_module.BinarySecurityTaskOperation.task_id)
             .filter(task_manager_module.BinarySecurityTaskOperation.status.in_(["pending", "queued", "running", "accepted"]))
@@ -697,6 +700,12 @@ class TaskRuntimeServiceMixin:
                     db.commit()
                     self._enqueue_task(task.id)
                     return None
+        if (
+            current_status != "pending"
+            and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
+            and not owner_guarded_control_operation
+        ):
+            return None
         if has_active_operation and not operation_allows_runtime_resume:
             if (
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()

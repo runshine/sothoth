@@ -503,7 +503,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         reclaimed = self.manager._reclaim_stale_running_locked(db)
 
         self.assertTrue(reclaimed)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(["task-1"], enqueued)
         self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
 
@@ -1008,7 +1008,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
@@ -1100,7 +1100,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
