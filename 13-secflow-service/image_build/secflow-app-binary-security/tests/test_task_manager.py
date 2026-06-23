@@ -34945,6 +34945,89 @@ def _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_q
     self.assertFalse(supported)
 
 
+def _test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-cancel-owner-stale",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        dispatch_started_at=_now() - timedelta(minutes=5),
+        lease_expires_at=_now() - timedelta(minutes=4),
+    )
+    db = _ModelAwareDb(tasks=[task], runtime_leases=[])
+
+    supported = manager._task_row_owner_is_runtime_supported(db, task)
+
+    self.assertFalse(supported)
+
+
+def _test_should_skip_readless_reconcile_for_active_task_uses_runtime_lease_without_status_gate(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-readless-active",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        lease_expires_at=_now() + timedelta(minutes=2),
+    )
+
+    original_lease_is_active = manager._lease_is_active
+    try:
+        manager._lease_is_active = lambda _task, db=None: True
+        supported = manager._should_skip_readless_reconcile_for_active_task(task)
+    finally:
+        manager._lease_is_active = original_lease_is_active
+
+    self.assertTrue(supported)
+
+
+def _test_should_preserve_task_dispatch_ownership_uses_runtime_lease_without_status_gate(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-preserve-owner",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        lease_expires_at=_now() + timedelta(minutes=2),
+    )
+
+    original_lease_is_active = manager._lease_is_active
+    try:
+        manager._lease_is_active = lambda _task, db=None: True
+        supported = manager._should_preserve_task_dispatch_ownership(
+            task,
+            previous_status=task_manager_module.TASK_STATUS_CANCELLING,
+            db=None,
+        )
+    finally:
+        manager._lease_is_active = original_lease_is_active
+
+    self.assertTrue(supported)
+
+
 def _test_upsert_runtime_lease_recovers_from_duplicate_insert_race(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -42107,6 +42190,9 @@ TaskManagerTests.test_reclaim_stale_dispatching_releases_runtime_lease_missing_l
 TaskManagerTests.test_repair_running_lease_invariant_requeues_without_owner_write_block = _test_repair_running_lease_invariant_requeues_without_owner_write_block
 TaskManagerTests.test_clear_runtime_lease_returns_retry_later_for_lock_timeout = _test_clear_runtime_lease_returns_retry_later_for_lock_timeout
 TaskManagerTests.test_run_task_active_commit_failure_releases_fake_dispatching_owner = _test_run_task_active_commit_failure_releases_fake_dispatching_owner
+TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status = _test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status
+TaskManagerTests.test_should_skip_readless_reconcile_for_active_task_uses_runtime_lease_without_status_gate = _test_should_skip_readless_reconcile_for_active_task_uses_runtime_lease_without_status_gate
+TaskManagerTests.test_should_preserve_task_dispatch_ownership_uses_runtime_lease_without_status_gate = _test_should_preserve_task_dispatch_ownership_uses_runtime_lease_without_status_gate
 TaskManagerTests.test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success = _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success
 TaskManagerTests.test_finalize_gate_blocks_when_active_children_exist = _test_finalize_gate_blocks_when_active_children_exist
 TaskManagerTests.test_finalize_gate_allows_when_workflow_terminal_and_children_terminal = _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal

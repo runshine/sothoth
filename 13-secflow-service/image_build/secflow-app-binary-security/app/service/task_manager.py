@@ -2543,9 +2543,6 @@ class TaskManager(
                 )
         operation_status = str(getattr(operation, "status", "") or "").strip().lower() if operation is not None else ""
         has_active_operation = operation_status in TASK_OPERATION_ACTIVE_STATUSES
-        current_status = str(getattr(task, "status", "") or "").strip().lower()
-        if current_status not in {"dispatching", "running"} and not has_active_operation:
-            return True
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if not dispatcher_instance_id:
             return not has_active_operation
@@ -7896,10 +7893,6 @@ class TaskManager(
         return summary
 
     def _should_skip_readless_reconcile_for_active_task(self, task: BinarySecurityTask) -> bool:
-        status = str(task.status or "").strip()
-        active_statuses = {"running", "dispatching"}
-        if status not in active_statuses:
-            return False
         if not str(task.dispatcher_instance_id or "").strip():
             return False
         return self._lease_is_active(task)
@@ -7911,9 +7904,7 @@ class TaskManager(
         previous_status: str | None = None,
         db: Session | None = None,
     ) -> bool:
-        status = str(previous_status if previous_status is not None else task.status or "").strip()
-        if status not in {"running", "dispatching"}:
-            return False
+        del previous_status
         if not str(task.dispatcher_instance_id or "").strip():
             return False
         return self._lease_is_active(task, db=db)
