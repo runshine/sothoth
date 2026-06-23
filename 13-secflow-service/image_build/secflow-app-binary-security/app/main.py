@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
 from contextlib import suppress
@@ -42,6 +43,14 @@ from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_st
 from app.service.registry import get_registry_service
 from app.service.task_queue import close_task_queue
 from app.service.task_manager import get_task_manager
+from app.time_utils import UTC_PLUS_8
+
+
+def _utc_plus_8_log_converter(timestamp: float):
+    return datetime.fromtimestamp(timestamp, UTC_PLUS_8).timetuple()
+
+
+logging.Formatter.converter = _utc_plus_8_log_converter
 
 
 logging.basicConfig(

@@ -50,8 +50,8 @@ class TaskRuntimeStateServiceMixin:
             "from_stage": str(from_stage or "").strip() or None,
             "to_stage": str(to_stage or "").strip() or None,
             "reason": str(reason or "").strip() or None,
-            "created_at": now_value.isoformat(),
-            "expires_at": (now_value + task_manager_module.timedelta(seconds=ttl_seconds)).isoformat(),
+            "created_at": task_shared._isoformat_or_none(now_value),
+            "expires_at": task_shared._isoformat_or_none(now_value + task_manager_module.timedelta(seconds=ttl_seconds)),
         }
         summary = dict(getattr(task, "summary", None) or {})
         summary["runtime_transition_guard"] = guard
@@ -1039,7 +1039,7 @@ class TaskRuntimeStateServiceMixin:
         self._apply_task_main_state_update(
             db,
             task,
-            source="runtime_state",
+            source="runtime_reclaim",
             reason="检测到运行中任务缺少有效租约，重置为待执行",
             status="pending",
             stage_name=next_stage_name,

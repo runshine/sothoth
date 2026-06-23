@@ -804,7 +804,7 @@ class TaskReadModelServiceMixin:
             stage_run.stage_name: {
                 "status": stage_run.status,
                 "counts": dict(stage_run.counts or {}),
-                "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+                "finished_at": task_shared._isoformat_or_none(stage_run.finished_at),
                 "last_error": stage_run.last_error,
             },
         }

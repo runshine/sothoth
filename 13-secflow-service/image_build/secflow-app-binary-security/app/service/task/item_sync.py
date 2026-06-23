@@ -16,6 +16,7 @@ from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySec
 from app.observability import observe_downstream_reconcile_observation, observe_task_readless_reconcile
 from app.service.readless_sync import ReadlessSyncStats
 from app.schemas import BinarySecurityActionResponse
+from app.time_utils import now_local, parse_local_iso_datetime
 
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager, _TaskStateSnapshot
@@ -53,7 +54,7 @@ class TaskItemSyncServiceMixin:
         if not candidates:
             return False
         stale_threshold_seconds = self._stage_item_sync_stale_seconds()
-        now_value = datetime.now()
+        now_value = now_local()
         for item in candidates:
             sync_at = self._stage_item_sync_attempt_at_value(item)
             if sync_at is None:
@@ -61,10 +62,7 @@ class TaskItemSyncServiceMixin:
             if sync_at is None:
                 raw = dict(getattr(item, "result", {}) or {}).get("downstream_status_synced_at")
                 if isinstance(raw, str) and raw.strip():
-                    try:
-                        sync_at = datetime.fromisoformat(raw)
-                    except ValueError:
-                        sync_at = None
+                    sync_at = parse_local_iso_datetime(raw)
             if sync_at is None:
                 continue
             if (now_value - sync_at).total_seconds() >= stale_threshold_seconds:
@@ -210,7 +208,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -237,7 +235,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -249,7 +247,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -284,7 +282,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -298,7 +296,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 

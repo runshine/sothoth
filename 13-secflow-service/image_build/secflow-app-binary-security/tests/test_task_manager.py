@@ -11407,6 +11407,33 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("pending", task.status)
             self.assertEqual([], db.archive_jobs)
 
+    def test_retry_task_persists_preaccept_task_state_snapshot(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+            execution_mode=None,
+            target_stage_name=None,
+            last_error="old failure",
+        )
+        db = _AppendingModelAwareDb(tasks=[task])
+
+        operation = self.manager.retry_task(db, project_id="p1", task_id="t1")
+
+        snapshot = dict(operation.request_payload or {}).get("task_state_snapshot") or {}
+        self.assertEqual("failed", snapshot.get("status"))
+        self.assertEqual("entry_analysis", snapshot.get("current_stage"))
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, snapshot.get("runtime_phase"))
+        self.assertEqual("old failure", snapshot.get("last_error"))
+
     def test_retry_task_end_to_end_requeues_streaming_tail_failed_task(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -15837,6 +15864,76 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("succeeded", step_payload["collect_cleanup_plan"]["status"])
         self.assertEqual("failed", step_payload["verify_cleanup_state"]["status"])
         self.assertNotIn("requeue_task", step_payload)
+
+    def test_validate_hard_restart_cleanup_allows_timeline_event_residue(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_items=[],
+            stage_runs=[],
+            archive_jobs=[],
+            state_events=[],
+            events=[
+                BinarySecurityEvent(
+                    id="evt1",
+                    task_id="task1",
+                    project_id="p1",
+                    level="info",
+                    event_type="operation_step_started",
+                    message="verify cleanup",
+                )
+            ],
+        )
+
+        checks = self.manager._validate_hard_restart_cleanup(db, task)
+
+        self.assertEqual(1, checks["timeline_event_count"])
+        self.assertEqual(0, checks["state_event_count"])
+
+    def test_validate_hard_restart_cleanup_allows_state_event_residue(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_items=[],
+            stage_runs=[],
+            archive_jobs=[],
+            events=[],
+            state_events=[
+                BinarySecurityStateEvent(
+                    id="se1",
+                    task_id="task1",
+                    project_id="p1",
+                    stage_name="system_analysis",
+                    event_type="retry_cleanup_verification_failed",
+                    payload_json="{}",
+                )
+            ],
+        )
+
+        checks = self.manager._validate_hard_restart_cleanup(db, task)
+
+        self.assertEqual(0, checks["timeline_event_count"])
+        self.assertEqual(1, checks["state_event_count"])
 
     def test_classify_retry_downstream_strategy_forces_recreate_after_hard_reset_cleanup_verified(self):
         task = BinarySecurityTask(
@@ -29912,6 +30009,8 @@ def _test_http_429_timeline_events_are_compressed(self):
     self.assertTrue(timeline.events[0].compressed)
     self.assertEqual(2, timeline.events[0].repeat_count)
     self.assertIn("已压缩 2 次", timeline.events[0].message)
+    self.assertTrue(str(timeline.events[0].payload.get("compressed_first_created_at") or "").endswith("+08:00"))
+    self.assertTrue(str(timeline.events[0].payload.get("compressed_last_created_at") or "").endswith("+08:00"))
 
 
 def _test_defer_item_after_downstream_transport_error_preserves_vuln_replacement_marker(self):
@@ -37537,10 +37636,12 @@ def _test_reclaim_stale_running_streaming_tail_requeues_for_takeover(self):
         def flush(self):
             pass
 
+    db = _ReclaimDb()
+    db.events = []
     original_loader = self.manager._load_service_config
     self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
     try:
-        reclaimed = self.manager._reclaim_stale_running_locked(_ReclaimDb())
+        reclaimed = self.manager._reclaim_stale_running_locked(db)
     finally:
         self.manager._load_service_config = original_loader
 
@@ -37550,6 +37651,47 @@ def _test_reclaim_stale_running_streaming_tail_requeues_for_takeover(self):
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertIsNone(task.dispatch_started_at)
     self.assertIsNone(task.lease_expires_at)
+    self.assertFalse(any(event.event_type == "main_state_write_blocked" for event in db.events))
+
+
+def _test_repair_running_lease_invariant_requeues_without_owner_write_block(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-new"
+    task = BinarySecurityTask(
+        id="task-running-lease-missing",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-dead",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.updated_at = _now() - timedelta(minutes=10)
+    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+    repaired = manager._repair_running_lease_invariant(
+        db,
+        task,
+        reason="unit_test_running_without_active_lease",
+        stage_name="dataflow_vuln_scan",
+        event_payload={"source": "unit_test"},
+    )
+
+    self.assertTrue(repaired)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("dataflow_vuln_scan", task.current_stage)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertTrue(any(event.event_type == "running_without_active_lease_requeued" for event in db.events))
+    self.assertFalse(any(event.event_type == "main_state_write_blocked" for event in db.events))
 
 
 def _test_run_task_records_takeover_resume_event_for_streaming_tail(self):
@@ -39915,6 +40057,75 @@ def _test_run_current_task_operation_finalizes_requeue_applied_operation_inline(
     self.assertIn("operation_succeeded", event_types)
 
 
+def _test_run_current_task_operation_restores_preaccept_snapshot_on_retry_failure(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-retry-failure-restore",
+        project_id="p1",
+        name="source",
+        status="running",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        current_operation_id="op-retry-failure",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+        lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-retry-failure",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry",
+        target_stage="firmware_unpack",
+        status="accepted",
+        request_payload={
+            "target_stage": "firmware_unpack",
+            "task_state_snapshot": {
+                "status": "failed",
+                "current_stage": "entry_analysis",
+                "runtime_phase": TASK_RUNTIME_PHASE_TERMINAL,
+                "last_error": "old failure",
+                "execution_mode": None,
+                "target_stage_name": None,
+            },
+        },
+    )
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="local-worker",
+        lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    original_run_steps = manager._run_task_operation_steps
+
+    async def _boom(_db, _task, _operation):
+        raise ValidationError("cleanup verify failed")
+
+    task_manager_module.get_session_factory = lambda: (lambda: db)
+    manager._run_task_operation_steps = _boom
+    try:
+        result = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._run_task_operation_steps = original_run_steps
+
+    self.assertTrue(result)
+    self.assertEqual("failed", operation.status)
+    self.assertIsNone(task.current_operation_id)
+    self.assertEqual("failed", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("operation_failed", event_types)
+
+
 def _test_record_downstream_sync_event_trims_task_sync_events_to_10000(self):
     task = BinarySecurityTask(
         id="task-sync-trim",
@@ -40393,8 +40604,10 @@ TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_run
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
 TaskManagerTests.test_run_current_task_operation_finalizes_requeue_applied_operation_inline = _test_run_current_task_operation_finalizes_requeue_applied_operation_inline
+TaskManagerTests.test_run_current_task_operation_restores_preaccept_snapshot_on_retry_failure = _test_run_current_task_operation_restores_preaccept_snapshot_on_retry_failure
 TaskManagerTests.test_owned_execution_takeover_requeue_uses_stage_name_for_main_state = _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state
 TaskManagerTests.test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window = _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window
+TaskManagerTests.test_repair_running_lease_invariant_requeues_without_owner_write_block = _test_repair_running_lease_invariant_requeues_without_owner_write_block
 TaskManagerTests.test_clear_runtime_lease_returns_retry_later_for_lock_timeout = _test_clear_runtime_lease_returns_retry_later_for_lock_timeout
 TaskManagerTests.test_run_task_active_commit_failure_releases_fake_dispatching_owner = _test_run_task_active_commit_failure_releases_fake_dispatching_owner
 TaskManagerTests.test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success = _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success

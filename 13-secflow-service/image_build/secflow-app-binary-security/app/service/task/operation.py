@@ -25,6 +25,20 @@ if TYPE_CHECKING:
 
 
 class TaskOperationServiceMixin:
+    def _blocking_operation_task_snapshot_payload(
+        self: TaskManager,
+        task: BinarySecurityTask,
+    ) -> dict[str, Any]:
+        return {
+            "status": str(getattr(task, "status", "") or "").strip() or None,
+            "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
+            "runtime_phase": self._task_runtime_phase(task),
+            "last_error": str(getattr(task, "last_error", "") or "").strip() or None,
+            "finished_at": task_shared._isoformat_or_none(getattr(task, "finished_at", None)),
+            "execution_mode": str(getattr(task, "execution_mode", "") or "").strip() or None,
+            "target_stage_name": str(getattr(task, "target_stage_name", "") or "").strip() or None,
+        }
+
     def _capture_blocking_operation_task_snapshot(
         self: TaskManager,
         task: BinarySecurityTask,
@@ -35,15 +49,7 @@ class TaskOperationServiceMixin:
         payload = dict(getattr(operation, "request_payload", None) or {})
         if isinstance(payload.get("task_state_snapshot"), dict):
             return
-        payload["task_state_snapshot"] = {
-            "status": str(getattr(task, "status", "") or "").strip() or None,
-            "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
-            "runtime_phase": self._task_runtime_phase(task),
-            "last_error": str(getattr(task, "last_error", "") or "").strip() or None,
-            "finished_at": task_shared._isoformat_or_none(getattr(task, "finished_at", None)),
-            "execution_mode": str(getattr(task, "execution_mode", "") or "").strip() or None,
-            "target_stage_name": str(getattr(task, "target_stage_name", "") or "").strip() or None,
-        }
+        payload["task_state_snapshot"] = self._blocking_operation_task_snapshot_payload(task)
         operation.request_payload = payload
 
     def _restore_failed_blocking_operation_task_snapshot(
@@ -347,9 +353,12 @@ class TaskOperationServiceMixin:
             created_at=task_manager_module._now(),
             updated_at=task_manager_module._now(),
         )
+        payload = dict(request_payload or {})
+        if self._operation_blocks_runtime_resume(operation) and not isinstance(payload.get("task_state_snapshot"), dict):
+            payload["task_state_snapshot"] = self._blocking_operation_task_snapshot_payload(task)
         self._persist_operation_request_payload(
             operation,
-            dict(request_payload or {}),
+            payload,
             workspace_root=task.workspace_root,
         )
         db.add(operation)

@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 class TaskEventServiceMixin:
     def _normalize_event_payload_value(self: TaskManager, value: Any) -> Any:
         if isinstance(value, datetime):
-            return value.isoformat()
+            return task_shared._isoformat_or_none(value)
         if isinstance(value, dict):
             return {str(key): self._normalize_event_payload_value(item) for key, item in value.items()}
         if isinstance(value, list):

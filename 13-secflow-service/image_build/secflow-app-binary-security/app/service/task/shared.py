@@ -15,7 +15,7 @@ from app.copy_utils import safe_copy2
 from app.model import BinarySecurityStageItem, BinarySecurityTask, TASK_TYPE_BINARY_MODULE, TASK_TYPE_SOURCE
 from app.observability import observe_state_file_write
 from app.service.security import ensure_dir
-from app.time_utils import now_local
+from app.time_utils import ensure_local, isoformat_local, now_local, parse_local_iso_datetime
 
 NO_CANDIDATE_MODULES_FAILURE_CODE = "no_candidate_modules"
 NO_CANDIDATE_MODULES_FAILURE_CATEGORY = "business"
@@ -40,44 +40,25 @@ def _now() -> datetime:
 
 
 def _isoformat_or_none(value: datetime | None) -> str | None:
-    return value.isoformat() if value else None
+    return isoformat_local(value)
 
 
 def _elapsed_seconds_since(value: datetime | None) -> float | None:
     if value is None:
         return None
-    if value.tzinfo is not None:
-        value = value.astimezone().replace(tzinfo=None)
-    candidates = [
-        (_now() - value).total_seconds(),
-        (datetime.utcnow() - value).total_seconds(),
-    ]
-    non_negative = [age for age in candidates if age >= 0]
-    if non_negative:
-        return min(non_negative)
-    return max(candidates)
+    local_value = ensure_local(value)
+    return (_now() - local_value).total_seconds()
 
 
 def _seconds_until(value: datetime | None) -> float | None:
     if value is None:
         return None
-    if value.tzinfo is not None:
-        value = value.astimezone().replace(tzinfo=None)
-    candidates = [
-        (value - _now()).total_seconds(),
-        (value - datetime.utcnow()).total_seconds(),
-    ]
-    return min(candidates, key=lambda remaining: abs(remaining))
+    local_value = ensure_local(value)
+    return (local_value - _now()).total_seconds()
 
 
 def _parse_iso_datetime(value: Any) -> datetime | None:
-    raw = str(value or "").strip()
-    if not raw:
-        return None
-    try:
-        return datetime.fromisoformat(raw)
-    except ValueError:
-        return None
+    return parse_local_iso_datetime(str(value or "").strip())
 
 
 def _runtime_health_status_rank(status: str) -> int:

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.model import BinarySecurityStageRun, BinarySecurityTask
 from app.service.stages.base import BinarySecurityStageHandler
+from app.service.task import shared as task_shared
 from app.time_utils import now_local
 
 if TYPE_CHECKING:
@@ -265,8 +266,8 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
                 "running_items": int((stage_run.counts or {}).get("running_items") or 0),
                 "cancelled_items": int((stage_run.counts or {}).get("cancelled_items") or 0),
                 "downstream_status_counts": {},
-                "started_at": stage_run.started_at.isoformat() if stage_run.started_at else None,
-                "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+                "started_at": task_shared._isoformat_or_none(stage_run.started_at),
+                "finished_at": task_shared._isoformat_or_none(stage_run.finished_at),
                 "last_error": stage_run.last_error,
             },
         )
