@@ -388,6 +388,8 @@ TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
     TASK_ACTION_RETRY_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FULL,
+    TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+    TASK_ACTION_RETRY_ARCHIVE_FULL,
     TASK_ACTION_CANCEL,
     TASK_ACTION_DELETE,
     "force_reset_to_pending",
@@ -402,8 +404,7 @@ TASK_OPERATION_REQUEUE_APPLIED_TYPES = {
     TASK_ACTION_RETRY_ARCHIVE_FULL,
 }
 TASK_OPERATION_OWNER_GUARDED_TYPES = {
-    TASK_ACTION_CANCEL,
-    TASK_ACTION_DELETE,
+    *TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES,
 }
 TASK_OPERATION_ACTIVE_STATUSES = {"requested", "accepted", "queued", "claimed", "running"}
 TASK_OPERATION_TERMINAL_STATUSES = {"succeeded", "failed", "superseded", "cancelled"}
@@ -2435,7 +2436,7 @@ class TaskManager(
             return False
         if snapshot["operation_id"] != str(getattr(task, "current_operation_id", "") or "").strip():
             return False
-        if snapshot["operation_type"] not in TASK_OPERATION_OWNER_GUARDED_TYPES:
+        if snapshot["operation_type"] not in TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES:
             return False
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id != str(self.instance_id or "").strip():
@@ -2472,7 +2473,7 @@ class TaskManager(
             return False
         if snapshot["operation_id"] != str(getattr(task, "current_operation_id", "") or "").strip():
             return False
-        if snapshot["operation_type"] not in TASK_OPERATION_OWNER_GUARDED_TYPES:
+        if snapshot["operation_type"] not in TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES:
             return False
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id != str(self.instance_id or "").strip():

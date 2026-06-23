@@ -35001,6 +35001,94 @@ def _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_q
     self.assertFalse(supported)
 
 
+def _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches_for_archive_retry(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-foreign-owner-archive-retry",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="remote-worker",
+        current_operation_id="op-remote-archive-retry",
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-remote-archive-retry",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry_archive_full",
+        status="queued",
+        current_step=None,
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=1,
+        owner_instance_id="remote-worker",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease])
+
+    supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+
+    self.assertTrue(supported)
+    self.assertEqual("remote-worker", task.dispatcher_instance_id)
+
+
+def _test_task_has_supported_control_operation_runtime_uses_runtime_lease_for_archive_retry(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-local-archive-retry-lease",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="local-worker",
+        current_operation_id="op-local-archive-retry",
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-local-archive-retry",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry_archive_failed_items",
+        status="running",
+        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+        updated_at=now_value,
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=1,
+        owner_instance_id="local-worker",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease])
+
+    supported = manager._task_has_supported_control_operation_runtime(
+        db,
+        task,
+        active_operation=operation,
+    )
+
+    self.assertTrue(supported)
+
+
 def _test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -38649,13 +38737,16 @@ def _test_run_task_finally_requeues_tail_runtime_without_active_owner(self):
 
     original_factory = task_manager_module.get_session_factory
     original_execute = manager._execute_task
+    original_active_context = manager._task_has_authoritative_active_stage_context
     try:
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager._execute_task = _tail_execute
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
         asyncio.run(manager._run_task(task.id))
     finally:
         task_manager_module.get_session_factory = original_factory
         manager._execute_task = original_execute
+        manager._task_has_authoritative_active_stage_context = original_active_context
 
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertFalse(manager._has_tail_reconcile_owner(task.id))
@@ -38727,13 +38818,16 @@ def _test_run_task_finally_requeues_nonstreaming_runtime_without_active_owner(se
 
     original_factory = task_manager_module.get_session_factory
     original_execute = manager._execute_task
+    original_active_context = manager._task_has_authoritative_active_stage_context
     try:
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager._execute_task = _noop_execute
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
         asyncio.run(manager._run_task(task.id))
     finally:
         task_manager_module.get_session_factory = original_factory
         manager._execute_task = original_execute
+        manager._task_has_authoritative_active_stage_context = original_active_context
 
     self.assertEqual("pending", task.status)
     self.assertEqual("system_analysis", task.current_stage)
@@ -38887,24 +38981,33 @@ def _test_run_task_records_takeover_resume_event_for_streaming_tail(self):
     async def _noop_execute(_task_id):
         return None
 
+    signal_calls = {"count": 0}
+
+    async def _run_task_runtime_signals(_task_id):
+        signal_calls["count"] += 1
+        if signal_calls["count"] >= 2:
+            task.status = "success"
+        return False
+
     original_factory = task_manager_module.get_session_factory
     original_execute = manager._execute_task
+    original_signals = manager._run_task_runtime_signals
     try:
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager._execute_task = _noop_execute
+        manager._run_task_runtime_signals = _run_task_runtime_signals
         asyncio.run(manager._run_task(task.id))
     finally:
         task_manager_module.get_session_factory = original_factory
         manager._execute_task = original_execute
+        manager._run_task_runtime_signals = original_signals
 
     self.assertTrue(any(event.event_type == "downstream_reconcile_resumed_after_takeover" for event in db.events))
-    self.assertEqual("pending", task.status)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
-    takeover_event = next(event for event in db.events if event.event_type == "owned_execution_takeover_requeued")
-    self.assertEqual("requeue_owned_execution", (takeover_event.payload or {}).get("takeover_action"))
-    self.assertEqual("runtime_worker_exited_without_active_holder", (takeover_event.payload or {}).get("takeover_reason"))
+    self.assertEqual("success", task.status)
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
 
 
 def _test_clear_runtime_lease_returns_retry_later_for_lock_timeout(self):
@@ -42391,6 +42494,8 @@ TaskManagerTests.test_repair_running_lease_invariant_requeues_without_owner_writ
 TaskManagerTests.test_clear_runtime_lease_returns_retry_later_for_lock_timeout = _test_clear_runtime_lease_returns_retry_later_for_lock_timeout
 TaskManagerTests.test_run_task_active_commit_failure_releases_fake_dispatching_owner = _test_run_task_active_commit_failure_releases_fake_dispatching_owner
 TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status = _test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status
+TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches_for_archive_retry = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches_for_archive_retry
+TaskManagerTests.test_task_has_supported_control_operation_runtime_uses_runtime_lease_for_archive_retry = _test_task_has_supported_control_operation_runtime_uses_runtime_lease_for_archive_retry
 TaskManagerTests.test_should_skip_readless_reconcile_for_active_task_uses_runtime_lease_without_status_gate = _test_should_skip_readless_reconcile_for_active_task_uses_runtime_lease_without_status_gate
 TaskManagerTests.test_should_preserve_task_dispatch_ownership_uses_runtime_lease_without_status_gate = _test_should_preserve_task_dispatch_ownership_uses_runtime_lease_without_status_gate
 TaskManagerTests.test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success = _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success

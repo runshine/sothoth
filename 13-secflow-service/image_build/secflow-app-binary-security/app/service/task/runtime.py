@@ -1676,6 +1676,63 @@ class TaskRuntimeServiceMixin:
             while await self._run_task_runtime_signals(task_id):
                 pass
             await self._execute_task(task_id)
+            while True:
+                runtime_db = session_factory()
+                try:
+                    task_after_execute = (
+                        runtime_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                        .first()
+                    )
+                    if task_after_execute is None:
+                        break
+                    if str(getattr(task_after_execute, "status", "") or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES:
+                        break
+                    if str(getattr(task_after_execute, "current_operation_id", "") or "").strip():
+                        continue
+                    if not self._task_runtime_owner_matches_current_instance(runtime_db, task_after_execute):
+                        break
+                    if self._task_runtime_transition_guard_active(task_after_execute):
+                        should_remain_active = True
+                    else:
+                        should_remain_active = self._task_has_authoritative_active_stage_context(
+                            runtime_db,
+                            task_after_execute,
+                            stage_name=str(getattr(task_after_execute, "current_stage", "") or "").strip() or None,
+                        )
+                    if not should_remain_active:
+                        break
+                finally:
+                    runtime_db.close()
+                await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
+                while await self._run_task_runtime_signals(task_id):
+                    pass
+                runtime_db = session_factory()
+                try:
+                    task_after_signals = (
+                        runtime_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                        .first()
+                    )
+                    if task_after_signals is None:
+                        break
+                    if str(getattr(task_after_signals, "status", "") or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES:
+                        break
+                    if str(getattr(task_after_signals, "current_operation_id", "") or "").strip():
+                        continue
+                    if not self._task_runtime_owner_matches_current_instance(runtime_db, task_after_signals):
+                        break
+                    if self._task_runtime_transition_guard_active(task_after_signals):
+                        continue
+                    if self._task_has_authoritative_active_stage_context(
+                        runtime_db,
+                        task_after_signals,
+                        stage_name=str(getattr(task_after_signals, "current_stage", "") or "").strip() or None,
+                    ):
+                        continue
+                    break
+                finally:
+                    runtime_db.close()
         except task_manager_module.StaleTaskExecution:
             return
         except Exception as exc:

@@ -765,6 +765,37 @@ class TaskRuntimeStateServiceMixin:
             return False
         return has_runnable_work or has_authoritative_active_stage
 
+    def _task_has_authoritative_active_stage_context(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str | None = None,
+    ) -> bool:
+        normalized_stage_name = str(stage_name or getattr(task, "current_stage", "") or "").strip()
+        if not normalized_stage_name:
+            return False
+        stage_run = (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == normalized_stage_name,
+            )
+            .first()
+        )
+        normalized_stage_status = (
+            self._normalize_downstream_status(getattr(stage_run, "status", None))
+            or str(getattr(stage_run, "status", "") or "").strip().lower()
+        ) if stage_run is not None else ""
+        if normalized_stage_status in {"pending", "queued", "running", "dispatching", "applying"}:
+            return True
+        items = self._stage_items(db, task.id, normalized_stage_name)
+        if any(self._is_active_item_status(getattr(item, "status", None)) for item in items):
+            return True
+        if any(str(getattr(item, "downstream_task_id", "") or "").strip() for item in items):
+            return True
+        return self._stage_has_real_runnable_work(db, task, normalized_stage_name)
+
     def _requeue_owned_execution_takeover(
         self: TaskManager,
         db: Session,
