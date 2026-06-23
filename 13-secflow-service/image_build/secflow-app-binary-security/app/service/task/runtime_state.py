@@ -468,26 +468,19 @@ class TaskRuntimeStateServiceMixin:
     def _lease_is_active(self: TaskManager, task: BinarySecurityTask, db: Session | None = None) -> bool:
         from app.service import task_manager as task_manager_module
 
+        task_id = str(getattr(task, "id", "") or "").strip()
+        if not task_id:
+            return False
         lease: BinarySecurityTaskRuntimeLease | None = None
         if db is not None:
-            lease = self._runtime_lease_for_task(db, task.id)
-        elif getattr(task, "lease_expires_at", None) is None:
+            lease = self._runtime_lease_for_task(db, task_id)
+        else:
             session = task_manager_module.get_session_factory()()
             try:
-                lease = self._runtime_lease_for_task(session, task.id)
+                lease = self._runtime_lease_for_task(session, task_id)
             finally:
                 session.close()
-        if lease is not None:
-            if self._runtime_lease_is_active(lease):
-                return True
-            if db is not None and self._control_operation_takeover_window_active(db, task):
-                lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip()
-                dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-                if dispatcher_instance_id and dispatcher_instance_id == str(self.instance_id or "").strip():
-                    if not lease_owner or lease_owner == dispatcher_instance_id:
-                        return True
-        remaining = task_manager_module._seconds_until(task.lease_expires_at)
-        return remaining is not None and remaining > 0
+        return self._runtime_lease_is_active(lease)
 
     def _next_lease_expiry(
         self: TaskManager,

@@ -2442,7 +2442,12 @@ class TaskReadModelServiceMixin:
         operation_lock_expires_at = task.operation_lock_expires_at
         local_operation_alive = False
         row_owner_is_local = bool(str(task.dispatcher_instance_id or "").strip() == str(self.instance_id or "").strip())
-        runtime_supported_locally = self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
+        runtime_supported_locally = bool(
+            row_owner_is_local
+            and runtime_lease is not None
+            and self._runtime_lease_is_active(runtime_lease)
+            and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+        )
         fake_local_owner = bool(
             row_owner_is_local
             and task_status in active_task_statuses

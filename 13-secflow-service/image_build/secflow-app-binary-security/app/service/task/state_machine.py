@@ -2594,7 +2594,11 @@ class TaskStateMachineMixin:
         )
         active_run = next((run for run in stage_runs if run.status in {"running", "dispatching"}), None)
         active_stage_name = active_run.stage_name if active_run and active_run.stage_name else task.current_stage
-        preserve_dispatch = self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status)
+        preserve_dispatch = self._should_preserve_task_dispatch_ownership(
+            task,
+            previous_status=previous_status,
+            db=db,
+        )
         next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
         if not preserve_dispatch:
             task.tail_reconcile_state = "idle"

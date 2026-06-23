@@ -2374,34 +2374,11 @@ class TaskManager(
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
-        if self._task_runtime_transition_guard_owned_by_current_instance(task):
-            return True
-        if self._control_operation_takeover_window_active(
-            db,
-            task,
-            active_operation=operation,
-        ):
-            return True
         runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
-        if (
+        return bool(
             self._runtime_lease_is_active(runtime_lease)
             and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
-        ):
-            return True
-        if self._task_owner_runtime_supported_locally(task, active_operation=operation):
-            return True
-        if not snapshot["local_operation_worker_alive"]:
-            return False
-        if not snapshot["recent_progress"]:
-            return False
-        if snapshot["operation_type"] != TASK_ACTION_CANCEL:
-            return True
-        return snapshot["current_step"] in {
-            TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
-            TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
-            TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
-            TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
-        }
+        )
 
     def _task_owner_runtime_supported_locally(
         self,
@@ -2480,33 +2457,11 @@ class TaskManager(
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if not dispatcher_instance_id:
             return not has_active_operation
-        if dispatcher_instance_id == str(self.instance_id or "").strip():
-            if self._task_has_supported_control_operation_runtime(db, task, active_operation=operation):
-                return True
-            return self._task_owner_runtime_supported_locally(task, active_operation=operation)
-        if current_status in {"dispatching", "running"}:
-            dispatch_started_at = getattr(task, "dispatch_started_at", None)
-            dispatch_age_seconds = _elapsed_seconds_since(dispatch_started_at)
-            lease_remaining_seconds = _seconds_until(getattr(task, "lease_expires_at", None))
-            if (
-                dispatch_started_at is not None
-                and dispatch_age_seconds is not None
-                and dispatch_age_seconds < 15
-                and lease_remaining_seconds is not None
-                and lease_remaining_seconds > 0
-            ):
-                return True
         lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
-        if (
+        return bool(
             self._runtime_lease_is_active(lease)
             and str(getattr(lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
-        ):
-            return True
-        if current_status == "dispatching" or has_active_operation:
-            return False
-        if operation_status in TASK_OPERATION_ACTIVE_STATUSES:
-            return False
-        return True
+        )
 
     def _release_unsupported_task_row_owner(
         self,
@@ -2530,7 +2485,7 @@ class TaskManager(
                 db,
                 task,
                 "task_owner_release_deferred_for_control_operation_takeover",
-                "检测到控制操作仍处于合法接管窗口，本次不释放 owner",
+                "检测到控制操作仍由有效 runtime lease 持有，本次不释放 owner",
                 level="info",
                 stage_name=task.current_stage,
                 payload={
@@ -2538,11 +2493,6 @@ class TaskManager(
                     "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
                     "dispatcher_instance_id": previous_dispatcher_instance_id,
                     "active_runtime_lease_owner": active_runtime_lease_owner,
-                    "takeover_window_active": self._control_operation_takeover_window_active(
-                        db,
-                        task,
-                        active_operation=active_operation,
-                    ),
                     "operation_runtime": self._operation_runtime_snapshot(active_operation),
                 },
             )
@@ -3429,7 +3379,13 @@ class TaskManager(
         item.claim_execution_token = None
         item.claim_started_at = None
 
-    def _stage_item_claim_matches_task_execution(self, item: BinarySecurityStageItem, task: BinarySecurityTask) -> bool:
+    def _stage_item_claim_matches_task_execution(
+        self,
+        item: BinarySecurityStageItem,
+        task: BinarySecurityTask,
+        *,
+        db: Session | None = None,
+    ) -> bool:
         claim_owner = str(getattr(item, "claim_owner_instance_id", "") or "").strip()
         claim_token = self._stage_item_claim_token(item)
         task_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
@@ -3440,7 +3396,7 @@ class TaskManager(
             claim_owner == task_owner
             and claim_token == task_token
             and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            and self._lease_is_active(task)
+            and self._lease_is_active(task, db=db)
         )
 
     def _bind_execution_token(self, task: BinarySecurityTask) -> None:
@@ -3816,9 +3772,7 @@ class TaskManager(
         *,
         allow_dispatching: bool = False,
     ) -> bool:
-        expected_statuses = {"running", "dispatching"} if allow_dispatching else {"running"}
-        if str(getattr(task, "status", "") or "").strip() not in expected_statuses:
-            return False
+        del allow_dispatching
         if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
             return False
         if not self._lease_is_active(task, db=db):
@@ -3932,7 +3886,7 @@ class TaskManager(
         task.last_error = None
         self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         task.tail_reconcile_state = "idle"
-        if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status):
+        if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status, db=db):
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
@@ -7546,13 +7500,19 @@ class TaskManager(
             return False
         return self._lease_is_active(task)
 
-    def _should_preserve_task_dispatch_ownership(self, task: BinarySecurityTask, *, previous_status: str | None = None) -> bool:
+    def _should_preserve_task_dispatch_ownership(
+        self,
+        task: BinarySecurityTask,
+        *,
+        previous_status: str | None = None,
+        db: Session | None = None,
+    ) -> bool:
         status = str(previous_status if previous_status is not None else task.status or "").strip()
         if status not in {"running", "dispatching"}:
             return False
         if not str(task.dispatcher_instance_id or "").strip():
             return False
-        return self._lease_is_active(task)
+        return self._lease_is_active(task, db=db)
 
     def _stage_items(self, db: Session, task_id: str, stage_name: str) -> list[BinarySecurityStageItem]:
         stage_name = normalize_stage_name(stage_name)

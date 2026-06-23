@@ -682,7 +682,7 @@ class TaskRuntimeServiceMixin:
         if has_active_operation and not operation_allows_runtime_resume:
             if (
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
-                and self._task_owner_runtime_supported_locally(task, active_operation=current_operation)
+                and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
             ):
                 return None
             if current_status != "pending" and not has_active_operation:
@@ -778,7 +778,7 @@ class TaskRuntimeServiceMixin:
                 )
                 seen_non_owner_skip_keys.add(skip_key)
                 continue
-            if not task.dispatch_started_at or not self._lease_is_active(task):
+            if not task.dispatch_started_at or not self._lease_is_active(task, db=db):
                 continue
             if self._stage_item_orchestration_in_retry_backoff(item):
                 continue
@@ -1136,7 +1136,11 @@ class TaskRuntimeServiceMixin:
             task = db.query(task_manager_module.BinarySecurityTask).filter(
                 task_manager_module.BinarySecurityTask.id == item.task_id
             ).first()
-            if str(item.claim_owner_instance_id or "").strip() and task is not None and self._stage_item_claim_matches_task_execution(item, task):
+            if (
+                str(item.claim_owner_instance_id or "").strip()
+                and task is not None
+                and self._stage_item_claim_matches_task_execution(item, task, db=db)
+            ):
                 continue
             if str(item.downstream_task_id or "").strip():
                 continue
@@ -1422,7 +1426,7 @@ class TaskRuntimeServiceMixin:
                 active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES
                 and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
             )
-            if control_operation_takeover:
+            if task is not None and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip():
                 try:
                     self._upsert_runtime_lease(
                         db,
@@ -1432,7 +1436,7 @@ class TaskRuntimeServiceMixin:
                     )
                 except task_manager_module.StaleTaskExecution:
                     task_manager_module.logger.warning(
-                        "binary-security run_task abandoned control operation takeover because runtime lease is owned by another live instance: "
+                        "binary-security run_task abandoned ownership takeover because runtime lease is owned by another live instance: "
                         "task_id=%s current_operation_id=%s dispatcher_instance_id=%s",
                         task_id,
                         str(getattr(task, "current_operation_id", "") or "").strip() or None,
@@ -1448,8 +1452,7 @@ class TaskRuntimeServiceMixin:
                         and self._task_has_active_cancel_operation(db, task)
                     )
                     and not (
-                        control_operation_takeover
-                        and str(getattr(task, "current_operation_id", "") or "").strip()
+                        str(getattr(task, "current_operation_id", "") or "").strip()
                     )
                 )
                 or task.dispatcher_instance_id != self.instance_id

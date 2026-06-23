@@ -3608,6 +3608,8 @@ class TaskOperationServiceMixin:
         self: TaskManager,
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
+        *,
+        db: Session,
     ) -> bool:
         operation_type = str(getattr(operation, "operation_type", "") or "").strip()
         if operation_type not in {
@@ -3619,9 +3621,9 @@ class TaskOperationServiceMixin:
             return False
         if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
             return False
-        if not self._lease_is_active(task, db=None):
+        if not self._lease_is_active(task, db=db):
             return False
-        return self._task_owner_runtime_supported_locally(task, active_operation=operation)
+        return True
 
     def _requeue_task_after_retry_operation(
         self: TaskManager,
@@ -3641,7 +3643,7 @@ class TaskOperationServiceMixin:
             payload={"operation_id": operation.id},
         )
         resume_decision.event_type = "task_requeued"
-        if self._can_resume_retry_operation_in_place(task, operation):
+        if self._can_resume_retry_operation_in_place(task, operation, db=db):
             self._set_task_status(
                 db,
                 task,
