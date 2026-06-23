@@ -7989,7 +7989,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.assertEqual("dataflow_vuln_scan", self.manager._next_incomplete_stage(db, task))
+        self.assertIsNone(self.manager._next_incomplete_stage(db, task))
 
     def test_next_incomplete_stage_treats_partial_success_as_completed(self):
         task = BinarySecurityTask(
@@ -16088,7 +16088,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, checks["timeline_event_count"])
         self.assertEqual(0, checks["state_event_count"])
 
-    def test_validate_hard_restart_cleanup_allows_state_event_residue(self):
+    def test_validate_hard_restart_cleanup_rejects_state_event_residue(self):
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -16118,10 +16118,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        checks = self.manager._validate_hard_restart_cleanup(db, task)
-
-        self.assertEqual(0, checks["timeline_event_count"])
-        self.assertEqual(1, checks["state_event_count"])
+        with self.assertRaises(ValidationError):
+            self.manager._validate_hard_restart_cleanup(db, task)
 
     def test_classify_retry_downstream_strategy_forces_recreate_after_hard_reset_cleanup_verified(self):
         task = BinarySecurityTask(
