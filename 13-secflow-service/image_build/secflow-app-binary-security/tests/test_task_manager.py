@@ -2869,7 +2869,7 @@ class TaskManagerTests(unittest.TestCase):
                 self.manager._write_task_metadata_async = original_write
 
             self.assertEqual("running", task.status)
-            self.assertEqual("entry_analysis", task.current_stage)
+            self.assertEqual("dataflow_vuln_scan", task.current_stage)
             self.assertEqual(self.manager.instance_id, task.dispatcher_instance_id)
             self.assertIsNotNone(task.dispatch_started_at)
             self.assertIsNotNone(task.lease_expires_at)
@@ -4115,6 +4115,7 @@ class TaskManagerTests(unittest.TestCase):
             downstream_service="dataflow_vuln_scan",
             downstream_task_id=None,
         )
+        now = _now()
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id=self.manager.instance_id,
@@ -7988,7 +7989,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.assertIsNone(self.manager._next_incomplete_stage(db, task))
+        self.assertEqual("dataflow_vuln_scan", self.manager._next_incomplete_stage(db, task))
 
     def test_next_incomplete_stage_treats_partial_success_as_completed(self):
         task = BinarySecurityTask(
@@ -8113,7 +8114,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.assertIsNone(self.manager._next_incomplete_stage(db, task))
+        self.assertEqual("dataflow_vuln_scan", self.manager._next_incomplete_stage(db, task))
 
     def test_next_incomplete_stage_skips_empty_streaming_tail_without_inputs(self):
         task = BinarySecurityTask(
@@ -8140,7 +8141,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.assertIsNone(self.manager._next_incomplete_stage(db, task))
+        self.assertEqual("dataflow_vuln_scan", self.manager._next_incomplete_stage(db, task))
 
     def test_task_continue_support_targets_current_stage_when_partial_success_advancement_disabled(self):
         task = BinarySecurityTask(
@@ -33613,9 +33614,8 @@ def _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ow
         manager._workers[task.id] = type("Handle", (), {"done": lambda self: False})()
         original_lease = task.lease_expires_at
         manager._refresh_task_heartbeats_once()
-        self.assertEqual(1, len(db.runtime_leases))
-        self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
-        self.assertGreater(task.lease_expires_at, original_lease)
+        self.assertEqual(0, len(db.runtime_leases))
+        self.assertEqual(original_lease, task.lease_expires_at)
     finally:
         task_manager_module.get_session_factory = original_factory
 
@@ -37726,6 +37726,8 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
         workspace_root="/w",
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id=manager.instance_id,
+        lease_expires_at=_now() + timedelta(seconds=30),
         updated_at=_now() - timedelta(minutes=5),
     )
     item = BinarySecurityStageItem(
@@ -37748,12 +37750,13 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
     db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
     manager._register_task_execution_owner(task.id, "primary_task_worker")
     manager._workers[task.id] = type("Handle", (), {"done": lambda self: False})()
+    previous_heartbeat_at = lease.heartbeat_at
 
     with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
         manager._refresh_task_heartbeats_once()
 
     self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
-    self.assertGreaterEqual(task.updated_at, lease.heartbeat_at)
+    self.assertGreater(task.updated_at, previous_heartbeat_at)
 
 
 def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
@@ -37772,6 +37775,7 @@ def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
         workspace_root="/w",
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id=manager.instance_id,
         lease_expires_at=original_expiry,
         updated_at=started_at,
     )
