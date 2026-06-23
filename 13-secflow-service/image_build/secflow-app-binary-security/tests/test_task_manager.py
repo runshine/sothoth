@@ -35106,6 +35106,33 @@ def _test_run_current_task_operation_treats_delete_as_succeeded_when_task_row_re
     self.assertTrue(result)
     self.assertEqual("succeeded", operation.status)
     self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+    self.assertIsNotNone(operation.finished_at)
+
+
+def _test_run_current_task_operation_finalizes_orphan_delete_operation_when_task_row_missing_at_start(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    operation = BinarySecurityTaskOperation(
+        id="op-delete-orphan-start",
+        task_id="task-delete-orphan-start",
+        project_id="p1",
+        operation_type="delete",
+        status="running",
+        current_step="operation_succeeded",
+    )
+    db = _ModelAwareDb(tasks=[], operations=[operation], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    task_manager_module.get_session_factory = lambda: (lambda: db)
+    try:
+        result = asyncio.run(manager._run_current_task_operation(operation.task_id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+
+    self.assertTrue(result)
+    self.assertEqual("succeeded", operation.status)
+    self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+    self.assertIsNotNone(operation.finished_at)
 
 
 def _test_run_current_task_operation_finalizes_after_requeue_owner_handoff(self):
@@ -35935,6 +35962,27 @@ def _test_active_operation_ignores_expired_claim_lease(self):
 
     self.assertIsNotNone(active)
     self.assertEqual("op-expired", active.id)
+
+
+def _test_requeue_stale_operations_finalizes_orphan_delete_operation_when_task_row_missing(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    operation = BinarySecurityTaskOperation(
+        id="op-orphan-delete-lifecycle",
+        task_id="task-orphan-delete-lifecycle",
+        project_id="p1",
+        operation_type=task_manager_module.TASK_ACTION_DELETE,
+        status="running",
+        current_step="operation_succeeded",
+    )
+    db = _ModelAwareDb(tasks=[], operations=[operation], runtime_leases=[], events=[])
+
+    changed = manager._requeue_stale_operations(db)
+
+    self.assertTrue(changed)
+    self.assertEqual("succeeded", operation.status)
+    self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+    self.assertIsNotNone(operation.finished_at)
 
 
 def _test_task_needs_downstream_reconcile_skips_locally_owned_running_task(self):

@@ -59,6 +59,13 @@ class TaskLifecycleServiceMixin:
                 .first()
             )
             if task is None:
+                if self._finalize_delete_operation_after_task_row_removed(
+                    db,
+                    operation,
+                    task_id=task_id,
+                    log_prefix="binary-security lifecycle finalized orphan delete operation after task row was already removed",
+                ):
+                    changed = True
                 continue
             if self._reconcile_stale_task_operation(db, task, operation):
                 changed = True

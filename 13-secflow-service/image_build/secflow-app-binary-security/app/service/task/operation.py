@@ -26,6 +26,49 @@ if TYPE_CHECKING:
 
 
 class TaskOperationServiceMixin:
+    def _finalize_delete_operation_after_task_row_removed(
+        self: TaskManager,
+        db: Session,
+        operation: BinarySecurityTaskOperation | None,
+        *,
+        task_id: str | None = None,
+        log_prefix: str,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if operation is None:
+            return False
+        if str(getattr(operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_DELETE:
+            return False
+        if str(getattr(operation, "status", "") or "").strip().lower() in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+            return False
+        task_row_exists = (
+            db.query(task_manager_module.BinarySecurityTask.id)
+            .filter(task_manager_module.BinarySecurityTask.id == getattr(operation, "task_id", task_id))
+            .first()
+            is not None
+        )
+        if task_row_exists:
+            return False
+        operation.status = "succeeded"
+        operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+        operation.finished_at = task_manager_module._now()
+        operation.updated_at = operation.finished_at
+        operation.error_code = None
+        operation.error_message = None
+        db.commit()
+        task_manager_module.logger.info(
+            "%s: task_id=%s operation_id=%s",
+            log_prefix,
+            str(getattr(operation, "task_id", task_id) or "").strip() or None,
+            str(getattr(operation, "id", "") or "").strip() or None,
+        )
+        task_manager_module.observe_control_operation(
+            str(getattr(operation, "operation_type", "") or "").strip() or "delete",
+            "succeeded",
+        )
+        return True
+
     def _operation_uses_task_state_snapshot(
         self: TaskManager,
         operation: BinarySecurityTaskOperation | None,
@@ -2657,6 +2700,24 @@ class TaskOperationServiceMixin:
                 .first()
             )
             if task is None:
+                orphan_delete_operation = (
+                    db.query(task_manager_module.BinarySecurityTaskOperation)
+                    .filter(
+                        task_manager_module.BinarySecurityTaskOperation.task_id == task_id,
+                        task_manager_module.BinarySecurityTaskOperation.status.in_(
+                            list(task_manager_module.TASK_OPERATION_ACTIVE_STATUSES)
+                        ),
+                    )
+                    .order_by(task_manager_module.BinarySecurityTaskOperation.created_at.desc())
+                    .first()
+                )
+                if self._finalize_delete_operation_after_task_row_removed(
+                    db,
+                    orphan_delete_operation,
+                    task_id=task_id,
+                    log_prefix="binary-security task owner finalized orphan delete operation after task row was already removed",
+                ):
+                    return True
                 return False
             self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             workset = self._task_runtime_workset(task)
@@ -2877,20 +2938,12 @@ class TaskOperationServiceMixin:
                     .first()
                     is None
                 )
-                if task_deleted:
-                    operation.status = "succeeded"
-                    operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
-                    operation.finished_at = task_manager_module._now()
-                    operation.updated_at = operation.finished_at
-                    db.commit()
-                    task_manager_module.logger.info(
-                        "binary-security task owner finalized delete operation after task row disappeared: "
-                        "task_id=%s operation_id=%s operation_type=%s",
-                        task_id,
-                        operation.id,
-                        str(operation.operation_type or "").strip(),
-                    )
-                    task_manager_module.observe_control_operation(operation_type, "succeeded")
+                if self._finalize_delete_operation_after_task_row_removed(
+                    db,
+                    operation,
+                    task_id=task_id,
+                    log_prefix="binary-security task owner finalized delete operation after task row disappeared",
+                ):
                     return True
             if self._can_finalize_requeue_applied_operation_inline(db, task, operation):
                 finalized_inline = self._finalize_task_operation_after_requeue(
@@ -3021,31 +3074,13 @@ class TaskOperationServiceMixin:
             task_manager_module.observe_control_operation(operation_type, "succeeded")
             return True
         except (task_manager_module.StaleTaskExecution, ObjectDeletedError):
-            if (
-                "operation" in locals()
-                and operation is not None
-                and str(getattr(operation, "operation_type", "") or "").strip() == task_manager_module.TASK_ACTION_DELETE
+            if "operation" in locals() and self._finalize_delete_operation_after_task_row_removed(
+                db,
+                operation,
+                task_id=task_id,
+                log_prefix="binary-security task owner treated delete operation as succeeded after task row was already removed",
             ):
-                task_row_exists = (
-                    db.query(task_manager_module.BinarySecurityTask.id)
-                    .filter(task_manager_module.BinarySecurityTask.id == getattr(operation, "task_id", task_id))
-                    .first()
-                    is not None
-                )
-                if not task_row_exists:
-                    operation.status = "succeeded"
-                    operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
-                    operation.finished_at = task_manager_module._now()
-                    operation.updated_at = operation.finished_at
-                    db.commit()
-                    task_manager_module.logger.info(
-                        "binary-security task owner treated delete operation as succeeded after task row was already removed: "
-                        "task_id=%s current_operation_id=%s",
-                        task_id,
-                        str(current_operation_id if "current_operation_id" in locals() else "") or None,
-                    )
-                    task_manager_module.observe_control_operation(operation_type, "succeeded")
-                    return True
+                return True
             task_manager_module.logger.warning(
                 "binary-security task owner stopped operation consumption because task ownership became stale: "
                 "task_id=%s current_operation_id=%s",
