@@ -4775,6 +4775,9 @@ class TaskManager(
                     "materialized_entry_module_count": int(metrics.get("materialized_entry_module_count") or 0),
                     "successful_entry_module_count": int(metrics.get("successful_entry_module_count") or 0),
                     "failed_entry_module_count": int(metrics.get("failed_entry_module_count") or 0),
+                    "status_synced": True,
+                    "sync_status": stage_run.status,
+                    **(stage_run.counts or {}),
                 },
             )
         return modules

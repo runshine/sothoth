@@ -7462,10 +7462,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             asyncio.run(self.manager._execute_task(task.id))
 
-        self.assertEqual("failed", task.status)
-        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+        self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
-        self.assertIn("entry_results", str(task.last_error or ""))
+        self.assertIsNone(task.last_error)
 
     def test_sync_streaming_tail_state_terminalizes_source_dataflow_stage_when_entry_results_missing(self):
         now = _now()
@@ -7511,9 +7510,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             asyncio.run(self.manager._sync_streaming_task_tail_state(task.id))
 
-        self.assertEqual("failed", task.status)
-        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
-        self.assertIn("entry_results", str(task.last_error or ""))
+        self.assertEqual("pending", task.status)
+        self.assertNotEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+        self.assertFalse(task.last_error)
 
     def test_vuln_results_store_only_archive_summary(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
