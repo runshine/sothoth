@@ -929,7 +929,7 @@ class TaskControlServiceMixin:
             if path_input is not None
             else str(input_dir)
         )
-        initial_stage_name = self._stage_sequence_for_task_type(task_type)[0]
+        initial_stage_name = self._stage_sequence_for_task(task_type)[0]
         task = task_manager_module.BinarySecurityTask(
             id=task_id,
             project_id=project_id,

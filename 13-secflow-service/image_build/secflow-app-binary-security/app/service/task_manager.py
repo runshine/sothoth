@@ -6407,7 +6407,6 @@ class TaskManager(
             "running",
             "pending_upload",
             "uploading",
-            "ready_to_start",
             TASK_STATUS_PENDING_MODULE_CONFIRMATION,
         )
         if not hasattr(base_query, "with_entities"):

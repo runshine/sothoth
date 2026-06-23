@@ -3532,7 +3532,7 @@ class TaskReadModelServiceMixin:
         status = str(task.status or "")
         if self._task_is_waiting_for_manual_confirmation(task, stage_summaries):
             return None
-        if status in {"success", "pending", "queued", "running", "dispatching", "ready_to_start", "pending_upload", "uploading"}:
+        if status in {"success", "pending", "queued", "running", "dispatching", "pending_upload", "uploading"}:
             return None
         if status == "cancelled":
             return self._build_abnormal_reason(

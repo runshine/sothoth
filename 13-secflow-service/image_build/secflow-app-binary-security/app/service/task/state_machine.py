@@ -1656,7 +1656,7 @@ class TaskStateMachineMixin:
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None, []
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status in {"pending_upload", "uploading"}:
             return False, "当前任务尚未完成输入准备，不能重试失败项", None, []
         blocked_statuses = {"pending", "dispatching", "running"}
         if task.status in blocked_statuses:
@@ -1707,7 +1707,7 @@ class TaskStateMachineMixin:
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status in {"pending_upload", "uploading"}:
             return False, f"当前任务状态不允许继续: {task.status}", None
         blocked_statuses = {"pending", "dispatching", "running"}
         if task.status in blocked_statuses:

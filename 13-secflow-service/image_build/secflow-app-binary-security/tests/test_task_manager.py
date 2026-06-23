@@ -6293,8 +6293,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     authorization_token="token",
                 )
 
-        self.assertEqual("ready_to_start", detail.status)
-        self.assertEqual("ready_to_start", db.tasks[-1].status)
+        self.assertEqual("pending", detail.status)
+        self.assertEqual("pending", db.tasks[-1].status)
         self.assertEqual(str(firmware_path), db.tasks[-1].summary["input_file_path"])
         self.assertEqual(str(firmware_path.parent), db.tasks[-1].summary["input_dir"])
         self.assertEqual("shared_path", db.tasks[-1].summary["input_mode"])
@@ -6340,7 +6340,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     authorization_token="token",
                 )
 
-        self.assertEqual("ready_to_start", detail.status)
+        self.assertEqual("pending", detail.status)
         self.assertEqual(str(source_root), db.tasks[-1].summary["input_dir"])
         self.assertEqual(str(source_root), db.tasks[-1].summary["input_dir_path"])
         self.assertEqual("source_tree_files", db.tasks[-1].summary["input_kind"])
@@ -6388,7 +6388,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     authorization_token="token",
                 )
 
-        self.assertEqual("ready_to_start", detail.status)
+        self.assertEqual("pending", detail.status)
         self.assertEqual(str(module_root / "mods"), db.tasks[-1].summary["input_dir"])
         self.assertEqual([str(first), str(second)], db.tasks[-1].summary["input_file_paths"])
         self.assertEqual(2, len(db.tasks[-1].summary["input_files"]))
@@ -6450,7 +6450,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager.start_task = original_start_task
                 self.manager._build_queue_info = original_build_queue_info
 
-            self.assertEqual("ready_to_start", task.status)
+            self.assertEqual("pending", task.status)
             self.assertTrue(task.summary["system_analysis_bypassed"])
             self.assertEqual("module_elf_files", task.summary["input_kind"])
             self.assertEqual("ipsec", task.summary["module_input"]["module_name"])
@@ -6459,7 +6459,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, task.metrics["selected_module_count"])
             self.assertEqual(1, task.metrics["candidate_module_count"])
             self.assertEqual(1, task.metrics["uploaded_file_count"])
-            self.assertEqual("ready_to_start", detail.status)
+            self.assertEqual("pending", detail.status)
 
     def test_normalize_source_input_files_accepts_source_tree_files(self):
         rows = self.manager._normalize_input_files(
@@ -6547,11 +6547,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager.start_task = original_start_task
                 self.manager._build_queue_info = original_build_queue_info
 
-            self.assertEqual("ready_to_start", task.status)
+            self.assertEqual("pending", task.status)
             self.assertEqual("source_tree_files", task.summary["input_kind"])
             self.assertEqual(2, len(task.summary["input_files"]))
             self.assertEqual(2, task.metrics["uploaded_file_count"])
-            self.assertEqual("ready_to_start", detail.status)
+            self.assertEqual("pending", detail.status)
 
     async def test_complete_uploads_accepts_source_tree_files_from_temp_upload_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -6616,12 +6616,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager.start_task = original_start_task
                 self.manager._build_queue_info = original_build_queue_info
 
-            self.assertEqual("ready_to_start", task.status)
+            self.assertEqual("pending", task.status)
             self.assertTrue((input_dir / "src" / "main.c").is_file())
             self.assertTrue((input_dir / "include" / "util.h").is_file())
             self.assertFalse((temp_dir / "src" / "main.c").exists())
             self.assertFalse((temp_dir / "include" / "util.h").exists())
-            self.assertEqual("ready_to_start", detail.status)
+            self.assertEqual("pending", detail.status)
 
     async def test_init_workspace_async_creates_source_temp_upload_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
