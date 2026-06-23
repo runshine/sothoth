@@ -20682,18 +20682,42 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("failed", status)
         self.assertEqual("binary-to-source failed: worker timeout", payload["error"])
 
-    def test_source_system_analysis_inputs_use_workspace_input(self):
+    def test_source_system_analysis_inputs_prefer_shared_input_dir_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "input").mkdir()
+            source_root = workspace / "shared-src"
+            source_root.mkdir()
             task = BinarySecurityTask(id="s1", project_id="p1", name="source-task", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root=str(workspace / "output"), workspace_root=str(workspace))
+            task.summary = {
+                "input_dir_path": str(source_root),
+                "source_root": str(source_root),
+            }
 
             rows = self.manager._system_analysis_inputs(task)
 
             self.assertEqual(1, len(rows))
             self.assertEqual(TASK_TYPE_SOURCE, rows[0]["task_type"])
-            self.assertEqual(str(workspace / "input"), rows[0]["unpacked_root"])
-            self.assertEqual(str(workspace / "input"), rows[0]["source_root"])
+            self.assertEqual(str(source_root), rows[0]["unpacked_root"])
+            self.assertEqual(str(source_root), rows[0]["source_root"])
+
+    def test_source_system_analysis_inputs_fallback_to_workspace_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            workspace_input = workspace / "input"
+            workspace_input.mkdir()
+            task = BinarySecurityTask(id="s1", project_id="p1", name="source-task", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/missing/src", output_root=str(workspace / "output"), workspace_root=str(workspace))
+            task.summary = {
+                "input_dir_path": "/missing/shared-src",
+                "source_root": "/missing/shared-src",
+            }
+
+            rows = self.manager._system_analysis_inputs(task)
+
+            self.assertEqual(1, len(rows))
+            self.assertEqual(TASK_TYPE_SOURCE, rows[0]["task_type"])
+            self.assertEqual(str(workspace_input), rows[0]["unpacked_root"])
+            self.assertEqual(str(workspace_input), rows[0]["source_root"])
 
     def test_binary_system_analysis_inputs_fallback_to_firmware_stage_items(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="binary-task", task_type=TASK_TYPE_BINARY, status="running", firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")

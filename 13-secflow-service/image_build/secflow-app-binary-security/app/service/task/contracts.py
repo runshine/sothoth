@@ -220,8 +220,23 @@ class TaskContractServiceMixin:
         from app.service import task_manager as task_manager_module
 
         if self._task_type(task) == task_manager_module.TASK_TYPE_SOURCE:
-            input_dir = Path(task.workspace_root) / "input"
-            if not input_dir.exists():
+            summary = dict(task.summary or {})
+            preferred_roots = [
+                summary.get("input_dir_path"),
+                summary.get("source_root"),
+                task.firmware_path,
+                Path(task.workspace_root) / "input",
+            ]
+            input_dir: Path | None = None
+            for candidate in preferred_roots:
+                value = str(candidate or "").strip()
+                if not value:
+                    continue
+                candidate_path = Path(value)
+                if candidate_path.is_dir():
+                    input_dir = candidate_path
+                    break
+            if input_dir is None:
                 return []
             return [
                 {
