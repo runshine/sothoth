@@ -22,6 +22,315 @@ if TYPE_CHECKING:
 
 
 class TaskStateMachineMixin:
+    def _task_has_any_active_children(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        active_statuses = {"pending", "queued", "dispatching", "running", "applying", "reconciling"}
+        runs = list(stage_runs or db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all())
+        items = list(stage_items or db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
+        if any(str(getattr(run, "status", "") or "").strip() in active_statuses for run in runs):
+            return True
+        if any((self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()) in active_statuses for item in items):
+            return True
+        archive_jobs = (
+            db.query(task_manager_module.BinarySecurityArchiveJob)
+            .filter(task_manager_module.BinarySecurityArchiveJob.task_id == task.id)
+            .all()
+        )
+        if any(str(getattr(job, "archive_status", "") or "").strip() in active_statuses for job in archive_jobs):
+            return True
+        runtime_lease = self._runtime_lease_for_task(db, task.id)
+        if self._runtime_lease_is_active(runtime_lease):
+            return True
+        if str(getattr(task, "status", "") or "").strip() in active_statuses and (
+            str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+            or str(getattr(task, "runtime_phase", "") or "").strip() == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+        ):
+            return True
+        return False
+
+    def _task_children_all_terminal(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> bool:
+        return not self._task_has_any_active_children(db, task, stage_runs=stage_runs, stage_items=stage_items)
+
+    def _task_has_pending_stage_materialization(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+    ) -> bool:
+        next_stage = self._next_incomplete_stage(db, task)
+        if not next_stage:
+            return False
+        normalized_stage = normalize_stage_name(next_stage)
+        runs = list(stage_runs or db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all())
+        next_stage_run = next((run for run in runs if normalize_stage_name(run.stage_name) == normalized_stage), None)
+        next_stage_items = self._stage_items(db, task.id, next_stage)
+        if next_stage_run is not None or next_stage_items:
+            return False
+        if self._should_skip_stage_without_runnable_work(db, task, next_stage):
+            return False
+        if self._should_finalize_without_entries(db, task, next_stage):
+            return False
+        return True
+
+    def _task_has_resumable_execution_path(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+    ) -> bool:
+        snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
+        workflow_blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
+        next_stage = self._next_incomplete_stage(db, task)
+        if workflow_blocked_stage or next_stage:
+            return True
+        return False
+
+    def _task_requires_runtime_takeover_or_requeue(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+    ) -> bool:
+        snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
+        blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
+        if not blocked_stage:
+            return False
+        blocked_snapshot = next(
+            (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == str(blocked_stage or "").strip()),
+            None,
+        )
+        blocked_status = str((blocked_snapshot or {}).get("status") or "").strip()
+        if blocked_status not in {"pending", "queued", "dispatching", "running", "applying", "reconciling"}:
+            return False
+        return self._should_requeue_for_owned_execution(
+            db,
+            task,
+            next_stage=blocked_stage,
+            next_stage_status=blocked_status,
+        )
+
+    def _evaluate_task_finalization_gate(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ):
+        from app.service import task_manager as task_manager_module
+
+        runs = list(stage_runs or db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all())
+        items = list(stage_items or db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
+        next_stage = self._next_incomplete_stage(db, task)
+        snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=runs)
+        blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
+        has_authoritative_failure = (
+            self._current_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
+            or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
+        )
+        has_active_items = self._task_has_any_active_children(db, task, stage_runs=runs, stage_items=items)
+        has_nonterminal_items = any(
+            (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
+            not in {"success", "failed", "cancelled", "partial_success", "downstream_missing", "skipped"}
+            for item in items
+        )
+        has_pending_materialization = self._task_has_pending_stage_materialization(db, task, stage_runs=runs)
+        has_runtime_takeover_need = self._task_requires_runtime_takeover_or_requeue(db, task, stage_runs=runs)
+        has_resumable_path = self._task_has_resumable_execution_path(db, task, stage_runs=runs)
+        materializable_stage = next(
+            (
+                str(snapshot.get("stage_name") or "").strip()
+                for snapshot in snapshots
+                if (
+                    str(snapshot.get("stage_name") or "").strip()
+                    and not bool(snapshot.get("has_stage_run"))
+                    and bool(snapshot.get("enabled"))
+                    and bool(snapshot.get("has_materialized_inputs"))
+                )
+            ),
+            None,
+        )
+
+        if task.status in {"cancelled", task_manager_module.TASK_STATUS_CANCEL_FAILED}:
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=True,
+                reason_code="terminal_shortcut",
+                blocked_by_stage=blocked_stage,
+                next_stage=next_stage,
+                has_active_items=has_active_items,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=has_resumable_path,
+                has_pending_materialization=has_pending_materialization,
+                has_runtime_takeover_need=has_runtime_takeover_need,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if has_active_items:
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="active_children_present",
+                blocked_by_stage=blocked_stage,
+                next_stage=next_stage,
+                has_active_items=True,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=has_resumable_path,
+                has_pending_materialization=has_pending_materialization,
+                has_runtime_takeover_need=has_runtime_takeover_need,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if materializable_stage:
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="pending_stage_materialization",
+                blocked_by_stage=materializable_stage,
+                next_stage=materializable_stage,
+                has_active_items=False,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=True,
+                has_pending_materialization=True,
+                has_runtime_takeover_need=has_runtime_takeover_need,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if blocked_stage:
+            blocked_snapshot = next(
+                (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == str(blocked_stage or "").strip()),
+                None,
+            )
+            blocked_has_run = bool((blocked_snapshot or {}).get("has_stage_run"))
+            blocked_has_inputs = (
+                self._stage_has_materialized_inputs(db, task, blocked_stage)
+                if self._stage_requires_materialized_inputs(task, blocked_stage)
+                else True
+            )
+            if not blocked_has_run and blocked_has_inputs:
+                return task_manager_module._TaskFinalizeGateDecision(
+                    allowed=False,
+                    reason_code="pending_stage_materialization",
+                    blocked_by_stage=blocked_stage,
+                    next_stage=blocked_stage,
+                    has_active_items=False,
+                    has_nonterminal_items=has_nonterminal_items,
+                    has_resumable_path=True,
+                    has_pending_materialization=True,
+                    has_runtime_takeover_need=has_runtime_takeover_need,
+                    has_authoritative_failure=has_authoritative_failure,
+                )
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="next_stage_resumable",
+                blocked_by_stage=blocked_stage,
+                next_stage=blocked_stage,
+                has_active_items=False,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=True,
+                has_pending_materialization=has_pending_materialization,
+                has_runtime_takeover_need=has_runtime_takeover_need,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if next_stage:
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="next_stage_resumable",
+                blocked_by_stage=blocked_stage or next_stage,
+                next_stage=next_stage,
+                has_active_items=False,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=True,
+                has_pending_materialization=has_pending_materialization,
+                has_runtime_takeover_need=has_runtime_takeover_need,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if has_pending_materialization:
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="pending_stage_materialization",
+                blocked_by_stage=blocked_stage,
+                next_stage=next_stage,
+                has_active_items=False,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=has_resumable_path,
+                has_pending_materialization=True,
+                has_runtime_takeover_need=has_runtime_takeover_need,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if has_runtime_takeover_need:
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="runtime_takeover_required",
+                blocked_by_stage=blocked_stage,
+                next_stage=next_stage,
+                has_active_items=False,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=has_resumable_path,
+                has_pending_materialization=has_pending_materialization,
+                has_runtime_takeover_need=True,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if has_resumable_path:
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="resumable_execution_path_present",
+                blocked_by_stage=blocked_stage,
+                next_stage=next_stage,
+                has_active_items=False,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=True,
+                has_pending_materialization=has_pending_materialization,
+                has_runtime_takeover_need=has_runtime_takeover_need,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        if not self._workflow_ready_for_finalization(snapshots):
+            return task_manager_module._TaskFinalizeGateDecision(
+                allowed=False,
+                reason_code="workflow_not_ready_for_finalization",
+                blocked_by_stage=blocked_stage,
+                next_stage=next_stage,
+                has_active_items=False,
+                has_nonterminal_items=has_nonterminal_items,
+                has_resumable_path=False,
+                has_pending_materialization=False,
+                has_runtime_takeover_need=False,
+                has_authoritative_failure=has_authoritative_failure,
+            )
+
+        return task_manager_module._TaskFinalizeGateDecision(
+            allowed=True,
+            reason_code="ready_for_finalization",
+            blocked_by_stage=blocked_stage,
+            next_stage=next_stage,
+            has_active_items=False,
+            has_nonterminal_items=has_nonterminal_items,
+            has_resumable_path=False,
+            has_pending_materialization=False,
+            has_runtime_takeover_need=False,
+            has_authoritative_failure=has_authoritative_failure,
+        )
+
     def _missing_entry_results_failure_context(
         self: TaskManager,
         db: Session,
@@ -1068,6 +1377,7 @@ class TaskStateMachineMixin:
         decision,
         *,
         operation: BinarySecurityTaskOperation | None = None,
+        enqueue_task: bool = True,
     ) -> bool:
         if not decision.should_resume or not decision.next_stage:
             return False
@@ -1132,7 +1442,8 @@ class TaskStateMachineMixin:
                 stage_name=decision.next_stage,
                 payload=dict(decision.payload or {}),
             )
-        self._enqueue_task(task.id)
+        if enqueue_task:
+            self._enqueue_task(task.id)
         return True
 
     def _should_auto_advance_to_stage(
@@ -1425,6 +1736,7 @@ class TaskStateMachineMixin:
         summary: dict[str, Any],
         payload: dict[str, Any],
         state_event_id: str | None,
+        source_event_type: str | None = None,
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
@@ -1605,7 +1917,17 @@ class TaskStateMachineMixin:
                 )
                 self._finalize_task(db, task)
             else:
-                self._apply_task_resume_decision(db, task, resume_decision)
+                skip_enqueue = (
+                    str(source_event_type or "").strip() == "archive_job_copied"
+                    and str(task.status or "").strip() == "pending"
+                    and str(task.current_stage or "").strip() == str(resume_decision.next_stage or "").strip()
+                )
+                self._apply_task_resume_decision(
+                    db,
+                    task,
+                    resume_decision,
+                    enqueue_task=not skip_enqueue,
+                )
             await self._write_task_metadata_async(task, metadata_path, status=task.status)
             return True
         if decision.action == "finalize_success":
@@ -1713,6 +2035,7 @@ class TaskStateMachineMixin:
                 summary=dict(decision.summary or {}),
                 payload=dict(decision.payload or {}),
                 state_event_id=state_event_id,
+                source_event_type=str(signal.get("source_event_type") or "").strip() or None,
             )
         if decision.action == "failure_finalize":
             failure_ctx = dict((decision.payload or {}).get("failure_ctx") or {})
@@ -1881,19 +2204,14 @@ class TaskStateMachineMixin:
         if self._refresh_task_status_after_sync_handle_retry_and_reopen(db, task, stage_runs=stage_runs, previous_status=current_status):
             _normalize_running_lease_invariant("refresh_task_status_after_sync_retry_or_reopen")
             return
-        if stage_runs and all(str(run.status or "").strip() == "success" for run in stage_runs):
-            self._apply_task_main_state_update(
+        finalize_gate = self._evaluate_task_finalization_gate(db, task, stage_runs=stage_runs)
+        if not finalize_gate.allowed:
+            self._handle_finalize_gate_blocked_active_path(
                 db,
                 task,
-                source="state_machine",
-                reason="所有阶段成功完成后等待后续统一收口",
-                status="pending",
-                stage_name=task.current_stage,
-                finished_at=None,
-                last_error=None,
+                stage_runs=stage_runs,
+                finalize_gate=finalize_gate,
             )
-            self._clear_task_abnormal_reason_snapshot(db, task)
-            task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
             return
         if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
             self._finalize_task(db, task)
@@ -2778,11 +3096,17 @@ class TaskStateMachineMixin:
         if self._finalize_task_handle_terminal_shortcuts(db, task):
             return
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        finalize_gate = self._evaluate_task_finalization_gate(db, task, stage_runs=stage_runs)
+        if not finalize_gate.allowed:
+            task_manager_module.logger.info(
+                "binary-security finalize gate blocked task_id=%s reason=%s blocked_by_stage=%s next_stage=%s",
+                task.id,
+                finalize_gate.reason_code or "-",
+                finalize_gate.blocked_by_stage or "-",
+                finalize_gate.next_stage or "-",
+            )
+            return
         workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
-        if self._finalize_task_handle_active_progress(db, task, stage_runs=stage_runs):
-            return
-        if self._finalize_task_handle_resume_or_missing_stage(db, task, stage_runs=stage_runs):
-            return
         snapshots = workflow_snapshots
         workflow_terminalization_ready = self._workflow_ready_for_finalization(snapshots)
         if not workflow_terminalization_ready:
@@ -2867,6 +3191,69 @@ class TaskStateMachineMixin:
             task_type=self._task_type(task),
         )
         self._record_event(db, task, "task_finished", f"任务结束: {task.status}")
+
+    def _handle_finalize_gate_blocked_active_path(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        finalize_gate=None,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        runs = list(stage_runs or db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all())
+        gate = finalize_gate or self._evaluate_task_finalization_gate(db, task, stage_runs=runs)
+        task_manager_module.logger.info(
+            "binary-security finalize gate diverted task_id=%s reason=%s blocked_by_stage=%s next_stage=%s",
+            task.id,
+            gate.reason_code or "-",
+            gate.blocked_by_stage or "-",
+            gate.next_stage or "-",
+        )
+        if self._finalize_task_handle_active_progress(db, task, stage_runs=runs):
+            return True
+        snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=runs)
+        blocked_stage = str(gate.next_stage or gate.blocked_by_stage or self._workflow_blocked_on_stage(task, snapshots) or task.current_stage or "").strip()
+        blocked_snapshot = next(
+            (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == blocked_stage),
+            None,
+        )
+        blocked_status = str((blocked_snapshot or {}).get("status") or "").strip()
+        if gate.reason_code == "pending_stage_materialization":
+            next_status = "pending"
+        else:
+            next_status = "running" if blocked_status in {"running", "dispatching", "applying"} or bool((blocked_snapshot or {}).get("has_active_items")) else "pending"
+        if blocked_stage:
+            self._apply_task_main_state_update(
+                db,
+                task,
+                source="state_machine",
+                reason="finalize gate 未通过，任务保持活跃等待继续推进",
+                status=next_status,
+                stage_name=blocked_stage,
+                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                clear_runtime_owner=True,
+                finished_at=None,
+                last_error=None,
+            )
+            task.tail_reconcile_state = "idle"
+            self._release_tail_reconcile_owner(task.id)
+            self._last_task_heartbeat_at.pop(task.id, None)
+            self._record_event(
+                db,
+                task,
+                "task_finalize_deferred_for_incomplete_stage",
+                f"任务仍可继续推进，延迟任务收口: {blocked_stage}",
+                level="info",
+                stage_name=blocked_stage,
+                payload={"reason_code": gate.reason_code, "stage_status": blocked_status or None},
+            )
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
+            if next_status == "pending" and (gate.has_resumable_path or gate.has_pending_materialization):
+                self._enqueue_task(task.id)
+            return True
+        return False
 
     def _finalize_task_handle_terminal_shortcuts(self: TaskManager, db: Session, task: BinarySecurityTask) -> bool:
         from app.service import task_manager as task_manager_module
@@ -3081,11 +3468,8 @@ class TaskStateMachineMixin:
         next_stage = self._next_incomplete_stage(db, task)
         if workflow_blocked_stage is None and self._workflow_ready_for_finalization(snapshots):
             return False
-        if next_stage:
-            if workflow_blocked_stage is None:
-                next_stage = None
-            else:
-                next_stage = workflow_blocked_stage
+        if workflow_blocked_stage:
+            next_stage = workflow_blocked_stage
         if next_stage:
             next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
             next_stage_items = self._stage_items(db, task.id, next_stage)

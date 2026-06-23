@@ -1201,77 +1201,69 @@ class TaskItemSyncServiceMixin:
         ):
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
             if self._tail_requires_execution_takeover(db, task):
-                self._set_task_status(
-                    db,
-                    task,
-                    "pending",
-                    reason="检测到尾段阶段未完成，退出收口并重新交给 worker 执行",
-                    source="item_sync",
-                    stage_name=task.current_stage,
-                )
-                task.current_stage = active_stage_name or task.current_stage
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
-                task.finished_at = None
-                task.last_error = None
-                self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
-                task.tail_reconcile_state = "idle"
-                self._clear_runtime_lease(db, task.id)
-                self._release_tail_reconcile_owner(task.id)
+                signal_stage_name = active_stage_name or str(task.current_stage or "").strip() or None
                 self._record_event(
                     db,
                     task,
-                    "tail_execution_takeover_resumed",
-                    "检测到尾段阶段尚未完成，已退出 reducer 收口并重新交给 worker 继续执行",
+                    "tail_execution_takeover_requested",
+                    "检测到尾段阶段尚未完成，reducer 已转交 owner worker 重新接管执行",
                     level="warning",
-                    stage_name=task.current_stage,
-                    payload={"reason": "incomplete_tail_stage"},
+                    stage_name=signal_stage_name,
+                    payload={
+                        "reason": "incomplete_tail_stage",
+                        "takeover_action": "signal_owned_execution",
+                        "deferred_role": "reducer",
+                    },
                 )
-                self._clear_task_abnormal_reason_snapshot(db, task)
-                db.commit()
-                self._enqueue_task(task.id)
+                self._signal_owned_execution_takeover(
+                    db,
+                    task,
+                    stage_name=signal_stage_name,
+                    reason="tail_reconcile_incomplete_stage_requires_owner_takeover",
+                    message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {signal_stage_name or task.current_stage or ''}".strip(": "),
+                    event_payload={
+                        "source": "reducer_tail_sync",
+                        "active_item_count": active_item_count,
+                        "has_downstream_refs": has_downstream_refs,
+                    },
+                )
                 return BinarySecurityActionResponse(
                     task_id=task.id,
                     status="accepted",
                     accepted=True,
-                    action="resume_owned_execution",
-                    message="已退出 tail 收口并重新交给 worker 继续执行",
+                    action="signal_owned_execution",
+                    message="已请求 owner worker 重新接管 tail 执行",
                 )
             if active_item_count > 0 or has_downstream_refs:
-                task.current_stage = active_stage_name or task.current_stage
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
-                task.finished_at = None
-                task.last_error = None
-                lease = self._activate_tail_reconciliation(
+                signal_stage_name = active_stage_name or str(task.current_stage or "").strip() or None
+                self._record_event(
                     db,
                     task,
-                    now_value=task_manager_module._now(),
-                    fallback_status="pending",
-                    takeover_result="sync_reclaim",
+                    "tail_reconcile_sync_deferred_to_owner_worker",
+                    "检测到 tail 收口仍有活动事实，reducer 已转交 owner worker 继续处理",
+                    level="info",
+                    stage_name=signal_stage_name,
+                    payload={
+                        "active_item_count": active_item_count,
+                        "has_downstream_refs": has_downstream_refs,
+                        "takeover_action": "request_task_layer_reconcile",
+                        "deferred_role": "reducer",
+                    },
                 )
-                if self._runtime_lease_is_active(lease):
-                    self._set_task_status(
-                        db,
-                        task,
-                        "running",
-                        reason="tail 收口重新获取有效租约并恢复运行",
-                        source="item_sync",
-                        stage_name=active_stage_name or task.current_stage,
-                    )
-                    self._clear_task_abnormal_reason_snapshot(db, task)
-                    db.commit()
-                    task = self._task_or_404(db, project_id, task_id)
-                else:
-                    self._repair_running_lease_invariant(
-                        db,
-                        task,
-                        reason="tail_reconcile_activation_failed_during_sync_reclaim",
-                        stage_name=active_stage_name or task.current_stage,
-                        event_payload={"source": "request_task_reconcile"},
-                    )
+                self._request_task_layer_reconcile(
+                    db,
+                    task,
+                    stage_name=signal_stage_name,
+                    source_event_type="sync_downstream_status",
+                    state_event_id=None,
+                    reconcile_reason="tail_reconcile_sync_reducer_deferred",
+                    message="tail 收口事实已更新，等待 owner worker 继续收口",
+                    event_payload={
+                        "active_item_count": active_item_count,
+                        "has_downstream_refs": has_downstream_refs,
+                        "source": "reducer_tail_sync",
+                    },
+                )
 
         batch_size = max(1, int(getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50))
         if stage_name and stage_name not in self._stage_sequence_for_task(task):

@@ -310,6 +310,20 @@ class _TaskLayerReconcileDecision:
 
 
 @dataclass
+class _TaskFinalizeGateDecision:
+    allowed: bool = False
+    reason_code: str | None = None
+    blocked_by_stage: str | None = None
+    next_stage: str | None = None
+    has_active_items: bool = False
+    has_nonterminal_items: bool = False
+    has_resumable_path: bool = False
+    has_pending_materialization: bool = False
+    has_runtime_takeover_need: bool = False
+    has_authoritative_failure: bool = False
+
+
+@dataclass
 class _TaskResumeDecision:
     should_resume: bool = False
     next_stage: str | None = None
@@ -9003,6 +9017,13 @@ class TaskManager(
         for stage_name in descendant_stages:
             stage_run = runs_by_stage.get(stage_name)
             stage_items = self._stage_items(db, task.id, stage_name)
+            has_materialized_progress = self._archive_apply_descendant_has_materialized_progress(
+                db,
+                task,
+                stage_name,
+                stage_run=stage_run,
+                stage_items=stage_items,
+            )
             stage_status = self._normalize_downstream_status(getattr(stage_run, "status", None)) or str(getattr(stage_run, "status", "") or "").strip().lower()
             failure_snapshot = self._stage_failure_snapshot(task, stage_run) if stage_run is not None else {}
             failure_code = self._string_or_none(failure_snapshot.get("failure_code"))
@@ -9020,7 +9041,7 @@ class TaskManager(
                 reason = "failed_due_to_missing_repaired_inputs"
             elif stage_status in {"pending", "queued", "running", "dispatching", "success", "partial_success"} and stage_items:
                 reason = "stale_descendant_items_present"
-            elif stage_status in {"pending", "queued", "running", "dispatching"} and stage_run is not None:
+            elif stage_status in {"pending", "queued", "running", "dispatching", "success", "partial_success"} and stage_run is not None and has_materialized_progress:
                 reason = "stale_descendant_stage_run_present"
             if reason:
                 contaminated.append(
@@ -9034,6 +9055,32 @@ class TaskManager(
                     }
                 )
         return contaminated
+
+    def _archive_apply_descendant_has_materialized_progress(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        stage_run: BinarySecurityStageRun | None,
+        stage_items: list[BinarySecurityStageItem],
+    ) -> bool:
+        if stage_items:
+            return True
+        if self._archive_jobs_for_stages(db, task.id, [stage_name]):
+            return True
+        stage_summary = dict(task.stage_summary or {})
+        if bool(stage_summary.get(stage_name)):
+            return True
+        summary = dict(task.summary or {})
+        if any(summary.get(key) for key in self._stage_result_keys(stage_name)):
+            return True
+        if stage_run is None:
+            return False
+        stage_status = self._normalize_downstream_status(getattr(stage_run, "status", None)) or str(getattr(stage_run, "status", "") or "").strip().lower()
+        if stage_status in {"success", "partial_success"}:
+            return bool(getattr(stage_run, "output_summary", None))
+        return False
 
     def _archive_apply_forced_descendant_contamination(
         self,
@@ -9096,6 +9143,14 @@ class TaskManager(
             ).first()
             stage_items = self._stage_items(db, task.id, stage_name)
             if stage_run is None and not stage_items:
+                continue
+            if not stage_items and not self._archive_apply_descendant_has_materialized_progress(
+                db,
+                task,
+                stage_name,
+                stage_run=stage_run,
+                stage_items=stage_items,
+            ):
                 continue
             contaminated.append(
                 {

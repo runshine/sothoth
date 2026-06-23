@@ -14,6 +14,7 @@ class TokenUser(BaseModel):
     user_id: Optional[str] = None
     username: Optional[str] = None
     token_type: Optional[str] = None
+    machine_code: Optional[str] = None
 
 
 class BinarySecurityInputFile(BaseModel):

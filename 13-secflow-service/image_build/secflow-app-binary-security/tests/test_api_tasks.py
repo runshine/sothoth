@@ -44,8 +44,30 @@ class _RouteManagerStub:
     def __init__(self):
         self.calls = []
 
-    async def delete_task(self, db, project_id, task_id, force=False):
-        self.calls.append(("delete_task", db, project_id, task_id, force))
+    async def delete_task(
+        self,
+        db,
+        project_id,
+        task_id,
+        force=False,
+        requested_by=None,
+        request_source="api",
+        request_token_type=None,
+        request_machine_code=None,
+    ):
+        self.calls.append(
+            (
+                "delete_task",
+                db,
+                project_id,
+                task_id,
+                force,
+                requested_by,
+                request_source,
+                request_token_type,
+                request_machine_code,
+            )
+        )
         return BinarySecurityActionResponse(
             task_id=task_id,
             operation_id="op-delete-1",
@@ -799,7 +821,35 @@ class TaskApiRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual("delete", payload["action"])
         self.assertTrue(payload["accepted"])
-        self.assertEqual(("delete_task", fake_db, "p1", "t1", True), manager.calls[0])
+        self.assertEqual(
+            ("delete_task", fake_db, "p1", "t1", True, "tester", "api", "user", None),
+            manager.calls[0],
+        )
+
+    def test_delete_task_route_passes_machine_token_identity(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        async def _machine_context_override(project_id: str = "p1", authorization: str | None = None):
+            del project_id, authorization
+            return TokenUser(user_id="svc", username="machine:secflow-service-token", token_type="machine", machine_code="secflow-service-token")
+
+        app.dependency_overrides[get_current_context] = _machine_context_override
+        try:
+            with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+                with TestClient(app) as client:
+                    response = client.delete(
+                        "/api/app/binary-security/projects/p1/tasks/t1",
+                        headers={"Authorization": "Bearer token"},
+                    )
+        finally:
+            app.dependency_overrides.pop(get_current_context, None)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            ("delete_task", fake_db, "p1", "t1", False, "machine:secflow-service-token", "api", "machine", "secflow-service-token"),
+            manager.calls[0],
+        )
 
     def test_get_module_selection_route_delegates_to_manager(self):
         app, fake_db = self._build_client()

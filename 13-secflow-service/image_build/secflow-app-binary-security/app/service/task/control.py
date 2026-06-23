@@ -915,10 +915,18 @@ class TaskControlServiceMixin:
         project_id: str,
         task_id: str,
         force: bool = False,
+        requested_by: str | None = None,
+        request_source: str = "api",
+        request_token_type: str | None = None,
+        request_machine_code: str | None = None,
     ) -> BinarySecurityActionResponse:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        normalized_requested_by = str(requested_by or getattr(task, "created_by", None) or "").strip() or None
+        normalized_request_source = str(request_source or "api").strip() or "api"
+        normalized_token_type = str(request_token_type or "").strip() or None
+        normalized_machine_code = str(request_machine_code or "").strip() or None
         active_delete_operation = self._active_operation(db, task.id)
         if active_delete_operation is not None and str(active_delete_operation.operation_type or "").strip() == task_manager_module.TASK_ACTION_DELETE:
             task_manager_module.observe_task_operation("delete", "already_queued")
@@ -936,15 +944,20 @@ class TaskControlServiceMixin:
             task,
             operation_type=task_manager_module.TASK_ACTION_DELETE,
             target_stage=task.current_stage,
-            requested_by=task.created_by,
+            requested_by=normalized_requested_by,
             request_payload={
                 "current_stage": task.current_stage,
                 "force": bool(force),
                 "force_delete": bool(force),
+                "requested_by": normalized_requested_by,
+                "request_token_type": normalized_token_type,
+                "request_machine_code": normalized_machine_code,
+                "request_source": normalized_request_source,
             },
             accepted_event_type="task_delete_accepted",
             accepted_message="任务删除已受理，后台正在清理任务及下游资源",
         )
+        operation.request_source = normalized_request_source
         task.current_operation_id = operation.id
         db.commit()
         task_manager_module.observe_task_operation("delete", "accepted")

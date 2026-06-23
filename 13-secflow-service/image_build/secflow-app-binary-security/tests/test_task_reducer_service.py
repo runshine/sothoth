@@ -123,7 +123,7 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         self.assertNotIn("owned_execution_takeover_requeued", event_types)
         self.assertEqual([], queued)
 
-    def test_task_execution_failed_locked_records_fact_and_signals_takeover(self):
+    def test_task_execution_failed_locked_records_fact_and_requests_reconcile(self):
         task = BinarySecurityTask(
             id="task-1",
             project_id="project-1",
@@ -171,7 +171,7 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
         self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
 
-    def test_archive_job_copy_failed_locked_records_fact_and_signals_takeover(self):
+    def test_archive_job_copy_failed_locked_records_fact_and_requests_reconcile(self):
         task = BinarySecurityTask(
             id="task-1",
             project_id="project-1",
@@ -222,6 +222,94 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
         takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
         self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+
+    def test_stage_worker_terminal_observed_only_records_fact_and_reconcile_request(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type="binary",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_path="/tmp/fw.bin",
+        )
+        event = BinarySecurityStateEvent(
+            id="evt-terminal",
+            task_id=task.id,
+            project_id=task.project_id,
+            event_type="stage_worker_terminal_observed",
+            stage_name="entry_analysis",
+            payload={
+                "stage_name": "entry_analysis",
+                "status": "success",
+                "summary": {"status": "success"},
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], state_events=[event], stage_runs=[], events=[])
+
+        queued = []
+        original_enqueue = self.manager._enqueue_task
+        original_write = self.manager._write_task_metadata_async
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._write_task_metadata_async = _noop_write
+        try:
+            import asyncio
+
+            asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
+        finally:
+            self.manager._enqueue_task = original_enqueue
+            self.manager._write_task_metadata_async = original_write
+
+        self.assertEqual("running", task.status)
+        self.assertEqual(["task-1"], queued)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("owned_execution_takeover_requeued", event_types)
+        self.assertNotIn("task_finished", event_types)
+        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
+        self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+        self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
+
+    def test_owned_execution_takeover_requeued_payload_distinguishes_reconcile_request(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type="binary",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_path="/tmp/fw.bin",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+
+        queued = []
+        original_enqueue = self.manager._enqueue_task
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        try:
+            self.manager._request_task_layer_reconcile(
+                db,
+                task,
+                stage_name="entry_analysis",
+                source_event_type="downstream_status_observed",
+                state_event_id="evt-1",
+                reconcile_reason="test_reconcile",
+                message="test reconcile request",
+            )
+        finally:
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(["task-1"], queued)
+        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
+        self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+        self.assertEqual("downstream_status_observed", (takeover_event.payload or {}).get("source_event_type"))
+        self.assertTrue((takeover_event.payload or {}).get("fact_applied"))
 
     def test_publish_reducer_metrics_snapshot_lightweight_skips_full_render(self):
         store = AsyncMock()

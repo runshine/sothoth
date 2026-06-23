@@ -464,10 +464,20 @@ async def delete_task(
     project_id: str,
     task_id: str,
     force: bool = Query(default=False),
-    _: TokenUser = Depends(get_current_context),
+    user: TokenUser = Depends(get_current_context),
     db: Session = Depends(get_db),
 ):
-    return await get_task_manager().delete_task(db, project_id=project_id, task_id=task_id, force=force)
+    requested_by = user.username or user.user_id or "unknown"
+    return await get_task_manager().delete_task(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        force=force,
+        requested_by=requested_by,
+        request_source="api",
+        request_token_type=user.token_type,
+        request_machine_code=user.machine_code,
+    )
 
 
 @router.post("/projects/{project_id}/tasks/{task_id}/force-reset", response_model=BinarySecurityActionResponse)

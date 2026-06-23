@@ -724,6 +724,22 @@ class TaskRuntimeStateServiceMixin:
         ) -> BinarySecurityTaskRuntimeLease | None:
         from app.service import task_manager as task_manager_module
 
+        if self._is_reducer_role():
+            self._record_event(
+                db,
+                task,
+                "tail_reconcile_handoff_deferred_to_owner_worker",
+                "reducer 仅记录 tail 收口事实，后续 handoff 交由 owner worker 处理",
+                level="info",
+                stage_name=str(task.current_stage or "").strip() or None,
+                payload={
+                    "fallback_status": fallback_status,
+                    "takeover_result": takeover_result,
+                    "deferred_role": "reducer",
+                },
+            )
+            return None
+
         if not self._should_enter_tail_reconciliation(db, task):
             current_stage_name = str(task.current_stage or "").strip()
             if not self._is_streaming_tail_stage(task, current_stage_name):

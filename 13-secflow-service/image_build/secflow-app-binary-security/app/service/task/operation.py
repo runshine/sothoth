@@ -2551,7 +2551,15 @@ class TaskOperationServiceMixin:
                     if finalize_task is None:
                         return False
                     self._ensure_task_write_ownership(finalize_task, db=finalize_db, allow_dispatching=True)
-                    self._finalize_task(finalize_db, finalize_task)
+                    finalize_gate = self._evaluate_task_finalization_gate(finalize_db, finalize_task)
+                    if finalize_gate.allowed:
+                        self._finalize_task(finalize_db, finalize_task)
+                    else:
+                        self._handle_finalize_gate_blocked_active_path(
+                            finalize_db,
+                            finalize_task,
+                            finalize_gate=finalize_gate,
+                        )
                     finalize_db.commit()
                 finally:
                     finalize_db.close()
@@ -2714,6 +2722,26 @@ class TaskOperationServiceMixin:
             )
 
             await self._run_task_operation_steps(db, task, operation)
+            if self._can_finalize_requeue_applied_operation_inline(db, task, operation):
+                finalized_inline = self._finalize_task_operation_after_requeue(
+                    db,
+                    task_id=task_id,
+                    operation_id=operation.id,
+                    finalize_event_type="operation_finalize_after_requeue",
+                    finalize_message="后台操作已在重排队后完成控制面收口",
+                    source="task_owner",
+                )
+                if finalized_inline:
+                    db.commit()
+                    task_manager_module.logger.info(
+                        "binary-security task owner finalized requeue-applied operation inline: "
+                        "task_id=%s operation_id=%s operation_type=%s",
+                        task_id,
+                        operation.id,
+                        str(operation.operation_type or "").strip(),
+                    )
+                    task_manager_module.observe_control_operation(operation_type, "succeeded")
+                    return True
             try:
                 self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             except task_manager_module.StaleTaskExecution:
@@ -2989,6 +3017,24 @@ class TaskOperationServiceMixin:
         if target_stage and str(task.current_stage or "").strip() != target_stage:
             return False
         if task.last_error not in {None, ""}:
+            return False
+        return True
+
+    def _can_finalize_requeue_applied_operation_inline(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> bool:
+        if str(getattr(operation, "operation_type", "") or "").strip() not in self._operation_requeue_family_types():
+            return False
+        if not self._operation_requeue_applied(task, operation):
+            return False
+        if str(getattr(task, "current_operation_id", "") or "").strip() != str(getattr(operation, "id", "") or "").strip():
+            return False
+        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+            return False
+        if not self._lease_is_active(task, db=db):
             return False
         return True
 
