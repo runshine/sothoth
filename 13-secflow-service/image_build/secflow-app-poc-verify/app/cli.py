@@ -364,14 +364,15 @@ def _build_pi_command(skill_name: str | None, prompt: str,
 
 
 def _build_rpc_command(model: str | None, thinking: str | None,
-                        extra_skill_paths: list[Path],
+                        master_skill_path: Path,
                         session_dir: Path | None = None,
                         session_name: str | None = None) -> list[str]:
     """构造 RPC 模式的 pi 命令(用于 `run` 子命令)。
 
     RPC 模式仍要传入 --session-dir 以便 session 记录保留在 workspace 下,
-    供后续 --resume / --continue 使用。RPC 用 --no-session 不存,
-    这里我们反之 *存* session 到 workspace,这样审计事后可以回顾。
+    供后续 --resume / --continue 使用。
+    显式加载 Master Skill (poc-verify-pipeline) 到 system prompt;
+    子 Skill 由 Master 通过 `read` 工具加载,不使用 --skill 注入。
     """
     cmd = ["pi", "--mode", "rpc"]
     if model:
@@ -382,8 +383,7 @@ def _build_rpc_command(model: str | None, thinking: str | None,
         cmd.extend(["--session-dir", str(session_dir)])
     if session_name:
         cmd.extend(["--name", session_name])
-    for p in extra_skill_paths:
-        cmd.extend(["--skill", str(p)])
+    cmd.extend(["--skill", str(master_skill_path)])
     return cmd
 
 
@@ -702,13 +702,16 @@ def _run_pipeline_rpc(args) -> int:
     sys.stderr.write(f"  写出: {prompt_f}\n")
 
     # 5. 构造 RPC 模式 pi 命令(session 存到 <output>/pi-sessions/run/)
-    sub_skills = list((Path(__file__).resolve().parent.parent / "skills").iterdir())
-    extra_paths = [s / "SKILL.md" for s in sub_skills if s.is_dir() and (s / "SKILL.md").is_file()]
+    # 创建 skills/ 符号链接,让 Master Skill 的 `read skills/...` 相对路径可解析
+    skills_link = output / "skills"
+    if not skills_link.exists():
+        skills_link.symlink_to(SKILL_DIR)
+        sys.stderr.write(f"  创建 symlink: {skills_link} -> {SKILL_DIR}\n")
     session_dir = output / "pi-sessions" / "run"
     session_dir.mkdir(parents=True, exist_ok=True)
     session_name = f"poc-verify-run-{output.name}"
     cmd = _build_rpc_command(
-        args.model, args.thinking, extra_paths,
+        args.model, args.thinking, master_skill,
         session_dir=session_dir, session_name=session_name,
     )
     _print_command_block("rpc pi subprocess", cmd, cwd=output)
@@ -748,6 +751,7 @@ def _run_pipeline_rpc(args) -> int:
         no_session=False,                    # *存* session 到 workspace
         session_dir=session_dir,
         session_name=session_name,
+        skill_paths=[master_skill],          # 显式加载 Master Skill
     )
     sys.stderr.write(f"  pi pid={client.proc.pid}\n")
     try:
