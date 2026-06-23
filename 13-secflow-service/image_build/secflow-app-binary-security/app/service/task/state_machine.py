@@ -1108,6 +1108,53 @@ class TaskStateMachineMixin:
             )
         else:
             self._clear_task_abnormal_reason_snapshot(db, task)
+
+    def _should_finalize_after_authoritative_failure(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        failure_ctx: dict[str, Any] | None = None,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+    ) -> bool:
+        gate = self._evaluate_task_finalization_gate(db, task, stage_runs=stage_runs)
+        if gate.allowed or str(gate.reason_code or "").strip() == "authoritative_failure":
+            return True
+        if not gate.has_authoritative_failure:
+            return False
+
+        failed_stage = str((failure_ctx or {}).get("stage_name") or "").strip()
+        if not failed_stage:
+            return False
+
+        ordered_stage_names = [
+            str(name or "").strip()
+            for name in self._stage_sequence_for_task(task)
+            if str(name or "").strip()
+        ]
+        stage_index = {name: idx for idx, name in enumerate(ordered_stage_names)}
+        failed_idx = stage_index.get(failed_stage)
+        current_stage = str(task.current_stage or "").strip()
+        current_idx = stage_index.get(current_stage)
+        blocked_stage = str(gate.blocked_by_stage or gate.next_stage or "").strip()
+        blocked_idx = stage_index.get(blocked_stage)
+
+        if gate.reason_code == "pending_stage_materialization":
+            if failed_idx is None or blocked_idx is None:
+                return False
+            return failed_idx <= blocked_idx
+
+        if gate.reason_code in {
+            "active_children_present",
+            "next_stage_resumable",
+            "resumable_execution_path_present",
+            "runtime_takeover_required",
+        }:
+            if failed_idx is None or current_idx is None:
+                return False
+            return failed_idx <= current_idx
+
+        return False
     def _next_incomplete_stage(
         self: TaskManager,
         db: Session,
@@ -1443,6 +1490,7 @@ class TaskStateMachineMixin:
                 payload=dict(decision.payload or {}),
             )
         if enqueue_task:
+            setattr(task, "_task_enqueue_emitted", True)
             self._enqueue_task(task.id)
         return True
 
@@ -2070,6 +2118,7 @@ class TaskStateMachineMixin:
         before_status = str(task.status or "").strip()
         before_stage = str(task.current_stage or "").strip()
         before_phase = str(getattr(task, "runtime_phase", "") or "").strip()
+        setattr(task, "_task_enqueue_emitted", False)
 
         self._refresh_task_status_after_sync(db, task)
         decision = self._decide_task_layer_reconcile(
@@ -2168,7 +2217,16 @@ class TaskStateMachineMixin:
                     "failure_message": str(getattr(failure_run, "last_error", None) or "owner_lost_retry_exhausted"),
                     "reason": "owner_lost_retry_exhausted_stage_run",
                 }
-        if str(authoritative_failure.get("failure_code") or "").strip() == "owner_lost_retry_exhausted" if authoritative_failure else False:
+        if (
+            str(authoritative_failure.get("failure_code") or "").strip() == "owner_lost_retry_exhausted"
+            if authoritative_failure
+            else False
+        ) and self._should_finalize_after_authoritative_failure(
+            db,
+            task,
+            failure_ctx=authoritative_failure,
+            stage_runs=stage_runs,
+        ):
             self._finalize_task_after_authoritative_failure(
                 db,
                 task,
@@ -2391,7 +2449,12 @@ class TaskStateMachineMixin:
         authoritative_failure_ctx = self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
         if authoritative_failure_ctx is None:
             authoritative_failure_ctx = self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
-        if authoritative_failure_ctx is not None:
+        if authoritative_failure_ctx is not None and self._should_finalize_after_authoritative_failure(
+            db,
+            task,
+            failure_ctx=authoritative_failure_ctx,
+            stage_runs=stage_runs,
+        ):
             self._finalize_task_after_authoritative_failure(
                 db,
                 task,
@@ -2802,6 +2865,14 @@ class TaskStateMachineMixin:
             and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
             and self._stage_ready_to_escalate_failure(workflow_snapshots, str(failed_stage_run.stage_name or "").strip())
             and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run)
+            and self._should_finalize_after_authoritative_failure(
+                db,
+                task,
+                failure_ctx={
+                    "stage_name": failed_stage_run.stage_name or task.current_stage,
+                },
+                stage_runs=stage_runs,
+            )
         ):
             failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
             self._finalize_task_after_authoritative_failure(
@@ -2827,7 +2898,14 @@ class TaskStateMachineMixin:
         ):
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             exhausted_owner_lost_items = [item for item in failed_items if self._owner_lost_retry_exhausted(task, item)]
-            if exhausted_owner_lost_items:
+            if exhausted_owner_lost_items and self._should_finalize_after_authoritative_failure(
+                db,
+                task,
+                failure_ctx={
+                    "stage_name": failed_stage_run.stage_name or task.current_stage,
+                },
+                stage_runs=stage_runs,
+            ):
                 exhausted_item = exhausted_owner_lost_items[0]
                 self._finalize_task_after_authoritative_failure(
                     db,
@@ -2856,6 +2934,15 @@ class TaskStateMachineMixin:
                 )
                 if "task owner pod lost" in failed_stage_error.lower() or "owner pod lost" in failed_stage_error.lower():
                     failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+                    if not self._should_finalize_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx={
+                            "stage_name": failed_stage_run.stage_name or task.current_stage,
+                        },
+                        stage_runs=stage_runs,
+                    ):
+                        return False
                     self._finalize_task_after_authoritative_failure(
                         db,
                         task,
@@ -3105,6 +3192,12 @@ class TaskStateMachineMixin:
                 finalize_gate.blocked_by_stage or "-",
                 finalize_gate.next_stage or "-",
             )
+            self._handle_finalize_gate_blocked_active_path(
+                db,
+                task,
+                stage_runs=stage_runs,
+                finalize_gate=finalize_gate,
+            )
             return
         workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         snapshots = workflow_snapshots
@@ -3250,7 +3343,12 @@ class TaskStateMachineMixin:
                 payload={"reason_code": gate.reason_code, "stage_status": blocked_status or None},
             )
             self._sync_task_abnormal_reason_snapshot(db, task, None)
-            if next_status == "pending" and (gate.has_resumable_path or gate.has_pending_materialization):
+            if (
+                next_status == "pending"
+                and (gate.has_resumable_path or gate.has_pending_materialization)
+                and not bool(getattr(task, "_task_enqueue_emitted", False))
+            ):
+                setattr(task, "_task_enqueue_emitted", True)
                 self._enqueue_task(task.id)
             return True
         return False
