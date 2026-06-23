@@ -58,6 +58,9 @@ class BinarySecurityTaskCreate(BaseModel):
     module_name: Optional[str] = None
     schedule_user_task_id: Optional[str] = None
     input_files: list[BinarySecurityInputFile] = Field(default_factory=list)
+    input_file_path: Optional[str] = None
+    input_dir_path: Optional[str] = None
+    input_file_paths: list[str] = Field(default_factory=list)
     output_root: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
     policy_overrides: TaskPolicyOverrides = Field(default_factory=TaskPolicyOverrides)

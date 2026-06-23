@@ -687,25 +687,6 @@ class TaskRuntimeServiceMixin:
                 return None
             if current_status != "pending" and not has_active_operation:
                 return None
-        if (
-            self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-            and self._tail_requires_execution_takeover(db, task)
-        ):
-            if not self._apply_task_main_state_update(
-                db,
-                task,
-                source="runtime_worker",
-                reason="tail 收口需回到 owned execution 继续推进",
-                stage_name=task.current_stage,
-                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
-            ):
-                return None
-            task.tail_reconcile_state = "idle"
-            self._release_tail_reconcile_owner(task.id)
-            db.flush()
-        if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
-            return None
         current_status = str(getattr(task, "status", "") or "").strip().lower()
         if current_status != "pending" and not operation_allows_runtime_resume and not has_active_operation:
             return None
@@ -952,13 +933,6 @@ class TaskRuntimeServiceMixin:
                 continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
             if self._runtime_lease_is_active(lease):
-                if (
-                    self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                    and str(lease.owner_instance_id or "").strip() == str(self.instance_id or "").strip()
-                    and self._has_tail_reconcile_owner(task.id)
-                ):
-                    task_manager_module.observe_tail_reconcile_requeue_blocked("active_local_tail_lease")
-                    continue
                 continue
             active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
             lease_remaining = task_manager_module._seconds_until(task.lease_expires_at)
@@ -1330,8 +1304,7 @@ class TaskRuntimeServiceMixin:
                 runnable_work_exists = True
             if not runnable_work_exists and self._is_streaming_tail_stage(task, current_stage_name):
                 runnable_work_exists = bool(
-                    self._should_enter_tail_reconciliation(db, task)
-                    or self._tail_requires_execution_takeover(db, task)
+                    self._tail_requires_execution_takeover(db, task)
                     or self._tail_has_runnable_unbound_work(db, task)
                 )
             if runnable_work_exists and self._repair_running_lease_invariant(
@@ -1707,7 +1680,6 @@ class TaskRuntimeServiceMixin:
                     or (
                         not self._has_local_task_execution_owner(task_id)
                         and not self._task_has_active_streaming_stage_workers(task_id)
-                        and not self._should_preserve_tail_runtime_lease(cleanup_db, task)
                     )
                 ):
                     clear_result = self._clear_runtime_lease(
@@ -1716,7 +1688,6 @@ class TaskRuntimeServiceMixin:
                         owner_instance_id=self.instance_id,
                         swallow_lock_error=True,
                     )
-                    self._release_tail_reconcile_owner(task_id)
                     if clear_result.status != "lease_locked_retry_later":
                         cleanup_db.commit()
                     else:
@@ -1727,8 +1698,6 @@ class TaskRuntimeServiceMixin:
                             self.instance_id,
                             clear_result.status,
                         )
-                elif self._should_preserve_tail_runtime_lease(cleanup_db, task):
-                    task_manager_module.observe_tail_reconcile_heartbeat("preserved_on_worker_exit")
             except Exception:
                 cleanup_db.rollback()
                 task_manager_module.logger.exception("binary-security runtime lease cleanup failed: task_id=%s", task_id)
@@ -2190,7 +2159,7 @@ class TaskRuntimeServiceMixin:
         session = get_session_factory()()
         try:
             firmware_key = input_file["firmware_key"]
-            input_path = Path(task.workspace_root) / "input" / input_file["filename"]
+            input_path = Path(str(input_file.get("path") or Path(task.workspace_root) / "input" / input_file["filename"]))
             item = self._upsert_stage_item(
                 session,
                 task=task,

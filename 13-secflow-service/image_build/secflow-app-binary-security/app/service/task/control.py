@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 import zipfile
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -135,6 +136,151 @@ class TaskControlServiceMixin:
         if any(str(item.get("relative_path") or item.get("filename") or "").strip() != str(item.get("filename") or "").strip() for item in list(input_files or [])):
             return "source_tree_files"
         return "source_archives"
+
+    def _common_path_root(self: TaskManager, paths: list[Path]) -> Path:
+        if not paths:
+            raise ValidationError("输入文件列表不能为空")
+        try:
+            root = Path(os.path.commonpath([str(path) for path in paths]))
+        except ValueError as exc:
+            raise ValidationError("输入文件路径必须位于同一文件系统根下") from exc
+        return root
+
+    def _summarize_path_input(
+        self: TaskManager,
+        *,
+        task_type: str,
+        input_file_path: str | None,
+        input_dir_path: str | None,
+        input_file_paths: list[str] | None,
+    ) -> dict[str, Any] | None:
+        file_path = str(input_file_path or "").strip()
+        dir_path = str(input_dir_path or "").strip()
+        file_paths = [str(item or "").strip() for item in list(input_file_paths or []) if str(item or "").strip()]
+        if not file_path and not dir_path and not file_paths:
+            return None
+        if task_type == "binary":
+            if not file_path:
+                raise ValidationError("binary 任务必须提供 input_file_path")
+            path = Path(file_path).expanduser()
+            if not path.is_file():
+                raise ValidationError(f"输入文件不存在或不是文件: {path}")
+            stat = path.stat()
+            return {
+                "mode": "path",
+                "input_files": [
+                    {
+                        "filename": path.name,
+                        "firmware_key": path.stem or path.name,
+                        "relative_path": path.name,
+                        "size": stat.st_size,
+                        "uploaded": True,
+                        "path": str(path),
+                    }
+                ],
+                "input_kind": "firmware_files",
+                "firmware_path": str(path),
+                "summary_updates": {
+                    "input_mode": "shared_path",
+                    "input_file_path": str(path),
+                    "input_dir_path": None,
+                    "input_file_paths": [],
+                    "input_dir": str(path.parent),
+                },
+                "metrics": {
+                    "input_total_bytes": int(stat.st_size or 0),
+                },
+            }
+        if task_type == "source":
+            if not dir_path:
+                raise ValidationError("source 任务必须提供 input_dir_path")
+            root = Path(dir_path).expanduser()
+            if not root.is_dir():
+                raise ValidationError(f"输入目录不存在或不是目录: {root}")
+            rows: list[dict[str, Any]] = []
+            total_bytes = 0
+            for child in sorted(root.rglob("*")):
+                if not child.is_file():
+                    continue
+                rel = child.relative_to(root).as_posix()
+                stat = child.stat()
+                total_bytes += int(stat.st_size or 0)
+                rows.append(
+                    {
+                        "filename": child.name,
+                        "relative_path": rel,
+                        "size": stat.st_size,
+                        "uploaded": True,
+                        "path": str(child),
+                    }
+                )
+            if not rows:
+                raise ValidationError("任务输入目录中没有可用文件")
+            return {
+                "mode": "path",
+                "input_files": rows,
+                "input_kind": "source_tree_files",
+                "firmware_path": str(root),
+                "summary_updates": {
+                    "input_mode": "shared_path",
+                    "input_file_path": None,
+                    "input_dir_path": str(root),
+                    "input_file_paths": [],
+                    "input_dir": str(root),
+                    "source_root": str(root),
+                },
+                "metrics": {
+                    "input_total_bytes": total_bytes,
+                },
+            }
+        if task_type == "binary_module":
+            if not file_paths:
+                raise ValidationError("binary_module 任务必须提供非空 input_file_paths")
+            normalized_paths = [Path(item).expanduser() for item in file_paths]
+            for path in normalized_paths:
+                if not path.is_file():
+                    raise ValidationError(f"输入模块文件不存在或不是文件: {path}")
+            root = self._common_path_root(normalized_paths)
+            if root.is_file():
+                root = root.parent
+            rows = []
+            total_bytes = 0
+            seen_relative_paths: set[str] = set()
+            for path in normalized_paths:
+                rel = path.relative_to(root).as_posix()
+                if rel in seen_relative_paths:
+                    raise ValidationError("存在重复模块输入路径")
+                seen_relative_paths.add(rel)
+                stat = path.stat()
+                total_bytes += int(stat.st_size or 0)
+                rows.append(
+                    {
+                        "filename": path.name,
+                        "relative_path": rel,
+                        "size": stat.st_size,
+                        "uploaded": True,
+                        "path": str(path),
+                    }
+                )
+            return {
+                "mode": "path",
+                "input_files": rows,
+                "input_kind": "module_elf_files",
+                "firmware_path": str(root),
+                "summary_updates": {
+                    "input_mode": "shared_path",
+                    "input_file_path": None,
+                    "input_dir_path": None,
+                    "input_file_paths": [str(path) for path in normalized_paths],
+                    "input_dir": str(root),
+                    "module_input_root_path": str(root),
+                    "source_root": str(root),
+                },
+                "metrics": {
+                    "input_total_bytes": total_bytes,
+                },
+            }
+        raise ValidationError(f"不支持的任务类型: {task_type}")
 
     def _check_storage_free_space(self: TaskManager, *, required_bytes: int) -> None:
         del required_bytes
@@ -745,7 +891,17 @@ class TaskControlServiceMixin:
         module_name = str(payload.module_name or "").strip()
         if task_type == task_manager_module.TASK_TYPE_BINARY_MODULE and not module_name:
             raise ValidationError("二进制模块任务必须填写模块名")
-        input_files = self._normalize_input_files(payload.input_files, task_type=task_type)
+        path_input = self._summarize_path_input(
+            task_type=task_type,
+            input_file_path=payload.input_file_path,
+            input_dir_path=payload.input_dir_path,
+            input_file_paths=payload.input_file_paths,
+        )
+        input_files = (
+            [dict(item) for item in path_input["input_files"]]
+            if path_input is not None
+            else self._normalize_input_files(payload.input_files, task_type=task_type)
+        )
         workspace_root = task_manager_module.app_task_root(project_id, task_id)
         output_root = self._resolve_output_root(workspace_root, payload.output_root)
         input_dir = workspace_root / "input"
@@ -758,6 +914,21 @@ class TaskControlServiceMixin:
         policy_overrides["pipeline_profile"] = pipeline_profile
         policy = self._merge_policy(db, project_id, policy_overrides, payload.stage_options)
 
+        input_kind = (
+            path_input["input_kind"]
+            if path_input is not None
+            else self._source_input_kind(input_files)
+            if task_type == task_manager_module.TASK_TYPE_SOURCE
+            else "module_elf_files"
+            if task_type == task_manager_module.TASK_TYPE_BINARY_MODULE
+            else "firmware_files"
+        )
+        task_status = "ready_to_start" if path_input is not None else "pending_upload"
+        firmware_path = (
+            str(path_input["firmware_path"])
+            if path_input is not None
+            else str(input_dir)
+        )
         task = task_manager_module.BinarySecurityTask(
             id=task_id,
             project_id=project_id,
@@ -766,11 +937,11 @@ class TaskControlServiceMixin:
             description=payload.description,
             schedule_user_task_id=str(payload.schedule_user_task_id or "").strip() or None,
             created_by=created_by,
-            status="pending_upload",
+            status=task_status,
             current_stage=None,
             firmware_name=f"{len(input_files)} files",
             firmware_source="project_filesystem",
-            firmware_path=str(input_dir),
+            firmware_path=firmware_path,
             output_root=str(output_root),
             workspace_root=str(workspace_root),
             task_key_source=str(payload.task_key_source or "").strip() or None,
@@ -790,13 +961,7 @@ class TaskControlServiceMixin:
             "temp_upload_dir": str(run_dir / "upload-tmp") if task_type == task_manager_module.TASK_TYPE_SOURCE else None,
             "input_manifest_path": str(metadata_path),
             "input_files": input_files,
-            "input_kind": (
-                self._source_input_kind(input_files)
-                if task_type == task_manager_module.TASK_TYPE_SOURCE
-                else "module_elf_files"
-                if task_type == task_manager_module.TASK_TYPE_BINARY_MODULE
-                else "firmware_files"
-            ),
+            "input_kind": input_kind,
             "module_input": {
                 "module_name": module_name,
                 "file_count": len(input_files),
@@ -815,7 +980,13 @@ class TaskControlServiceMixin:
                 "task_key_source": str(payload.task_key_source or "").strip() or None,
             },
             "pipeline_profile": pipeline_profile,
+            **(path_input["summary_updates"] if path_input is not None else {"input_mode": "uploaded_files", "input_file_path": None, "input_dir_path": None, "input_file_paths": []}),
         }
+        if task_type == task_manager_module.TASK_TYPE_BINARY_MODULE:
+            task.summary = {
+                **task.summary,
+                **self._build_binary_module_summary(task, input_files),
+            }
         task.metrics = {
             "high_risk_module_count": 0,
             "medium_risk_module_count": 0,
@@ -830,19 +1001,28 @@ class TaskControlServiceMixin:
             "entry_count": 0,
             "vuln_result_count": 0,
             "input_file_count": len(input_files),
-            "uploaded_file_count": 0,
-            "input_total_bytes": int(sum(int(item.get("size") or 0) for item in input_files)),
+            "uploaded_file_count": len(input_files) if path_input is not None else 0,
+            "input_total_bytes": int(path_input["metrics"]["input_total_bytes"] if path_input is not None else sum(int(item.get("size") or 0) for item in input_files)),
             "firmware_item_count": len(input_files),
             "unpacked_firmware_count": 0,
             "failed_firmware_count": 0,
         }
+        if task_type == task_manager_module.TASK_TYPE_BINARY_MODULE:
+            task.metrics = {
+                **task.metrics,
+                "selected_module_count": 1,
+                "candidate_module_count": 1,
+            }
         task.stage_summary = {}
         task.cleanup_snapshot = {}
         db.add(task)
         db.commit()
-        await self._write_task_metadata_async(task, metadata_path, status="pending_upload")
+        await self._write_task_metadata_async(task, metadata_path, status=task_status)
         self._record_event(db, task, "task_created", f"创建任务 {task.id}", payload={"input_files": input_files})
-        self._record_event(db, task, "task_upload_pending", "任务创建完成，等待上传文件")
+        if path_input is not None:
+            self._record_event(db, task, "task_ready_to_start", "共享路径输入校验完成，任务已就绪")
+        else:
+            self._record_event(db, task, "task_upload_pending", "任务创建完成，等待上传文件")
         task_manager_module.observe_task_lifecycle("created", status=task.status, task_type=self._task_type(task))
         db.commit()
         return self.get_task_detail(db, project_id=project_id, task_id=task.id)

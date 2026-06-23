@@ -272,6 +272,12 @@ class _ModelAwareDb:
     def flush(self):
         pass
 
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
     def begin_nested(self):
         return _NestedTransaction()
 
@@ -1036,6 +1042,9 @@ class _AppendingModelAwareDb(_ModelAwareDb):
                 rows.remove(obj)
 
     def close(self):
+        return None
+
+    def rollback(self):
         return None
 
 
@@ -3760,6 +3769,86 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("pending", dataflow_run.status)
         self.assertIsNone(dataflow_run.finished_at)
 
+    def test_refresh_task_status_after_sync_finalizes_later_failed_stage_when_current_stage_is_stale(self):
+        task = BinarySecurityTask(
+            id="t-kg-stale-stage",
+            project_id="p1",
+            name="kg-source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="knowledge_graph_entry_fetch",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}),
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=_now() - timedelta(minutes=2),
+            lease_expires_at=_now() + timedelta(minutes=1),
+        )
+        kg_run = BinarySecurityStageRun(
+            id="sr-kg-ok",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="knowledge_graph_entry_fetch",
+            sequence_no=1,
+            status="success",
+            started_at=_now() - timedelta(minutes=3),
+            finished_at=_now() - timedelta(minutes=2),
+        )
+        dataflow_run = BinarySecurityStageRun(
+            id="sr-dvs-failed",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="failed",
+            started_at=_now() - timedelta(minutes=2),
+            finished_at=_now() - timedelta(minutes=1),
+            last_error="dataflow child failed",
+            output_summary={
+                "failure_code": "downstream_child_failed",
+                "failure_category": "downstream",
+                "failure_message": "dataflow child failed",
+            },
+        )
+        dataflow_item = BinarySecurityStageItem(
+            id="si-dvs-failed",
+            task_id=task.id,
+            project_id="p1",
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="entry-1",
+            parent_key="source-project",
+            item_identity_key="entry-1::source-project",
+            status="failed",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs-1",
+            error_message="dataflow child failed",
+            finished_at=_now() - timedelta(minutes=1),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[kg_run, dataflow_run],
+            stage_items=[dataflow_item],
+            events=[],
+        )
+
+        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            self.manager._refresh_task_status_after_sync(db, task)
+
+        self.assertEqual("failed", task.status)
+        self.assertEqual("dataflow_vuln_scan", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+        self.assertEqual("dataflow child failed", task.last_error)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertIsNone(task.lease_expires_at)
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("dispatching_state_force_terminalized", event_types)
+        self.assertIn("task_finalized_after_child_failure", event_types)
+
     def test_refresh_task_status_after_sync_does_not_jump_to_empty_streaming_tail_stage(self):
         task = BinarySecurityTask(
             id="t1",
@@ -6153,6 +6242,144 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("source_tree_files", detail.summary["input_kind"])
         self.assertEqual("source_tree_files", db.tasks[-1].summary["input_kind"])
+
+    async def test_create_task_accepts_path_mode_for_binary(self):
+        db = _AppendingModelAwareDb()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            firmware_path = Path(tmp) / "firmware.bin"
+            firmware_path.write_bytes(b"firmware-demo")
+            workspace = Path(tmp) / "task-root"
+            payload = BinarySecurityTaskCreate(
+                task_id="bin-path-1",
+                task_type=TASK_TYPE_BINARY,
+                name="binary-path-task",
+                input_file_path=str(firmware_path),
+            )
+            with (
+                patch.object(task_manager_module, "app_task_root", return_value=workspace),
+                patch.object(self.manager, "_ensure_task_directories", unittest.mock.AsyncMock()),
+                patch.object(
+                    self.manager,
+                    "get_task_detail",
+                    side_effect=lambda _db, project_id, task_id: SimpleNamespace(
+                        id=task_id,
+                        project_id=project_id,
+                        status=_db.tasks[-1].status,
+                        summary=dict(_db.tasks[-1].summary or {}),
+                        metrics=dict(_db.tasks[-1].metrics or {}),
+                    ),
+                ),
+            ):
+                detail = await self.manager.create_task(
+                    db,
+                    project_id="p1",
+                    payload=payload,
+                    created_by="tester",
+                    authorization_token="token",
+                )
+
+        self.assertEqual("ready_to_start", detail.status)
+        self.assertEqual("ready_to_start", db.tasks[-1].status)
+        self.assertEqual(str(firmware_path), db.tasks[-1].summary["input_file_path"])
+        self.assertEqual(str(firmware_path.parent), db.tasks[-1].summary["input_dir"])
+        self.assertEqual("shared_path", db.tasks[-1].summary["input_mode"])
+        self.assertEqual(str(firmware_path), db.tasks[-1].summary["input_files"][0]["path"])
+        self.assertEqual(1, db.tasks[-1].metrics["uploaded_file_count"])
+
+    async def test_create_task_accepts_path_mode_for_source_directory(self):
+        db = _AppendingModelAwareDb()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source_root = Path(tmp) / "src-root"
+            (source_root / "src").mkdir(parents=True)
+            (source_root / "include").mkdir(parents=True)
+            (source_root / "src" / "main.c").write_text("int main(void) { return 0; }\n", encoding="utf-8")
+            (source_root / "include" / "util.h").write_text("#pragma once\n", encoding="utf-8")
+            workspace = Path(tmp) / "task-root"
+            payload = BinarySecurityTaskCreate(
+                task_id="src-path-1",
+                task_type=TASK_TYPE_SOURCE,
+                name="source-path-task",
+                input_dir_path=str(source_root),
+            )
+            with (
+                patch.object(task_manager_module, "app_task_root", return_value=workspace),
+                patch.object(self.manager, "_ensure_task_directories", unittest.mock.AsyncMock()),
+                patch.object(
+                    self.manager,
+                    "get_task_detail",
+                    side_effect=lambda _db, project_id, task_id: SimpleNamespace(
+                        id=task_id,
+                        project_id=project_id,
+                        status=_db.tasks[-1].status,
+                        summary=dict(_db.tasks[-1].summary or {}),
+                        metrics=dict(_db.tasks[-1].metrics or {}),
+                    ),
+                ),
+            ):
+                detail = await self.manager.create_task(
+                    db,
+                    project_id="p1",
+                    payload=payload,
+                    created_by="tester",
+                    authorization_token="token",
+                )
+
+        self.assertEqual("ready_to_start", detail.status)
+        self.assertEqual(str(source_root), db.tasks[-1].summary["input_dir"])
+        self.assertEqual(str(source_root), db.tasks[-1].summary["input_dir_path"])
+        self.assertEqual("source_tree_files", db.tasks[-1].summary["input_kind"])
+        self.assertEqual(2, len(db.tasks[-1].summary["input_files"]))
+        self.assertEqual(2, db.tasks[-1].metrics["uploaded_file_count"])
+
+    async def test_create_task_accepts_path_mode_for_binary_module(self):
+        db = _AppendingModelAwareDb()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            module_root = Path(tmp) / "module-root"
+            (module_root / "mods").mkdir(parents=True)
+            first = module_root / "mods" / "a.bin"
+            second = module_root / "mods" / "b.bin"
+            first.write_bytes(b"a")
+            second.write_bytes(b"bb")
+            workspace = Path(tmp) / "task-root"
+            payload = BinarySecurityTaskCreate(
+                task_id="mod-path-1",
+                task_type=TASK_TYPE_BINARY_MODULE,
+                name="module-path-task",
+                module_name="libcrypto",
+                input_file_paths=[str(first), str(second)],
+            )
+            with (
+                patch.object(task_manager_module, "app_task_root", return_value=workspace),
+                patch.object(self.manager, "_ensure_task_directories", unittest.mock.AsyncMock()),
+                patch.object(
+                    self.manager,
+                    "get_task_detail",
+                    side_effect=lambda _db, project_id, task_id: SimpleNamespace(
+                        id=task_id,
+                        project_id=project_id,
+                        status=_db.tasks[-1].status,
+                        summary=dict(_db.tasks[-1].summary or {}),
+                        metrics=dict(_db.tasks[-1].metrics or {}),
+                    ),
+                ),
+            ):
+                detail = await self.manager.create_task(
+                    db,
+                    project_id="p1",
+                    payload=payload,
+                    created_by="tester",
+                    authorization_token="token",
+                )
+
+        self.assertEqual("ready_to_start", detail.status)
+        self.assertEqual(str(module_root / "mods"), db.tasks[-1].summary["input_dir"])
+        self.assertEqual([str(first), str(second)], db.tasks[-1].summary["input_file_paths"])
+        self.assertEqual(2, len(db.tasks[-1].summary["input_files"]))
+        self.assertEqual(1, db.tasks[-1].metrics["selected_module_count"])
+        self.assertEqual(1, db.tasks[-1].metrics["candidate_module_count"])
 
     async def test_complete_uploads_populates_binary_module_summary_and_metrics(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -9701,10 +9928,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, by_stage["dataflow_vuln_scan"].running_items)
         self.assertEqual("pending", response.status)
         self.assertEqual("dataflow_vuln_scan", response.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, response.runtime_phase)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, response.task_control_mode)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, response.runtime_phase)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, response.task_control_mode)
         self.assertEqual("runtime-owner", response.task_lease_owner_instance_id)
-        self.assertEqual("tail_runtime_lease", response.task_lease_source)
+        self.assertEqual("runtime_lease", response.task_lease_source)
         self.assertFalse(hasattr(response, "reconcile_owner_instance_id"))
         self.assertFalse(hasattr(response, "reconcile_lease_expires_at"))
 
@@ -33025,7 +33252,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
         manager._refresh_task_status_after_sync(db, task)
 
     self.assertEqual("running", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertFalse(bool(task.dispatch_started_at))
     self.assertFalse(bool(task.lease_expires_at))
@@ -36952,7 +37179,7 @@ def _test_requeue_released_running_locked_skips_locally_owned_tail_lease(self):
 
     changed = manager._requeue_released_running_locked(db)
 
-    self.assertFalse(changed)
+    self.assertTrue(changed)
     self.assertEqual("running", task.status)
     self.assertTrue(manager._has_tail_reconcile_owner(task.id))
 
@@ -36970,7 +37197,7 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
         output_root="/o",
         workspace_root="/w",
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         updated_at=_now() - timedelta(minutes=5),
     )
     item = BinarySecurityStageItem(
@@ -36991,7 +37218,7 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
         lease_expires_at=_now() + timedelta(seconds=30),
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
-    manager._acquire_tail_reconcile_owner(task.id)
+    manager._register_task_execution_owner(task.id, "primary_task_worker")
     manager._workers[task.id] = type("Handle", (), {"done": lambda self: False})()
 
     with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
@@ -37016,7 +37243,7 @@ def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
         output_root="/o",
         workspace_root="/w",
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         lease_expires_at=original_expiry,
         updated_at=started_at,
     )
@@ -37043,7 +37270,7 @@ def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
     try:
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager.cfg.scheduler.heartbeat_update_interval_seconds = 0
-        manager._acquire_tail_reconcile_owner(task.id)
+        manager._register_task_execution_owner(task.id, "primary_task_worker")
         manager._touch_task_heartbeat(task.id)
     finally:
         task_manager_module.get_session_factory = original_factory
@@ -37182,7 +37409,7 @@ def _test_reducer_activate_tail_reconciliation_defers_to_owner_worker(self):
 
     self.assertIsNone(lease)
     self.assertEqual("running", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     deferred_events = [event for event in db.events if event.event_type == "tail_reconcile_handoff_deferred_to_owner_worker"]
     self.assertTrue(deferred_events)
 
@@ -38236,7 +38463,7 @@ def _test_process_readless_reconcile_records_incomplete_tail_reason(self):
         self.manager._enqueue_task = original_enqueue
 
     self.assertTrue(processed)
-    self.assertFalse(changed)
+    self.assertTrue(changed)
     self.assertEqual([task.id], queued)
     self.assertTrue(db.events)
     event = db.events[-1]
@@ -38256,8 +38483,6 @@ def _test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync(self)
         status="running",
         current_stage="dataflow_vuln_scan",
         runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
-        dispatcher_instance_id="worker-a",
-        lease_expires_at=_now() + timedelta(minutes=5),
         task_type=TASK_TYPE_SOURCE,
         firmware_source="project_filesystem",
         firmware_path="/fw",
@@ -38310,7 +38535,7 @@ def _test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync(self)
         self.manager._enqueue_task = original_enqueue
 
     self.assertTrue(processed)
-    self.assertFalse(changed)
+    self.assertTrue(changed)
     self.assertEqual("success", item.result.get("downstream_status"))
     self.assertEqual("success", dict(item.result.get("sync_observation") or {}).get("mapped_status"))
     self.assertEqual([], queued)
@@ -39936,6 +40161,209 @@ def _test_drain_task_sync_queue_consumes_and_acks_entry(self):
     self.assertEqual([], fake_queue.entries_by_task[task.id])
 
 
+def _test_drain_task_sync_queue_retries_failed_entry(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-retry",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="entry_analysis",
+        dispatcher_instance_id=manager.instance_id,
+        lease_expires_at=_now() + timedelta(minutes=5),
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+    fake_queue = _FakeTaskSyncQueue()
+    fake_queue.entries_by_task[task.id] = [
+        {
+            "queue_item_id": "tsq-retry-1",
+            "dedupe_key": "downstream_status:entry_analysis:i1:*",
+            "sync_kind": "downstream_status",
+            "source": "test",
+            "reason": "retry",
+            "source_event_type": "downstream_status_observed",
+            "stage_name": "entry_analysis",
+            "item_ids": ["i1"],
+            "archive_job_ids": [],
+            "force": False,
+            "requested_at": _now().isoformat(),
+            "last_requested_at": _now().isoformat(),
+            "next_retry_at": _now().isoformat(),
+            "attempts": 0,
+            "priority": 10,
+            "payload": {},
+        }
+    ]
+    original_get_queue = task_manager_module.get_task_queue
+    original_sync = manager.sync_downstream_status
+    original_repair = manager._repair_task_sync_queue_on_runtime_start
+    try:
+        task_manager_module.get_task_queue = lambda: fake_queue
+
+        async def _fake_sync(*_args, **_kwargs):
+            raise UpstreamError("boom")
+
+        manager.sync_downstream_status = _fake_sync
+        manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
+        with self.assertRaises(UpstreamError):
+            asyncio.run(manager._drain_task_sync_queue(db, task))
+    finally:
+        task_manager_module.get_task_queue = original_get_queue
+        manager.sync_downstream_status = original_sync
+        manager._repair_task_sync_queue_on_runtime_start = original_repair
+
+    entries = fake_queue.entries_by_task[task.id]
+    self.assertEqual(1, len(entries))
+    self.assertEqual(1, entries[0]["attempts"])
+    self.assertEqual("boom", entries[0]["last_error"])
+
+
+def _test_migrate_legacy_pending_downstream_sync_to_redis_queue(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-legacy",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    fake_queue = _FakeTaskSyncQueue()
+    queued: list[str] = []
+    original_get_queue = task_manager_module.get_task_queue
+    original_enqueue = manager._enqueue_task
+    try:
+        task_manager_module.get_task_queue = lambda: fake_queue
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        asyncio.run(
+            manager._migrate_legacy_pending_sync_signal_to_redis_queue(
+                task,
+                {
+                    "source": "legacy",
+                    "reason": "legacy_pending_downstream_sync",
+                    "stage_name": "entry_analysis",
+                    "item_ids": ["i1", "i2"],
+                    "force": True,
+                },
+            )
+        )
+    finally:
+        task_manager_module.get_task_queue = original_get_queue
+        manager._enqueue_task = original_enqueue
+
+    entries = fake_queue.entries_by_task[task.id]
+    self.assertEqual(1, len(entries))
+    self.assertEqual("downstream_status", entries[0]["sync_kind"])
+    self.assertEqual(["i1", "i2"], entries[0]["item_ids"])
+    self.assertTrue(entries[0]["payload"]["migrated_from_runtime_workset"])
+    self.assertEqual([task.id], queued)
+
+
+def _test_migrate_legacy_pending_binding_repair_to_redis_queue(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-binding-legacy",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    fake_queue = _FakeTaskSyncQueue()
+    queued: list[str] = []
+    original_get_queue = task_manager_module.get_task_queue
+    original_enqueue = manager._enqueue_task
+    try:
+        task_manager_module.get_task_queue = lambda: fake_queue
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        asyncio.run(
+            manager._migrate_legacy_pending_sync_signal_to_redis_queue(
+                task,
+                {
+                    "source": "legacy",
+                    "reason": "binding_repair",
+                    "stage_name": "dataflow_vuln_scan",
+                    "item_ids": ["i1"],
+                    "force": True,
+                },
+            )
+        )
+    finally:
+        task_manager_module.get_task_queue = original_get_queue
+        manager._enqueue_task = original_enqueue
+
+    entries = fake_queue.entries_by_task[task.id]
+    self.assertEqual(1, len(entries))
+    self.assertEqual("binding_repair", entries[0]["sync_kind"])
+    self.assertEqual("legacy_pending_binding_repair", entries[0]["source_event_type"])
+    self.assertEqual("binding_repair", entries[0]["payload"]["legacy_signal_kind"])
+    self.assertEqual([task.id], queued)
+
+
+def _test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task(self):
+    manager = TaskManager()
+    manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+    task = BinarySecurityTask(
+        id="task-stale-tail-cross-stage",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+    )
+    entry_item = BinarySecurityStageItem(
+        id="si-stale-entry",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="source_project-a",
+        item_name="module-a",
+        parent_key="source_project",
+        item_identity_key="source_project-a::source_project",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        result={
+            "sync_observation": {
+                "sync_status": "synced",
+                "downstream_status": "running",
+                "mapped_status": "running",
+                "last_attempt_at": (_now() - timedelta(minutes=10)).isoformat(),
+            },
+            "downstream_status": "running",
+        },
+        updated_at=_now() - timedelta(minutes=10),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[entry_item], events=[])
+
+    refs = manager._list_tasks_with_stale_stage_item_syncs(db)
+
+    self.assertEqual(1, len(refs))
+    self.assertEqual(task.id, refs[0]["task_id"])
+    self.assertEqual("entry_analysis", refs[0]["stage_name"])
+    self.assertEqual(["si-stale-entry"], refs[0]["item_ids"])
+
+
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
@@ -39954,6 +40382,10 @@ TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
 TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync
 TaskManagerTests.test_drain_task_sync_queue_consumes_and_acks_entry = _test_drain_task_sync_queue_consumes_and_acks_entry
+TaskManagerTests.test_drain_task_sync_queue_retries_failed_entry = _test_drain_task_sync_queue_retries_failed_entry
+TaskManagerTests.test_migrate_legacy_pending_downstream_sync_to_redis_queue = _test_migrate_legacy_pending_downstream_sync_to_redis_queue
+TaskManagerTests.test_migrate_legacy_pending_binding_repair_to_redis_queue = _test_migrate_legacy_pending_binding_repair_to_redis_queue
+TaskManagerTests.test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task = _test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task
 
 
 if __name__ == "__main__":

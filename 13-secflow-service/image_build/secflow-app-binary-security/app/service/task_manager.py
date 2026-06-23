@@ -104,10 +104,6 @@ from app.observability import (
     observe_task_list_query_stage,
     observe_task_lifecycle,
     observe_task_operation,
-    observe_tail_reconcile_heartbeat,
-    observe_tail_reconcile_owner,
-    observe_tail_reconcile_requeue_blocked,
-    observe_tail_reconcile_takeover,
     observe_worker_counts,
     observe_streaming_parent_recovered,
     render_metrics,
@@ -243,10 +239,6 @@ from app.service.knowledge_graph_audit import get_knowledge_graph_audit_client
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
-
-
-
-TAIL_RECONCILE_OWNER = "tail_reconcile_worker"
 
 DB_SUMMARY_ITEM_LIMIT = 50
 DB_FAILURE_ITEM_LIMIT = 20
@@ -703,7 +695,6 @@ class TaskManager(
         self._loop_heartbeats: dict[str, datetime] = {}
         self._last_stale_operation_requeue_at: datetime | None = None
         self._last_stage_item_sync_reconcile_at: datetime | None = None
-        self._tail_reconcile_handoff_reason: dict[str, str] = {}
         self._non_owner_claim_log_state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._non_owner_claim_log_lock = threading.Lock()
         self._non_owner_claim_event_state: dict[tuple[str, str, str, str], datetime] = {}
@@ -958,8 +949,6 @@ class TaskManager(
 
     def _can_own_runtime_phase(self, phase: str | None) -> bool:
         normalized = str(phase or "").strip().lower()
-        if normalized == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return self._is_worker_role() or self._is_reducer_role()
         if normalized in {"", TASK_RUNTIME_PHASE_OWNED_EXECUTION}:
             return self._is_worker_role()
         if normalized == TASK_RUNTIME_PHASE_TERMINAL:
@@ -967,7 +956,8 @@ class TaskManager(
         return self._is_worker_role()
 
     def _allow_tail_runtime_write(self, task: BinarySecurityTask | None) -> bool:
-        return bool(task is not None and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and self._is_reducer_role())
+        del task
+        return False
 
     def _is_tail_control_plane_stale_error(
         self,
@@ -1684,51 +1674,26 @@ class TaskManager(
                     return
             await asyncio.sleep(interval_seconds)
 
-    def _acquire_tail_reconcile_owner(self, task_id: str) -> None:
-        if not self._is_reducer_role():
-            return
-        normalized_task_id = str(task_id or "").strip()
-        if not normalized_task_id:
-            return
-        if self._has_tail_reconcile_owner(normalized_task_id):
-            return
-        self._register_task_execution_owner(normalized_task_id, TAIL_RECONCILE_OWNER)
-        observe_tail_reconcile_owner("acquired")
-
-    def _release_tail_reconcile_owner(self, task_id: str) -> None:
-        normalized_task_id = str(task_id or "").strip()
-        if not normalized_task_id:
-            return
-        had_owner = self._has_tail_reconcile_owner(normalized_task_id)
-        self._release_task_execution_owner(normalized_task_id, TAIL_RECONCILE_OWNER)
-        if had_owner:
-            observe_tail_reconcile_owner("released")
-
-    def _has_tail_reconcile_owner(self, task_id: str) -> bool:
-        normalized_task_id = str(task_id or "").strip()
-        if not normalized_task_id:
-            return False
-        with self._task_execution_owner_lock:
-            owners = self._task_execution_owners.get(normalized_task_id) or set()
-            return TAIL_RECONCILE_OWNER in owners
-
-    def _tail_reconcile_owner_token(self) -> dict[str, Any]:
-        return {
-            "owner_instance_id": self.instance_id,
-            "owner_pod_uid": self.owner_pod_uid,
-            "owner_boot_id": self.owner_boot_id,
-            "generation": self._owner_generation,
-            "owner_started_at": self.owner_started_at,
-        }
-
-    def _next_tail_reconcile_generation(self, current_generation: int | None = None) -> int:
-        base = int(current_generation or self._owner_generation or 0)
-        self._owner_generation = max(self._owner_generation, base + 1)
-        return self._owner_generation
-
     def _collect_heartbeat_candidates(self) -> list[str]:
         with self._task_execution_owner_lock:
             return sorted(task_id for task_id, owners in self._task_execution_owners.items() if owners)
+
+    def _acquire_tail_reconcile_owner(self, task_id: str) -> None:
+        del task_id
+
+    def _release_tail_reconcile_owner(self, task_id: str) -> None:
+        del task_id
+
+    def _has_tail_reconcile_owner(self, task_id: str) -> bool:
+        del task_id
+        return False
+
+    def _tail_reconcile_owner_token(self) -> dict[str, Any]:
+        return {}
+
+    def _next_tail_reconcile_generation(self, current_generation: int | None = None) -> int:
+        del current_generation
+        return int(self._owner_generation or 0)
 
     def _task_delete_snapshot(self, task: BinarySecurityTask) -> dict[str, Any]:
         snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
@@ -2208,8 +2173,8 @@ class TaskManager(
         return elapsed_seconds is not None and elapsed_seconds <= startup_window_seconds
 
     def _tail_reconcile_context_active(self, db: Session, task: BinarySecurityTask) -> bool:
-        active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
-        return bool(active_stage_name) and (active_item_count > 0 or has_downstream_refs)
+        del db, task
+        return False
 
     def _can_preserve_dispatching_state(self, db: Session, task: BinarySecurityTask, *, stage_runs: list[BinarySecurityStageRun] | None = None) -> bool:
         if str(task.status or "").strip() != "dispatching":
@@ -2291,14 +2256,6 @@ class TaskManager(
             return False
         if self._task_has_active_cancel_operation(db, task):
             return False
-        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and self._has_tail_reconcile_owner(task.id):
-            lease = self._runtime_lease_for_task(db, task.id)
-            if (
-                self._runtime_lease_is_active(lease)
-                and str(lease.owner_instance_id or "").strip() == str(self.instance_id or "").strip()
-                and self._tail_reconcile_context_active(db, task)
-            ):
-                return True
         if not self._has_local_task_execution_owner(task.id) and not self._task_has_active_streaming_stage_workers(task.id):
             return False
         return True
@@ -2586,19 +2543,14 @@ class TaskManager(
                 owner_started_at=self.owner_started_at,
             )
             task.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
-            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                task.tail_reconcile_state = "active"
+            task.tail_reconcile_state = "idle"
             task.updated_at = now_value
             session.commit()
             self._last_task_heartbeat_at[task_id] = now_value
             observe_heartbeat_update(f"{source}_written")
-            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                observe_tail_reconcile_heartbeat("written")
-                observe_tail_reconcile_owner("handoff_completed")
             return True
         session.rollback()
         observe_heartbeat_update(f"{source}_skipped")
-        observe_tail_reconcile_heartbeat("skipped")
         return False
 
     def _refresh_task_heartbeats_once(self) -> None:
@@ -3435,33 +3387,7 @@ class TaskManager(
         finally:
             session.close()
 
-    def _ensure_tail_reconciliation_current(self, task: BinarySecurityTask) -> None:
-        session = get_session_factory()()
-        try:
-            row = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
-            if row is None:
-                raise StaleTaskExecution(f"任务 {task.id} 不存在")
-            if self._task_runtime_phase(row) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛上下文已失效")
-            if str(row.status or "").strip().lower() in TASK_TERMINAL_STATUSES:
-                raise StaleTaskExecution(f"任务 {task.id} 已进入终态")
-            lease = self._runtime_lease_for_task(session, task.id)
-            if not self._runtime_lease_is_active(lease):
-                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛 lease 已失效")
-            if str(lease.owner_instance_id or "").strip() != str(self.instance_id or "").strip():
-                self._release_tail_reconcile_owner(task.id)
-                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛 owner 已变更")
-            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(session, row)
-            if active_item_count <= 0 and not has_downstream_refs:
-                raise StaleTaskExecution(f"任务 {task.id} 当前 tail 收敛上下文已结束")
-        finally:
-            session.close()
-
     def _ensure_task_execution_current(self, task: BinarySecurityTask) -> None:
-        phase = self._task_runtime_phase(task)
-        if phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            self._ensure_tail_reconciliation_current(task)
-            return
         self._ensure_owned_execution_current(task)
 
     async def _ensure_task_execution_current_async(self, task: BinarySecurityTask) -> None:
@@ -3710,7 +3636,7 @@ class TaskManager(
         finally:
             await get_task_queue().release_task_sync_repair_lock(task.id, owner_token, context="task_sync_repair_unlock")
 
-    async def _migrate_legacy_pending_downstream_sync_to_redis_queue(
+    async def _migrate_legacy_pending_sync_signal_to_redis_queue(
         self,
         task: BinarySecurityTask,
         signal: dict[str, Any],
@@ -3719,19 +3645,24 @@ class TaskManager(
         item_ids = [str(item_id).strip() for item_id in list(signal.get("item_ids") or []) if str(item_id).strip()]
         archive_job_ids = [str(job_id).strip() for job_id in list(signal.get("archive_job_ids") or []) if str(job_id).strip()]
         sync_kind = "binding_repair" if str(signal.get("reason") or "").strip() in {"binding_repair", "stale_binding_repair"} else "downstream_status"
+        source_event_type = str(signal.get("source_event_type") or "").strip() or (
+            "legacy_pending_binding_repair" if sync_kind == "binding_repair" else "legacy_pending_downstream_sync"
+        )
         return await self._enqueue_task_sync_request(
             task,
             sync_kind=sync_kind,
             source=str(signal.get("source") or "legacy_runtime_workset").strip() or "legacy_runtime_workset",
-            reason=str(signal.get("reason") or "legacy_pending_downstream_sync").strip() or "legacy_pending_downstream_sync",
+            reason=str(signal.get("reason") or ("legacy_pending_binding_repair" if sync_kind == "binding_repair" else "legacy_pending_downstream_sync")).strip()
+            or ("legacy_pending_binding_repair" if sync_kind == "binding_repair" else "legacy_pending_downstream_sync"),
             stage_name=stage_name,
             item_ids=item_ids,
             archive_job_ids=archive_job_ids,
             force=bool(signal.get("force")),
-            source_event_type=str(signal.get("source_event_type") or "legacy_pending_downstream_sync").strip() or "legacy_pending_downstream_sync",
+            source_event_type=source_event_type,
             payload={
                 "migrated_from_runtime_workset": True,
                 "legacy_signal": True,
+                "legacy_signal_kind": sync_kind,
             },
             priority=50,
         )
@@ -3913,33 +3844,12 @@ class TaskManager(
         task.current_stage = active_stage_name or task.current_stage
         task.finished_at = None
         task.last_error = None
-        if self._tail_requires_execution_takeover(db, task):
-            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
-            task.tail_reconcile_state = "idle"
-            if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status):
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
-        else:
-            self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        task.tail_reconcile_state = "idle"
+        if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status):
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
-            lease = self._activate_tail_reconciliation(
-                db,
-                task,
-                now_value=_now(),
-                fallback_status="pending",
-                takeover_result="recovered",
-            )
-            if not self._runtime_lease_is_active(lease):
-                self._repair_running_lease_invariant(
-                    db,
-                    task,
-                    reason="streaming_parent_state_recovered_without_active_tail_lease",
-                    stage_name=active_stage_name or task.current_stage,
-                    event_payload={"source": "recover_parent_state_from_tail_items"},
-                )
         self._clear_task_abnormal_reason_snapshot(db, task)
         if record_event:
             self._record_event(
@@ -3957,7 +3867,7 @@ class TaskManager(
                     "had_downstream_refs": has_downstream_refs,
                     "previous_dispatcher_instance_id": previous_dispatcher,
                     "tail_control_mode": summary.get("tail_control_mode"),
-                    "runtime_lease_established": self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+                    "runtime_lease_established": self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     "reason": reason,
                 },
             )
@@ -4185,20 +4095,24 @@ class TaskManager(
         if not self._streaming_mode_enabled(task):
             return False, None, None
         active_statuses = {"pending", "queued", "running", "dispatching", "applying"}
-        runs_by_stage = {run.stage_name: run for run in stage_runs}
         active_candidates: list[tuple[str, str]] = []
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
                 continue
             if self._is_streaming_tail_stage(task, stage_name):
                 continue
-            run = runs_by_stage.get(stage_name)
-            if run is None:
+            stage_candidates = [
+                run
+                for run in stage_runs
+                if normalize_stage_name(run.stage_name) == normalize_stage_name(stage_name)
+            ]
+            if not stage_candidates:
                 active_candidates.append((stage_name, "pending"))
                 continue
-            normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
-            if normalized_status in active_statuses:
-                active_candidates.append((stage_name, normalized_status))
+            for run in sorted(stage_candidates, key=lambda row: int(getattr(row, "sequence_no", 0) or 0)):
+                normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+                if normalized_status in active_statuses:
+                    active_candidates.append((stage_name, normalized_status))
         if active_candidates:
             stage_name, normalized_status = active_candidates[-1]
             return True, stage_name, normalized_status
@@ -4211,7 +4125,6 @@ class TaskManager(
         stage_runs: list[BinarySecurityStageRun],
     ) -> tuple[bool, str | None, str | None]:
         active_statuses = {"pending", "queued", "running", "dispatching", "applying"}
-        runs_by_stage = {run.stage_name: run for run in stage_runs}
         task_retry_target_stage = (
             str(task.target_stage_name or "").strip()
             if task.execution_mode in {"task_retry", "task_retry_failed_items"} and str(task.target_stage_name or "").strip()
@@ -4221,16 +4134,21 @@ class TaskManager(
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
                 continue
-            run = runs_by_stage.get(stage_name)
-            if run is None:
+            stage_candidates = [
+                run
+                for run in stage_runs
+                if normalize_stage_name(run.stage_name) == normalize_stage_name(stage_name)
+            ]
+            if not stage_candidates:
                 continue
-            normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
-            if task_retry_target_stage and stage_name == task_retry_target_stage and normalized_status == "success":
-                continue
-            if normalized_status in {"pending", "queued"} and not self._stage_has_real_runnable_work(db, task, stage_name):
-                continue
-            if normalized_status in active_statuses:
-                active_candidates.append((stage_name, normalized_status))
+            for run in sorted(stage_candidates, key=lambda row: int(getattr(row, "sequence_no", 0) or 0)):
+                normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
+                if task_retry_target_stage and stage_name == task_retry_target_stage and normalized_status == "success":
+                    continue
+                if normalized_status in {"pending", "queued"} and not self._stage_has_real_runnable_work(db, task, stage_name):
+                    continue
+                if normalized_status in active_statuses:
+                    active_candidates.append((stage_name, normalized_status))
         if active_candidates:
             stage_name, normalized_status = active_candidates[-1]
             return True, stage_name, normalized_status
@@ -7502,21 +7420,6 @@ class TaskManager(
             return False
         if not str(task.dispatcher_instance_id or "").strip():
             return False
-        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION:
-            return False
-        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            try:
-                session = get_session_factory()()
-                try:
-                    db_task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
-                    if db_task is None:
-                        return False
-                    if self._task_has_pending_cross_stage_downstream_sync(session, db_task):
-                        return False
-                finally:
-                    session.close()
-            except Exception:
-                return False
         return self._lease_is_active(task)
 
     def _should_preserve_task_dispatch_ownership(self, task: BinarySecurityTask, *, previous_status: str | None = None) -> bool:
@@ -9625,14 +9528,14 @@ class TaskManager(
         summary = {
             "fileserver_project_path": str(task.workspace_root),
             "task_root_path": str(task.workspace_root),
-            "input_dir": str(input_dir),
+            "input_dir": str(existing_summary.get("input_dir") or input_dir),
             "output_dir": str(output_root),
             "run_dir": str(run_dir),
             "temp_upload_dir": str(run_dir / "upload-tmp") if task_type == TASK_TYPE_SOURCE else None,
             "input_manifest_path": str(input_dir / "task-metadata.json"),
             "input_files": normalized_inputs,
             "input_kind": (
-                "source_archives"
+                str(existing_summary.get("input_kind") or "source_archives")
                 if task_type == TASK_TYPE_SOURCE
                 else "module_elf_files"
                 if task_type == TASK_TYPE_BINARY_MODULE
@@ -9652,6 +9555,10 @@ class TaskManager(
             "candidate_modules": [],
             "selected_modules": [],
             "execution_epoch": int(getattr(task, "execution_epoch", 0) or 0),
+            "input_mode": str(existing_summary.get("input_mode") or "uploaded_files"),
+            "input_file_path": existing_summary.get("input_file_path"),
+            "input_dir_path": existing_summary.get("input_dir_path"),
+            "input_file_paths": list(existing_summary.get("input_file_paths") or []),
         }
         if task_type == TASK_TYPE_BINARY_MODULE:
             summary = {
@@ -10197,9 +10104,8 @@ class TaskManager(
             observe_heartbeat_update("fallback_skipped")
             return
         has_owner = self._has_local_task_execution_owner(task_id)
-        has_tail_owner = self._has_tail_reconcile_owner(task_id)
         has_streaming_worker = self._task_has_active_streaming_stage_workers(task_id)
-        if not has_owner and not has_tail_owner and not has_streaming_worker:
+        if not has_owner and not has_streaming_worker:
             observe_heartbeat_update("fallback_skipped")
             return
         session = get_session_factory()()
@@ -10247,7 +10153,10 @@ class TaskManager(
                 input_file["firmware_key"],
                 input_file["filename"],
                 input_file["firmware_key"],
-                {"filename": input_file["filename"], "path": str(Path(task.workspace_root) / "input" / input_file["filename"])},
+                {
+                    "filename": input_file["filename"],
+                    "path": str(input_file.get("path") or Path(task.workspace_root) / "input" / input_file["filename"]),
+                },
             ),
             output_ref=lambda input_file: {
                 "downstream_service": "firmware_unpacker",
