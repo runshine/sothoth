@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -393,6 +393,48 @@ class BinarySecurityEvent(Base, JsonMixin):
     event_type = Column(String(64), nullable=False, index=True)
     message = Column(Text, nullable=False)
     payload_json = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=now_local, nullable=False, index=True)
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        return self._load_json(self.payload_json, {})
+
+    @payload.setter
+    def payload(self, value: dict[str, Any] | None) -> None:
+        self.payload_json = self._dump_json(value or {})
+
+
+class BinarySecuritySyncEvent(Base, JsonMixin):
+    __tablename__ = "secflow_binary_security_sync_event"
+
+    id = Column(String(48), primary_key=True)
+    project_id = Column(String(64), nullable=False, index=True)
+    task_id = Column(String(32), nullable=False, index=True)
+    stage_name = Column(String(64), nullable=True, index=True)
+    item_id = Column(String(40), nullable=True, index=True)
+    item_key = Column(String(128), nullable=True, index=True)
+    item_name = Column(String(255), nullable=True)
+    downstream_service = Column(String(64), nullable=True, index=True)
+    downstream_task_id = Column(String(128), nullable=True, index=True)
+    operation = Column(String(64), nullable=True, index=True)
+    event_type = Column(String(64), nullable=False, index=True)
+    sync_status = Column(String(64), nullable=True, index=True)
+    outcome = Column(String(64), nullable=True, index=True)
+    state_applied = Column(Boolean, nullable=True, index=True)
+    error_type = Column(String(128), nullable=True, index=True)
+    error_message = Column(Text, nullable=True)
+    http_status = Column(Integer, nullable=True)
+    recorder_instance_id = Column(String(128), nullable=True, index=True)
+    recorder_hostname = Column(String(255), nullable=True)
+    recorder_pod_name = Column(String(255), nullable=True)
+    recorder_node_name = Column(String(255), nullable=True)
+    recorder_role = Column(String(64), nullable=True, index=True)
+    origin_instance_id = Column(String(128), nullable=True, index=True)
+    origin_hostname = Column(String(255), nullable=True)
+    origin_pod_name = Column(String(255), nullable=True)
+    origin_node_name = Column(String(255), nullable=True)
+    origin_role = Column(String(64), nullable=True, index=True)
+    payload_json = Column(MEDIUMTEXT, nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False, index=True)
 
     @property
@@ -811,6 +853,29 @@ def _ensure_compat_columns(engine) -> None:
                 f"ALTER TABLE {event_table} ADD COLUMN operation_id VARCHAR(48) NULL"
             )
         _execute_compat_statements(statements)
+    sync_event_table = BinarySecuritySyncEvent.__tablename__
+    if inspector.has_table(sync_event_table):
+        indexes = {index["name"] for index in inspector.get_indexes(sync_event_table)}
+        index_statements = []
+        if "ix_bssync_task_created_id" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bssync_task_created_id ON {sync_event_table} (task_id, created_at, id)"
+            )
+        if "ix_bssync_task_stage_created" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bssync_task_stage_created ON {sync_event_table} (task_id, stage_name, created_at)"
+            )
+        if "ix_bssync_task_event_created" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bssync_task_event_created ON {sync_event_table} (task_id, event_type, created_at)"
+            )
+        if "ix_bssync_task_service_created" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bssync_task_service_created ON {sync_event_table} (task_id, downstream_service, created_at)"
+            )
+        _execute_compat_statements(index_statements)
+    else:
+        Base.metadata.tables[sync_event_table].create(bind=engine, checkfirst=True)
     stage_item_table = BinarySecurityStageItem.__tablename__
     if inspector.has_table(stage_item_table):
         column_defs = {column["name"]: column for column in inspector.get_columns(stage_item_table)}

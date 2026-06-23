@@ -810,6 +810,14 @@ class TaskDownstreamServiceMixin:
         payload: dict[str, Any] | None = None,
     ) -> None:
         stage_name = str(task_manager_module._stage_item_attr(item, "stage_name") or "").strip() or None
+        sync_payload = {
+            "event_type": event_type,
+            "message": message,
+            "level": level,
+            "downstream_service": task_manager_module._stage_item_attr(item, "downstream_service"),
+            "downstream_task_id": task_manager_module._stage_item_attr(item, "downstream_task_id"),
+            **(payload or {}),
+        }
         self._record_event(
             db,
             task,
@@ -818,12 +826,28 @@ class TaskDownstreamServiceMixin:
             level=level,
             stage_name=stage_name,
             item=item,
-            payload={
-                "downstream_service": task_manager_module._stage_item_attr(item, "downstream_service"),
-                "downstream_task_id": task_manager_module._stage_item_attr(item, "downstream_task_id"),
-                **(payload or {}),
-            },
+            payload=sync_payload,
         )
+        if hasattr(self, "_record_downstream_sync_event"):
+            sync_status = self._string_or_none(sync_payload.get("sync_status")) or self._string_or_none(sync_payload.get("outcome"))
+            try:
+                self._record_downstream_sync_event(
+                    db,
+                    task=task,
+                    item=item,
+                    stage_name=stage_name,
+                    operation=str(sync_payload.get("operation") or "downstream_sync").strip() or "downstream_sync",
+                    event_type=str(event_type or "observed").strip() or "observed",
+                    sync_status=sync_status,
+                    outcome=self._string_or_none(sync_payload.get("outcome")),
+                    state_applied=sync_payload.get("state_applied"),
+                    error_type=self._string_or_none(sync_payload.get("error_type")),
+                    error_message=self._string_or_none(sync_payload.get("error_message")) or message,
+                    http_status=sync_payload.get("http_status"),
+                    payload=sync_payload,
+                )
+            except Exception:
+                pass
 
     def _record_downstream_control_outcome(
         self,

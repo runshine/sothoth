@@ -77,19 +77,6 @@ class TaskReducerServiceMixin:
             "finished_at": None,
         }
         task.stage_summary = stage_summary
-        self._record_event(
-            db,
-            task,
-            "stage_started",
-            f"阶段开始执行: {stage_name}",
-            stage_name=stage_name,
-            payload={
-                "state_event_id": event.id,
-                "stage_retry_mode": bool(payload.get("stage_retry_mode")),
-                "task_retry_mode": bool(payload.get("task_retry_mode")),
-                "target_stage_name": payload.get("target_stage_name"),
-            },
-        )
         if self._task_runtime_transition_guard_active(task):
             guard = self._task_runtime_transition_guard(task)
             self._record_event(

@@ -2589,34 +2589,13 @@ class TaskOperationServiceMixin:
                     reconcile_db.close()
             if workset.get("pending_binding_repair") or workset.get("pending_downstream_sync"):
                 signal = dict(workset.get("pending_binding_repair") or workset.get("pending_downstream_sync") or {})
-                stage_name = str(signal.get("stage_name") or "").strip() or None
-                item_ids = [
-                    str(item_id).strip()
-                    for item_id in list(signal.get("item_ids") or [])
-                    if str(item_id).strip()
-                ]
-                force = bool(signal.get("force"))
                 self._clear_task_runtime_signal(task, "pending_binding_repair")
                 self._clear_task_runtime_signal(task, "pending_downstream_sync")
-                repaired = self._repair_replacement_binding_state_for_task(db, task)
                 db.commit()
-                if repaired:
-                    return True
-                sync_db = session_factory()
-                try:
-                    await self.sync_downstream_status(
-                        sync_db,
-                        project_id=task.project_id,
-                        task_id=task.id,
-                        stage_name=stage_name,
-                        item_ids=item_ids or None,
-                        force=force,
-                        token=self._service_token(),
-                        record_request_event=False,
-                        apply_state=True,
-                    )
-                finally:
-                    sync_db.close()
+                await self._migrate_legacy_pending_downstream_sync_to_redis_queue(task, signal)
+                return True
+            drained = await self._drain_task_sync_queue(db, task)
+            if drained:
                 return True
             return False
         except task_manager_module.StaleTaskExecution:

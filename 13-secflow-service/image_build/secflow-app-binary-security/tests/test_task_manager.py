@@ -22,6 +22,7 @@ from app.model import (
     BinarySecurityEvent,
     BinarySecurityProjectConfig,
     BinarySecurityServiceConfig,
+    BinarySecuritySyncEvent,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityStateEvent,
@@ -208,6 +209,7 @@ class _ModelAwareDb:
         self.stage_items = list(stage_items or [])
         self.archive_jobs = list(archive_jobs or [])
         self.events = list(events or [])
+        self.sync_events = []
         self.state_events = list(state_events or [])
         self.state_leases = list(state_leases or [])
         self.runtime_leases = list(runtime_leases or [])
@@ -228,6 +230,8 @@ class _ModelAwareDb:
             return _FakeQuery(self.archive_jobs)
         if model_name == "BinarySecurityEvent":
             return _FakeQuery(self.events)
+        if model_name == "BinarySecuritySyncEvent":
+            return _FakeQuery(self.sync_events)
         if model_name == "BinarySecurityStateEvent":
             return _FakeQuery(self.state_events)
         if model_name == "BinarySecurityTaskStateLease":
@@ -247,6 +251,8 @@ class _ModelAwareDb:
         model_name = obj.__class__.__name__
         if model_name == "BinarySecurityEvent":
             self.events.append(obj)
+        elif model_name == "BinarySecuritySyncEvent":
+            self.sync_events.append(obj)
         elif model_name == "BinarySecurityStateEvent":
             self.state_events.append(obj)
         elif model_name == "BinarySecurityArchiveJob":
@@ -269,6 +275,96 @@ class _ModelAwareDb:
     def begin_nested(self):
         return _NestedTransaction()
 
+
+class _FakeTaskSyncQueue:
+    def __init__(self):
+        self.entries_by_task: dict[str, list[dict[str, object]]] = {}
+        self.repair_locks: dict[str, str] = {}
+
+    @staticmethod
+    def _dedupe_key(entry: dict[str, object], fallback: str | None = None) -> str:
+        value = str(entry.get("dedupe_key") or fallback or "").strip()
+        if value:
+            return value
+        return "missing"
+
+    async def enqueue_task_sync_request(self, task_id: str, entry: dict[str, object], *, dedupe_key: str, context: str = "test"):
+        del context
+        task_entries = self.entries_by_task.setdefault(str(task_id), [])
+        resolved_dedupe_key = self._dedupe_key(entry, dedupe_key)
+        for current in task_entries:
+            if self._dedupe_key(current) != resolved_dedupe_key:
+                continue
+            current["item_ids"] = sorted(
+                {
+                    *[str(value).strip() for value in list(current.get("item_ids") or []) if str(value).strip()],
+                    *[str(value).strip() for value in list(entry.get("item_ids") or []) if str(value).strip()],
+                }
+            )
+            current["archive_job_ids"] = sorted(
+                {
+                    *[str(value).strip() for value in list(current.get("archive_job_ids") or []) if str(value).strip()],
+                    *[str(value).strip() for value in list(entry.get("archive_job_ids") or []) if str(value).strip()],
+                }
+            )
+            current["force"] = bool(current.get("force") or entry.get("force"))
+            current["last_requested_at"] = entry.get("last_requested_at") or current.get("last_requested_at")
+            current["payload"] = {**dict(current.get("payload") or {}), **dict(entry.get("payload") or {})}
+            return dict(current)
+        normalized = dict(entry)
+        normalized["dedupe_key"] = resolved_dedupe_key
+        normalized["queue_item_id"] = str(entry.get("queue_item_id") or f"tsq_{len(task_entries) + 1}")
+        task_entries.append(normalized)
+        return dict(normalized)
+
+    async def pop_task_sync_request(self, task_id: str, *, now_epoch: float | None = None, context: str = "test"):
+        del now_epoch, context
+        task_entries = self.entries_by_task.get(str(task_id), [])
+        if not task_entries:
+            return None
+        return dict(task_entries[0])
+
+    async def ack_task_sync_request(self, task_id: str, *, queue_item_id: str, dedupe_key: str | None = None, context: str = "test"):
+        del context
+        task_entries = self.entries_by_task.get(str(task_id), [])
+        remaining = []
+        for current in task_entries:
+            if str(current.get("queue_item_id") or "").strip() == str(queue_item_id or "").strip():
+                continue
+            if dedupe_key and self._dedupe_key(current) == str(dedupe_key or "").strip():
+                continue
+            remaining.append(current)
+        self.entries_by_task[str(task_id)] = remaining
+
+    async def retry_task_sync_request(self, task_id: str, entry: dict[str, object], *, context: str = "test"):
+        del context
+        task_entries = self.entries_by_task.setdefault(str(task_id), [])
+        queue_item_id = str(entry.get("queue_item_id") or "").strip()
+        for index, current in enumerate(task_entries):
+            if str(current.get("queue_item_id") or "").strip() == queue_item_id:
+                task_entries[index] = dict(entry)
+                return dict(entry)
+        task_entries.append(dict(entry))
+        return dict(entry)
+
+    async def list_task_sync_requests(self, task_id: str, *, context: str = "test"):
+        del context
+        return [dict(entry) for entry in list(self.entries_by_task.get(str(task_id), []))]
+
+    async def acquire_task_sync_repair_lock(self, task_id: str, owner_token: str, *, ttl_seconds: int = 30, context: str = "test"):
+        del ttl_seconds, context
+        task_id = str(task_id)
+        if task_id in self.repair_locks:
+            return False
+        self.repair_locks[task_id] = str(owner_token)
+        return True
+
+    async def release_task_sync_repair_lock(self, task_id: str, owner_token: str, *, context: str = "test"):
+        del context
+        task_id = str(task_id)
+        if self.repair_locks.get(task_id) == str(owner_token):
+            self.repair_locks.pop(task_id, None)
+
     def refresh(self, obj):
         return obj
 
@@ -284,6 +380,8 @@ class _ModelAwareDb:
     def delete(self, obj):
         if obj in self.events:
             self.events.remove(obj)
+        if obj in self.sync_events:
+            self.sync_events.remove(obj)
         if obj in self.state_events:
             self.state_events.remove(obj)
         if obj in self.runtime_leases:
@@ -936,6 +1034,9 @@ class _AppendingModelAwareDb(_ModelAwareDb):
         ):
             if obj in rows:
                 rows.remove(obj)
+
+    def close(self):
+        return None
 
 
 class _FlakyCommitDb(_AppendingModelAwareDb):
@@ -1950,7 +2051,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("dispatching", item.status)
         self.assertFalse(any(event.event_type == "streaming_stage_item_dispatch_reclaimed" for event in db.events))
 
-    def test_task_needs_downstream_reconcile_skips_streaming_tail_task(self):
+    def test_task_needs_downstream_reconcile_skips_streaming_tail_task_without_cross_stage_candidates(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
             id="t1",
@@ -1968,6 +2069,46 @@ class TaskManagerTests(unittest.TestCase):
         db = _AppendingModelAwareDb(tasks=[task])
 
         self.assertFalse(self.manager._task_needs_downstream_reconcile(db, task))
+
+    def test_task_needs_downstream_reconcile_allows_streaming_tail_task_with_cross_stage_candidates(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="source_project-a",
+            item_name="module-a",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+            result={
+                "downstream_status": "running",
+                "sync_observation": {
+                    "sync_status": "synced",
+                    "last_attempt_at": (_now() - timedelta(minutes=10)).isoformat(),
+                },
+            },
+            updated_at=_now() - timedelta(minutes=10),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[entry_item])
+
+        self.assertTrue(self.manager._task_needs_downstream_reconcile(db, task))
 
     def test_claim_streaming_stage_items_marks_pending_item_dispatching(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -30815,6 +30956,9 @@ def _test_archive_apply_uses_explicit_task_layer_reconcile(self):
     self.assertEqual("request", calls[1][0])
     self.assertEqual("archive_job_copied", calls[1][1]["source_event_type"])
     self.assertEqual("archive_apply", calls[1][1]["reconcile_reason"])
+    event_types = [event.event_type for event in db.events]
+    self.assertNotIn("task_finalize_deferred_for_incomplete_stage", event_types)
+    self.assertNotIn("main_state_write_blocked", event_types)
 
 
 def _test_prepare_retry_failed_items_reconciles_affected_stages_in_session(self):
@@ -38104,6 +38248,74 @@ def _test_process_readless_reconcile_records_incomplete_tail_reason(self):
     self.assertEqual("incomplete_tail_stage", workset["pending_operation_repair"]["takeover_reason"])
 
 
+def _test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync(self):
+    task = BinarySecurityTask(
+        id="task-readless-cross-stage",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        dispatcher_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(minutes=5),
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+    )
+    item = BinarySecurityStageItem(
+        id="si-readless-cross-stage",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        item_key="source_project-a",
+        parent_key="source_project",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        result={
+            "downstream_status": "running",
+            "sync_observation": {
+                "sync_status": "synced",
+                "downstream_status": "success",
+                "mapped_status": "success",
+                "last_attempt_at": (_now() - timedelta(minutes=10)).isoformat(),
+            },
+        },
+        updated_at=_now() - timedelta(minutes=10),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    original_factory = task_manager_module.get_session_factory
+    original_tail_takeover = self.manager._tail_requires_execution_takeover
+    original_task_layer = self.manager._readless_reconcile_task_layer
+    original_enqueue = self.manager._enqueue_task
+    queued: list[str] = []
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        self.manager._tail_requires_execution_takeover = lambda _db, _task: False
+        self.manager._readless_reconcile_task_layer = lambda _task_id: task_manager_module._TaskStateSnapshot(
+            status=task.status,
+            current_stage=task.current_stage,
+            runtime_phase=task.runtime_phase,
+        )
+        self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+
+        processed, changed = self.manager._process_readless_reconcile_task_sync(task.id)
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        self.manager._tail_requires_execution_takeover = original_tail_takeover
+        self.manager._readless_reconcile_task_layer = original_task_layer
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertTrue(processed)
+    self.assertFalse(changed)
+    self.assertEqual("success", item.result.get("downstream_status"))
+    self.assertEqual("success", dict(item.result.get("sync_observation") or {}).get("mapped_status"))
+    self.assertEqual([], queued)
+
+
 def _test_process_readless_reconcile_preserves_item_layer_commit_when_task_layer_conflicts(self):
     task = BinarySecurityTask(
         id="task-readless-split",
@@ -39162,6 +39374,7 @@ TaskManagerTests.test_tail_stage_work_summary_keeps_replacement_binding_active =
 TaskManagerTests.test_tail_stage_work_summary_keeps_transport_error_binding_active = _test_tail_stage_work_summary_keeps_transport_error_binding_active
 TaskManagerTests.test_tail_stage_work_summary_ignores_empty_pending_tail_stage_without_work = _test_tail_stage_work_summary_ignores_empty_pending_tail_stage_without_work
 TaskManagerTests.test_process_readless_reconcile_records_incomplete_tail_reason = _test_process_readless_reconcile_records_incomplete_tail_reason
+TaskManagerTests.test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync = _test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync
 TaskManagerTests.test_process_readless_reconcile_preserves_item_layer_commit_when_task_layer_conflicts = _test_process_readless_reconcile_preserves_item_layer_commit_when_task_layer_conflicts
 TaskManagerTests.test_sync_downstream_status_system_analysis_success_creates_archive_job = _test_sync_downstream_status_system_analysis_success_creates_archive_job
 TaskManagerTests.test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled = _test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled
@@ -39452,6 +39665,277 @@ def _test_run_current_task_operation_finalizes_requeue_applied_operation_inline(
     self.assertIn("operation_succeeded", event_types)
 
 
+def _test_record_downstream_sync_event_trims_task_sync_events_to_10000(self):
+    task = BinarySecurityTask(
+        id="task-sync-trim",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+    for index in range(10_005):
+        self.manager._record_downstream_sync_event(
+            db,
+            task=task,
+            stage_name="entry_analysis",
+            operation="downstream_sync",
+            event_type="observed",
+            sync_status="observed",
+            outcome="success",
+            state_applied=False,
+            payload={"seq": index},
+        )
+    self.assertEqual(10_000, len(db.sync_events))
+    self.assertGreaterEqual(len([row for row in db.added if isinstance(row, BinarySecuritySyncEvent)]), 10_000)
+
+
+def _test_get_sync_events_returns_paginated_filtered_records(self):
+    task = BinarySecurityTask(
+        id="task-sync-query",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    row1 = BinarySecuritySyncEvent(
+        id="syncevt-1",
+        project_id="p1",
+        task_id=task.id,
+        stage_name="entry_analysis",
+        item_id="item-1",
+        item_key="entry-1",
+        item_name="EntryOne",
+        downstream_service="entry_analyse",
+        downstream_task_id="ea-1",
+        operation="downstream_sync",
+        event_type="applied",
+        sync_status="synced",
+        outcome="success",
+        state_applied=True,
+        created_at=_now(),
+    )
+    row1.payload = {"seq": 1}
+    row2 = BinarySecuritySyncEvent(
+        id="syncevt-2",
+        project_id="p1",
+        task_id=task.id,
+        stage_name="dataflow_vuln_scan",
+        item_id="item-2",
+        item_key="entry-2",
+        item_name="EntryTwo",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dfa-2",
+        operation="downstream_sync",
+        event_type="transport_error",
+        sync_status="transport_error",
+        outcome="error",
+        state_applied=False,
+        error_type="UpstreamError",
+        error_message="boom",
+        created_at=_now() + timedelta(seconds=1),
+    )
+    row2.payload = {"seq": 2}
+    db = _ModelAwareDb(tasks=[task], events=[])
+    db.sync_events = [row1, row2]
+    page = self.manager.get_sync_events(
+        db,
+        project_id="p1",
+        task_id=task.id,
+        has_error=True,
+        page=1,
+        page_size=50,
+    )
+    self.assertEqual(1, page.total)
+    self.assertEqual("syncevt-2", page.items[0].id)
+    self.assertEqual("UpstreamError", page.items[0].error_type)
+
+
+def _test_enqueue_task_sync_request_merges_same_dedupe_key(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-merge",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    fake_queue = _FakeTaskSyncQueue()
+    queued: list[str] = []
+    original_enqueue = manager._enqueue_task
+    original_get_queue = task_manager_module.get_task_queue
+    try:
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        task_manager_module.get_task_queue = lambda: fake_queue
+        asyncio.run(
+            manager._enqueue_task_sync_request(
+                task,
+                sync_kind="downstream_status",
+                source="test",
+                reason="merge-a",
+                stage_name="entry_analysis",
+                item_ids=["i1"],
+            )
+        )
+        asyncio.run(
+            manager._enqueue_task_sync_request(
+                task,
+                sync_kind="downstream_status",
+                source="test",
+                reason="merge-b",
+                stage_name="entry_analysis",
+                item_ids=["i2"],
+            )
+        )
+    finally:
+        manager._enqueue_task = original_enqueue
+        task_manager_module.get_task_queue = original_get_queue
+
+    entries = fake_queue.entries_by_task[task.id]
+    self.assertEqual(1, len(entries))
+    self.assertEqual(["i1", "i2"], entries[0]["item_ids"])
+    self.assertEqual([task.id, task.id], queued)
+
+
+def _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync(self):
+    manager = TaskManager()
+    manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+    task = BinarySecurityTask(
+        id="task-sync-repair",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        dispatcher_instance_id=manager.instance_id,
+        lease_expires_at=_now() + timedelta(minutes=5),
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json='{"pipeline_mode": "mixed_streaming"}',
+    )
+    entry_item = BinarySecurityStageItem(
+        id="si-entry-late",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr-entry",
+        stage_name="entry_analysis",
+        item_key="source_project-a",
+        item_name="module-a",
+        parent_key="source_project",
+        item_identity_key="source_project-a::source_project",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        result={
+            "sync_observation": {
+                "sync_status": "synced",
+                "downstream_status": "success",
+                "mapped_status": "success",
+                "last_attempt_at": (_now() - timedelta(minutes=10)).isoformat(),
+            },
+            "downstream_status": "running",
+        },
+        updated_at=_now() - timedelta(minutes=10),
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[entry_item], events=[])
+    fake_queue = _FakeTaskSyncQueue()
+    original_get_queue = task_manager_module.get_task_queue
+    original_enqueue = manager._enqueue_task
+    try:
+        task_manager_module.get_task_queue = lambda: fake_queue
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        repaired = asyncio.run(manager._repair_task_sync_queue_on_runtime_start(db, task))
+    finally:
+        task_manager_module.get_task_queue = original_get_queue
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual(1, repaired)
+    entries = fake_queue.entries_by_task[task.id]
+    self.assertEqual(1, len(entries))
+    self.assertEqual("entry_analysis", entries[0]["stage_name"])
+    self.assertEqual("late_child_terminal_sync", entries[0]["sync_kind"])
+    self.assertEqual(["si-entry-late"], entries[0]["item_ids"])
+
+
+def _test_drain_task_sync_queue_consumes_and_acks_entry(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-drain",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="entry_analysis",
+        dispatcher_instance_id=manager.instance_id,
+        lease_expires_at=_now() + timedelta(minutes=5),
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+    fake_queue = _FakeTaskSyncQueue()
+    fake_queue.entries_by_task[task.id] = [
+        {
+            "queue_item_id": "tsq-1",
+            "dedupe_key": "downstream_status:entry_analysis:i1:*",
+            "sync_kind": "downstream_status",
+            "source": "test",
+            "reason": "drain",
+            "source_event_type": "downstream_status_observed",
+            "stage_name": "entry_analysis",
+            "item_ids": ["i1"],
+            "archive_job_ids": [],
+            "force": True,
+            "requested_at": _now().isoformat(),
+            "last_requested_at": _now().isoformat(),
+            "next_retry_at": _now().isoformat(),
+            "attempts": 0,
+            "priority": 10,
+            "payload": {},
+        }
+    ]
+    calls: list[tuple[str, str | None, list[str] | None, bool]] = []
+    original_get_queue = task_manager_module.get_task_queue
+    original_sync = manager.sync_downstream_status
+    original_repair = manager._repair_task_sync_queue_on_runtime_start
+    try:
+        task_manager_module.get_task_queue = lambda: fake_queue
+
+        async def _fake_sync(_db, *, project_id, task_id, stage_name=None, item_ids=None, force=False, **kwargs):
+            del _db, project_id, task_id, kwargs
+            calls.append(("sync", stage_name, list(item_ids or []), force))
+            return SimpleNamespace(task_id=task.id, accepted=True, status="accepted", action="sync", message="ok")
+
+        manager.sync_downstream_status = _fake_sync
+        manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
+        changed = asyncio.run(manager._drain_task_sync_queue(db, task))
+    finally:
+        task_manager_module.get_task_queue = original_get_queue
+        manager.sync_downstream_status = original_sync
+        manager._repair_task_sync_queue_on_runtime_start = original_repair
+
+    self.assertTrue(changed)
+    self.assertEqual([("sync", "entry_analysis", ["i1"], True)], calls)
+    self.assertEqual([], fake_queue.entries_by_task[task.id])
+
+
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
@@ -39465,6 +39949,11 @@ TaskManagerTests.test_finalize_gate_blocks_when_active_children_exist = _test_fi
 TaskManagerTests.test_finalize_gate_allows_when_workflow_terminal_and_children_terminal = _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal
 TaskManagerTests.test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized = _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized
 TaskManagerTests.test_reducer_activate_tail_reconciliation_defers_to_owner_worker = _test_reducer_activate_tail_reconciliation_defers_to_owner_worker
+TaskManagerTests.test_record_downstream_sync_event_trims_task_sync_events_to_10000 = _test_record_downstream_sync_event_trims_task_sync_events_to_10000
+TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
+TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
+TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync
+TaskManagerTests.test_drain_task_sync_queue_consumes_and_acks_entry = _test_drain_task_sync_queue_consumes_and_acks_entry
 
 
 if __name__ == "__main__":

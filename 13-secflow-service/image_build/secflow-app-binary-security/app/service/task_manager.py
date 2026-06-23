@@ -49,6 +49,7 @@ from app.model import (
     BinarySecurityArchiveJob,
     BinarySecurityProjectConfig,
     BinarySecurityServiceConfig,
+    BinarySecuritySyncEvent,
     BinarySecurityTaskOperation,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
@@ -155,6 +156,8 @@ from app.schemas import (
     BinarySecurityRootTaskKeySnapshot,
     BinarySecurityTaskRuntimePolicyUpdatePayload,
     BinarySecurityTaskResponse,
+    BinarySecuritySyncEventPageResponse,
+    BinarySecuritySyncEventResponse,
     BinarySecurityTimelineResponse,
     BinarySecurityUploadCompletePayload,
     BinarySecurityWorkKeySnapshot,
@@ -171,6 +174,7 @@ from app.service.fileserver import get_fileserver_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
 from app.service.readless_sync import ReadlessSyncStats, run_readless_sync_loop
+from app.service.task_queue import get_task_queue
 from app.service.task.archive import TaskArchiveServiceMixin
 from app.service.task.contracts import TaskContractServiceMixin
 from app.service.task.control import TaskControlServiceMixin
@@ -338,6 +342,7 @@ DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
 DB_TIMELINE_EVENT_LIMIT = 10_000
+DB_SYNC_EVENT_LIMIT = 10_000
 DETAIL_STAGE_ITEMS_LIMIT = 100
 READONLY_TASK_PROJECTION_CACHE_TTL_SECONDS = 1.0
 MODULE_TASK_INPUT_KEY = "module-input"
@@ -3190,6 +3195,20 @@ class TaskManager(
             level=level,
             payload=payload,
         )
+        self._record_downstream_sync_event(
+            db,
+            task=task,
+            item=item,
+            stage_name=item.stage_name,
+            operation=str(payload.get("operation") or "downstream_sync").strip() or "downstream_sync",
+            event_type="binding_mismatch",
+            sync_status=self._string_or_none(payload.get("sync_status")) or "binding_mismatch",
+            outcome="binding_mismatch",
+            state_applied=False,
+            error_type="binding_mismatch",
+            error_message=message,
+            payload=payload,
+        )
 
     def _is_payload_bound_to_current_item(
         self,
@@ -3527,6 +3546,251 @@ class TaskManager(
         if signal_name in workset:
             workset.pop(signal_name, None)
             self._set_task_runtime_workset(task, workset)
+
+    def _task_has_pending_cross_stage_sync(self, db: Session, task: BinarySecurityTask) -> bool:
+        return bool(self._task_has_pending_cross_stage_downstream_sync(db, task))
+
+    def _task_sync_request_dedupe_key(
+        self,
+        *,
+        sync_kind: str,
+        stage_name: str | None,
+        item_ids: list[str] | None,
+        archive_job_ids: list[str] | None,
+    ) -> str:
+        normalized_kind = str(sync_kind or "downstream_status").strip() or "downstream_status"
+        normalized_stage = str(stage_name or "").strip() or "*"
+        normalized_item_ids = ",".join(sorted({str(item_id).strip() for item_id in list(item_ids or []) if str(item_id).strip()})) or "*"
+        normalized_archive_job_ids = ",".join(sorted({str(job_id).strip() for job_id in list(archive_job_ids or []) if str(job_id).strip()})) or "*"
+        return f"{normalized_kind}:{normalized_stage}:{normalized_item_ids}:{normalized_archive_job_ids}"
+
+    async def _enqueue_task_sync_request(
+        self,
+        task: BinarySecurityTask,
+        *,
+        sync_kind: str,
+        source: str,
+        reason: str,
+        stage_name: str | None = None,
+        item_ids: list[str] | None = None,
+        archive_job_ids: list[str] | None = None,
+        force: bool = False,
+        source_event_type: str | None = None,
+        payload: dict[str, Any] | None = None,
+        priority: int = 100,
+    ) -> dict[str, Any]:
+        requested_at = _now().isoformat()
+        entry = {
+            "sync_kind": str(sync_kind or "downstream_status").strip() or "downstream_status",
+            "source": str(source or "").strip() or "unknown",
+            "reason": str(reason or "").strip() or "sync_requested",
+            "source_event_type": str(source_event_type or "").strip() or None,
+            "stage_name": str(stage_name or "").strip() or None,
+            "item_ids": [str(item_id).strip() for item_id in list(item_ids or []) if str(item_id).strip()],
+            "archive_job_ids": [str(job_id).strip() for job_id in list(archive_job_ids or []) if str(job_id).strip()],
+            "force": bool(force),
+            "requested_at": requested_at,
+            "last_requested_at": requested_at,
+            "next_retry_at": requested_at,
+            "attempts": 0,
+            "priority": int(priority or 100),
+            "payload": dict(payload or {}),
+        }
+        dedupe_key = self._task_sync_request_dedupe_key(
+            sync_kind=entry["sync_kind"],
+            stage_name=entry.get("stage_name"),
+            item_ids=entry.get("item_ids"),
+            archive_job_ids=entry.get("archive_job_ids"),
+        )
+        normalized_entry = await get_task_queue().enqueue_task_sync_request(
+            task.id,
+            entry,
+            dedupe_key=dedupe_key,
+            context="task_sync_enqueue",
+        )
+        self._enqueue_task(task.id)
+        return normalized_entry
+
+    def _build_expected_sync_requests_from_db(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> list[dict[str, Any]]:
+        expected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in self._task_reconcile_candidate_items(
+            db,
+            task,
+            force=False,
+            include_failed_terminal_items=True,
+        ):
+            normalized_stage = str(normalize_stage_name(item.stage_name) or "").strip() or None
+            observed_status = self._latest_observed_downstream_status(item)
+            needs_binding_repair = self._item_needs_downstream_binding_reconcile(item)
+            needs_sync = self._item_needs_downstream_sync(
+                item,
+                for_task_status=str(task.status or "").strip().lower() or None,
+            )
+            missing_recorded_status = self._item_missing_recorded_downstream_status(item)
+            if not (needs_binding_repair or needs_sync or missing_recorded_status):
+                continue
+            sync_kind = "binding_repair" if needs_binding_repair else "late_child_terminal_sync" if (
+                observed_status in {"success", "failed", "partial_success", "cancelled", "downstream_missing"}
+                and (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
+                not in {"success", "failed", "partial_success", "cancelled", "downstream_missing"}
+            ) else "downstream_status"
+            entry = {
+                "sync_kind": sync_kind,
+                "source": "db_repair",
+                "reason": "repair_missing_or_stale_sync_queue_entry",
+                "source_event_type": "task_sync_queue_repair",
+                "stage_name": normalized_stage,
+                "item_ids": [str(item.id or "").strip()] if str(item.id or "").strip() else [],
+                "archive_job_ids": [],
+                "force": bool(needs_binding_repair or missing_recorded_status),
+                "payload": {
+                    "item_key": str(item.item_key or "").strip() or None,
+                    "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    "observed_downstream_status": observed_status,
+                    "cross_stage_sync": bool(normalized_stage and normalized_stage != str(normalize_stage_name(task.current_stage) or "").strip()),
+                },
+                "priority": 10 if needs_binding_repair else 20 if missing_recorded_status else 30,
+            }
+            dedupe_key = self._task_sync_request_dedupe_key(
+                sync_kind=entry["sync_kind"],
+                stage_name=entry.get("stage_name"),
+                item_ids=entry.get("item_ids"),
+                archive_job_ids=entry.get("archive_job_ids"),
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            expected.append(entry)
+        return expected
+
+    async def _repair_task_sync_queue_on_runtime_start(self, db: Session, task: BinarySecurityTask) -> int:
+        owner_token = f"{self.instance_id}:{task.id}:{uuid.uuid4().hex[:12]}"
+        acquired = await get_task_queue().acquire_task_sync_repair_lock(
+            task.id,
+            owner_token,
+            ttl_seconds=max(5, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5) * 6),
+            context="task_sync_repair_lock",
+        )
+        if not acquired:
+            return 0
+        try:
+            expected = self._build_expected_sync_requests_from_db(db, task)
+            existing = await get_task_queue().list_task_sync_requests(task.id, context="task_sync_repair_list")
+            existing_dedupe_keys = {str(entry.get("dedupe_key") or "").strip() for entry in existing if str(entry.get("dedupe_key") or "").strip()}
+            repaired = 0
+            for entry in expected:
+                dedupe_key = self._task_sync_request_dedupe_key(
+                    sync_kind=str(entry.get("sync_kind") or "").strip(),
+                    stage_name=entry.get("stage_name"),
+                    item_ids=entry.get("item_ids"),
+                    archive_job_ids=entry.get("archive_job_ids"),
+                )
+                if dedupe_key in existing_dedupe_keys:
+                    continue
+                await self._enqueue_task_sync_request(
+                    task,
+                    sync_kind=str(entry.get("sync_kind") or "").strip(),
+                    source="runtime_start_repair",
+                    reason=str(entry.get("reason") or "repair_missing_or_stale_sync_queue_entry").strip(),
+                    stage_name=entry.get("stage_name"),
+                    item_ids=list(entry.get("item_ids") or []),
+                    archive_job_ids=list(entry.get("archive_job_ids") or []),
+                    force=bool(entry.get("force")),
+                    source_event_type=str(entry.get("source_event_type") or "task_sync_queue_repair").strip(),
+                    payload=dict(entry.get("payload") or {}),
+                    priority=int(entry.get("priority") or 100),
+                )
+                repaired += 1
+            return repaired
+        finally:
+            await get_task_queue().release_task_sync_repair_lock(task.id, owner_token, context="task_sync_repair_unlock")
+
+    async def _migrate_legacy_pending_downstream_sync_to_redis_queue(
+        self,
+        task: BinarySecurityTask,
+        signal: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        stage_name = str(signal.get("stage_name") or "").strip() or None
+        item_ids = [str(item_id).strip() for item_id in list(signal.get("item_ids") or []) if str(item_id).strip()]
+        archive_job_ids = [str(job_id).strip() for job_id in list(signal.get("archive_job_ids") or []) if str(job_id).strip()]
+        sync_kind = "binding_repair" if str(signal.get("reason") or "").strip() in {"binding_repair", "stale_binding_repair"} else "downstream_status"
+        return await self._enqueue_task_sync_request(
+            task,
+            sync_kind=sync_kind,
+            source=str(signal.get("source") or "legacy_runtime_workset").strip() or "legacy_runtime_workset",
+            reason=str(signal.get("reason") or "legacy_pending_downstream_sync").strip() or "legacy_pending_downstream_sync",
+            stage_name=stage_name,
+            item_ids=item_ids,
+            archive_job_ids=archive_job_ids,
+            force=bool(signal.get("force")),
+            source_event_type=str(signal.get("source_event_type") or "legacy_pending_downstream_sync").strip() or "legacy_pending_downstream_sync",
+            payload={
+                "migrated_from_runtime_workset": True,
+                "legacy_signal": True,
+            },
+            priority=50,
+        )
+
+    async def _drain_task_sync_queue(self, db: Session, task: BinarySecurityTask) -> bool:
+        await self._repair_task_sync_queue_on_runtime_start(db, task)
+        entry = await get_task_queue().pop_task_sync_request(task.id, context="task_sync_pop")
+        if entry is None:
+            return False
+        queue_item_id = str(entry.get("queue_item_id") or "").strip()
+        dedupe_key = str(entry.get("dedupe_key") or "").strip() or None
+        stage_name = str(entry.get("stage_name") or "").strip() or None
+        item_ids = [str(item_id).strip() for item_id in list(entry.get("item_ids") or []) if str(item_id).strip()]
+        force = bool(entry.get("force"))
+        sync_kind = str(entry.get("sync_kind") or "downstream_status").strip() or "downstream_status"
+        try:
+            if sync_kind == "binding_repair":
+                repaired = self._repair_replacement_binding_state_for_task(db, task)
+                db.commit()
+                if repaired:
+                    await get_task_queue().ack_task_sync_request(
+                        task.id,
+                        queue_item_id=queue_item_id,
+                        dedupe_key=dedupe_key,
+                        context="task_sync_ack",
+                    )
+                    return True
+            sync_db = get_session_factory()()
+            try:
+                await self.sync_downstream_status(
+                    sync_db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    stage_name=stage_name,
+                    item_ids=item_ids or None,
+                    force=force,
+                    token=self._service_token(),
+                    record_request_event=False,
+                    apply_state=True,
+                )
+            finally:
+                sync_db.close()
+            await get_task_queue().ack_task_sync_request(
+                task.id,
+                queue_item_id=queue_item_id,
+                dedupe_key=dedupe_key,
+                context="task_sync_ack",
+            )
+            return True
+        except Exception as exc:
+            retry_seconds = max(5, min(60, 5 * (2 ** min(5, int(entry.get("attempts") or 0)))))
+            retry_entry = {
+                **dict(entry),
+                "attempts": int(entry.get("attempts") or 0) + 1,
+                "last_error": str(exc),
+                "next_retry_at": (_now() + timedelta(seconds=retry_seconds)).isoformat(),
+            }
+            await get_task_queue().retry_task_sync_request(task.id, retry_entry, context="task_sync_retry")
+            raise
 
     def _has_task_write_ownership(
         self,
@@ -4956,6 +5220,11 @@ class TaskManager(
             state_applied=state_applied,
         ):
             return True
+        sync_event_type = "applied" if state_applied else "observed"
+        if sync_status in {"transport_error", "rate_limited", "binding_mismatch", "skipped"}:
+            sync_event_type = sync_status
+        elif error_message or error_type:
+            sync_event_type = "failed"
         max_attempts = self._retryable_write_attempts()
         for attempt in range(max_attempts):
             try:
@@ -4976,6 +5245,32 @@ class TaskManager(
                         next_retry_at=next_retry_at,
                         last_sync_result=last_sync_result,
                         clear_error_state=clear_error_state,
+                    )
+                    self._record_downstream_sync_event(
+                        db,
+                        task=task,
+                        item=item,
+                        stage_name=item.stage_name,
+                        operation=change_source or "downstream_sync",
+                        event_type=sync_event_type,
+                        sync_status=sync_status,
+                        outcome=last_sync_result or ("error" if error_message or error_type else "success"),
+                        state_applied=state_applied,
+                        error_type=error_type,
+                        error_message=error_message,
+                        http_status=http_status,
+                        payload={
+                            "change_source": change_source,
+                            "downstream_status_raw": status_raw,
+                            "downstream_status_mapped": mapped_status,
+                            "downstream_status": downstream_status,
+                            "state_applied": state_applied,
+                            "consecutive_error_count": consecutive_error_count,
+                            "budget_exhausted": budget_exhausted,
+                            "next_retry_at": _isoformat_or_none(next_retry_at),
+                            "last_sync_result": last_sync_result,
+                            **(extra_payload or {}),
+                        },
                     )
                     db.flush()
                 return True
@@ -7209,6 +7504,19 @@ class TaskManager(
             return False
         if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION:
             return False
+        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            try:
+                session = get_session_factory()()
+                try:
+                    db_task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+                    if db_task is None:
+                        return False
+                    if self._task_has_pending_cross_stage_downstream_sync(session, db_task):
+                        return False
+                finally:
+                    session.close()
+            except Exception:
+                return False
         return self._lease_is_active(task)
 
     def _should_preserve_task_dispatch_ownership(self, task: BinarySecurityTask, *, previous_status: str | None = None) -> bool:

@@ -343,16 +343,17 @@ class TaskLifecycleServiceMixin:
         db = task_manager_module.get_session_factory()()
         try:
             task = self._task_or_404(db, ref["project_id"], ref["task_id"])
-            self._merge_task_runtime_signal(
+            await self._enqueue_task_sync_request(
                 task,
-                "pending_downstream_sync",
+                sync_kind="downstream_status",
                 source="lease_auditor_signal",
                 reason="downstream_reconcile_requested",
                 force=False,
-                extra={"requested_by_token_present": bool(str(token or "").strip())},
+                source_event_type="downstream_status_observed",
+                payload={"requested_by_token_present": bool(str(token or "").strip())},
+                priority=40,
             )
             db.commit()
-            self._enqueue_task(task.id)
         finally:
             db.close()
 
@@ -454,17 +455,22 @@ class TaskLifecycleServiceMixin:
                     "source": "lease_auditor_signal",
                 },
             )
-            self._merge_task_runtime_signal(
+            await self._enqueue_task_sync_request(
                 task,
-                "pending_downstream_sync",
+                sync_kind="stale_sync_retry",
                 source="lease_auditor_signal",
                 reason="stale_sync_attempt",
                 stage_name=str(ref.get("stage_name") or "").strip() or None,
                 item_ids=[str(item_id).strip() for item_id in list(ref.get("item_ids") or []) if str(item_id).strip()],
                 force=True,
+                source_event_type="downstream_status_observed",
+                payload={
+                    "resolution_reason": "stale_sync_attempt",
+                    "requested_by_token_present": bool(str(token or "").strip()),
+                },
+                priority=20,
             )
             db.commit()
-            self._enqueue_task(task.id)
         finally:
             db.close()
 

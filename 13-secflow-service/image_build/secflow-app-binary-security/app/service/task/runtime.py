@@ -1823,8 +1823,6 @@ class TaskRuntimeServiceMixin:
                         "target_stage_name": target_stage_name,
                     },
                 )
-                if start_event is not None:
-                    self._apply_stage_worker_start_requested_locked(db, start_event)
                 handler = self._run_stage_executor
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 existing_stage_items = self._stage_items(db, task.id, stage_name) if task_retry_mode else []

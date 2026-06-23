@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
+import uuid
 from typing import Any, Optional
 
 from redis.asyncio import Redis
@@ -333,6 +335,272 @@ class TaskQueue:
         self._client = None
         if client is not None:
             await self._close_client(client)
+
+    def _task_sync_queue_base(self, task_id: str) -> str:
+        prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
+        return f"{prefix}:{str(task_id or '').strip()}"
+
+    def _task_sync_queue_keys(self, task_id: str) -> dict[str, str]:
+        base = self._task_sync_queue_base(task_id)
+        return {
+            "queue": f"{base}:queue",
+            "dedupe": f"{base}:dedupe",
+            "payload_prefix": f"{base}:payload",
+            "lock": f"{base}:repair_lock",
+        }
+
+    async def enqueue_task_sync_request(
+        self,
+        task_id: str,
+        entry: dict[str, Any],
+        *,
+        dedupe_key: str,
+        context: str = "task_sync_enqueue",
+    ) -> dict[str, Any]:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        normalized_dedupe_key = str(dedupe_key or "").strip()
+        if not normalized_task_id or not normalized_dedupe_key:
+            raise ValueError("task_id and dedupe_key are required")
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        now_score = self._task_sync_entry_score(entry)
+        try:
+            existing_item_id = await client.hget(keys["dedupe"], normalized_dedupe_key)
+            if existing_item_id:
+                payload_key = f"{keys['payload_prefix']}:{existing_item_id}"
+                existing_raw = await client.get(payload_key)
+                existing_entry = json.loads(existing_raw) if existing_raw else {}
+                merged = self._merge_task_sync_entries(existing_entry, entry)
+                merged["queue_item_id"] = str(existing_item_id).strip()
+                await client.set(payload_key, json.dumps(merged, ensure_ascii=True, sort_keys=True))
+                await client.zadd(keys["queue"], {merged["queue_item_id"]: self._task_sync_entry_score(merged)})
+                return merged
+            queue_item_id = str(entry.get("queue_item_id") or f"tsq_{uuid.uuid4().hex[:24]}").strip()
+            normalized_entry = self._normalize_task_sync_entry(
+                {
+                    **dict(entry or {}),
+                    "queue_item_id": queue_item_id,
+                    "dedupe_key": normalized_dedupe_key,
+                }
+            )
+            await client.set(
+                f"{keys['payload_prefix']}:{queue_item_id}",
+                json.dumps(normalized_entry, ensure_ascii=True, sort_keys=True),
+            )
+            await client.hset(keys["dedupe"], normalized_dedupe_key, queue_item_id)
+            await client.zadd(keys["queue"], {queue_item_id: now_score})
+            return normalized_entry
+        except Exception:
+            logger.exception("binary-security task sync enqueue failed: task_id=%s dedupe_key=%s", normalized_task_id, normalized_dedupe_key)
+            raise
+
+    async def pop_task_sync_request(
+        self,
+        task_id: str,
+        *,
+        now_epoch: float | None = None,
+        context: str = "task_sync_pop",
+    ) -> dict[str, Any] | None:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return None
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        threshold = float(now_epoch if now_epoch is not None else time.time())
+        try:
+            queue_item_ids = await client.zrangebyscore(keys["queue"], "-inf", threshold, start=0, num=1)
+            if not queue_item_ids:
+                return None
+            queue_item_id = str(queue_item_ids[0] or "").strip()
+            if not queue_item_id:
+                return None
+            raw = await client.get(f"{keys['payload_prefix']}:{queue_item_id}")
+            if raw is None:
+                await client.zrem(keys["queue"], queue_item_id)
+                return None
+            payload = json.loads(raw)
+            return self._normalize_task_sync_entry(payload)
+        except Exception:
+            logger.exception("binary-security task sync pop failed: task_id=%s", normalized_task_id)
+            raise
+
+    async def ack_task_sync_request(
+        self,
+        task_id: str,
+        *,
+        queue_item_id: str,
+        dedupe_key: str | None = None,
+        context: str = "task_sync_ack",
+    ) -> None:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        normalized_queue_item_id = str(queue_item_id or "").strip()
+        if not normalized_task_id or not normalized_queue_item_id:
+            return
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        try:
+            if dedupe_key:
+                await client.hdel(keys["dedupe"], str(dedupe_key).strip())
+            else:
+                raw = await client.get(f"{keys['payload_prefix']}:{normalized_queue_item_id}")
+                if raw:
+                    payload = json.loads(raw)
+                    resolved_dedupe_key = str(payload.get("dedupe_key") or "").strip()
+                    if resolved_dedupe_key:
+                        await client.hdel(keys["dedupe"], resolved_dedupe_key)
+            await client.zrem(keys["queue"], normalized_queue_item_id)
+            await client.delete(f"{keys['payload_prefix']}:{normalized_queue_item_id}")
+        except Exception:
+            logger.exception("binary-security task sync ack failed: task_id=%s queue_item_id=%s", normalized_task_id, normalized_queue_item_id)
+            raise
+
+    async def retry_task_sync_request(
+        self,
+        task_id: str,
+        entry: dict[str, Any],
+        *,
+        context: str = "task_sync_retry",
+    ) -> dict[str, Any]:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        normalized_entry = self._normalize_task_sync_entry(entry)
+        queue_item_id = str(normalized_entry.get("queue_item_id") or "").strip()
+        if not normalized_task_id or not queue_item_id:
+            raise ValueError("task_id and queue_item_id are required")
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        try:
+            await client.set(
+                f"{keys['payload_prefix']}:{queue_item_id}",
+                json.dumps(normalized_entry, ensure_ascii=True, sort_keys=True),
+            )
+            await client.zadd(keys["queue"], {queue_item_id: self._task_sync_entry_score(normalized_entry)})
+            dedupe_key = str(normalized_entry.get("dedupe_key") or "").strip()
+            if dedupe_key:
+                await client.hset(keys["dedupe"], dedupe_key, queue_item_id)
+            return normalized_entry
+        except Exception:
+            logger.exception("binary-security task sync retry failed: task_id=%s queue_item_id=%s", normalized_task_id, queue_item_id)
+            raise
+
+    async def list_task_sync_requests(
+        self,
+        task_id: str,
+        *,
+        context: str = "task_sync_list",
+    ) -> list[dict[str, Any]]:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return []
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        try:
+            queue_item_ids = [str(value).strip() for value in list(await client.zrange(keys["queue"], 0, -1) or []) if str(value).strip()]
+            entries: list[dict[str, Any]] = []
+            for queue_item_id in queue_item_ids:
+                raw = await client.get(f"{keys['payload_prefix']}:{queue_item_id}")
+                if not raw:
+                    continue
+                entries.append(self._normalize_task_sync_entry(json.loads(raw)))
+            return entries
+        except Exception:
+            logger.exception("binary-security task sync list failed: task_id=%s", normalized_task_id)
+            raise
+
+    async def acquire_task_sync_repair_lock(
+        self,
+        task_id: str,
+        owner_token: str,
+        *,
+        ttl_seconds: int = 30,
+        context: str = "task_sync_repair_lock",
+    ) -> bool:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner_token = str(owner_token or "").strip()
+        if not normalized_task_id or not normalized_owner_token:
+            return False
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        try:
+            return bool(await client.set(keys["lock"], normalized_owner_token, ex=max(1, int(ttl_seconds)), nx=True))
+        except Exception:
+            logger.exception("binary-security task sync repair lock acquire failed: task_id=%s", normalized_task_id)
+            raise
+
+    async def release_task_sync_repair_lock(
+        self,
+        task_id: str,
+        owner_token: str,
+        *,
+        context: str = "task_sync_repair_unlock",
+    ) -> None:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner_token = str(owner_token or "").strip()
+        if not normalized_task_id or not normalized_owner_token:
+            return
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        try:
+            current = await client.get(keys["lock"])
+            if str(current or "").strip() == normalized_owner_token:
+                await client.delete(keys["lock"])
+        except Exception:
+            logger.exception("binary-security task sync repair lock release failed: task_id=%s", normalized_task_id)
+            raise
+
+    @staticmethod
+    def _task_sync_entry_score(entry: dict[str, Any]) -> float:
+        raw = str(dict(entry or {}).get("next_retry_at") or dict(entry or {}).get("requested_at") or "").strip()
+        if raw:
+            try:
+                return max(0.0, time.mktime(time.strptime(raw.split(".")[0], "%Y-%m-%dT%H:%M:%S")))
+            except Exception:
+                pass
+        return time.time()
+
+    @staticmethod
+    def _normalize_task_sync_entry(entry: dict[str, Any] | None) -> dict[str, Any]:
+        payload = dict(entry or {})
+        normalized = {
+            "queue_item_id": str(payload.get("queue_item_id") or "").strip() or None,
+            "dedupe_key": str(payload.get("dedupe_key") or "").strip() or None,
+            "sync_kind": str(payload.get("sync_kind") or "downstream_status").strip() or "downstream_status",
+            "source": str(payload.get("source") or "").strip() or None,
+            "reason": str(payload.get("reason") or "").strip() or None,
+            "source_event_type": str(payload.get("source_event_type") or "").strip() or None,
+            "stage_name": str(payload.get("stage_name") or "").strip() or None,
+            "item_ids": sorted({str(item_id).strip() for item_id in list(payload.get("item_ids") or []) if str(item_id).strip()}),
+            "archive_job_ids": sorted({str(job_id).strip() for job_id in list(payload.get("archive_job_ids") or []) if str(job_id).strip()}),
+            "force": bool(payload.get("force")),
+            "requested_at": str(payload.get("requested_at") or "").strip() or None,
+            "last_requested_at": str(payload.get("last_requested_at") or "").strip() or None,
+            "next_retry_at": str(payload.get("next_retry_at") or "").strip() or None,
+            "attempts": int(payload.get("attempts") or 0),
+            "priority": int(payload.get("priority") or 100),
+            "payload": dict(payload.get("payload") or {}) if isinstance(payload.get("payload"), dict) else {},
+            "last_error": str(payload.get("last_error") or "").strip() or None,
+        }
+        return normalized
+
+    @classmethod
+    def _merge_task_sync_entries(cls, existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        current = cls._normalize_task_sync_entry(existing)
+        latest = cls._normalize_task_sync_entry(incoming)
+        merged = {
+            **current,
+            **{key: value for key, value in latest.items() if value not in {None, "", [], {}}},
+        }
+        merged["item_ids"] = sorted({*list(current.get("item_ids") or []), *list(latest.get("item_ids") or [])})
+        merged["archive_job_ids"] = sorted({*list(current.get("archive_job_ids") or []), *list(latest.get("archive_job_ids") or [])})
+        merged["payload"] = {
+            **dict(current.get("payload") or {}),
+            **dict(latest.get("payload") or {}),
+        }
+        merged["force"] = bool(current.get("force") or latest.get("force"))
+        merged["attempts"] = min(int(current.get("attempts") or 0), int(latest.get("attempts") or 0))
+        merged["requested_at"] = current.get("requested_at") or latest.get("requested_at")
+        merged["last_requested_at"] = latest.get("last_requested_at") or current.get("last_requested_at")
+        merged["priority"] = min(int(current.get("priority") or 100), int(latest.get("priority") or 100))
+        return merged
 
 
 _task_queue: TaskQueue | None = None

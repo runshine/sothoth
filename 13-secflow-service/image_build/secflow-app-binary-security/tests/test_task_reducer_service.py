@@ -61,7 +61,7 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(1, len(db.stage_runs))
         self.assertEqual("running", db.stage_runs[0].status)
         event_types = [row.event_type for row in db.events]
-        self.assertIn("stage_started", event_types)
+        self.assertNotIn("stage_started", event_types)
         self.assertIn("main_state_write_blocked", event_types)
         self.assertIn("owned_execution_takeover_requeued", event_types)
         self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
@@ -117,7 +117,6 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(1, len(db.stage_runs))
         self.assertEqual("running", db.stage_runs[0].status)
         event_types = [row.event_type for row in db.events]
-        self.assertIn("stage_started", event_types)
         self.assertIn("stage_worker_start_observed_during_guard", event_types)
         self.assertNotIn("main_state_write_blocked", event_types)
         self.assertNotIn("owned_execution_takeover_requeued", event_types)

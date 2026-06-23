@@ -734,6 +734,44 @@ class BinarySecurityTimelineResponse(BaseModel):
     events: list[BinarySecurityTaskEventResponse] = Field(default_factory=list)
 
 
+class BinarySecuritySyncEventResponse(BaseModel):
+    id: str
+    stage_name: Optional[str] = None
+    item_id: Optional[str] = None
+    item_key: Optional[str] = None
+    item_name: Optional[str] = None
+    downstream_service: Optional[str] = None
+    downstream_task_id: Optional[str] = None
+    operation: Optional[str] = None
+    event_type: str
+    sync_status: Optional[str] = None
+    outcome: Optional[str] = None
+    state_applied: Optional[bool] = None
+    error_type: Optional[str] = None
+    error_message: Optional[str] = None
+    http_status: Optional[int] = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    recorder_instance_id: Optional[str] = None
+    recorder_hostname: Optional[str] = None
+    recorder_pod_name: Optional[str] = None
+    recorder_node_name: Optional[str] = None
+    recorder_role: Optional[str] = None
+    origin_instance_id: Optional[str] = None
+    origin_hostname: Optional[str] = None
+    origin_pod_name: Optional[str] = None
+    origin_node_name: Optional[str] = None
+    origin_role: Optional[str] = None
+    created_at: datetime
+
+
+class BinarySecuritySyncEventPageResponse(BaseModel):
+    task_id: str
+    total: int = 0
+    page: int = 1
+    page_size: int = 100
+    items: list[BinarySecuritySyncEventResponse] = Field(default_factory=list)
+
+
 class BinarySecurityArtifactEntry(BaseModel):
     path: str
     size: int

@@ -33,6 +33,7 @@ from app.schemas import (
     BinarySecurityReducerEventPageResponse,
     BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemPageResponse,
+    BinarySecuritySyncEventPageResponse,
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskCreate,
     BinarySecurityTaskPolicyUpdatePayload,
@@ -403,6 +404,46 @@ def get_timeline(
         task_id=task_id,
         page=page,
         page_size=page_size,
+    )
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/sync-events", response_model=BinarySecuritySyncEventPageResponse)
+def get_sync_events(
+    project_id: str,
+    task_id: str,
+    stage_name: Optional[str] = Query(None),
+    downstream_service: Optional[str] = Query(None),
+    operation: Optional[str] = Query(None),
+    event_type: Optional[str] = Query(None),
+    sync_status: Optional[str] = Query(None),
+    outcome: Optional[str] = Query(None),
+    has_error: Optional[bool] = Query(None),
+    state_applied: Optional[bool] = Query(None),
+    search: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=10, le=1000),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_sync_events(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        stage_name=stage_name,
+        downstream_service=downstream_service,
+        operation=operation,
+        event_type=event_type,
+        sync_status=sync_status,
+        outcome=outcome,
+        has_error=has_error,
+        state_applied=state_applied,
+        search=search,
+        page=page,
+        page_size=page_size,
+        sort_by=sort_by,
+        sort_order=sort_order,
     )
 
 

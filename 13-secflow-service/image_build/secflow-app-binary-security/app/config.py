@@ -142,6 +142,7 @@ class QueueConfig(BaseModel):
     enabled: bool = True
     redis_url: str = "redis://secflow-app-binary-security-redis.secflow-ns.svc.cluster.local:6379/0"
     task_queue_key: str = "secflow:binary-security:tasks"
+    task_sync_queue_prefix: str = "bs:task_sync_queue"
     block_timeout_seconds: int = 5
     reconcile_interval_seconds: int = 30
     seed_batch_size: int = 20

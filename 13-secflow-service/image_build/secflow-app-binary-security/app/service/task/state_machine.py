@@ -1233,7 +1233,7 @@ class TaskStateMachineMixin:
         stage_name: str,
     ):
         stage_run = self._reconcile_stage_domain_in_session(db, task, stage_name)
-        snapshot = self._reconcile_task_summary_in_session(db, task)
+        snapshot = self._task_state_snapshot(task)
         return stage_run, snapshot
 
     def _reconcile_after_item_layer_update_in_session(

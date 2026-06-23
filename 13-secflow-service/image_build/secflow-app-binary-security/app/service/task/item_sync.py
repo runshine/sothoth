@@ -22,6 +22,25 @@ if TYPE_CHECKING:
 
 
 class TaskItemSyncServiceMixin:
+    def _task_has_pending_cross_stage_downstream_sync(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        current_stage = normalize_stage_name(task.current_stage)
+        if not current_stage:
+            return False
+        for item in self._task_reconcile_candidate_items(
+            db,
+            task,
+            force=False,
+            include_failed_terminal_items=True,
+        ):
+            item_stage = normalize_stage_name(item.stage_name)
+            if item_stage and item_stage != current_stage:
+                return True
+        return False
+
     def _task_sync_cooldown_elapsed(self: TaskManager, db: Session, task: BinarySecurityTask) -> bool:
         candidates = self._task_reconcile_candidate_items(db, task, force=True)
         if not candidates and hasattr(db, "stage_items"):
@@ -71,7 +90,11 @@ class TaskItemSyncServiceMixin:
             project_id = str(getattr(task, "project_id", "") or "").strip()
             if not task_id or not project_id:
                 continue
-            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
+            if (
+                self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
+                and not self._is_reducer_role()
+                and not self._task_has_pending_cross_stage_downstream_sync(db, task)
+            ):
                 continue
             if not self._task_needs_downstream_reconcile(db, task):
                 continue
@@ -603,7 +626,7 @@ class TaskItemSyncServiceMixin:
         if status not in {"dispatching", "running"}:
             return False
         if self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, task.current_stage):
-            return False
+            return self._task_has_pending_cross_stage_downstream_sync(db, task)
         if self._task_has_active_streaming_stage_workers(task.id):
             return False
         if self._has_local_task_execution_owner(task.id):
@@ -763,6 +786,26 @@ class TaskItemSyncServiceMixin:
             within_seconds=dedupe_window_seconds,
         ):
             return
+        self._record_downstream_sync_event(
+            db,
+            task=task,
+            item=item,
+            stage_name=item.stage_name,
+            operation=str(payload.get("operation") or "downstream_sync").strip() or "downstream_sync",
+            event_type="skipped",
+            sync_status="skipped",
+            outcome=reason_code,
+            state_applied=False,
+            error_type=self._string_or_none(payload.get("error_type")),
+            error_message=message,
+            http_status=self._int_or_none(payload.get("http_status")),
+            payload={
+                **payload,
+                "reason_code": reason_code,
+                "reason_category": reason_category,
+                "message": message,
+            },
+        )
         self._record_event(
             db,
             task,
@@ -1316,6 +1359,26 @@ class TaskItemSyncServiceMixin:
                     "selected_items": len(items),
                 },
             )
+            self._record_downstream_sync_event(
+                db,
+                task=task,
+                stage_name=stage_name,
+                operation="downstream_sync",
+                event_type="requested",
+                sync_status="requested",
+                outcome="requested",
+                state_applied=False,
+                payload={
+                    "stage_name": stage_name,
+                    "item_id": item_id,
+                    "item_ids": [str(item.id) for item in items] if item_ids else None,
+                    "force": force,
+                    "batch_size": batch_size,
+                    "candidate_item_count": len(items),
+                    "selected_stage_names": sorted({str(item.stage_name or "") for item in items if str(item.stage_name or "").strip()}),
+                    "selected_items": len(items),
+                },
+            )
             db.commit()
 
         synced_count = 0
@@ -1347,20 +1410,32 @@ class TaskItemSyncServiceMixin:
                         failed_count += 1
                 if not str(item.downstream_task_id or "").strip():
                     continue
-            if not item.downstream_service or not item.downstream_task_id:
-                skipped_count += 1
-                if record_noop_events:
-                    self._record_event(
-                        db,
+                if not item.downstream_service or not item.downstream_task_id:
+                    skipped_count += 1
+                    if record_noop_events:
+                        self._record_event(
+                            db,
                         task,
                         "downstream_status_sync_skipped",
                         "跳过同步：子任务缺少下游服务或任务ID",
                         level="warning",
                         stage_name=item.stage_name,
-                        item=item,
-                        payload={"binding_state": self._downstream_binding_state(item)},
-                    )
-                continue
+                            item=item,
+                            payload={"binding_state": self._downstream_binding_state(item)},
+                        )
+                        self._record_downstream_sync_event(
+                            db,
+                            task=task,
+                            item=item,
+                            stage_name=item.stage_name,
+                            operation="downstream_sync",
+                            event_type="skipped",
+                            sync_status="skipped",
+                            outcome="missing_downstream_binding",
+                            state_applied=False,
+                            payload={"binding_state": self._downstream_binding_state(item)},
+                        )
+                    continue
             ready_items.append(item)
 
         fetch_results = await self._run_with_limits(
@@ -2527,6 +2602,7 @@ class TaskItemSyncServiceMixin:
                 self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
                 and not self._is_reducer_role()
                 and not self._tail_requires_execution_takeover(session, task)
+                and not self._task_has_pending_cross_stage_downstream_sync(session, task)
             ):
                 session.rollback()
                 return True, False

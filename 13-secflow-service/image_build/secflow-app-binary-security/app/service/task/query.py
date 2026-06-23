@@ -16,6 +16,7 @@ from app.model import (
     TASK_TYPE_SOURCE,
     BinarySecurityArchiveJob,
     BinarySecurityEvent,
+    BinarySecuritySyncEvent,
     BinarySecurityStageItem,
     BinarySecurityTask,
     normalize_stage_name,
@@ -32,6 +33,8 @@ from app.schemas import (
     BinarySecurityTaskEventResponse,
     BinarySecurityTaskListResponse,
     BinarySecurityTaskOperationPageResponse,
+    BinarySecuritySyncEventPageResponse,
+    BinarySecuritySyncEventResponse,
     BinarySecurityTimelineResponse,
 )
 
@@ -559,6 +562,117 @@ class TaskQueryServiceMixin:
                 )
                 for event in timeline_events
             ],
+        )
+
+    def get_sync_events(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        stage_name: str | None = None,
+        downstream_service: str | None = None,
+        operation: str | None = None,
+        event_type: str | None = None,
+        sync_status: str | None = None,
+        outcome: str | None = None,
+        has_error: bool | None = None,
+        state_applied: bool | None = None,
+        search: str | None = None,
+        page: int = 1,
+        page_size: int = 100,
+        sort_by: str = "created_at",
+        sort_order: str = "desc",
+    ) -> BinarySecuritySyncEventPageResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        query = db.query(BinarySecuritySyncEvent).filter(BinarySecuritySyncEvent.task_id == task.id)
+        normalized_stage_name = str(stage_name or "").strip()
+        if normalized_stage_name:
+            query = query.filter(BinarySecuritySyncEvent.stage_name == normalized_stage_name)
+        normalized_service = str(downstream_service or "").strip()
+        if normalized_service:
+            query = query.filter(BinarySecuritySyncEvent.downstream_service == normalized_service)
+        normalized_operation = str(operation or "").strip()
+        if normalized_operation:
+            query = query.filter(BinarySecuritySyncEvent.operation == normalized_operation)
+        normalized_event_type = str(event_type or "").strip()
+        if normalized_event_type:
+            query = query.filter(BinarySecuritySyncEvent.event_type == normalized_event_type)
+        normalized_sync_status = str(sync_status or "").strip()
+        if normalized_sync_status:
+            query = query.filter(BinarySecuritySyncEvent.sync_status == normalized_sync_status)
+        normalized_outcome = str(outcome or "").strip()
+        if normalized_outcome:
+            query = query.filter(BinarySecuritySyncEvent.outcome == normalized_outcome)
+        page = max(1, int(page or 1))
+        page_size = min(1000, max(10, int(page_size or 100)))
+        sort_map = {
+            "created_at": BinarySecuritySyncEvent.created_at,
+            "stage_name": BinarySecuritySyncEvent.stage_name,
+            "item_key": BinarySecuritySyncEvent.item_key,
+            "downstream_service": BinarySecuritySyncEvent.downstream_service,
+        }
+        sort_column = sort_map.get(str(sort_by or "").strip(), BinarySecuritySyncEvent.created_at)
+        order_expr = sort_column.asc() if str(sort_order or "").strip().lower() == "asc" else sort_column.desc()
+        rows = query.order_by(order_expr, BinarySecuritySyncEvent.id.desc()).all()
+        if has_error is not None:
+            rows = [
+                row for row in rows
+                if (bool(getattr(row, "error_type", None) or getattr(row, "error_message", None)) == bool(has_error))
+            ]
+        if state_applied is not None:
+            rows = [row for row in rows if bool(getattr(row, "state_applied", None)) == bool(state_applied)]
+        normalized_search = str(search or "").strip().lower()
+        if normalized_search:
+            rows = [
+                row for row in rows
+                if normalized_search in " ".join([
+                    str(getattr(row, "item_id", "") or ""),
+                    str(getattr(row, "item_key", "") or ""),
+                    str(getattr(row, "item_name", "") or ""),
+                    str(getattr(row, "downstream_task_id", "") or ""),
+                ]).lower()
+            ]
+        total = len(rows)
+        rows = rows[(page - 1) * page_size : (page - 1) * page_size + page_size]
+        return BinarySecuritySyncEventPageResponse(
+            task_id=task.id,
+            total=total,
+            page=page,
+            page_size=page_size,
+            items=[self._sync_event_response(row) for row in rows],
+        )
+
+    def _sync_event_response(self: TaskManager, event: BinarySecuritySyncEvent) -> BinarySecuritySyncEventResponse:
+        payload = dict(event.payload or {})
+        return BinarySecuritySyncEventResponse(
+            id=event.id,
+            stage_name=event.stage_name,
+            item_id=event.item_id,
+            item_key=event.item_key,
+            item_name=event.item_name,
+            downstream_service=event.downstream_service,
+            downstream_task_id=event.downstream_task_id,
+            operation=event.operation,
+            event_type=event.event_type,
+            sync_status=event.sync_status,
+            outcome=event.outcome,
+            state_applied=event.state_applied,
+            error_type=event.error_type,
+            error_message=event.error_message,
+            http_status=event.http_status,
+            payload=payload,
+            recorder_instance_id=event.recorder_instance_id,
+            recorder_hostname=event.recorder_hostname,
+            recorder_pod_name=event.recorder_pod_name,
+            recorder_node_name=event.recorder_node_name,
+            recorder_role=event.recorder_role,
+            origin_instance_id=event.origin_instance_id,
+            origin_hostname=event.origin_hostname,
+            origin_pod_name=event.origin_pod_name,
+            origin_node_name=event.origin_node_name,
+            origin_role=event.origin_role,
+            created_at=event.created_at,
         )
 
     def _timeline_response_payload(self: TaskManager, event: BinarySecurityEvent) -> dict[str, Any]:
