@@ -50,7 +50,7 @@ def _utc_plus_8_log_converter(timestamp: float, *_unused):
     return datetime.fromtimestamp(timestamp, UTC_PLUS_8).timetuple()
 
 
-logging.Formatter.converter = _utc_plus_8_log_converter
+logging.Formatter.converter = staticmethod(_utc_plus_8_log_converter)
 
 
 logging.basicConfig(
