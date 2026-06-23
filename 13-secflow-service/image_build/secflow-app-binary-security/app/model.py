@@ -412,6 +412,7 @@ class BinarySecuritySyncEvent(Base, JsonMixin):
     task_id = Column(String(32), nullable=False, index=True)
     stage_name = Column(String(64), nullable=True, index=True)
     item_id = Column(String(40), nullable=True, index=True)
+    item_bucket_key = Column(String(255), nullable=True, index=True)
     item_key = Column(String(128), nullable=True, index=True)
     item_name = Column(String(255), nullable=True)
     downstream_service = Column(String(64), nullable=True, index=True)
@@ -855,6 +856,13 @@ def _ensure_compat_columns(engine) -> None:
         _execute_compat_statements(statements)
     sync_event_table = BinarySecuritySyncEvent.__tablename__
     if inspector.has_table(sync_event_table):
+        columns = {column["name"] for column in inspector.get_columns(sync_event_table)}
+        statements = []
+        if "item_bucket_key" not in columns:
+            statements.append(
+                f"ALTER TABLE {sync_event_table} ADD COLUMN item_bucket_key VARCHAR(255) NULL"
+            )
+        _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(sync_event_table)}
         index_statements = []
         if "ix_bssync_task_created_id" not in indexes:
@@ -872,6 +880,10 @@ def _ensure_compat_columns(engine) -> None:
         if "ix_bssync_task_service_created" not in indexes:
             index_statements.append(
                 f"CREATE INDEX ix_bssync_task_service_created ON {sync_event_table} (task_id, downstream_service, created_at)"
+            )
+        if "ix_bssync_task_bucket_created" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bssync_task_bucket_created ON {sync_event_table} (task_id, item_bucket_key, created_at, id)"
             )
         _execute_compat_statements(index_statements)
     else:

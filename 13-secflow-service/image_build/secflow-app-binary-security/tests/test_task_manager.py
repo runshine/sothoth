@@ -10643,6 +10643,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
         cancelled: list[str] = []
+        enqueued: list[str] = []
 
         async def fake_write_task_metadata_async(*args, **kwargs):
             return None
@@ -10652,10 +10653,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.manager._write_task_metadata_async = fake_write_task_metadata_async
         self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
+        self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
 
         response = asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
 
-        self.assertEqual([], cancelled)
+        self.assertEqual(["t1:False"], cancelled)
+        self.assertGreaterEqual(len(enqueued), 1)
+        self.assertTrue(all(task_id == "t1" for task_id in enqueued))
         self.assertEqual("cancelling", task.status)
         event_types = [getattr(event, "event_type", "") for event in db.added]
         self.assertEqual("accepted", response.status)
@@ -10663,10 +10667,51 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_cancel_accepted", event_types)
         asyncio.run(self.manager._prepare_cancel_task(db, task))
 
-        self.assertEqual(["t1:False"], cancelled)
+        self.assertEqual(["t1:False", "t1:False"], cancelled)
         self.assertEqual("cancelling", task.status)
         self.assertEqual("cancelled", stage_run.status)
         self.assertEqual("cancelled", item.status)
+
+    def test_delete_task_requests_local_worker_cancel_on_accept(self):
+        task = BinarySecurityTask(
+            id="t-del",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="worker-a",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[])
+        cancelled: list[str] = []
+        enqueued: list[str] = []
+
+        async def fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
+            cancelled.append(f"{task_id}:{wait_for_runner}")
+
+        self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
+        self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
+
+        response = asyncio.run(self.manager.delete_task(db, project_id="p1", task_id="t-del"))
+
+        self.assertTrue(response.accepted)
+        self.assertEqual("accepted", response.status)
+        self.assertEqual("delete", response.action)
+        self.assertEqual(["t-del:False"], cancelled)
+        self.assertGreaterEqual(len(enqueued), 1)
+        self.assertTrue(all(task_id == "t-del" for task_id in enqueued))
+        self.assertIsNotNone(response.operation_id)
+        self.assertEqual(response.operation_id, task.current_operation_id)
+        operations = [row for row in db.added if row.__class__.__name__ == "BinarySecurityTaskOperation"]
+        self.assertEqual(1, len(operations))
+        self.assertEqual("queued", operations[0].status)
+        self.assertEqual(task_manager_module.TASK_ACTION_DELETE, operations[0].operation_type)
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("task_delete_accepted", event_types)
 
     def test_cancel_task_holds_lock_during_async_cleanup(self):
         task = BinarySecurityTask(
@@ -40642,7 +40687,7 @@ def _test_run_current_task_operation_restores_preaccept_snapshot_on_retry_failur
     self.assertIn("operation_failed", event_types)
 
 
-def _test_record_downstream_sync_event_trims_task_sync_events_to_10000(self):
+def _test_record_downstream_sync_event_trims_per_item_bucket_to_20(self):
     task = BinarySecurityTask(
         id="task-sync-trim",
         project_id="p1",
@@ -40655,10 +40700,12 @@ def _test_record_downstream_sync_event_trims_task_sync_events_to_10000(self):
         workspace_root="/w",
     )
     db = _ModelAwareDb(tasks=[task], events=[])
-    for index in range(10_005):
+    item = {"id": "item-a", "stage_name": "entry_analysis", "item_key": "entry-a", "downstream_service": "entry_analyse"}
+    for index in range(25):
         self.manager._record_downstream_sync_event(
             db,
             task=task,
+            item=item,
             stage_name="entry_analysis",
             operation="downstream_sync",
             event_type="observed",
@@ -40667,8 +40714,192 @@ def _test_record_downstream_sync_event_trims_task_sync_events_to_10000(self):
             state_applied=False,
             payload={"seq": index},
         )
-    self.assertEqual(10_000, len(db.sync_events))
-    self.assertGreaterEqual(len([row for row in db.added if isinstance(row, BinarySecuritySyncEvent)]), 10_000)
+    self.assertEqual(20, len(db.sync_events))
+    seqs = [row.payload.get("seq") for row in db.sync_events]
+    self.assertEqual(list(range(5, 25)), seqs)
+
+
+def _test_record_downstream_sync_event_trims_each_item_bucket_independently(self):
+    task = BinarySecurityTask(
+        id="task-sync-trim-two",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+    for prefix in ("a", "b"):
+        item = {"id": f"item-{prefix}", "stage_name": "system_analysis", "item_key": f"entry-{prefix}", "downstream_service": "system_analyse"}
+        for index in range(25):
+            self.manager._record_downstream_sync_event(
+                db,
+                task=task,
+                item=item,
+                stage_name="system_analysis",
+                operation="downstream_sync",
+                event_type="observed",
+                sync_status="observed",
+                outcome="success",
+                state_applied=False,
+                payload={"seq": index, "bucket": prefix},
+            )
+    self.assertEqual(40, len(db.sync_events))
+    bucket_a = [row.payload.get("seq") for row in db.sync_events if row.payload.get("bucket") == "a"]
+    bucket_b = [row.payload.get("seq") for row in db.sync_events if row.payload.get("bucket") == "b"]
+    self.assertEqual(list(range(5, 25)), bucket_a)
+    self.assertEqual(list(range(5, 25)), bucket_b)
+
+
+def _test_record_downstream_sync_event_uses_fallback_bucket_without_item_id(self):
+    task = BinarySecurityTask(
+        id="task-sync-fallback",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+    item = {"stage_name": "system_analysis", "item_key": "source_project", "downstream_service": "system_analyse"}
+    for index in range(25):
+        self.manager._record_downstream_sync_event(
+            db,
+            task=task,
+            item=item,
+            stage_name="system_analysis",
+            operation="downstream_sync",
+            event_type="observed",
+            sync_status="observed",
+            outcome="success",
+            state_applied=False,
+            payload={"seq": index},
+        )
+    self.assertEqual(20, len(db.sync_events))
+    self.assertTrue(all(str(getattr(row, "item_bucket_key", "")).startswith("fallback:system_analysis:system_analyse:source_project") for row in db.sync_events))
+    self.assertEqual(list(range(5, 25)), [row.payload.get("seq") for row in db.sync_events])
+
+
+def _test_record_downstream_item_disposition_maps_create_and_retry_audit_events(self):
+    task = BinarySecurityTask(
+        id="task-sync-disposition",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="item-disp",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr1",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        downstream_service="system_analyse",
+        downstream_task_id="sa-1",
+        status="running",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+    self.manager._record_downstream_item_disposition(
+        db,
+        task,
+        item,
+        event_type="downstream_child_created",
+        message="created",
+        payload={"new_downstream_task_id": "sa-1"},
+    )
+    self.manager._record_downstream_item_disposition(
+        db,
+        task,
+        item,
+        event_type="downstream_retry_attached",
+        message="adopted",
+        payload={"outcome": "success"},
+    )
+    self.manager._record_downstream_item_disposition(
+        db,
+        task,
+        item,
+        event_type="downstream_retry_fallback_recreated",
+        message="recreated",
+        payload={"new_downstream_task_id": "sa-2"},
+    )
+    sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
+    self.assertEqual(["applied", "adopted", "recreated"], [row.event_type for row in sync_rows])
+    self.assertEqual(["downstream_create", "retry_control", "retry_control"], [row.operation for row in sync_rows])
+
+
+def _test_downstream_create_task_records_requested_and_applied_sync_events(self):
+    task = BinarySecurityTask(
+        id="task-sync-create",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="item-create",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr1",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        downstream_service="system_analyse",
+        status="pending",
+    )
+    db = _ModelAwareDb(tasks=[task], events=[])
+    create_calls: list[dict[str, Any]] = []
+
+    class _FakeDownstreamTasks:
+        async def create_child_task(self, _db, _task, _item, *, service, token, payload, event_payload):
+            create_calls.append({"service": service, "token": token, "payload": dict(payload), "event_payload": dict(event_payload or {})})
+            return {"task_id": "child-1", "status": "running"}
+
+    original_downstream_tasks = self.manager._downstream_tasks
+    original_active_delete_operation = self.manager._active_delete_operation
+    original_derive_downstream_work_key = self.manager._derive_downstream_work_key
+    try:
+        self.manager._downstream_tasks = lambda: _FakeDownstreamTasks()
+        self.manager._active_delete_operation = lambda *_args, **_kwargs: None
+        async def _fake_derive_downstream_work_key(**_kwargs):
+            return {}
+        self.manager._derive_downstream_work_key = _fake_derive_downstream_work_key
+        created = asyncio.run(
+            self.manager._downstream_create_task(
+                db,
+                task,
+                item,
+                service="system_analyse",
+                token="tok",
+                payload={"input_path": "/src"},
+            )
+        )
+    finally:
+        self.manager._downstream_tasks = original_downstream_tasks
+        self.manager._active_delete_operation = original_active_delete_operation
+        self.manager._derive_downstream_work_key = original_derive_downstream_work_key
+    self.assertEqual("child-1", created["task_id"])
+    self.assertEqual(1, len(create_calls))
+    sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
+    self.assertEqual(2, len(sync_rows))
+    self.assertEqual(["requested", "applied"], [row.event_type for row in sync_rows])
+    self.assertTrue(all(row.operation == "downstream_create" for row in sync_rows))
 
 
 def _test_get_sync_events_returns_paginated_filtered_records(self):
@@ -41131,7 +41362,11 @@ TaskManagerTests.test_finalize_gate_blocks_when_active_children_exist = _test_fi
 TaskManagerTests.test_finalize_gate_allows_when_workflow_terminal_and_children_terminal = _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal
 TaskManagerTests.test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized = _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized
 TaskManagerTests.test_reducer_activate_tail_reconciliation_defers_to_owner_worker = _test_reducer_activate_tail_reconciliation_defers_to_owner_worker
-TaskManagerTests.test_record_downstream_sync_event_trims_task_sync_events_to_10000 = _test_record_downstream_sync_event_trims_task_sync_events_to_10000
+TaskManagerTests.test_record_downstream_sync_event_trims_per_item_bucket_to_20 = _test_record_downstream_sync_event_trims_per_item_bucket_to_20
+TaskManagerTests.test_record_downstream_sync_event_trims_each_item_bucket_independently = _test_record_downstream_sync_event_trims_each_item_bucket_independently
+TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_item_id = _test_record_downstream_sync_event_uses_fallback_bucket_without_item_id
+TaskManagerTests.test_record_downstream_item_disposition_maps_create_and_retry_audit_events = _test_record_downstream_item_disposition_maps_create_and_retry_audit_events
+TaskManagerTests.test_downstream_create_task_records_requested_and_applied_sync_events = _test_downstream_create_task_records_requested_and_applied_sync_events
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
 TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync

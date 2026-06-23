@@ -818,6 +818,42 @@ class TaskDownstreamServiceMixin:
             "downstream_task_id": task_manager_module._stage_item_attr(item, "downstream_task_id"),
             **(payload or {}),
         }
+        operation = str(sync_payload.get("operation") or "downstream_sync").strip() or "downstream_sync"
+        audit_event_type = str(sync_payload.get("audit_event_type") or event_type or "observed").strip() or "observed"
+        audit_outcome = self._string_or_none(sync_payload.get("outcome"))
+        audit_sync_status = self._string_or_none(sync_payload.get("sync_status")) or audit_outcome
+        state_applied = sync_payload.get("state_applied")
+        if audit_event_type in {"downstream_child_created", "retry_item_new_child_created"}:
+            operation = "downstream_create"
+            audit_event_type = "applied"
+            audit_outcome = audit_outcome or "success"
+            audit_sync_status = audit_sync_status or "observed"
+            state_applied = True if state_applied is None else state_applied
+        elif audit_event_type in {"downstream_retry_accepted", "downstream_retry_attached"}:
+            operation = "retry_control"
+            audit_event_type = "adopted"
+            audit_outcome = audit_outcome or "success"
+            audit_sync_status = audit_sync_status or "observed"
+        elif audit_event_type in {"downstream_retry_terminal_reused"}:
+            operation = "retry_control"
+            audit_event_type = "observed"
+            audit_outcome = audit_outcome or "success"
+            audit_sync_status = audit_sync_status or "observed"
+        elif audit_event_type in {"downstream_retry_fallback_recreated"}:
+            operation = "retry_control"
+            audit_event_type = "recreated"
+            audit_outcome = audit_outcome or "success"
+            audit_sync_status = audit_sync_status or "observed"
+        elif audit_event_type in {"downstream_retry_target_missing"}:
+            operation = "retry_control"
+            audit_event_type = "failed"
+            audit_outcome = audit_outcome or "missing_downstream_binding"
+            audit_sync_status = audit_sync_status or "downstream_missing"
+        elif audit_event_type in {"downstream_retry_deferred"}:
+            operation = "retry_control"
+            audit_event_type = "retry_scheduled"
+            audit_outcome = audit_outcome or "error"
+            audit_sync_status = audit_sync_status or "transport_error"
         self._record_event(
             db,
             task,
@@ -829,18 +865,18 @@ class TaskDownstreamServiceMixin:
             payload=sync_payload,
         )
         if hasattr(self, "_record_downstream_sync_event"):
-            sync_status = self._string_or_none(sync_payload.get("sync_status")) or self._string_or_none(sync_payload.get("outcome"))
             try:
-                self._record_downstream_sync_event(
+                self._record_stage_item_sync_audit(
                     db,
                     task=task,
                     item=item,
                     stage_name=stage_name,
-                    operation=str(sync_payload.get("operation") or "downstream_sync").strip() or "downstream_sync",
-                    event_type=str(event_type or "observed").strip() or "observed",
-                    sync_status=sync_status,
-                    outcome=self._string_or_none(sync_payload.get("outcome")),
-                    state_applied=sync_payload.get("state_applied"),
+                    downstream_service=self._string_or_none(sync_payload.get("downstream_service")),
+                    operation=operation,
+                    event_type=audit_event_type,
+                    sync_status=audit_sync_status,
+                    outcome=audit_outcome,
+                    state_applied=state_applied,
                     error_type=self._string_or_none(sync_payload.get("error_type")),
                     error_message=self._string_or_none(sync_payload.get("error_message")) or message,
                     http_status=sync_payload.get("http_status"),

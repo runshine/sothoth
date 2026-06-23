@@ -1084,6 +1084,8 @@ class TaskControlServiceMixin:
         task.last_error = None
         task.current_operation_id = operation.id
         db.commit()
+        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
+        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("cancel", "accepted")
         return BinarySecurityActionResponse(
             task_id=task_id,
@@ -1147,6 +1149,8 @@ class TaskControlServiceMixin:
         operation.request_source = normalized_request_source
         task.current_operation_id = operation.id
         db.commit()
+        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
+        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("delete", "accepted")
         return BinarySecurityActionResponse(
             task_id=task_id,

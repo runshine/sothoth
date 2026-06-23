@@ -1280,6 +1280,23 @@ class TaskManager(
         payload: dict[str, Any],
         event_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._record_stage_item_sync_audit(
+            db,
+            task=task,
+            item=item,
+            stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
+            downstream_service=service,
+            operation="downstream_create",
+            event_type="requested",
+            sync_status="requested",
+            outcome="requested",
+            state_applied=False,
+            payload={
+                "service": str(service or ""),
+                "request_payload_keys": sorted([str(key) for key in dict(payload or {}).keys()]),
+                **(event_payload or {}),
+            },
+        )
         active_delete_operation = self._active_delete_operation(db, task.id)
         if active_delete_operation is not None:
             self._record_event(
@@ -1354,7 +1371,7 @@ class TaskManager(
                     "agent_task_key_source": work_key_payload.get("agent_task_key_source"),
                 },
             )
-        return await self._downstream_tasks().create_child_task(
+        created = await self._downstream_tasks().create_child_task(
             db,
             task,
             item,
@@ -1363,6 +1380,25 @@ class TaskManager(
             payload=effective_payload,
             event_payload=event_payload,
         )
+        self._record_stage_item_sync_audit(
+            db,
+            task=task,
+            item=item,
+            stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
+            downstream_service=service,
+            operation="downstream_create",
+            event_type="applied",
+            sync_status="observed",
+            outcome="success",
+            state_applied=True,
+            payload={
+                "service": str(service or ""),
+                "created_task_id": created.get("task_id") or created.get("id"),
+                "created_status": created.get("status"),
+                **(event_payload or {}),
+            },
+        )
+        return created
 
     async def _downstream_control_existing_task(
         self,
@@ -1663,6 +1699,8 @@ class TaskManager(
             if handle is None or handle.cancel_requested or handle.runner_task.done():
                 return
             try:
+                if await self._handoff_active_serial_control_operation_from_runtime(task_id):
+                    return
                 await asyncio.to_thread(self._touch_task_heartbeat, task_id)
                 handle.last_progress_at = _now()
                 failure_count = 0
@@ -1677,6 +1715,66 @@ class TaskManager(
                         handle.runner_task.cancel()
                     return
             await asyncio.sleep(interval_seconds)
+
+    async def _handoff_active_serial_control_operation_from_runtime(self, task_id: str) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        handle = self._runtime_handle(normalized_task_id)
+        if (
+            handle is None
+            or handle.done()
+            or handle.cancel_requested
+            or not handle.active_commit_succeeded
+            or not handle.lease_established
+        ):
+            return False
+        session = get_session_factory()()
+        try:
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == normalized_task_id).first()
+            if task is None:
+                return False
+            if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+                return False
+            lease = self._runtime_lease_for_task(session, normalized_task_id)
+            if not (
+                self._runtime_lease_is_active(lease)
+                and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+            ):
+                return False
+            operation = self._task_active_operation(session, task)
+            if operation is None:
+                return False
+            operation_status = str(getattr(operation, "status", "") or "").strip().lower()
+            operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+            if operation_status not in TASK_OPERATION_ACTIVE_STATUSES:
+                return False
+            if operation_type not in TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES:
+                return False
+            if not self._operation_blocks_runtime_resume(operation):
+                return False
+            if self._local_operation_worker_alive(getattr(operation, "id", None)):
+                return False
+            self._record_event(
+                session,
+                task,
+                "runtime_yielded_for_serial_control_operation",
+                "检测到串行控制操作已入队，当前 owner business runtime 已让位给 owner inbox",
+                level="info",
+                stage_name=str(getattr(operation, "target_stage", "") or getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                    "operation_type": operation_type or None,
+                    "operation_status": operation_status or None,
+                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                },
+            )
+            session.commit()
+        finally:
+            session.close()
+        await self._request_local_worker_cancel(normalized_task_id, wait_for_runner=False)
+        self._enqueue_task(normalized_task_id)
+        return True
 
     def _collect_heartbeat_candidates(self) -> list[str]:
         with self._task_execution_owner_lock:
@@ -10128,10 +10226,21 @@ class TaskManager(
             cleanup_scope=cleanup_scope,
         )
 
+    async def _drain_owner_inbox_during_polling(self, task: BinarySecurityTask) -> None:
+        operation_passes = 0
+        while await self._run_current_task_operation(task.id):
+            operation_passes += 1
+        if operation_passes <= 0:
+            return
+        if await self._is_task_cancelled_async(task.id):
+            return
+        await self._ensure_task_execution_current_async(task)
+
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         while True:
             try:
                 await self._ensure_task_execution_current_async(task)
+                await self._drain_owner_inbox_during_polling(task)
                 await self._touch_task_heartbeat_async(task.id)
                 payload = await fetcher()
                 await self._ensure_task_execution_current_async(task)

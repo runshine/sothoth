@@ -19,6 +19,23 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
+    def _sync_event_item_bucket_key(
+        self: TaskManager,
+        *,
+        item: BinarySecurityStageItem | dict[str, Any] | None = None,
+        stage_name: str | None = None,
+        downstream_service: str | None = None,
+    ) -> str | None:
+        item_id = str(task_shared._stage_item_attr(item, "id") or "").strip()
+        if item_id:
+            return f"item:{item_id}"
+        normalized_stage = str(stage_name or task_shared._stage_item_attr(item, "stage_name") or "").strip()
+        normalized_service = str(downstream_service or task_shared._stage_item_attr(item, "downstream_service") or "").strip()
+        normalized_item_key = str(task_shared._stage_item_attr(item, "item_key") or "").strip()
+        if normalized_stage or normalized_service or normalized_item_key:
+            return f"fallback:{normalized_stage}:{normalized_service}:{normalized_item_key}"
+        return None
+
     def _normalize_event_payload_value(self: TaskManager, value: Any) -> Any:
         if isinstance(value, datetime):
             return task_shared._isoformat_or_none(value)
@@ -268,13 +285,56 @@ class TaskEventServiceMixin:
         for stale_row in stale_rows:
             db.delete(stale_row)
 
-    def _record_downstream_sync_event(
+    def _trim_stage_item_sync_events(
+        self: TaskManager,
+        db: Session,
+        *,
+        task_id: str,
+        item_bucket_key: str | None,
+        keep_limit: int = 20,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        normalized_bucket = str(item_bucket_key or "").strip()
+        effective_limit = max(1, int(keep_limit or 20))
+        if not normalized_bucket or not hasattr(db, "query") or not hasattr(db, "delete"):
+            return
+        if hasattr(db, "sync_events"):
+            bucket_rows = [
+                row for row in (getattr(db, "sync_events") or [])
+                if str(getattr(row, "task_id", "") or "").strip() == task_id
+                and str(getattr(row, "item_bucket_key", "") or "").strip() == normalized_bucket
+            ]
+            current_count = len(bucket_rows)
+        else:
+            current_count = (
+                db.query(task_manager_module.BinarySecuritySyncEvent)
+                .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
+                .filter(task_manager_module.BinarySecuritySyncEvent.item_bucket_key == normalized_bucket)
+                .count()
+            )
+        overflow = current_count - effective_limit
+        if overflow <= 0:
+            return
+        stale_rows = (
+            db.query(task_manager_module.BinarySecuritySyncEvent)
+            .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
+            .filter(task_manager_module.BinarySecuritySyncEvent.item_bucket_key == normalized_bucket)
+            .order_by(task_manager_module.BinarySecuritySyncEvent.created_at.asc(), task_manager_module.BinarySecuritySyncEvent.id.asc())
+            .limit(overflow)
+            .all()
+        )
+        for stale_row in stale_rows:
+            db.delete(stale_row)
+
+    def _record_stage_item_sync_audit(
         self: TaskManager,
         db: Session | None,
         *,
         task: BinarySecurityTask | None,
         item: BinarySecurityStageItem | dict[str, Any] | None = None,
         stage_name: str | None = None,
+        downstream_service: str | None = None,
         operation: str | None = None,
         event_type: str,
         sync_status: str | None = None,
@@ -291,20 +351,28 @@ class TaskEventServiceMixin:
         try:
             from app.service import task_manager as task_manager_module
 
+            normalized_stage = str(stage_name or task_shared._stage_item_attr(item, "stage_name") or "").strip() or None
+            normalized_service = str(downstream_service or task_shared._stage_item_attr(item, "downstream_service") or "").strip() or None
             normalized_payload = self._merge_event_recorder_metadata(payload, role=role or self._event_runtime_role())
             normalized_payload = self._merge_event_origin_metadata(
                 normalized_payload,
                 state_event=getattr(self, "_active_timeline_origin_state_event", None),
             )
+            item_bucket_key = self._sync_event_item_bucket_key(
+                item=item,
+                stage_name=normalized_stage,
+                downstream_service=normalized_service,
+            )
             row = task_manager_module.BinarySecuritySyncEvent(
                 id=f"syncevt_{uuid.uuid4().hex[:24]}",
                 project_id=task.project_id,
                 task_id=task.id,
-                stage_name=stage_name or task_shared._stage_item_attr(item, "stage_name"),
+                stage_name=normalized_stage,
                 item_id=task_shared._stage_item_attr(item, "id"),
+                item_bucket_key=item_bucket_key,
                 item_key=task_shared._stage_item_attr(item, "item_key"),
                 item_name=task_shared._stage_item_attr(item, "item_name"),
-                downstream_service=task_shared._stage_item_attr(item, "downstream_service"),
+                downstream_service=normalized_service,
                 downstream_task_id=task_shared._stage_item_attr(item, "downstream_task_id"),
                 operation=str(operation or "").strip() or None,
                 event_type=str(event_type or "").strip() or "observed",
@@ -335,10 +403,53 @@ class TaskEventServiceMixin:
                 state_event=False,
             )
             db.add(row)
+            self._trim_stage_item_sync_events(
+                db,
+                task_id=task.id,
+                item_bucket_key=item_bucket_key,
+                keep_limit=20,
+            )
             self._trim_task_sync_events(db, task_id=task.id)
         except Exception:
             if hasattr(self, "_logger"):
                 self._logger.exception("record downstream sync event failed")
+
+    def _record_downstream_sync_event(
+        self: TaskManager,
+        db: Session | None,
+        *,
+        task: BinarySecurityTask | None,
+        item: BinarySecurityStageItem | dict[str, Any] | None = None,
+        stage_name: str | None = None,
+        operation: str | None = None,
+        event_type: str,
+        sync_status: str | None = None,
+        outcome: str | None = None,
+        state_applied: bool | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
+        http_status: int | None = None,
+        payload: dict[str, Any] | None = None,
+        role: str | None = None,
+    ) -> None:
+        if db is None or task is None:
+            return
+        self._record_stage_item_sync_audit(
+            db,
+            task=task,
+            item=item,
+            stage_name=stage_name,
+            operation=operation,
+            event_type=event_type,
+            sync_status=sync_status,
+            outcome=outcome,
+            state_applied=state_applied,
+            error_type=error_type,
+            error_message=error_message,
+            http_status=http_status,
+            payload=payload,
+            role=role,
+        )
 
     def _event_dedupe_window_seconds(self: TaskManager, event_type: str) -> int:
         if str(event_type or "").strip() in {
