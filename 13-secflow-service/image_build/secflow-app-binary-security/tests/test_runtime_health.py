@@ -16,7 +16,7 @@ class RuntimeHealthTests(unittest.TestCase):
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": False, "stale": False},
             },
-            "tail_reconcile_active": True,
+            "lease_auditor_active": True,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
@@ -38,7 +38,7 @@ class RuntimeHealthTests(unittest.TestCase):
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
             },
-            "tail_reconcile_active": True,
+            "lease_auditor_active": True,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
@@ -60,7 +60,7 @@ class RuntimeHealthTests(unittest.TestCase):
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
             },
-            "tail_reconcile_active": False,
+            "lease_auditor_active": False,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
@@ -82,7 +82,7 @@ class RuntimeHealthTests(unittest.TestCase):
                 "state_reducer": {"alive": True, "stale": False},
                 "reducer_metrics_snapshot": {"alive": True, "stale": False},
             },
-            "tail_reconcile_active": True,
+            "lease_auditor_active": True,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"

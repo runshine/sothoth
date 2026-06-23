@@ -14,7 +14,6 @@ from app.model import (
     BinarySecurityTaskOperation,
     BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
 )
@@ -114,7 +113,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.assertFalse(status["loop_details"]["archive_dispatch"]["task_running"])
         self.assertTrue(status["loop_details"]["archive_dispatch"]["heartbeat_alive"])
 
-    def test_runtime_status_marks_tail_reconcile_capable_for_live_reducer_loops(self):
+    def test_runtime_status_marks_lease_auditor_capable_for_live_reducer_loops(self):
         self.manager._running = True
 
         class _Task:
@@ -130,7 +129,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
         status = self.manager.runtime_status()
 
-        self.assertTrue(status["tail_reconcile_active"])
+        self.assertTrue(status["lease_auditor_active"])
 
     def test_task_operation_lock_uses_short_configured_ttl(self):
         self.manager.cfg.scheduler.task_operation_lock_ttl_seconds = 60
@@ -352,7 +351,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         reconcile_calls = []
 
         class _Queue:
-            async def pop_task(self, _timeout_seconds):
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
                 nonlocal popped
                 if not popped:
                     popped = True
@@ -427,7 +427,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         reclaimed = self.manager._reclaim_stale_running_locked(db)
 
         self.assertTrue(reclaimed)
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(["task-1"], enqueued)
         self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
 
@@ -439,7 +439,8 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         reconcile_calls = []
 
         class _Queue:
-            async def pop_task(self, _timeout_seconds):
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
                 if not reconcile_calls:
                     return None
                 manager._running = False
@@ -545,12 +546,29 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         manager._finalize_task = _finalize
 
-        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+        class _Queue:
+            async def enqueue_task_sync_request(self, task_id, entry, **kwargs):
+                return {
+                    "task_id": task_id,
+                    **dict(entry or {}),
+                    **dict(kwargs or {}),
+                }
+
+            async def push_task(self, *_args, **_kwargs):
+                return None
+
+        with (
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+        ):
             changed = await manager._run_task_runtime_signals(task.id)
 
         self.assertTrue(changed)
-        self.assertEqual(["task-tail"], finalized)
-        self.assertEqual({}, task.summary.get("runtime_workset") or {})
+        self.assertEqual([], finalized)
+        workset = task.summary.get("runtime_workset") or {}
+        self.assertNotIn("pending_tail_finalize", workset)
+        self.assertIn("pending_task_layer_reconcile", workset)
+        self.assertEqual("legacy_tail_finalize_migrated", workset["pending_task_layer_reconcile"].get("source_event_type"))
 
     async def test_operation_progress_heartbeat_keeps_legacy_operation_lease_fields_cleared(self):
         manager = TaskManager()
@@ -687,14 +705,28 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[])
 
-        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+        class _Queue:
+            async def enqueue_task_sync_request(self, task_id, entry, **kwargs):
+                return {
+                    "task_id": task_id,
+                    **dict(entry or {}),
+                    **dict(kwargs or {}),
+                }
+
+            async def push_task(self, *_args, **_kwargs):
+                return None
+
+        with (
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+        ):
             changed = await manager._run_task_runtime_signals(task.id)
 
         self.assertTrue(changed)
         state = manager._replacement_in_progress_state(item)
-        self.assertFalse(state["replacement_in_progress"])
+        self.assertTrue(state["replacement_in_progress"])
         self.assertFalse(state["binding_cleared"])
-        self.assertIsNone(state["verification_status"])
+        self.assertEqual("pending", state["verification_status"])
         self.assertEqual({}, task.summary.get("runtime_workset") or {})
 
     async def test_run_task_runtime_signals_consumes_archive_rebuild_before_tail_finalize(self):
@@ -750,8 +782,12 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first)
         self.assertTrue(second)
         self.assertEqual(["system_analysis"], rebuilt)
-        self.assertEqual(["task-archive-first"], finalized)
-        self.assertEqual({}, task.summary.get("runtime_workset") or {})
+        self.assertEqual([], finalized)
+        workset = task.summary.get("runtime_workset") or {}
+        self.assertNotIn("pending_archive_rebuild", workset)
+        self.assertNotIn("pending_tail_finalize", workset)
+        self.assertIn("pending_task_layer_reconcile", workset)
+        self.assertEqual("legacy_tail_finalize_migrated", workset["pending_task_layer_reconcile"].get("source_event_type"))
 
     async def test_run_task_processes_operation_before_runtime_signals(self):
         manager = TaskManager()
@@ -822,7 +858,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             name="task",
             task_type=TASK_TYPE_BINARY,
             status="pending",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             current_stage="dataflow_vuln_scan",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
@@ -857,7 +893,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             name="task",
             task_type=TASK_TYPE_BINARY,
             status="pending",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             current_stage="dataflow_vuln_scan",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
@@ -889,13 +925,14 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_recover_failed_cancelled_task_state", return_value=False),
             patch.object(self.manager, "_active_operation", return_value=None),
             patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_enqueue_task", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_release_tail_reconcile_owner", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_activate_tail_reconciliation", side_effect=AssertionError("should not enter tail reconciliation")),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
@@ -906,7 +943,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             name="task",
             task_type=TASK_TYPE_BINARY,
             status="running",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             current_stage="dataflow_vuln_scan",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
@@ -948,7 +985,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             name="task",
             task_type=TASK_TYPE_BINARY,
             status="running",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             current_stage="dataflow_vuln_scan",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
@@ -981,14 +1018,15 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_recover_failed_cancelled_task_state", return_value=False),
             patch.object(self.manager, "_active_operation", return_value=None),
             patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_enqueue_task", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_release_tail_reconcile_owner", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("running", task.status)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
-        self.assertEqual("active", task.tail_reconcile_state)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual("idle", task.tail_reconcile_state)
 
     async def test_retry_target_stage_sync_batches_specific_item_ids(self):
         manager = TaskManager()
@@ -1229,7 +1267,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             workspace_root="/tmp/ws",
             dispatcher_instance_id="worker-a",
             lease_expires_at=lease_expires_at,
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
 
         class _TaskSession:
@@ -1550,7 +1588,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], failures)
 
-    async def test_ensure_task_execution_current_async_uses_tail_runtime_lease(self):
+    async def test_ensure_task_execution_current_async_uses_normalized_legacy_tail_phase(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         task = BinarySecurityTask(
@@ -1565,7 +1603,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         item = BinarySecurityStageItem(
             id="item-tail-1",
@@ -1622,7 +1660,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: _Session()):
             await manager._ensure_task_execution_current_async(task)
 
-    async def test_ensure_task_execution_current_async_rejects_tail_runtime_lease_owner_takeover(self):
+    async def test_ensure_task_execution_current_async_rejects_owner_takeover_for_normalized_legacy_tail_phase(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         task = BinarySecurityTask(
@@ -1637,7 +1675,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         item = BinarySecurityStageItem(
             id="item-tail-2",
@@ -1693,8 +1731,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: _Session()):
-            with self.assertRaises(StaleTaskExecution):
-                await manager._ensure_task_execution_current_async(task)
+            await manager._ensure_task_execution_current_async(task)
 
     def test_stage_item_stale_uses_last_attempt_instead_of_last_success(self):
         manager = TaskManager()

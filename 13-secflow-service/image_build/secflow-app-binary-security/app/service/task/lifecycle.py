@@ -242,7 +242,6 @@ class TaskLifecycleServiceMixin:
                 "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
-            "tail_reconcile_active": bool(self._is_reducer_role() and self._runtime_lease_capable()),
             "lease_auditor_active": bool(self._is_reducer_role() and self._runtime_lease_capable()),
         }
 
@@ -485,8 +484,6 @@ class TaskLifecycleServiceMixin:
             task_id = str(getattr(task, "id", "") or "").strip()
             project_id = str(getattr(task, "project_id", "") or "").strip()
             if not task_id or not project_id:
-                continue
-            if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and not self._is_reducer_role():
                 continue
             items = self._task_reconcile_candidate_items(
                 db,

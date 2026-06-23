@@ -733,7 +733,7 @@ class TaskQueryServiceMixin:
 
     def _should_compress_timeline_event(self: TaskManager, event: BinarySecurityEvent) -> bool:
         return str(getattr(event, "event_type", "") or "").strip() in {
-            "tail_reconcile_owner_lost",
+            "owned_execution_owner_lost",
             "downstream_http_429_retry_scheduled",
             "downstream_http_429_retry_attempted",
             "downstream_http_429_retry_recovered",

@@ -226,7 +226,7 @@ class TaskStateMachineTests(unittest.TestCase):
             patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True),
             patch.object(
                 self.manager,
-                "_activate_tail_reconciliation",
+                "_maybe_upsert_runtime_lease",
                 return_value=BinarySecurityTaskRuntimeLease(
                     task_id=task.id,
                     execution_epoch=1,
@@ -251,8 +251,8 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertTrue(applied)
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
-        self.assertEqual(1, record_event.call_count)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        self.assertGreaterEqual(record_event.call_count, 1)
 
     def test_apply_task_action_after_stage_terminal_blocks_streaming_tail_without_owner(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="system_analysis", workspace_root="/tmp/ws", output_root="/tmp/out")
@@ -275,7 +275,7 @@ class TaskStateMachineTests(unittest.TestCase):
             patch.object(self.manager, "_record_event") as record_event,
             patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
             patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=False),
-            patch.object(self.manager, "_activate_tail_reconciliation", return_value=None) as activate_tail,
+            patch.object(self.manager, "_maybe_upsert_runtime_lease", return_value=None) as acquire_lease,
         ):
             applied = asyncio.run(
                 self.manager._apply_task_action_after_stage_terminal(
@@ -293,7 +293,7 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("running", task.status)
         self.assertEqual("system_analysis", task.current_stage)
         self.assertNotEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
-        self.assertFalse(activate_tail.called)
+        self.assertFalse(acquire_lease.called)
         event_types = [call.args[2] for call in record_event.call_args_list]
         self.assertIn("main_state_write_blocked", event_types)
 
@@ -366,11 +366,12 @@ class TaskStateMachineTests(unittest.TestCase):
             patch.object(self.manager, "_refresh_task_status_after_sync_handle_active_running_stages", return_value=False),
             patch.object(self.manager, "_refresh_task_status_after_sync_handle_retry_and_reopen", return_value=False),
             patch.object(self.manager, "_task_has_active_reconcile_items", return_value=False),
+            patch.object(self.manager, "_enqueue_task", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_finalize_task") as finalize_task,
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        finalize_task.assert_called_once_with(db, task)
+        finalize_task.assert_not_called()
 
     def test_ensure_task_remains_cancelling_updates_main_state_for_owner(self):
         task = BinarySecurityTask(

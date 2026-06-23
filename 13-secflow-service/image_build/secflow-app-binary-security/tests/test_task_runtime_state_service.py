@@ -5,7 +5,6 @@ from app.model import (
     BinarySecurityTask,
     BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_RUNTIME_PHASE_TERMINAL,
     TASK_TYPE_BINARY,
 )
@@ -90,9 +89,9 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_control_mode(task))
 
-        self.manager._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION)
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_runtime_phase(task))
-        self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, self.manager._task_control_mode(task))
+        self.manager._set_task_runtime_phase(task, "tail_reconciliation")
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_control_mode(task))
 
         self.manager._set_task_runtime_phase(task, "")
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
@@ -117,12 +116,12 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         )
 
         self.assertTrue(repaired)
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
+        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertIsNotNone(task.dispatch_started_at)
+        self.assertIsNotNone(task.lease_expires_at)
         self.assertEqual(["task-1"], enqueued)
         self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
 
@@ -130,7 +129,7 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         task = self._task(
             status="running",
             current_stage="dataflow_vuln_scan",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,

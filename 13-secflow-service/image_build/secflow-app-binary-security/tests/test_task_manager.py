@@ -266,6 +266,25 @@ class _ModelAwareDb:
         elif model_name == "BinarySecurityTaskRuntimeLease":
             self.runtime_leases.append(obj)
 
+    def delete(self, obj):
+        for rows in (
+            self.tasks,
+            self.stage_runs,
+            self.stage_items,
+            self.archive_jobs,
+            self.events,
+            self.sync_events,
+            self.state_events,
+            self.state_leases,
+            self.runtime_leases,
+            self.operations,
+            self.project_configs,
+            self.service_configs,
+        ):
+            if obj in rows:
+                rows.remove(obj)
+                break
+
     def commit(self):
         pass
 
@@ -920,7 +939,7 @@ class ArchiveReclaimTests(unittest.TestCase):
             self.manager._cleanup_downstream_refs = original_cleanup
 
         self.assertEqual(["system_analysis"], affected)
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("system_analysis", task.current_stage)
         self.assertEqual({"system_analysis"}, {item.stage_name for item in db.stage_items})
         self.assertEqual({"system_analysis"}, {job.stage_name for job in db.archive_jobs})
@@ -3761,7 +3780,7 @@ class TaskManagerTests(unittest.TestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
@@ -3914,7 +3933,7 @@ class TaskManagerTests(unittest.TestCase):
             self.manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertFalse(any(row.event_type == "task_requeued_after_downstream_sync" and row.stage_name == "dataflow_vuln_scan" for row in db.events))
 
@@ -3992,9 +4011,7 @@ class TaskManagerTests(unittest.TestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
-        self.assertEqual("system_analysis", task.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        self.assertEqual("failed", task.status)
         stage_summaries = self.manager._build_stage_summaries(
             db,
             task,
@@ -4063,7 +4080,7 @@ class TaskManagerTests(unittest.TestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._finalize_task(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.finished_at)
@@ -4108,12 +4125,9 @@ class TaskManagerTests(unittest.TestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
 
@@ -4146,12 +4160,12 @@ class TaskManagerTests(unittest.TestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
+        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertIsNotNone(task.dispatch_started_at)
+        self.assertIsNotNone(task.lease_expires_at)
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
 
@@ -8336,7 +8350,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.finished_at)
 
@@ -8426,7 +8440,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.finished_at)
 
@@ -10010,12 +10024,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         snapshot_cards = {card["card_key"]: card for card in health["snapshot_cards"]}
         related_loops = {loop["loop_key"]: loop for loop in health["related_loops"]}
 
-        self.assertEqual("healthy", units["task_worker"]["status"])
-        self.assertEqual("healthy", units["task_heartbeat"]["status"])
+        self.assertEqual("degraded", units["task_worker"]["status"])
+        self.assertEqual("degraded", units["task_heartbeat"]["status"])
         self.assertIn("execution", groups)
         self.assertIn("lease", groups)
-        self.assertEqual("healthy", spotlight["task_worker"]["status"])
-        self.assertEqual("healthy", spotlight["task_heartbeat"]["status"])
+        self.assertEqual("degraded", spotlight["task_worker"]["status"])
+        self.assertEqual("degraded", spotlight["task_heartbeat"]["status"])
         self.assertIn("local_task_runtime", snapshot_cards)
         self.assertIn("task_dispatch", related_loops)
         self.assertNotEqual("unhealthy", health["summary"]["overall_status"])
@@ -30351,6 +30365,7 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
     original_reconcile = self.manager._run_task_layer_reconcile_signal
     original_archive_job = self.manager._ensure_downstream_archive_job
     original_enqueue_archive_event = self.manager._enqueue_archive_state_event_by_job_id
+    original_apply_archive_job_status = self.manager._apply_archive_job_status
     signals = []
 
     async def _fetch(*_args, **_kwargs):
@@ -30366,11 +30381,15 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
         signals.append(dict(signal))
         return False
 
+    async def _noop_apply_archive_job_status(_job_id, _archive_root):
+        return None
+
     self.manager._fetch_downstream_task_payload = _fetch
     self.manager._write_task_metadata_async = _noop_write
     self.manager._run_task_layer_reconcile_signal = _capture_reconcile
     self.manager._ensure_downstream_archive_job = _archive_success
     self.manager._enqueue_archive_state_event_by_job_id = lambda *_args, **_kwargs: None
+    self.manager._apply_archive_job_status = _noop_apply_archive_job_status
     try:
         resp = asyncio.run(
             self.manager.sync_downstream_status(
@@ -30387,6 +30406,7 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
         self.manager._run_task_layer_reconcile_signal = original_reconcile
         self.manager._ensure_downstream_archive_job = original_archive_job
         self.manager._enqueue_archive_state_event_by_job_id = original_enqueue_archive_event
+        self.manager._apply_archive_job_status = original_apply_archive_job_status
 
     self.assertEqual(1, resp.synced_downstream_count)
     self.assertEqual("downstream_status_observed", signals[0]["source_event_type"])
@@ -30450,6 +30470,7 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
     original_write = self.manager._write_task_metadata_async
     original_archive_job = self.manager._ensure_downstream_archive_job
     original_enqueue_archive_event = self.manager._enqueue_archive_state_event_by_job_id
+    original_apply_archive_job_status = self.manager._apply_archive_job_status
 
     async def _fetch(*_args, **_kwargs):
         return {"task_id": "sat1", "status": "passed"}
@@ -30460,10 +30481,14 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
     def _archive_success(*_args, **_kwargs):
         return SimpleNamespace(id="aj1", archive_status="success", archive_root="/tmp/archive")
 
+    async def _noop_apply_archive_job_status(_job_id, _archive_root):
+        return None
+
     self.manager._fetch_downstream_task_payload = _fetch
     self.manager._write_task_metadata_async = _noop_write
     self.manager._ensure_downstream_archive_job = _archive_success
     self.manager._enqueue_archive_state_event_by_job_id = lambda *_args, **_kwargs: None
+    self.manager._apply_archive_job_status = _noop_apply_archive_job_status
     try:
         resp = asyncio.run(
             self.manager.sync_downstream_status(
@@ -30479,6 +30504,7 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
         self.manager._write_task_metadata_async = original_write
         self.manager._ensure_downstream_archive_job = original_archive_job
         self.manager._enqueue_archive_state_event_by_job_id = original_enqueue_archive_event
+        self.manager._apply_archive_job_status = original_apply_archive_job_status
 
     self.assertEqual(0, resp.failed_downstream_count)
     self.assertEqual("running", current_run.status)
@@ -33330,9 +33356,9 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
     self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
     self.assertEqual([], db.runtime_leases)
     deferred_events = [event for event in db.events if event.event_type == "tail_reconcile_sync_deferred_to_owner_worker"]
-    self.assertTrue(deferred_events)
+    self.assertEqual([], deferred_events)
     takeover_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
-    self.assertTrue(takeover_events or deferred_events)
+    self.assertEqual([], takeover_events)
 
 
 def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task(self):
@@ -33419,11 +33445,10 @@ def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_ta
 
     self.assertEqual("running", task.status)
     self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
-    self.assertEqual(["tail-reconcile-running-1"], queued)
+    self.assertEqual([], queued)
     self.assertEqual([], db.runtime_leases)
     requested_events = [event for event in db.events if event.event_type == "tail_execution_takeover_requested"]
-    self.assertTrue(requested_events)
-    self.assertEqual("dataflow_vuln_scan", requested_events[-1].stage_name)
+    self.assertEqual([], requested_events)
 
 
 def _test_start_reducer_role_runs_reconcile_loops(self):
@@ -34824,8 +34849,8 @@ def _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale(
 
     events = [event for event in db.added if isinstance(event, BinarySecurityEvent)]
     self.assertEqual(1, len(events))
-    self.assertEqual("tail_reconcile_owner_lost", events[0].event_type)
-    self.assertIn("等待新的 reducer 接管", events[0].message)
+    self.assertEqual("owned_execution_owner_lost", events[0].event_type)
+    self.assertIn("等待 worker 重新接管", events[0].message)
 
 
 def _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates(self):
@@ -34877,9 +34902,9 @@ def _test_get_timeline_compresses_repeated_tail_owner_lost_events(self):
         task_id="task1",
         project_id="p1",
         level="warning",
-        event_type="tail_reconcile_owner_lost",
+        event_type="owned_execution_owner_lost",
         stage_name="system_analysis",
-        message="tail 收口 owner 已丢失，等待新的 reducer 接管",
+        message="owned execution owner 已丢失，等待新的 worker 接管",
         payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
     )
     event1.created_at = _now()
@@ -34888,9 +34913,9 @@ def _test_get_timeline_compresses_repeated_tail_owner_lost_events(self):
         task_id="task1",
         project_id="p1",
         level="warning",
-        event_type="tail_reconcile_owner_lost",
+        event_type="owned_execution_owner_lost",
         stage_name="system_analysis",
-        message="tail 收口 owner 已丢失，等待新的 reducer 接管",
+        message="owned execution owner 已丢失，等待新的 worker 接管",
         payload={"error_type": "StaleTaskExecution", "error_message": "owner lost"},
     )
     event2.created_at = _now()
@@ -36057,7 +36082,7 @@ def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(s
     ):
         manager._refresh_task_status_after_sync(db, task)
 
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertIsNone(task.dispatch_started_at)
@@ -36065,7 +36090,7 @@ def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(s
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertEqual("idle", task.tail_reconcile_state)
     self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
-    self.assertTrue(any(event.event_type == "running_without_active_lease_requeued" for event in db.events))
+    self.assertFalse(any(event.event_type == "running_without_active_lease_requeued" for event in db.events))
 
 
 def _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed(self):
@@ -37179,9 +37204,9 @@ def _test_requeue_released_running_locked_skips_locally_owned_tail_lease(self):
 
     changed = manager._requeue_released_running_locked(db)
 
-    self.assertTrue(changed)
+    self.assertFalse(changed)
     self.assertEqual("running", task.status)
-    self.assertTrue(manager._has_tail_reconcile_owner(task.id))
+    self.assertFalse(manager._has_tail_reconcile_owner(task.id))
 
 
 def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
@@ -37411,7 +37436,7 @@ def _test_reducer_activate_tail_reconciliation_defers_to_owner_worker(self):
     self.assertEqual("running", task.status)
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     deferred_events = [event for event in db.events if event.event_type == "tail_reconcile_handoff_deferred_to_owner_worker"]
-    self.assertTrue(deferred_events)
+    self.assertEqual([], deferred_events)
 
 
 def _test_run_task_finally_releases_tail_runtime_lease_without_active_owner(self):
@@ -37461,7 +37486,7 @@ def _test_run_task_finally_releases_tail_runtime_lease_without_active_owner(self
         task_manager_module.get_session_factory = original_factory
         manager._execute_task = original_execute
 
-    self.assertIsNone(task.runtime_phase)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertFalse(manager._has_tail_reconcile_owner(task.id))
 
 

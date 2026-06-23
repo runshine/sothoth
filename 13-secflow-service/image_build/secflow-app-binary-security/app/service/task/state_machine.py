@@ -51,7 +51,6 @@ class TaskStateMachineMixin:
             return True
         if str(getattr(task, "status", "") or "").strip() in active_statuses and (
             str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-            or str(getattr(task, "runtime_phase", "") or "").strip() == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
         ):
             return True
         return False
@@ -145,6 +144,7 @@ class TaskStateMachineMixin:
         has_authoritative_failure = (
             self._current_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
             or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
+            or self._later_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
         )
         has_active_items = self._task_has_any_active_children(db, task, stage_runs=runs, stage_items=items)
         has_nonterminal_items = any(
@@ -759,6 +759,7 @@ class TaskStateMachineMixin:
     ) -> bool:
         if stage_run is None or str(stage_run.status or "").strip() != "failed":
             return False
+        snapshot = self._stage_failure_snapshot(task, stage_run)
         error_text = " ".join(
             str(part or "").strip()
             for part in (
@@ -770,12 +771,14 @@ class TaskStateMachineMixin:
         )
         if self._is_owner_lost_recoverable_failure(
             failure_message=error_text,
-            failure_category=self._stage_failure_snapshot(task, stage_run).get("failure_category"),
+            failure_category=snapshot.get("failure_category"),
         ):
             return False
-        if "task owner pod lost" in error_text.lower() or "owner pod lost" in error_text.lower():
+        failure_code = str(snapshot.get("failure_code") or "").strip().lower()
+        failure_category = str(snapshot.get("failure_category") or "").strip().lower()
+        if failure_code or failure_category:
             return True
-        return False
+        return "task owner pod lost" in error_text.lower() or "owner pod lost" in error_text.lower()
 
     def _current_stage_authoritative_failure_context(
         self: TaskManager,
@@ -946,6 +949,94 @@ class TaskStateMachineMixin:
                 "failure_category": snapshot.get("failure_category"),
                 "failure_message": snapshot.get("failure_message") or snapshot.get("error") or failure_message or getattr(stage_run, "last_error", None),
                 "reason": "earlier_stage_items_terminal",
+            }
+        return None
+
+    def _later_stage_authoritative_failure_context(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+    ) -> dict[str, Any] | None:
+        current_stage = str(task.current_stage or "").strip()
+        if not current_stage:
+            return None
+        if stage_runs is None:
+            stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
+        ordered_stage_names = [
+            str(name or "").strip()
+            for name in self._stage_sequence_for_task(task)
+            if str(name or "").strip()
+        ]
+        try:
+            current_index = ordered_stage_names.index(current_stage)
+        except ValueError:
+            return None
+        for stage_name in ordered_stage_names[current_index + 1 :]:
+            stage_run = next((run for run in stage_runs if str(run.stage_name or "").strip() == stage_name), None)
+            if (
+                stage_run is not None
+                and self._stage_ready_to_escalate_failure(workflow_snapshots, stage_name)
+                and self._should_terminalize_parent_for_failed_stage(task, stage_run)
+            ):
+                snapshot = self._stage_failure_snapshot(task, stage_run)
+                return {
+                    "stage_name": stage_name,
+                    "stage_run": stage_run,
+                    "failure_code": snapshot.get("failure_code"),
+                    "failure_category": snapshot.get("failure_category"),
+                    "failure_message": snapshot.get("failure_message") or snapshot.get("error") or stage_run.last_error,
+                    "reason": "later_stage_run_failed",
+                }
+            items = self._stage_items(db, task.id, stage_name)
+            if not items:
+                continue
+            normalized_statuses = [
+                self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+                for item in items
+            ]
+            if any(status in {"pending", "queued", "running", "dispatching"} for status in normalized_statuses):
+                continue
+            aggregate_status = self._aggregate_item_statuses(normalized_statuses)
+            if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
+                continue
+            if aggregate_status == "failed":
+                snapshot = self._stage_failure_snapshot(task, stage_run)
+                exhausted_owner_lost_items = [item for item in items if self._owner_lost_retry_exhausted(task, item)]
+                if exhausted_owner_lost_items:
+                    exhausted_item = exhausted_owner_lost_items[0]
+                    return {
+                        "stage_name": stage_name,
+                        "stage_run": stage_run,
+                        "failure_code": "owner_lost_retry_exhausted",
+                        "failure_category": "infrastructure",
+                        "failure_message": str(exhausted_item.error_message or "").strip() or "owner_lost_retry_exhausted",
+                        "reason": "owner_lost_retry_exhausted",
+                    }
+                recoverable_items = [
+                    item for item in items
+                    if self._is_owner_lost_recoverable_failure(
+                        failure_message=str(item.error_message or "").strip() or None,
+                        failure_category=snapshot.get("failure_category"),
+                        error_type=self._stage_item_sync_error_type_value(item),
+                        item=item,
+                    )
+                ]
+                if recoverable_items:
+                    continue
+            snapshot = self._stage_failure_snapshot(task, stage_run)
+            failure_message = next((str(item.error_message or "").strip() for item in items if str(item.error_message or "").strip()), None)
+            if not self._stage_ready_to_escalate_failure(workflow_snapshots, stage_name):
+                continue
+            return {
+                "stage_name": stage_name,
+                "stage_run": stage_run,
+                "failure_code": snapshot.get("failure_code"),
+                "failure_category": snapshot.get("failure_category"),
+                "failure_message": snapshot.get("failure_message") or snapshot.get("error") or failure_message or getattr(stage_run, "last_error", None),
+                "reason": "later_stage_items_terminal",
             }
         return None
 
@@ -1142,6 +1233,8 @@ class TaskStateMachineMixin:
         if gate.reason_code == "pending_stage_materialization":
             if failed_idx is None or blocked_idx is None:
                 return False
+            if current_idx is not None and failed_idx > current_idx:
+                return True
             return failed_idx <= blocked_idx
 
         if gate.reason_code in {
@@ -1152,6 +1245,8 @@ class TaskStateMachineMixin:
         }:
             if failed_idx is None or current_idx is None:
                 return False
+            if failed_idx > current_idx:
+                return True
             return failed_idx <= current_idx
 
         return False
@@ -1896,19 +1991,13 @@ class TaskStateMachineMixin:
                 reason="进入 streaming tail 收口",
                 stage_name=decision.next_stage,
                 status="running",
-                runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+                runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 finished_at=None,
                 last_error=None,
                 clear_runtime_owner=True,
             ):
                 return True
-            lease = self._activate_tail_reconciliation(
-                db,
-                task,
-                now_value=task_manager_module._now(),
-                fallback_status="pending",
-                takeover_result="refresh",
-            )
+            lease = self._runtime_lease_for_task(db, task.id)
             if not self._runtime_lease_is_active(lease):
                 self._repair_running_lease_invariant(
                     db,
@@ -2013,6 +2102,8 @@ class TaskStateMachineMixin:
             failure_ctx = self._current_stage_authoritative_failure_context(db, task)
             if failure_ctx is None:
                 failure_ctx = self._earlier_stage_authoritative_failure_context(db, task)
+            if failure_ctx is None:
+                failure_ctx = self._later_stage_authoritative_failure_context(db, task)
             if failure_ctx is not None:
                 decision.action = "failure_finalize"
                 decision.stage_name = str(failure_ctx.get("stage_name") or stage_name or task.current_stage or "").strip() or None
@@ -2200,6 +2291,8 @@ class TaskStateMachineMixin:
         if authoritative_failure is None:
             authoritative_failure = self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
         if authoritative_failure is None:
+            authoritative_failure = self._later_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+        if authoritative_failure is None:
             failure_run = next(
                 (
                     run for run in stage_runs
@@ -2217,22 +2310,21 @@ class TaskStateMachineMixin:
                     "failure_message": str(getattr(failure_run, "last_error", None) or "owner_lost_retry_exhausted"),
                     "reason": "owner_lost_retry_exhausted_stage_run",
                 }
-        if (
-            str(authoritative_failure.get("failure_code") or "").strip() == "owner_lost_retry_exhausted"
-            if authoritative_failure
-            else False
-        ) and self._should_finalize_after_authoritative_failure(
+        if authoritative_failure is not None and self._should_finalize_after_authoritative_failure(
             db,
             task,
             failure_ctx=authoritative_failure,
             stage_runs=stage_runs,
         ):
+            failure_code = str(authoritative_failure.get("failure_code") or "").strip()
             self._finalize_task_after_authoritative_failure(
                 db,
                 task,
                 failure_ctx=authoritative_failure,
                 previous_status=current_status,
-                event_type="task_owner_lost_final_failed",
+                event_type="task_owner_lost_final_failed"
+                if failure_code == "owner_lost_retry_exhausted"
+                else "dispatching_state_force_terminalized",
             )
             return
         if self._recover_streaming_parent_running_state_locked(
@@ -2369,27 +2461,16 @@ class TaskStateMachineMixin:
                 )
                 task.current_operation_id = active_operation.id
                 return True
-            if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                self._apply_task_main_state_update(
-                    db,
-                    task,
-                    source="state_machine",
-                    reason="活动操作存在，任务维持 owned execution 运行期状态",
-                    runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                    finished_at=None,
-                    last_error=None if str(active_operation.status or "").strip() in {"accepted", "queued", "running"} else self._MAIN_STATE_UNSET,
-                    record_blocked_event=False,
-                )
-            else:
-                self._apply_task_main_state_update(
-                    db,
-                    task,
-                    source="state_machine",
-                    reason="tail reconcile 期间存在活动操作，保留当前运行期状态",
-                    finished_at=None,
-                    last_error=None if str(active_operation.status or "").strip() in {"accepted", "queued", "running"} else self._MAIN_STATE_UNSET,
-                    record_blocked_event=False,
-                )
+            self._apply_task_main_state_update(
+                db,
+                task,
+                source="state_machine",
+                reason="活动操作存在，任务维持 owned execution 运行期状态",
+                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                finished_at=None,
+                last_error=None if str(active_operation.status or "").strip() in {"accepted", "queued", "running"} else self._MAIN_STATE_UNSET,
+                record_blocked_event=False,
+            )
             task.current_operation_id = active_operation.id
             return True
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
@@ -2449,6 +2530,8 @@ class TaskStateMachineMixin:
         authoritative_failure_ctx = self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
         if authoritative_failure_ctx is None:
             authoritative_failure_ctx = self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+        if authoritative_failure_ctx is None:
+            authoritative_failure_ctx = self._later_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
         if authoritative_failure_ctx is not None and self._should_finalize_after_authoritative_failure(
             db,
             task,
@@ -2482,16 +2565,8 @@ class TaskStateMachineMixin:
                 )
                 return True
             next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            clear_runtime_owner = False
-            if self._is_streaming_tail_stage(task, task.current_stage) and self._tail_requires_execution_takeover(db, task):
-                task.tail_reconcile_state = "idle"
-            else:
-                next_runtime_phase = (
-                    task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                    if self._is_streaming_tail_stage(task, task.current_stage) and self._should_enter_tail_reconciliation(db, task)
-                    else task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                )
-                clear_runtime_owner = True
+            clear_runtime_owner = bool(self._is_streaming_tail_stage(task, task.current_stage))
+            task.tail_reconcile_state = "idle"
             self._apply_task_main_state_update(
                 db,
                 task,
@@ -2522,14 +2597,7 @@ class TaskStateMachineMixin:
         preserve_dispatch = self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status)
         next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
         if not preserve_dispatch:
-            if self._is_streaming_tail_stage(task, active_stage_name) and self._tail_requires_execution_takeover(db, task):
-                task.tail_reconcile_state = "idle"
-            else:
-                next_runtime_phase = (
-                    task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                    if self._is_streaming_tail_stage(task, active_stage_name) and self._should_enter_tail_reconciliation(db, task)
-                    else task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                )
+            task.tail_reconcile_state = "idle"
         self._apply_task_main_state_update(
             db,
             task,
@@ -2542,69 +2610,36 @@ class TaskStateMachineMixin:
             last_error=None,
         )
         if not preserve_dispatch:
-            if self._task_runtime_phase(task) == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                lease = self._activate_tail_reconciliation(
+            self._apply_task_main_state_update(
+                db,
+                task,
+                source="state_machine",
+                reason="活跃阶段释放运行期 owner，等待 worker 重新接管",
+                clear_runtime_owner=True,
+                record_blocked_event=False,
+            )
+            current_stage_items = self._stage_items(db, task.id, str(task.current_stage or "").strip())
+            has_live_downstream_children = self._stage_has_live_downstream_children(current_stage_items)
+            if (
+                not has_live_downstream_children
+                and str(previous_status or "").strip() in {"running", "dispatching", "pending"}
+                and self._should_requeue_for_owned_execution(
                     db,
                     task,
-                    now_value=task_manager_module._now(),
-                    fallback_status="pending",
-                    takeover_result="refresh",
+                    next_stage=str(task.current_stage or "").strip() or None,
+                    next_stage_status="running",
                 )
-                if not self._runtime_lease_is_active(lease):
-                    if str(task.current_stage or "").strip() and self._is_streaming_tail_stage(task, task.current_stage):
-                        self._apply_task_main_state_update(
-                            db,
-                            task,
-                            source="state_machine",
-                            reason="tail 收口租约未建立但仍保留 streaming tail 运行态",
-                            status="running",
-                            stage_name=task.current_stage,
-                            finished_at=None,
-                            last_error=None,
-                        )
-                    else:
-                        self._apply_task_main_state_update(
-                            db,
-                            task,
-                            source="state_machine",
-                            reason="tail 收口租约未建立，任务回到待执行",
-                            status="pending",
-                            stage_name=task.current_stage,
-                            finished_at=None,
-                            last_error=None,
-                        )
-            else:
-                self._apply_task_main_state_update(
+            ):
+                self._requeue_owned_execution_takeover(
                     db,
                     task,
-                    source="state_machine",
-                    reason="非 tail reconcile 活跃阶段释放运行期 owner，等待 worker 重新接管",
-                    clear_runtime_owner=True,
-                    record_blocked_event=False,
+                    stage_name=str(task.current_stage or "").strip() or None,
+                    reason="refresh_task_status_no_active_owner",
+                    event_type="owned_execution_takeover_requeued",
+                    message="检测到执行接管悬空，已重新排队等待 worker 接管",
+                    event_payload={"source": "refresh_task_status_after_sync"},
                 )
-                self._release_tail_reconcile_owner(task.id)
-                current_stage_items = self._stage_items(db, task.id, str(task.current_stage or "").strip())
-                has_live_downstream_children = self._stage_has_live_downstream_children(current_stage_items)
-                if (
-                    not has_live_downstream_children
-                    and str(previous_status or "").strip() in {"running", "dispatching", "pending"}
-                    and self._should_requeue_for_owned_execution(
-                        db,
-                        task,
-                        next_stage=str(task.current_stage or "").strip() or None,
-                        next_stage_status="running",
-                    )
-                ):
-                    self._requeue_owned_execution_takeover(
-                        db,
-                        task,
-                        stage_name=str(task.current_stage or "").strip() or None,
-                        reason="refresh_task_status_no_active_owner",
-                        event_type="owned_execution_takeover_requeued",
-                        message="检测到执行接管悬空，已重新排队等待 worker 接管",
-                        event_payload={"source": "refresh_task_status_after_sync"},
-                    )
-                    return True
+                return True
         task.finished_at = None
         self._clear_task_failure_state(task)
         self._clear_task_abnormal_reason_snapshot(db, task)
@@ -2723,11 +2758,7 @@ class TaskStateMachineMixin:
                 )
                 task.tail_reconcile_state = "idle"
             else:
-                next_runtime_phase = (
-                    task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                    if self._should_enter_tail_reconciliation(db, task)
-                    else task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                )
+                next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
                 _apply_retry_reopen_patch(
                     status=deferred_status,
                     reason="streaming dataflow 尾段未终态，任务按权威结果刷新状态",
@@ -2737,14 +2768,6 @@ class TaskStateMachineMixin:
                     last_error=None,
                     clear_runtime_owner=True,
                 )
-                if next_runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                    self._activate_tail_reconciliation(
-                        db,
-                        task,
-                        now_value=task_manager_module._now(),
-                        fallback_status="pending",
-                        takeover_result="refresh",
-                    )
             return True
         next_stage = self._next_incomplete_stage(db, task)
         if had_task_retry_mode and not next_stage and original_target_stage_name:
@@ -2764,6 +2787,37 @@ class TaskStateMachineMixin:
             and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
             and not self._is_streaming_tail_stage(task, failed_stage_run.stage_name)
         ):
+            failed_stage_name = str(failed_stage_run.stage_name or task.current_stage or "").strip() or None
+            if (
+                self._stage_ready_to_escalate_failure(workflow_snapshots, failed_stage_name or "")
+                and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run)
+                and self._should_finalize_after_authoritative_failure(
+                    db,
+                    task,
+                    failure_ctx={"stage_name": failed_stage_name},
+                    stage_runs=stage_runs,
+                )
+            ):
+                failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+                self._finalize_task_after_authoritative_failure(
+                    db,
+                    task,
+                    failure_ctx={
+                        "stage_name": failed_stage_name,
+                        "stage_run": failed_stage_run,
+                        "failure_code": failure_snapshot.get("failure_code"),
+                        "failure_category": failure_snapshot.get("failure_category"),
+                        "failure_message": (
+                            failed_stage_run.last_error
+                            or failure_snapshot.get("failure_message")
+                            or failure_snapshot.get("error")
+                        ),
+                        "reason": "failed_stage_run_terminalized_after_sync",
+                    },
+                    previous_status=current_status,
+                    event_type="dispatching_state_force_terminalized",
+                )
+                return True
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             recoverable_owner_lost = any(self._owner_lost_retry_exhausted(task, item) is False and self._is_owner_lost_recoverable_failure(
                 failure_message=str(item.error_message or "").strip() or None,
@@ -2797,11 +2851,7 @@ class TaskStateMachineMixin:
                     )
                     task.tail_reconcile_state = "idle"
                 else:
-                    next_runtime_phase = (
-                        task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                        if self._should_enter_tail_reconciliation(db, task)
-                        else task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                    )
+                    next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
                     _apply_retry_reopen_patch(
                         status=streaming_status,
                         reason="streaming tail 失败阶段根据当前上下文刷新任务状态",
@@ -2811,16 +2861,6 @@ class TaskStateMachineMixin:
                         last_error=None,
                         clear_runtime_owner=True,
                     )
-                    if next_runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                        self._activate_tail_reconciliation(
-                            db,
-                            task,
-                            now_value=task_manager_module._now(),
-                            fallback_status="pending",
-                            takeover_result="refresh",
-                        )
-                    else:
-                        self._release_tail_reconcile_owner(task.id)
                 self._clear_task_abnormal_reason_snapshot(db, task)
                 return True
             if not failed_items and "owner pod lost" in str(getattr(failed_stage_run, "last_error", "") or "").lower():
@@ -2996,11 +3036,7 @@ class TaskStateMachineMixin:
                 )
                 task.tail_reconcile_state = "idle"
             else:
-                next_runtime_phase = (
-                    task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                    if self._is_streaming_tail_stage(task, failed_stage_run.stage_name) and self._should_enter_tail_reconciliation(db, task)
-                    else task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                )
+                next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
                 _apply_retry_reopen_patch(
                     status="pending",
                     reason="失败阶段等待重新接管，任务保持待执行",
@@ -3009,19 +3045,56 @@ class TaskStateMachineMixin:
                     finished_at=None,
                     clear_runtime_owner=True,
                 )
-                if next_runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                    self._activate_tail_reconciliation(
-                        db,
-                        task,
-                        now_value=task_manager_module._now(),
-                        fallback_status="pending",
-                        takeover_result="refresh",
-                    )
-                else:
-                    self._release_tail_reconcile_owner(task.id)
             return True
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
+        current_stage_name = str(task.current_stage or "").strip()
+        current_stage_items = self._stage_items(db, task.id, current_stage_name) if current_stage_name else []
+        current_stage_has_live_work = bool(
+            current_stage_name
+            and (
+                self._stage_has_active_items(current_stage_items)
+                or self._stage_has_live_downstream_children(current_stage_items)
+                or self._stage_has_real_runnable_work(db, task, current_stage_name)
+            )
+        )
+        if (
+            next_stage
+            and next_stage != current_stage_name
+            and self._streaming_mode_enabled(task)
+            and current_stage_has_live_work
+            and self._is_streaming_tail_stage(task, next_stage)
+        ):
+            _apply_retry_reopen_patch(
+                status="running",
+                reason="当前上游阶段仍有活跃工作，流式 tail 预建不会抢占任务主阶段",
+                stage_name=current_stage_name,
+                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                finished_at=None,
+                last_error=None,
+                clear_runtime_owner=True,
+            )
+            self._clear_task_abnormal_reason_snapshot(db, task)
+            return True
+        if (
+            next_stage
+            and next_stage != current_stage_name
+            and self._streaming_mode_enabled(task)
+            and self._is_streaming_tail_stage(task, current_stage_name)
+            and self._is_streaming_tail_stage(task, next_stage)
+            and self._stage_has_active_items(current_stage_items)
+        ):
+            _apply_retry_reopen_patch(
+                status="running",
+                reason="当前流式阶段仍有未完成子项，保持在当前阶段继续执行",
+                stage_name=current_stage_name,
+                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                finished_at=None,
+                last_error=None,
+                clear_runtime_owner=True,
+            )
+            self._clear_task_abnormal_reason_snapshot(db, task)
+            return True
         if (
             next_stage
             and str(next_stage_status or "").strip() in {"pending", "queued", "running", "dispatching"}
@@ -3032,7 +3105,20 @@ class TaskStateMachineMixin:
             )
         ):
             previous_stage_name = str(task.current_stage or "").strip()
-            next_task_status = "running" if str(next_stage_status or "").strip() in {"running", "dispatching"} else "pending"
+            next_task_status = (
+                "running"
+                if (
+                    str(next_stage_status or "").strip() in {"running", "dispatching"}
+                    or (
+                        next_stage == previous_stage_name
+                        and (
+                            self._stage_has_real_runnable_work(db, task, next_stage)
+                            or self._should_hold_task_on_stage_after_requeue(db, task, next_stage)
+                        )
+                    )
+                )
+                else "pending"
+            )
             if self._is_streaming_tail_stage(task, next_stage) and self._tail_requires_execution_takeover(db, task):
                 _apply_retry_reopen_patch(
                     status=next_task_status,
@@ -3044,11 +3130,7 @@ class TaskStateMachineMixin:
                 )
                 task.tail_reconcile_state = "idle"
             else:
-                next_runtime_phase = (
-                    task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                    if self._is_streaming_tail_stage(task, next_stage) and self._should_enter_tail_reconciliation(db, task)
-                    else task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                )
+                next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
                 _apply_retry_reopen_patch(
                     status=next_task_status,
                     reason="下一个未完成阶段存在可执行工作，刷新任务状态",
@@ -3058,23 +3140,6 @@ class TaskStateMachineMixin:
                     last_error=None,
                     clear_runtime_owner=True,
                 )
-                if next_runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                    lease = self._activate_tail_reconciliation(
-                        db,
-                        task,
-                        now_value=task_manager_module._now(),
-                        fallback_status="pending",
-                        takeover_result="refresh",
-                    )
-                    if not self._runtime_lease_is_active(lease):
-                        _apply_retry_reopen_patch(
-                            status="pending",
-                            reason="tail 收口租约未建立，下一个阶段等待重新调度",
-                            stage_name=next_stage,
-                            finished_at=None,
-                        )
-                else:
-                    self._release_tail_reconcile_owner(task.id)
             summary = dict(task.summary or {})
             if summary.get("stale_from_stage") and next_stage in set(summary.get("stale_stages") or []):
                 summary["stale_stages"] = []
@@ -3093,6 +3158,19 @@ class TaskStateMachineMixin:
                     next_stage_status=str(next_stage_status or "").strip(),
                 )
             )
+            if next_stage == previous_stage_name and next_task_status == "running":
+                if should_owned_execution_requeue:
+                    self._requeue_owned_execution_takeover(
+                        db,
+                        task,
+                        stage_name=next_stage,
+                        reason="downstream_sync_same_stage_no_active_owner",
+                        event_type="owned_execution_takeover_requeued",
+                        message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {next_stage}",
+                        event_payload={"stage_status": str(next_stage_status or "").strip() or None},
+                        preserve_active_state=True,
+                    )
+                return True
             if should_owned_execution_requeue and str(next_stage_status or "").strip() in {"running", "dispatching"}:
                 self._requeue_owned_execution_takeover(
                     db,
@@ -3313,8 +3391,20 @@ class TaskStateMachineMixin:
             None,
         )
         blocked_status = str((blocked_snapshot or {}).get("status") or "").strip()
-        if gate.reason_code == "pending_stage_materialization":
-            next_status = "pending"
+        has_active_incomplete_stage, active_stage_name, active_stage_status = self._has_any_active_incomplete_stage(db, task, runs)
+        if gate.reason_code == "active_children_present" and has_active_incomplete_stage and active_stage_name:
+            blocked_stage = active_stage_name
+            blocked_status = str(active_stage_status or "").strip()
+            next_status = "running"
+        elif gate.reason_code == "pending_stage_materialization":
+            current_stage_name = str(task.current_stage or "").strip()
+            current_stage_items = self._stage_items(db, task.id, current_stage_name) if current_stage_name else []
+            keep_running = bool(
+                has_active_incomplete_stage
+                and active_stage_name
+                and active_stage_name == current_stage_name
+            ) or bool(self._stage_has_active_items(current_stage_items))
+            next_status = "running" if keep_running else "pending"
         else:
             next_status = "running" if blocked_status in {"running", "dispatching", "applying"} or bool((blocked_snapshot or {}).get("has_active_items")) else "pending"
         if blocked_stage:
@@ -3410,6 +3500,22 @@ class TaskStateMachineMixin:
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
+        def _stage_should_keep_task_running(stage_name: str | None, stage_status: str | None) -> bool:
+            normalized_stage = str(stage_name or "").strip()
+            normalized_status = str(stage_status or "").strip()
+            if normalized_status in {"running", "dispatching", "applying"}:
+                return True
+            if not normalized_stage:
+                return False
+            stage_items = self._stage_items(db, task.id, normalized_stage)
+            if self._stage_has_active_items(stage_items):
+                return True
+            if self._stage_has_live_downstream_children(stage_items):
+                return True
+            if self._stage_has_real_runnable_work(db, task, normalized_stage):
+                return True
+            return False
+
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
         has_active_streaming_upstream, active_streaming_stage, active_streaming_status = self._streaming_has_active_upstream_stage(task, stage_runs)
         original_runtime_phase = str(getattr(task, "runtime_phase", "") or "").strip()
@@ -3419,7 +3525,7 @@ class TaskStateMachineMixin:
                 task,
                 source="state_machine",
                 reason="深度模式仍有上游阶段活跃，任务延迟收口",
-                status="running" if active_streaming_status in {"running", "dispatching", "applying"} else "pending",
+                status="running" if _stage_should_keep_task_running(active_streaming_stage, active_streaming_status) else "pending",
                 stage_name=active_streaming_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 clear_runtime_owner=True,
@@ -3456,12 +3562,13 @@ class TaskStateMachineMixin:
                     event_type="owned_execution_takeover_requeued",
                     message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {active_streaming_stage}",
                     event_payload={"stage_status": active_streaming_status, "source": "finalize_streaming_upstream"},
+                    preserve_active_state=True,
                 )
             return True
         has_active_incomplete_stage, active_stage_name, active_stage_status = self._has_any_active_incomplete_stage(db, task, stage_runs)
         if not has_active_incomplete_stage:
             return False
-        next_active_status = "running" if active_stage_status in {"running", "dispatching", "applying"} else "pending"
+        next_active_status = "running" if _stage_should_keep_task_running(active_stage_name, active_stage_status) else "pending"
         if (
             self._is_streaming_tail_stage(task, active_stage_name)
             and self._tail_requires_execution_takeover(db, task)
@@ -3493,34 +3600,23 @@ class TaskStateMachineMixin:
             )
             self._sync_task_abnormal_reason_snapshot(db, task, None)
             return True
-        if self._is_streaming_tail_stage(task, active_stage_name) and self._should_enter_tail_reconciliation(db, task):
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="state_machine",
-                reason="活跃 tail 阶段进入 tail reconciliation",
-                status="running",
-                stage_name=active_stage_name,
-                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
-                clear_runtime_owner=True,
-                finished_at=None,
-                last_error=None,
-            )
-            task.tail_reconcile_state = "idle"
-        else:
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="state_machine",
-                reason="仍有活跃未完成阶段，任务延迟最终收口",
-                status=next_active_status,
-                stage_name=active_stage_name or task.current_stage,
-                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
-                finished_at=None,
-                last_error=None,
-            )
-            self._release_tail_reconcile_owner(task.id)
+        self._apply_task_main_state_update(
+            db,
+            task,
+            source="state_machine",
+            reason="仍有活跃未完成阶段，任务延迟最终收口",
+            status="running"
+            if self._is_streaming_tail_stage(task, active_stage_name)
+            or str(active_stage_status or "").strip() in {"running", "dispatching", "applying"}
+            else next_active_status,
+            stage_name=active_stage_name or task.current_stage,
+            runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            clear_runtime_owner=True,
+            finished_at=None,
+            last_error=None,
+        )
+        task.tail_reconcile_state = "idle"
+        self._release_tail_reconcile_owner(task.id)
         self._last_task_heartbeat_at.pop(task.id, None)
         self._record_event(
             db,
@@ -3549,6 +3645,7 @@ class TaskStateMachineMixin:
                 event_type="owned_execution_takeover_requeued",
                 message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {active_stage_name}",
                 event_payload={"stage_status": active_stage_status, "source": "finalize_active_stage"},
+                preserve_active_state=True,
             )
         return True
 

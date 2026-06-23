@@ -12,7 +12,7 @@ from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session
 
 from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
-from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask, TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, normalize_stage_name
+from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask, normalize_stage_name
 from app.observability import observe_downstream_reconcile_observation, observe_task_readless_reconcile
 from app.service.readless_sync import ReadlessSyncStats
 from app.schemas import BinarySecurityActionResponse
@@ -89,12 +89,6 @@ class TaskItemSyncServiceMixin:
             task_id = str(getattr(task, "id", "") or "").strip()
             project_id = str(getattr(task, "project_id", "") or "").strip()
             if not task_id or not project_id:
-                continue
-            if (
-                self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                and not self._is_reducer_role()
-                and not self._task_has_pending_cross_stage_downstream_sync(db, task)
-            ):
                 continue
             if not self._task_needs_downstream_reconcile(db, task):
                 continue
@@ -1005,8 +999,8 @@ class TaskItemSyncServiceMixin:
                 self._record_event(
                     session,
                     task,
-                    "tail_reconcile_owner_lost",
-                    "tail 收敛 owner 已丢失，等待新的 reducer 接管",
+                    "owned_execution_owner_lost",
+                    "当前执行 owner 已丢失，等待 worker 重新接管",
                     level="warning",
                     stage_name=item.stage_name,
                     item=item,
@@ -1174,8 +1168,6 @@ class TaskItemSyncServiceMixin:
         error_message: str | None,
         http_status: int | None = None,
     ) -> bool:
-        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and self._is_reducer_role():
-            return False
         before_status = str(item.status or "").strip().lower()
         item.status = "downstream_missing"
         item.error_message = error_message
@@ -1231,83 +1223,6 @@ class TaskItemSyncServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
-        ownership_required = bool(
-            str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-            or self._lease_is_active(task, db=db)
-        )
-        if apply_state and ownership_required:
-            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
-        if (
-            self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-            and self._is_reducer_role()
-            and str(task.status or "").strip().lower() in {"pending", "running", "dispatching"}
-        ):
-            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
-            if self._tail_requires_execution_takeover(db, task):
-                signal_stage_name = active_stage_name or str(task.current_stage or "").strip() or None
-                self._record_event(
-                    db,
-                    task,
-                    "tail_execution_takeover_requested",
-                    "检测到尾段阶段尚未完成，reducer 已转交 owner worker 重新接管执行",
-                    level="warning",
-                    stage_name=signal_stage_name,
-                    payload={
-                        "reason": "incomplete_tail_stage",
-                        "takeover_action": "signal_owned_execution",
-                        "deferred_role": "reducer",
-                    },
-                )
-                self._signal_owned_execution_takeover(
-                    db,
-                    task,
-                    stage_name=signal_stage_name,
-                    reason="tail_reconcile_incomplete_stage_requires_owner_takeover",
-                    message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {signal_stage_name or task.current_stage or ''}".strip(": "),
-                    event_payload={
-                        "source": "reducer_tail_sync",
-                        "active_item_count": active_item_count,
-                        "has_downstream_refs": has_downstream_refs,
-                    },
-                )
-                return BinarySecurityActionResponse(
-                    task_id=task.id,
-                    status="accepted",
-                    accepted=True,
-                    action="signal_owned_execution",
-                    message="已请求 owner worker 重新接管 tail 执行",
-                )
-            if active_item_count > 0 or has_downstream_refs:
-                signal_stage_name = active_stage_name or str(task.current_stage or "").strip() or None
-                self._record_event(
-                    db,
-                    task,
-                    "tail_reconcile_sync_deferred_to_owner_worker",
-                    "检测到 tail 收口仍有活动事实，reducer 已转交 owner worker 继续处理",
-                    level="info",
-                    stage_name=signal_stage_name,
-                    payload={
-                        "active_item_count": active_item_count,
-                        "has_downstream_refs": has_downstream_refs,
-                        "takeover_action": "request_task_layer_reconcile",
-                        "deferred_role": "reducer",
-                    },
-                )
-                self._request_task_layer_reconcile(
-                    db,
-                    task,
-                    stage_name=signal_stage_name,
-                    source_event_type="sync_downstream_status",
-                    state_event_id=None,
-                    reconcile_reason="tail_reconcile_sync_reducer_deferred",
-                    message="tail 收口事实已更新，等待 owner worker 继续收口",
-                    event_payload={
-                        "active_item_count": active_item_count,
-                        "has_downstream_refs": has_downstream_refs,
-                        "source": "reducer_tail_sync",
-                    },
-                )
-
         batch_size = max(1, int(getattr(self.cfg.scheduler, "downstream_sync_batch_size", 50) or 50))
         if stage_name and stage_name not in self._stage_sequence_for_task(task):
             raise ValidationError(f"无效阶段: {stage_name}")
@@ -1457,8 +1372,6 @@ class TaskItemSyncServiceMixin:
                 if exc is not None:
                     raise exc
                 assert isinstance(payload, dict)
-                if observed_apply_state and ownership_required:
-                    self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
                 if item.downstream_service == "entry_analyse":
                     payload, rebound_notice_payload = await self._reconcile_entry_payload_binding(task, item, payload, auth_token)
                     if rebound_notice_payload is not None:
@@ -2067,7 +1980,8 @@ class TaskItemSyncServiceMixin:
                     if job.archive_status == "success":
                         db.commit()
                         await self._apply_archive_job_status(job.id, job.archive_root)
-                        db.expire_all()
+                        if hasattr(db, "expire_all"):
+                            db.expire_all()
                         refreshed_item = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.id == item.id).first()
                         if refreshed_item is not None:
                             if not self._persist_child_sync_observation(
@@ -2598,14 +2512,6 @@ class TaskItemSyncServiceMixin:
             task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task is None:
                 return False, False
-            if (
-                self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-                and not self._is_reducer_role()
-                and not self._tail_requires_execution_takeover(session, task)
-                and not self._task_has_pending_cross_stage_downstream_sync(session, task)
-            ):
-                session.rollback()
-                return True, False
             if self._should_skip_readless_reconcile_for_active_task(task):
                 session.rollback()
                 return True, False
@@ -2613,13 +2519,18 @@ class TaskItemSyncServiceMixin:
         finally:
             session.close()
 
-        self._readless_reconcile_item_layer(task_id)
+        touched_item_stages = self._readless_reconcile_item_layer(task_id)
         touched_stages = self._readless_reconcile_stage_layer(task_id)
         after = self._readless_reconcile_task_layer(task_id)
         if after is None:
             return False, False
-        self._readless_reconcile_tail_takeover(task_id)
-        changed = self._task_state_snapshot_changed(before, after) or bool(touched_stages)
+        tail_takeover_requested = self._readless_reconcile_tail_takeover(task_id)
+        changed = (
+            self._task_state_snapshot_changed(before, after)
+            or bool(touched_item_stages)
+            or bool(touched_stages)
+            or tail_takeover_requested
+        )
         return True, changed
 
     def _task_state_snapshot(self: TaskManager, task: BinarySecurityTask) -> _TaskStateSnapshot:
@@ -2791,17 +2702,17 @@ class TaskItemSyncServiceMixin:
                 touched.add(stage_name)
         return touched
 
-    def _readless_reconcile_tail_takeover(self: TaskManager, task_id: str) -> None:
+    def _readless_reconcile_tail_takeover(self: TaskManager, task_id: str) -> bool:
         from app.service import task_manager as task_manager_module
 
         session = task_manager_module.get_session_factory()()
         try:
             task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task is None:
-                return
+                return False
             if not self._tail_requires_execution_takeover(session, task):
                 session.rollback()
-                return
+                return False
             tail_summary = self._tail_stage_work_summary(session, task)
             takeover_reason = str(tail_summary.get("takeover_reason") or "").strip() or "runnable_unbound_tail_items"
             if takeover_reason == "incomplete_tail_stage":
@@ -2838,6 +2749,7 @@ class TaskItemSyncServiceMixin:
         finally:
             session.close()
         self._enqueue_task(task_id)
+        return True
 
     async def _process_readless_reconcile_task(self: TaskManager, task_id: str) -> tuple[bool, bool]:
         result = await asyncio.to_thread(self._process_readless_reconcile_task_sync, task_id)

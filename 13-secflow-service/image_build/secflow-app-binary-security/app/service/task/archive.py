@@ -205,7 +205,7 @@ class TaskArchiveServiceMixin:
                 if stage_run is not None:
                     self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
 
-        self._mark_task_waiting_for_archive_retry(db, task, target_stage)
+        self._mark_task_waiting_for_archive_retry(db, task, target_stage, preserve_active_state=True)
         self._record_event(
             db,
             task,
@@ -458,12 +458,20 @@ class TaskArchiveServiceMixin:
             return False, self._archive_stage_full_retry_failure_reason(normalized_stage), jobs, []
         return True, None, jobs, retryable_items
 
-    def _mark_task_waiting_for_archive_retry(self: TaskManager, db: Session, task: Any, stage_name: str) -> None:
+    def _mark_task_waiting_for_archive_retry(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        stage_name: str,
+        *,
+        preserve_active_state: bool = False,
+    ) -> None:
+        next_status = "running" if preserve_active_state else "pending"
         self._set_task_status(
             db,
             task,
-            "pending",
-            reason="归档重试后重新排队",
+            next_status,
+            reason="归档重试后重新排队" if not preserve_active_state else "归档重试后保持当前阶段活跃执行",
             source="archive_worker",
             stage_name=stage_name,
         )
@@ -481,14 +489,18 @@ class TaskArchiveServiceMixin:
         self._clear_runtime_lease(db, task.id)
         self._release_tail_reconcile_owner(task.id)
         self._enqueue_task(task.id)
-        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status="pending")
+        self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=next_status)
         self._record_event(
             db,
             task,
             "task_archive_retry_requeued",
             "失败任务的产物归档已重新排队，等待归档 worker 完成后继续推进",
             stage_name=stage_name,
-            payload={"stage_name": stage_name, "retry_semantics": "archive_retry"},
+            payload={
+                "stage_name": stage_name,
+                "retry_semantics": "archive_retry",
+                "preserve_active_state": preserve_active_state,
+            },
         )
 
     async def _prepare_archive_retry_failed_items(

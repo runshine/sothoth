@@ -244,11 +244,17 @@ class TaskEventServiceMixin:
         effective_limit = task_manager_module.DB_SYNC_EVENT_LIMIT if keep_limit is None else int(keep_limit)
         if effective_limit <= 0 or not hasattr(db, "query") or not hasattr(db, "delete"):
             return
+        current_count = 0
+        if hasattr(db, "sync_events"):
+            current_count = len(getattr(db, "sync_events") or [])
+        else:
+            current_count = (
+                db.query(task_manager_module.BinarySecuritySyncEvent)
+                .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
+                .count()
+            )
         overflow = (
-            db.query(task_manager_module.BinarySecuritySyncEvent)
-            .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
-            .count()
-            - effective_limit
+            current_count - effective_limit
         )
         if overflow <= 0:
             return
@@ -385,11 +391,17 @@ class TaskEventServiceMixin:
             return
         if not hasattr(db, "query") or not hasattr(db, "delete"):
             return
+        current_count = 0
+        if hasattr(db, "events"):
+            current_count = len(getattr(db, "events") or [])
+        else:
+            current_count = (
+                db.query(task_manager_module.BinarySecurityEvent)
+                .filter(task_manager_module.BinarySecurityEvent.task_id == task_id)
+                .count()
+            )
         overflow = (
-            db.query(task_manager_module.BinarySecurityEvent)
-            .filter(task_manager_module.BinarySecurityEvent.task_id == task_id)
-            .count()
-            - effective_limit
+            current_count - effective_limit
         )
         if overflow <= 0:
             return

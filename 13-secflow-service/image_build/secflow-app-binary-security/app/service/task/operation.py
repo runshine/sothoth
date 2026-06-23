@@ -2539,30 +2539,24 @@ class TaskOperationServiceMixin:
                     rebuild_db.close()
                 return True
             if workset.get("pending_tail_finalize"):
+                signal = dict(workset.get("pending_tail_finalize") or {})
                 self._clear_task_runtime_signal(task, "pending_tail_finalize")
+                self._request_task_layer_reconcile(
+                    db,
+                    task,
+                    stage_name=str(signal.get("stage_name") or task.current_stage or "").strip() or None,
+                    source_event_type="legacy_tail_finalize_migrated",
+                    state_event_id=None,
+                    reconcile_reason=str(signal.get("reason") or "legacy_tail_finalize_migrated"),
+                    message="检测到历史 tail finalize 信号，已迁移为 owner reconcile 收口",
+                    event_type="task_runtime_signal_migrated",
+                    event_level="info",
+                    event_payload={
+                        "migrated_from": "pending_tail_finalize",
+                        "legacy_signal": signal,
+                    },
+                )
                 db.commit()
-                finalize_db = session_factory()
-                try:
-                    finalize_task = (
-                        finalize_db.query(task_manager_module.BinarySecurityTask)
-                        .filter(task_manager_module.BinarySecurityTask.id == task.id)
-                        .first()
-                    )
-                    if finalize_task is None:
-                        return False
-                    self._ensure_task_write_ownership(finalize_task, db=finalize_db, allow_dispatching=True)
-                    finalize_gate = self._evaluate_task_finalization_gate(finalize_db, finalize_task)
-                    if finalize_gate.allowed:
-                        self._finalize_task(finalize_db, finalize_task)
-                    else:
-                        self._handle_finalize_gate_blocked_active_path(
-                            finalize_db,
-                            finalize_task,
-                            finalize_gate=finalize_gate,
-                        )
-                    finalize_db.commit()
-                finally:
-                    finalize_db.close()
                 return True
             if workset.get("pending_task_layer_reconcile"):
                 signal = dict(workset.get("pending_task_layer_reconcile") or {})
@@ -2592,7 +2586,7 @@ class TaskOperationServiceMixin:
                 self._clear_task_runtime_signal(task, "pending_binding_repair")
                 self._clear_task_runtime_signal(task, "pending_downstream_sync")
                 db.commit()
-                await self._migrate_legacy_pending_downstream_sync_to_redis_queue(task, signal)
+                await self._migrate_legacy_pending_sync_signal_to_redis_queue(task, signal)
                 return True
             drained = await self._drain_task_sync_queue(db, task)
             if drained:

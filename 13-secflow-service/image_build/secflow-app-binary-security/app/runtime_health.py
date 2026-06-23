@@ -99,7 +99,7 @@ def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
     running = bool(runtime.get("running"))
     required_loops = ("state_reducer", "reducer_metrics_snapshot")
     missing = [loop_name for loop_name in required_loops if not _loop_ready(loop_name, runtime)]
-    lease_capable = bool(runtime.get("lease_auditor_active", runtime.get("tail_reconcile_active")))
+    lease_capable = bool(runtime.get("lease_auditor_active"))
     return running and not missing and lease_capable, {
         "enabled": True,
         "running": running,

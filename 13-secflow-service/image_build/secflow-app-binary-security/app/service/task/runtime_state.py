@@ -16,11 +16,6 @@ from app.model import (
     TASK_TERMINAL_STATUSES,
 )
 from app.schemas import BinarySecurityServiceConfigPayload, BinarySecurityServiceConfigResponse
-from app.observability import (
-    observe_tail_reconcile_heartbeat,
-    observe_tail_reconcile_owner,
-    observe_tail_reconcile_takeover,
-)
 from . import shared as task_shared
 
 if TYPE_CHECKING:
@@ -527,15 +522,6 @@ class TaskRuntimeStateServiceMixin:
     ) -> tuple[str | None, Any | None, str | None, str | None, str | None, int | None]:
         lease = self._runtime_lease_for_task(db, task.id)
         if lease is not None:
-            if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                return (
-                    lease.owner_instance_id,
-                    lease.lease_expires_at,
-                    "tail_runtime_lease",
-                    lease.owner_pod_uid,
-                    lease.owner_boot_id,
-                    lease.generation,
-                )
             return (
                 lease.owner_instance_id,
                 lease.lease_expires_at,
@@ -704,14 +690,8 @@ class TaskRuntimeStateServiceMixin:
         return bool(summary.get("tail_control_mode") == "execution_takeover" and summary.get("takeover_required"))
 
     def _should_enter_tail_reconciliation(self: TaskManager, db: Session, task: BinarySecurityTask) -> bool:
-        summary = self._tail_stage_work_summary(db, task)
-        if summary.get("tail_control_mode") == "reconciliation":
-            return True
-        return bool(
-            not summary.get("has_runnable_unbound_items")
-            and int(summary.get("bound_active_item_count", 0) or 0) > 0
-            and bool(summary.get("has_downstream_refs"))
-        )
+        del db, task
+        return False
 
     def _activate_tail_reconciliation(
         self: TaskManager,
@@ -722,51 +702,11 @@ class TaskRuntimeStateServiceMixin:
         fallback_status: str | None = None,
         takeover_result: str | None = None,
         ) -> BinarySecurityTaskRuntimeLease | None:
-        from app.service import task_manager as task_manager_module
-
-        if self._is_reducer_role():
-            self._record_event(
-                db,
-                task,
-                "tail_reconcile_handoff_deferred_to_owner_worker",
-                "reducer 仅记录 tail 收口事实，后续 handoff 交由 owner worker 处理",
-                level="info",
-                stage_name=str(task.current_stage or "").strip() or None,
-                payload={
-                    "fallback_status": fallback_status,
-                    "takeover_result": takeover_result,
-                    "deferred_role": "reducer",
-                },
-            )
-            return None
-
-        if not self._should_enter_tail_reconciliation(db, task):
-            current_stage_name = str(task.current_stage or "").strip()
-            if not self._is_streaming_tail_stage(task, current_stage_name):
-                return None
-            current_stage_items = self._stage_items(db, task.id, current_stage_name)
-            has_active_tail_items = any(
-                (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
-                in {"pending", "queued", "dispatching", "running"}
-                or str(item.downstream_task_id or "").strip()
-                for item in current_stage_items
-            )
-            if not has_active_tail_items:
-                return None
-        current_now = now_value or task_manager_module._now()
-        if not self._apply_task_main_state_update(
-            db,
-            task,
-            source="runtime_state",
-            reason="tail 收口 handoff 准备，切换到 tail reconciliation 运行期状态",
-            stage_name=str(task.current_stage or "").strip() or None,
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
-            clear_runtime_owner=True,
-            record_blocked_event=True,
-        ):
-            return None
-        task.tail_reconcile_state = "handoff_waiting"
-        lease = self._maybe_upsert_runtime_lease(
+        del fallback_status, takeover_result
+        task.tail_reconcile_state = "idle"
+        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        current_now = now_value
+        return self._maybe_upsert_runtime_lease(
             db,
             task,
             now_value=current_now,
@@ -776,110 +716,13 @@ class TaskRuntimeStateServiceMixin:
             generation=self._owner_generation,
             owner_started_at=self.owner_started_at,
         )
-        lease_owner = str(lease.owner_instance_id or "").strip() if lease is not None else ""
-        if self._runtime_lease_is_active(lease) and lease_owner == str(self.instance_id or "").strip():
-            if self._is_reducer_role():
-                task.tail_reconcile_state = "active"
-                self._acquire_tail_reconcile_owner(task.id)
-            if takeover_result:
-                observe_tail_reconcile_takeover(takeover_result)
-            self._tail_reconcile_handoff_reason.pop(task.id, None)
-            self._record_event(
-                db,
-                task,
-                "tail_reconcile_handoff_completed",
-                f"tail 收口接管完成: {task.id}",
-                level="info",
-                payload={
-                    "lease_owner": lease_owner,
-                    "lease_generation": int(getattr(lease, "generation", 0) or 0),
-                    "owner_pod_uid": getattr(lease, "owner_pod_uid", None),
-                    "owner_boot_id": getattr(lease, "owner_boot_id", None),
-                },
-            )
-            return lease
-        self._release_tail_reconcile_owner(task.id)
-        self._tail_reconcile_handoff_reason[task.id] = "owner_conflict"
-        conflict_payload = {
-            "lease_owner": lease_owner or None,
-            "lease_generation": int(getattr(lease, "generation", 0) or 0) if lease is not None else None,
-            "owner_pod_uid": getattr(lease, "owner_pod_uid", None) if lease is not None else None,
-            "owner_boot_id": getattr(lease, "owner_boot_id", None) if lease is not None else None,
-        }
-        conflict_message = f"tail 收口 owner 冲突: {task.id}"
-        if not self._has_recent_matching_task_event(
-            db,
-            task,
-            event_type="tail_reconcile_owner_conflict",
-            stage_name=task.current_stage,
-            message=conflict_message,
-            payload_keys=conflict_payload,
-            within_seconds=60,
-        ):
-            self._record_event(
-                db,
-                task,
-                "tail_reconcile_owner_conflict",
-                conflict_message,
-                level="warning",
-                payload=conflict_payload,
-            )
-        if fallback_status is not None:
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="runtime_state",
-                reason="tail 收口 handoff 未获取有效租约，回退任务状态",
-                stage_name=str(task.current_stage or "").strip() or None,
-                status=fallback_status,
-                runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
-            )
-        task.tail_reconcile_state = "handoff_waiting"
-        observe_tail_reconcile_heartbeat("handoff")
-        observe_tail_reconcile_owner("handoff_started")
-        handoff_message = f"tail 收口 handoff 开始: {task.id}"
-        if not self._has_recent_matching_task_event(
-            db,
-            task,
-            event_type="tail_reconcile_handoff_started",
-            stage_name=task.current_stage,
-            message=handoff_message,
-            payload_keys=conflict_payload,
-            within_seconds=60,
-        ):
-            self._record_event(
-                db,
-                task,
-                "tail_reconcile_handoff_started",
-                handoff_message,
-                level="info",
-                payload=conflict_payload,
-            )
-        if takeover_result:
-            observe_tail_reconcile_takeover("conflict")
-        return lease
 
     def _should_preserve_tail_runtime_lease(self: TaskManager, db: Session, task: BinarySecurityTask | None) -> bool:
-        if task is None:
-            return False
-        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return False
-        if str(task.status or "").strip().lower() in TASK_TERMINAL_STATUSES:
-            return False
-        lease = self._runtime_lease_for_task(db, task.id)
-        if (
-            self._runtime_lease_is_active(lease)
-            and str(lease.owner_instance_id or "").strip() == str(self.instance_id or "").strip()
-        ):
-            return True
-        return self._has_tail_reconcile_owner(task.id)
+        del db, task
+        return False
 
     def _tail_reconcile_state(self: TaskManager, task: BinarySecurityTask | None) -> str:
-        if task is None:
-            return "idle"
-        raw = str(getattr(task, "tail_reconcile_state", "") or "").strip().lower()
-        if raw in {"active", "handoff_waiting", "idle"}:
-            return raw
+        del task
         return "idle"
 
     def _has_active_owned_execution_holder(
@@ -933,6 +776,7 @@ class TaskRuntimeStateServiceMixin:
         message: str,
         event_level: str = "warning",
         event_payload: dict[str, Any] | None = None,
+        preserve_active_state: bool = False,
     ) -> None:
         if bool(getattr(task, "_owned_execution_requeue_emitted", False)):
             return
@@ -947,7 +791,7 @@ class TaskRuntimeStateServiceMixin:
             source="runtime_state",
             reason="owned execution 接管重排队",
             stage_name=next_stage_name,
-            status="pending",
+            status="running" if preserve_active_state else "pending",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             finished_at=None,
             last_error=None,
@@ -1060,8 +904,6 @@ class TaskRuntimeStateServiceMixin:
         db: Session,
         task: BinarySecurityTask,
     ) -> tuple[str | None, Any | None, str | None, str | None, int | None]:
-        if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return None, None, None, None, None
         lease = self._runtime_lease_for_task(db, task.id)
         if lease is None:
             return None, None, None, None, None
@@ -1075,9 +917,10 @@ class TaskRuntimeStateServiceMixin:
 
     def _task_runtime_phase(self: TaskManager, task: BinarySecurityTask) -> str:
         value = str(getattr(task, "runtime_phase", "") or "").strip()
+        if value == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            return TASK_RUNTIME_PHASE_OWNED_EXECUTION
         if value in {
             TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
             TASK_RUNTIME_PHASE_TERMINAL,
         }:
             return value
@@ -1087,13 +930,13 @@ class TaskRuntimeStateServiceMixin:
         return TASK_RUNTIME_PHASE_OWNED_EXECUTION
 
     def _set_task_runtime_phase(self: TaskManager, task: BinarySecurityTask, phase: str) -> None:
-        task.runtime_phase = str(phase or "").strip() or TASK_RUNTIME_PHASE_OWNED_EXECUTION
+        normalized = str(phase or "").strip() or TASK_RUNTIME_PHASE_OWNED_EXECUTION
+        if normalized == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
+            normalized = TASK_RUNTIME_PHASE_OWNED_EXECUTION
+        task.runtime_phase = normalized
 
     def _task_control_mode(self: TaskManager, task: BinarySecurityTask) -> str:
-        phase = self._task_runtime_phase(task)
-        if phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
-        if phase == TASK_RUNTIME_PHASE_TERMINAL:
+        if self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_TERMINAL:
             return TASK_RUNTIME_PHASE_TERMINAL
         return TASK_RUNTIME_PHASE_OWNED_EXECUTION
 
@@ -1115,10 +958,7 @@ class TaskRuntimeStateServiceMixin:
         if str(getattr(task, "status", "") or "").strip().lower() != "running":
             return False
         phase = self._task_runtime_phase(task)
-        if phase not in {
-            TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
-        }:
+        if phase != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
             return False
         return True
 
@@ -1129,12 +969,7 @@ class TaskRuntimeStateServiceMixin:
     ) -> bool:
         if not self._running_task_requires_live_runtime_lease(db, task):
             return True
-        phase = self._task_runtime_phase(task)
-        if phase == TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return self._task_has_live_runtime_lease(db, task)
-        if phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION:
-            return self._task_has_live_runtime_lease(db, task)
-        return False
+        return self._task_has_live_runtime_lease(db, task)
 
     def _repair_running_lease_invariant(
         self: TaskManager,
@@ -1152,6 +987,31 @@ class TaskRuntimeStateServiceMixin:
         if not self._running_task_requires_live_runtime_lease(db, task):
             return False
         if self._running_task_has_valid_runtime_ownership(db, task):
+            return False
+        local_runtime_handle_state = self._local_runtime_handle_state(task.id)
+        if (
+            self._task_runtime_owner_matches_current_instance(db, task)
+            or self._has_local_task_execution_owner(task.id)
+            or self._local_runtime_handle_protects_dispatching_reclaim(
+                task.id,
+                dispatch_started_at=getattr(task, "dispatch_started_at", None),
+            )
+        ):
+            self._record_event(
+                db,
+                task,
+                "running_without_active_lease_repair_suppressed",
+                "检测到当前实例仍持有本地执行上下文，暂不执行 lease invariant 修复",
+                level="warning",
+                stage_name=stage_name or str(task.current_stage or "").strip() or None,
+                payload={
+                    "reason": reason,
+                    "local_runtime_handle_state": local_runtime_handle_state,
+                    "local_task_execution_owner": self._has_local_task_execution_owner(task.id),
+                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    **(event_payload or {}),
+                },
+            )
             return False
         if self._task_runtime_transition_guard_active(task):
             guard = self._task_runtime_transition_guard(task)

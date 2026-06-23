@@ -3486,6 +3486,8 @@ class TaskManager(
     ) -> str:
         normalized_kind = str(sync_kind or "downstream_status").strip() or "downstream_status"
         normalized_stage = str(stage_name or "").strip() or "*"
+        if normalized_kind in {"downstream_status", "binding_repair", "late_child_terminal_sync"}:
+            return f"{normalized_kind}:{normalized_stage}:*:*"
         normalized_item_ids = ",".join(sorted({str(item_id).strip() for item_id in list(item_ids or []) if str(item_id).strip()})) or "*"
         normalized_archive_job_ids = ",".join(sorted({str(job_id).strip() for job_id in list(archive_job_ids or []) if str(job_id).strip()})) or "*"
         return f"{normalized_kind}:{normalized_stage}:{normalized_item_ids}:{normalized_archive_job_ids}"

@@ -168,9 +168,6 @@ class TaskReadModelServiceMixin:
         queue_info = queue_info or {}
         pending_positions = queue_info.get("pending_positions", {}) or {}
         status = str(task.status or "").strip().lower()
-        runtime_phase = self._task_runtime_phase(task)
-        if runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-            return "tail_reconciling", "tail_reconciliation_active"
         if status in {"dispatching", "running"}:
             if task.dispatcher_instance_id or task.lease_expires_at:
                 return "dispatching", None
@@ -2500,50 +2497,33 @@ class TaskReadModelServiceMixin:
         units: list[dict[str, Any]] = []
 
         if task_status in active_task_statuses:
-            if runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                if lease_active and tail_active_item_count > 0:
-                    task_worker_status = "healthy"
-                elif lease_active or tail_active_item_count > 0 or tail_has_downstream_refs:
-                    task_worker_status = "degraded"
-                else:
-                    task_worker_status = "unhealthy"
-                task_worker_label = "Tail 收敛协程"
-                task_worker_detail = "负责流式 tail 的对账、同步与终态收敛"
-                task_worker_reason = (
-                    "tail runtime lease 与活跃 tail 子项均存在"
-                    if task_worker_status == "healthy"
-                    else "tail 收敛仍在继续，但 lease 或活跃子项证据不完整"
-                    if task_worker_status == "degraded"
-                    else "tail 收敛期缺少有效 lease 或活跃 tail 证据"
-                )
-            else:
-                task_worker_status = (
-                    "healthy"
-                    if (local_worker_alive and has_local_owner)
-                    else "degraded"
-                    if (local_worker_alive or has_local_owner or lease_expires_at or remote_owner_active)
-                    else "unhealthy"
-                )
-                if fake_local_owner:
-                    task_worker_status = "unhealthy"
-                if not local_worker_alive and not has_local_owner and lease_expires_at is None:
-                    task_worker_status = "unhealthy"
-                elif remote_owner_active and not local_worker_alive and not has_local_owner:
-                    task_worker_status = "degraded"
-                task_worker_label = "主任务执行协程"
-                task_worker_detail = "负责当前父任务阶段推进与调度衔接"
-                task_worker_reason = (
-                    "任务 row owner 指向当前 Pod，但没有本地执行句柄，owner 元数据与真实执行已脱节"
-                    if fake_local_owner
-                    else
-                    "本地任务协程与执行 owner 正常存在"
-                    if task_worker_status == "healthy"
-                    else "当前任务由远端 owner 持有，本 Pod 仅观察到有效 lease"
-                    if remote_owner_active and not local_worker_alive and not has_local_owner
-                    else "主任务协程存在但 owner/lease 信号不完整"
-                    if task_worker_status == "degraded"
-                    else "任务处于活动态，但当前看不到稳定的本地执行协程或 owner"
-                )
+            task_worker_status = (
+                "healthy"
+                if (local_worker_alive and has_local_owner)
+                else "degraded"
+                if (local_worker_alive or has_local_owner or lease_expires_at or remote_owner_active or tail_active_item_count > 0 or tail_has_downstream_refs)
+                else "unhealthy"
+            )
+            if fake_local_owner:
+                task_worker_status = "unhealthy"
+            if not local_worker_alive and not has_local_owner and lease_expires_at is None and tail_active_item_count <= 0 and not tail_has_downstream_refs:
+                task_worker_status = "unhealthy"
+            elif remote_owner_active and not local_worker_alive and not has_local_owner:
+                task_worker_status = "degraded"
+            task_worker_label = "主任务执行协程"
+            task_worker_detail = "负责当前父任务阶段推进、tail 调度与事实同步"
+            task_worker_reason = (
+                "任务 row owner 指向当前 Pod，但没有本地执行句柄，owner 元数据与真实执行已脱节"
+                if fake_local_owner
+                else
+                "本地任务协程与执行 owner 正常存在"
+                if task_worker_status == "healthy"
+                else "当前任务由远端 owner 持有，本 Pod 仅观察到有效 lease"
+                if remote_owner_active and not local_worker_alive and not has_local_owner
+                else "主任务协程存在但 owner/lease 信号不完整，或仍在等待 tail 事实回流"
+                if task_worker_status == "degraded"
+                else "任务处于活动态，但当前看不到稳定的本地执行协程或 owner"
+            )
             units.append(
                 self._build_runtime_health_unit(
                     unit_key="task_worker",
@@ -2592,14 +2572,6 @@ class TaskReadModelServiceMixin:
                     healthy_threshold_seconds=heartbeat_interval_seconds * 2,
                     degraded_threshold_seconds=worker_stale_seconds,
                 )
-            elif runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                stage_status = self._runtime_health_age_status(
-                    stage_age_seconds,
-                    healthy_threshold_seconds=heartbeat_interval_seconds * 2,
-                    degraded_threshold_seconds=worker_stale_seconds,
-                )
-                if stage_status == "unknown":
-                    stage_status = "degraded"
             elif remote_owner_active or lease_active:
                 stage_status = self._runtime_health_age_status(
                     stage_age_seconds,
@@ -2776,16 +2748,10 @@ class TaskReadModelServiceMixin:
                 heartbeat_status = "unhealthy"
             if remote_owner_active and not has_local_owner and last_task_heartbeat_at is None:
                 heartbeat_status = "degraded"
-            if runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION:
-                if lease_expires_at is not None and (task_shared._seconds_until(lease_expires_at) or 0) > 0 and tail_active_item_count > 0:
-                    heartbeat_status = "healthy"
-                elif lease_expires_at is not None and (task_shared._seconds_until(lease_expires_at) or 0) > 0:
-                    heartbeat_status = "degraded"
             if (
                 remote_owner_active
                 and not has_local_owner
                 and heartbeat_status == "healthy"
-                and runtime_phase != task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION
             ):
                 heartbeat_status = "degraded"
             units.append(
@@ -2849,7 +2815,7 @@ class TaskReadModelServiceMixin:
                 )
             if sync_age_reference is None and never_synced_item_count > 0:
                 sync_status = "degraded"
-            if runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_TAIL_RECONCILIATION and sync_status == "unknown" and tail_active_item_count > 0:
+            if sync_status == "unknown" and tail_active_item_count > 0:
                 sync_status = "degraded"
             units.append(
                 self._build_runtime_health_unit(

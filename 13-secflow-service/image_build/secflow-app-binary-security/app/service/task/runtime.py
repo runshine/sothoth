@@ -1731,7 +1731,8 @@ class TaskRuntimeServiceMixin:
             for stage_name in stage_sequence[start_index:]:
                 if stage_retry_mode and stage_sequence.index(stage_name) < target_stage_index:
                     continue
-                db.refresh(task)
+                if hasattr(db, "refresh"):
+                    db.refresh(task)
                 if task.status == "cancelled":
                     return
                 missing_entry_results_failure = self._missing_entry_results_failure_context(
