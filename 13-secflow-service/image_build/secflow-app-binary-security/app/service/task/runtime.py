@@ -507,7 +507,7 @@ class TaskRuntimeServiceMixin:
         queue = task_manager_module.get_task_queue()
         seed_batch_size = max(1, int(getattr(self.cfg.queue, "seed_batch_size", 20) or 20))
         task_rows = (
-            db.query(task_manager_module.BinarySecurityTask.id)
+            db.query(task_manager_module.BinarySecurityTask)
             .filter(task_manager_module.BinarySecurityTask.status.in_(["pending", "dispatching", "running"]))
             .order_by(
                 task_manager_module.BinarySecurityTask.updated_at.asc(),
@@ -517,8 +517,11 @@ class TaskRuntimeServiceMixin:
             .limit(seed_batch_size)
             .all()
         )
-        for (task_id,) in task_rows:
-            await queue.push_task(str(task_id))
+        for task in task_rows:
+            current_status = str(getattr(task, "status", "") or "").strip().lower()
+            if current_status != "pending" and self._task_row_owner_is_runtime_supported(db, task):
+                continue
+            await queue.push_task(str(task.id))
         operation_rows = (
             db.query(task_manager_module.BinarySecurityTaskOperation.task_id)
             .filter(task_manager_module.BinarySecurityTaskOperation.status.in_(["pending", "queued", "running", "accepted"]))
@@ -625,6 +628,10 @@ class TaskRuntimeServiceMixin:
             has_active_operation and self._operation_allows_runtime_resume(current_operation)
         )
         operation_requires_runtime_handle = bool(has_active_operation and operation_allows_runtime_resume)
+        active_operation_type = str(getattr(current_operation, "operation_type", "") or "").strip()
+        owner_guarded_control_operation = bool(
+            has_active_operation and active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES
+        )
         if operation_requires_runtime_handle and self._release_unsupported_task_row_owner(
             db,
             task,
@@ -634,7 +641,21 @@ class TaskRuntimeServiceMixin:
             db.commit()
             self._enqueue_task(task.id)
             return None
-        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if owner_guarded_control_operation and not self._task_row_owner_is_runtime_supported(
+            db,
+            task,
+            active_operation=current_operation,
+        ):
+            self._release_unsupported_task_row_owner(
+                db,
+                task,
+                active_operation=current_operation,
+                reason="dispatch_attempt_owner_guarded_control_takeover",
+            )
+            db.flush()
+            current_status = str(getattr(task, "status", "") or "").strip().lower()
+        else:
+            current_status = str(getattr(task, "status", "") or "").strip().lower()
         if has_active_operation and current_status:
             if current_status != "pending" and operation_allows_runtime_resume:
                 task_manager_module.logger.info(
@@ -679,10 +700,16 @@ class TaskRuntimeServiceMixin:
                     db.commit()
                     self._enqueue_task(task.id)
                     return None
+        if (
+            current_status != "pending"
+            and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
+            and not owner_guarded_control_operation
+        ):
+            return None
         if has_active_operation and not operation_allows_runtime_resume:
             if (
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
-                and self._task_owner_runtime_supported_locally(task, active_operation=current_operation)
+                and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
             ):
                 return None
             if current_status != "pending" and not has_active_operation:
@@ -694,6 +721,11 @@ class TaskRuntimeServiceMixin:
             return None
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
+        next_task_status = "dispatching"
+        if has_active_operation and active_operation_type == task_manager_module.TASK_ACTION_CANCEL:
+            next_task_status = task_manager_module.TASK_STATUS_CANCELLING
+        elif has_active_operation and active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES and current_status and current_status != "pending":
+            next_task_status = current_status
         updated = (
             db.query(task_manager_module.BinarySecurityTask)
             .filter(
@@ -702,7 +734,7 @@ class TaskRuntimeServiceMixin:
             )
             .update(
                 {
-                    task_manager_module.BinarySecurityTask.status: "dispatching",
+                    task_manager_module.BinarySecurityTask.status: next_task_status,
                     task_manager_module.BinarySecurityTask.runtime_phase: task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     task_manager_module.BinarySecurityTask.dispatcher_instance_id: self.instance_id,
                     task_manager_module.BinarySecurityTask.dispatch_started_at: started_at,
@@ -772,7 +804,7 @@ class TaskRuntimeServiceMixin:
                 )
                 seen_non_owner_skip_keys.add(skip_key)
                 continue
-            if not task.dispatch_started_at or not self._lease_is_active(task):
+            if not task.dispatch_started_at or not self._lease_is_active(task, db=db):
                 continue
             if self._stage_item_orchestration_in_retry_backoff(item):
                 continue
@@ -881,8 +913,6 @@ class TaskRuntimeServiceMixin:
                 and (task_manager_module._elapsed_seconds_since(dispatch_started_at) or 0) <= max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
             ):
                 continue
-            if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
-                continue
             lease = self._runtime_lease_for_task(db, task.id)
             if self._runtime_lease_is_active(lease):
                 continue
@@ -921,14 +951,6 @@ class TaskRuntimeServiceMixin:
         for task in stale_rows:
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
                 continue
-            if (
-                str(task.dispatcher_instance_id or "").strip() == self.instance_id
-                and self._local_runtime_handle_protects_dispatching_reclaim(
-                    task.id,
-                    dispatch_started_at=getattr(task, "dispatch_started_at", None),
-                )
-            ):
-                continue
             if self._task_runtime_transition_guard_active(task):
                 continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
@@ -947,13 +969,7 @@ class TaskRuntimeServiceMixin:
             protected_dispatching_window = bool(
                 active_item_count > 0
                 and (
-                    self._local_runtime_handle_protects_dispatching_reclaim(
-                        task.id,
-                        dispatch_started_at=getattr(task, "dispatch_started_at", None),
-                    )
-                    or self._has_local_task_execution_owner(task.id)
-                    or self._task_has_active_streaming_stage_workers(task.id)
-                    or (
+                    (
                         row_owner_matches_runtime_lease
                         and runtime_lease_expires_at is not None
                         and (task_manager_module._seconds_until(runtime_lease_expires_at) or 0) > 0
@@ -1130,7 +1146,11 @@ class TaskRuntimeServiceMixin:
             task = db.query(task_manager_module.BinarySecurityTask).filter(
                 task_manager_module.BinarySecurityTask.id == item.task_id
             ).first()
-            if str(item.claim_owner_instance_id or "").strip() and task is not None and self._stage_item_claim_matches_task_execution(item, task):
+            if (
+                str(item.claim_owner_instance_id or "").strip()
+                and task is not None
+                and self._stage_item_claim_matches_task_execution(item, task, db=db)
+            ):
                 continue
             if str(item.downstream_task_id or "").strip():
                 continue
@@ -1410,9 +1430,41 @@ class TaskRuntimeServiceMixin:
                     "binary-security run_task aborted before execution because task row is missing: task_id=%s",
                     task_id,
                 )
+            active_operation = self._task_active_operation(db, task)
+            active_operation_type = str(getattr(active_operation, "operation_type", "") or "").strip()
+            control_operation_takeover = (
+                active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES
+                and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+            )
+            if task is not None and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip():
+                try:
+                    self._upsert_runtime_lease(
+                        db,
+                        task,
+                        now_value=task_manager_module._now(),
+                        owner_instance_id=self.instance_id,
+                    )
+                except task_manager_module.StaleTaskExecution:
+                    task_manager_module.logger.warning(
+                        "binary-security run_task abandoned ownership takeover because runtime lease is owned by another live instance: "
+                        "task_id=%s current_operation_id=%s dispatcher_instance_id=%s",
+                        task_id,
+                        str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                        str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    )
+                    return
             if (
                 task is None
-                or task.status != "dispatching"
+                or (
+                    task.status != "dispatching"
+                    and not (
+                        str(getattr(task, "status", "") or "").strip() == task_manager_module.TASK_STATUS_CANCELLING
+                        and self._task_has_active_cancel_operation(db, task)
+                    )
+                    and not (
+                        str(getattr(task, "current_operation_id", "") or "").strip()
+                    )
+                )
                 or task.dispatcher_instance_id != self.instance_id
                 or not self._lease_is_active(task, db=db)
             ):
@@ -1441,14 +1493,37 @@ class TaskRuntimeServiceMixin:
                 task.started_at = task_manager_module._now()
             started_at = task_manager_module._now()
             execution_token = started_at.isoformat()
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="runtime_worker",
-                reason="任务进入调度执行",
-                status="running",
-                stage_name=task.current_stage,
-            )
+            if active_operation_type == task_manager_module.TASK_ACTION_CANCEL:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    reason="取消控制操作接管 owner 执行",
+                    status=task_manager_module.TASK_STATUS_CANCELLING,
+                    stage_name=task.current_stage,
+                    finished_at=None,
+                    last_error=None,
+                )
+            elif active_operation_type == task_manager_module.TASK_ACTION_DELETE:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    reason="删除控制操作接管 owner 执行",
+                    status=str(getattr(task, "status", "") or "").strip() or "running",
+                    stage_name=task.current_stage,
+                    finished_at=None,
+                    last_error=None,
+                )
+            else:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="runtime_worker",
+                    reason="任务进入调度执行",
+                    status="running",
+                    stage_name=task.current_stage,
+                )
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
             self._sync_task_row_lease_view_from_owner(
                 db,
@@ -1456,16 +1531,6 @@ class TaskRuntimeServiceMixin:
                 stage_name=task.current_stage,
                 reason="run_task_dispatch_row_lease_view",
             )
-            if self._task_runtime_transition_guard_active(task):
-                self._clear_task_runtime_transition_guard(task)
-                self._record_event(
-                    db,
-                    task,
-                    "runtime_transition_guard_cleared",
-                    "owner worker 已接管任务，阶段切换保护窗口已关闭",
-                    stage_name=task.current_stage,
-                    payload={"dispatcher_instance_id": self.instance_id},
-                )
             self._clear_task_abnormal_reason_snapshot(db, task)
             self._bind_execution_token(task)
             self._register_task_execution_owner(task.id, "primary_task_worker")
@@ -1585,6 +1650,87 @@ class TaskRuntimeServiceMixin:
             while await self._run_task_runtime_signals(task_id):
                 pass
             await self._execute_task(task_id)
+            while True:
+                runtime_db = session_factory()
+                try:
+                    task_after_execute = (
+                        runtime_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                        .first()
+                    )
+                    if task_after_execute is None:
+                        break
+                    if str(getattr(task_after_execute, "status", "") or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES:
+                        break
+                    if str(getattr(task_after_execute, "current_operation_id", "") or "").strip():
+                        continue
+                    if not self._task_runtime_owner_matches_current_instance(runtime_db, task_after_execute):
+                        break
+                    authoritative_context_active = self._task_has_authoritative_active_stage_context(
+                        runtime_db,
+                        task_after_execute,
+                        stage_name=str(getattr(task_after_execute, "current_stage", "") or "").strip() or None,
+                    )
+                    if self._task_runtime_transition_guard_active(task_after_execute):
+                        if authoritative_context_active:
+                            self._clear_task_runtime_transition_guard(task_after_execute)
+                            self._record_event(
+                                runtime_db,
+                                task_after_execute,
+                                "runtime_transition_guard_cleared",
+                                "阶段切换保护窗口已在权威阶段上下文建立后关闭",
+                                stage_name=task_after_execute.current_stage,
+                                payload={"dispatcher_instance_id": self.instance_id},
+                            )
+                            runtime_db.commit()
+                        should_remain_active = True
+                    else:
+                        should_remain_active = authoritative_context_active
+                    if not should_remain_active:
+                        break
+                finally:
+                    runtime_db.close()
+                await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
+                while await self._run_task_runtime_signals(task_id):
+                    pass
+                runtime_db = session_factory()
+                try:
+                    task_after_signals = (
+                        runtime_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                        .first()
+                    )
+                    if task_after_signals is None:
+                        break
+                    if str(getattr(task_after_signals, "status", "") or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES:
+                        break
+                    if str(getattr(task_after_signals, "current_operation_id", "") or "").strip():
+                        continue
+                    if not self._task_runtime_owner_matches_current_instance(runtime_db, task_after_signals):
+                        break
+                    authoritative_context_active = self._task_has_authoritative_active_stage_context(
+                        runtime_db,
+                        task_after_signals,
+                        stage_name=str(getattr(task_after_signals, "current_stage", "") or "").strip() or None,
+                    )
+                    if self._task_runtime_transition_guard_active(task_after_signals):
+                        if authoritative_context_active:
+                            self._clear_task_runtime_transition_guard(task_after_signals)
+                            self._record_event(
+                                runtime_db,
+                                task_after_signals,
+                                "runtime_transition_guard_cleared",
+                                "阶段切换保护窗口已在权威阶段上下文建立后关闭",
+                                stage_name=task_after_signals.current_stage,
+                                payload={"dispatcher_instance_id": self.instance_id},
+                            )
+                            runtime_db.commit()
+                        continue
+                    if authoritative_context_active:
+                        continue
+                    break
+                finally:
+                    runtime_db.close()
         except task_manager_module.StaleTaskExecution:
             return
         except Exception as exc:
@@ -1671,15 +1817,59 @@ class TaskRuntimeServiceMixin:
                     await handle.heartbeat_task
             cleanup_db = session_factory()
             try:
+                cleanup_completed = False
                 task = cleanup_db.query(task_manager_module.BinarySecurityTask).filter(
                     task_manager_module.BinarySecurityTask.id == task_id
                 ).first()
+                has_local_runtime_holder = bool(
+                    self._has_local_task_execution_owner(task_id)
+                    or self._task_has_active_streaming_stage_workers(task_id)
+                )
                 if (
-                    task is None
-                    or str(task.status or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES
-                    or (
-                        not self._has_local_task_execution_owner(task_id)
-                        and not self._task_has_active_streaming_stage_workers(task_id)
+                    task is not None
+                    and not has_local_runtime_holder
+                    and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+                    and str(task.status or "").strip().lower() not in task_manager_module.TASK_TERMINAL_STATUSES
+                ):
+                    active_operation = self._task_active_operation(cleanup_db, task)
+                    active_operation_status = (
+                        str(getattr(active_operation, "status", "") or "").strip().lower()
+                        if active_operation is not None else ""
+                    )
+                    if (
+                        active_operation_status in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+                        or str(task.status or "").strip().lower() in {"running", "dispatching", task_manager_module.TASK_STATUS_CANCELLING}
+                    ):
+                        self._requeue_owned_execution_takeover(
+                            cleanup_db,
+                            task,
+                            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                            reason=(
+                                "runtime_worker_exited_with_active_operation"
+                                if active_operation_status in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+                                else "runtime_worker_exited_without_active_holder"
+                            ),
+                            event_type="owned_execution_takeover_requeued",
+                            message=(
+                                "owner runtime 已退出，后台操作将由新的 worker 重新接管"
+                                if active_operation_status in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+                                else "owner runtime 已退出，任务已重新排队等待新的 worker 接管"
+                            ),
+                            event_payload={
+                                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                                "operation_type": str(getattr(active_operation, "operation_type", "") or "").strip() or None,
+                                "runtime_exit_after_active_commit": bool(active_commit_succeeded),
+                            },
+                        )
+                        cleanup_db.commit()
+                        cleanup_completed = True
+                if (
+                    not cleanup_completed
+                    and (
+                        task is None
+                        or str(task.status or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES
+                        or not has_local_runtime_holder
                     )
                 ):
                     clear_result = self._clear_runtime_lease(
@@ -1775,6 +1965,19 @@ class TaskRuntimeServiceMixin:
                     )
                     db.commit()
                     continue
+                stage_run = self._ensure_stage_run(db, task, stage_name)
+                if stage_name == "entry_analysis":
+                    self._rebuild_missing_entry_analysis_stage_items_from_inputs(
+                        db,
+                        task,
+                        stage_run=stage_run,
+                    )
+                self._set_task_runtime_transition_guard(
+                    task,
+                    from_stage=str(getattr(task, "current_stage", "") or "").strip() or None,
+                    to_stage=stage_name,
+                    reason="stage_worker_start_requested",
+                )
                 start_event = self._enqueue_state_event(
                     db,
                     task=task,
@@ -1794,7 +1997,6 @@ class TaskRuntimeServiceMixin:
                     },
                 )
                 handler = self._run_stage_executor
-                stage_run = self._ensure_stage_run(db, task, stage_name)
                 existing_stage_items = self._stage_items(db, task.id, stage_name) if task_retry_mode else []
                 db.commit()
                 retry_existing = False
@@ -1852,7 +2054,8 @@ class TaskRuntimeServiceMixin:
                             execution_token=execution_token,
                         )
                         db.commit()
-                db.refresh(task)
+                if hasattr(db, "refresh"):
+                    db.refresh(task)
                 if str(task.status or "").strip() in task_manager_module.TASK_TERMINAL_STATUSES:
                     return
         finally:
@@ -3645,7 +3848,6 @@ class TaskRuntimeServiceMixin:
             taint_params = [str(value).strip() for value in (entry.get("taint_params") or []) if str(value).strip()]
             if not taint_params:
                 taint_params = _entry_signature_params(entry)
-            definition_found = bool(entry.get("is_definition_found", True))
             definition_kind = self._resolve_entry_definition_kind(entry)
             definition_file = str(entry.get("definition_file") or entry.get("file_name") or "").strip()
             definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
@@ -3657,35 +3859,6 @@ class TaskRuntimeServiceMixin:
                     entry = {**recovered_entry, **entry}
                     module_input_path = module_input_path or str(entry.get("module_input_path") or "").strip()
                     source_root_path = source_root_path or str(entry.get("source_root_path") or "").strip()
-            if not definition_found:
-                item.status = "failed"
-                item.finished_at = _now()
-                item.error_message = "未找到函数定义，无法执行数据流分析"
-                self._persist_stage_item_result(
-                    task,
-                    item,
-                    stage_name=stage_run.stage_name,
-                    result={**entry, "failed": True, "failure_reason": item.error_message},
-                )
-                session.commit()
-                return {"status": "failed", "error": item.error_message, "item": entry}
-            if definition_kind != "definition":
-                item.status = "failed"
-                item.finished_at = _now()
-                item.error_message = "入口仅定位到声明，无法执行数据流分析"
-                self._persist_stage_item_result(
-                    task,
-                    item,
-                    stage_name=stage_run.stage_name,
-                    result={
-                        **entry,
-                        "failed": True,
-                        "failure_reason": item.error_message,
-                        "definition_kind": definition_kind,
-                    },
-                )
-                session.commit()
-                return {"status": "failed", "error": item.error_message, "item": entry}
             if not module_input_path:
                 item.status = "failed"
                 item.finished_at = _now()
@@ -3711,6 +3884,18 @@ class TaskRuntimeServiceMixin:
                 session.commit()
                 return {"status": "failed", "error": item.error_message, "item": entry}
             normalized_source_file = self._normalize_dfa_source_file(source_root_path, entry)
+            if not normalized_source_file:
+                item.status = "failed"
+                item.finished_at = _now()
+                item.error_message = "未找到可访问的源码入口文件，无法执行数据流分析"
+                self._persist_stage_item_result(
+                    task,
+                    item,
+                    stage_name=stage_run.stage_name,
+                    result={**entry, "failed": True, "failure_reason": item.error_message},
+                )
+                session.commit()
+                return {"status": "failed", "error": item.error_message, "item": entry}
             prompt = f"分析文件 {definition_file or entry['file_name']} 中函数 {entry['function_name']} 的外部输入数据流"
             line_hint = ""
             if definition_line:

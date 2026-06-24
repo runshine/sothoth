@@ -317,6 +317,82 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(heartbeat_cancelled.is_set())
         self.assertNotIn("task-1", manager._workers)
 
+    async def test_task_heartbeat_handoffs_active_serial_control_operation(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-serial-op",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            current_operation_id="op-delete",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            status="queued",
+            target_stage=task.current_stage,
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id="worker-a",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease], events=[])
+        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+            task_id=task.id,
+            runner_task=asyncio.current_task(),
+            heartbeat_task=None,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_completed_at=_now(),
+            active_commit_succeeded=True,
+            lease_established=True,
+        )
+        cancelled: list[tuple[str, bool]] = []
+        enqueued: list[str] = []
+
+        async def _cancel(task_id: str, *, wait_for_runner: bool):
+            cancelled.append((task_id, wait_for_runner))
+            handle = manager._workers.get(task_id)
+            if handle is not None:
+                handle.cancel_requested = True
+
+        original_factory = task_manager_module.get_session_factory
+        original_enqueue = manager._enqueue_task
+        original_cancel = manager._request_local_worker_cancel
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
+        manager._request_local_worker_cancel = _cancel
+        try:
+            handed_off = await manager._handoff_active_serial_control_operation_from_runtime(task.id)
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            manager._enqueue_task = original_enqueue
+            manager._request_local_worker_cancel = original_cancel
+            manager._workers.pop(task.id, None)
+
+        self.assertTrue(handed_off)
+        self.assertEqual([(task.id, False)], cancelled)
+        self.assertEqual([task.id], enqueued)
+        self.assertTrue(any(event.event_type == "runtime_yielded_for_serial_control_operation" for event in db.events))
+
     def test_recover_loop_db_error_disposes_engine_for_operational_and_timeout_errors(self):
         manager = TaskManager()
 
@@ -427,7 +503,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         reclaimed = self.manager._reclaim_stale_running_locked(db)
 
         self.assertTrue(reclaimed)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(["task-1"], enqueued)
         self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
 
@@ -807,7 +883,13 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             lease_expires_at=_now() + timedelta(minutes=5),
             dispatch_started_at=_now(),
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
         order = []
 
         async def _run_current_task_operation(_task_id):
@@ -833,7 +915,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         manager._register_task_execution_owner = lambda *_args, **_kwargs: True
         manager._release_task_execution_owner = lambda *_args, **_kwargs: None
         manager._service_role = lambda: "worker"
-        manager._lease_is_active = lambda *_args, **_kwargs: True
         manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
         manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
         manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
@@ -844,7 +925,234 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             await manager._run_task(task.id)
 
-        self.assertEqual(["operation", "operation", "signal", "signal", "execute"], order)
+        self.assertEqual(["operation", "operation", "signal", "signal", "execute", "signal", "signal", "signal", "signal"], order)
+
+    async def test_run_task_keeps_runtime_alive_for_authoritative_active_stage_context(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-delegated-active",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="firmware_unpack",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+            dispatch_started_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        order: list[str] = []
+
+        async def _run_current_task_operation(_task_id):
+            order.append("operation")
+            return False
+
+        async def _run_task_runtime_signals(_task_id):
+            order.append("signal")
+            if order.count("signal") == 2:
+                task.status = "success"
+            return False
+
+        async def _execute_task(_task_id):
+            order.append("execute")
+            task.status = "running"
+            return None
+
+        authoritative_context_checks = {"count": 0}
+
+        def _active_context(_db, _task, *, stage_name=None):
+            del _db, _task, stage_name
+            authoritative_context_checks["count"] += 1
+            return authoritative_context_checks["count"] == 1
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = _active_context
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager.cfg.scheduler.stage_poll_interval_seconds = 0
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task(task.id)
+
+        self.assertEqual(
+            ["operation", "signal", "execute", "signal"],
+            order,
+        )
+        self.assertGreaterEqual(authoritative_context_checks["count"], 1)
+        self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+
+    async def test_run_task_keeps_runtime_alive_for_stage_start_transition_guard(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-stage-start-guard",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="firmware_unpack",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+            dispatch_started_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        order: list[str] = []
+
+        async def _run_current_task_operation(_task_id):
+            order.append("operation")
+            return False
+
+        signal_calls = {"count": 0}
+
+        async def _run_task_runtime_signals(_task_id):
+            order.append("signal")
+            signal_calls["count"] += 1
+            if signal_calls["count"] >= 3:
+                task.status = "success"
+            return False
+
+        async def _execute_task(_task_id):
+            order.append("execute")
+            task.status = "running"
+            manager._set_task_runtime_transition_guard(
+                task,
+                from_stage="firmware_unpack",
+                to_stage="firmware_unpack",
+                reason="stage_worker_start_requested",
+            )
+            return None
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager.cfg.scheduler.stage_poll_interval_seconds = 0
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task(task.id)
+
+        self.assertEqual(
+            ["operation", "signal", "execute", "signal", "signal"],
+            order,
+        )
+        self.assertTrue(manager._task_runtime_transition_guard_active(task))
+        self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+
+    async def test_run_task_clears_stage_start_transition_guard_only_after_authoritative_context_materializes(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-stage-start-guard-clear-late",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="firmware_unpack",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+            dispatch_started_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        order: list[str] = []
+
+        async def _run_current_task_operation(_task_id):
+            order.append("operation")
+            return False
+
+        signal_calls = {"count": 0}
+
+        async def _run_task_runtime_signals(_task_id):
+            order.append("signal")
+            signal_calls["count"] += 1
+            if signal_calls["count"] >= 3:
+                task.status = "success"
+            return False
+
+        async def _execute_task(_task_id):
+            order.append("execute")
+            task.status = "running"
+            manager._set_task_runtime_transition_guard(
+                task,
+                from_stage="firmware_unpack",
+                to_stage="firmware_unpack",
+                reason="stage_worker_start_requested",
+            )
+            return None
+
+        authoritative_context_checks = {"count": 0}
+
+        def _active_context(_db, _task, *, stage_name=None):
+            del _db, _task, stage_name
+            authoritative_context_checks["count"] += 1
+            return authoritative_context_checks["count"] >= 2
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = _active_context
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager.cfg.scheduler.stage_poll_interval_seconds = 0
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task(task.id)
+
+        self.assertEqual(
+            ["operation", "signal", "execute", "signal", "signal"],
+            order,
+        )
+        self.assertGreaterEqual(authoritative_context_checks["count"], 2)
+        self.assertFalse(manager._task_runtime_transition_guard_active(task))
+        cleared_events = [event for event in db.events if event.event_type == "runtime_transition_guard_cleared"]
+        self.assertEqual(1, len(cleared_events))
+        self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
 
 
 class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
@@ -932,7 +1240,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
@@ -1024,7 +1332,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
@@ -1539,6 +1847,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         manager._touch_task_heartbeat_async = _touch
         manager._is_task_cancelled_async = _cancelled
         manager._record_polled_child_sync_failure = _record_failure
+        manager._run_current_task_operation = _cancelled
 
         with patch("app.service.task_manager.asyncio.sleep", _sleep):
             status, payload = await manager._poll_until_terminal(
@@ -1576,6 +1885,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         manager._ensure_task_execution_current_async = _ensure
         manager._touch_task_heartbeat_async = _touch
         manager._record_polled_child_sync_failure = _record_failure
+        manager._run_current_task_operation = _touch
 
         with self.assertRaises(StaleTaskExecution):
             await manager._poll_until_terminal(
@@ -1587,6 +1897,48 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual([], failures)
+
+    async def test_poll_until_terminal_drains_owner_inbox_before_fetch(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        item = type("Item", (), {"id": "item-1", "downstream_task_id": "child-1"})()
+        operation_passes: list[str] = []
+        fetch_calls: list[str] = []
+
+        async def _ensure(_task):
+            return None
+
+        async def _touch(_task_id):
+            return None
+
+        async def _cancelled(_task_id):
+            return False
+
+        async def _run_operation(task_id: str) -> bool:
+            operation_passes.append(task_id)
+            return len(operation_passes) == 1
+
+        async def _fetch():
+            fetch_calls.append("fetch")
+            return {"status": "success"}
+
+        manager._ensure_task_execution_current_async = _ensure
+        manager._touch_task_heartbeat_async = _touch
+        manager._is_task_cancelled_async = _cancelled
+        manager._run_current_task_operation = _run_operation
+
+        status, payload = await manager._poll_until_terminal(
+            _fetch,
+            success_statuses={"success"},
+            failure_statuses={"failed", "cancelled"},
+            task=task,
+            item=item,
+        )
+
+        self.assertEqual("success", status)
+        self.assertEqual({"status": "success"}, payload)
+        self.assertEqual(["task-1", "task-1"], operation_passes)
+        self.assertEqual(["fetch"], fetch_calls)
 
     async def test_ensure_task_execution_current_async_uses_normalized_legacy_tail_phase(self):
         manager = TaskManager()

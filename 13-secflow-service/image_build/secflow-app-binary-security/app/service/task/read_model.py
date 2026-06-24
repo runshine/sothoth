@@ -37,6 +37,7 @@ def _schedule_user_task_id_value(task) -> str | None:
 class TaskReadModelServiceMixin:
     def _manual_operation_state_from_active_operation(
         self: TaskManager,
+        db: Session,
         task,
         active_operation,
     ) -> dict[str, Any]:
@@ -67,7 +68,7 @@ class TaskReadModelServiceMixin:
         task_owner = str(task.dispatcher_instance_id or "").strip() or None
         age_seconds = self._task_operation_age_seconds(active_operation)
         is_stale = bool(age_seconds is not None and age_seconds >= float(self._operation_stale_threshold_seconds()))
-        requeue_applied = bool(self._operation_requeue_applied(task, active_operation))
+        requeue_applied = bool(self._operation_requeue_applied(task, active_operation, db=db))
         auto_reconcile_candidate = bool(
             is_stale
             and str(getattr(active_operation, "operation_type", "") or "").strip() in self._operation_requeue_family_types()
@@ -804,7 +805,7 @@ class TaskReadModelServiceMixin:
             stage_run.stage_name: {
                 "status": stage_run.status,
                 "counts": dict(stage_run.counts or {}),
-                "finished_at": stage_run.finished_at.isoformat() if stage_run.finished_at else None,
+                "finished_at": task_shared._isoformat_or_none(stage_run.finished_at),
                 "last_error": stage_run.last_error,
             },
         }
@@ -2442,7 +2443,12 @@ class TaskReadModelServiceMixin:
         operation_lock_expires_at = task.operation_lock_expires_at
         local_operation_alive = False
         row_owner_is_local = bool(str(task.dispatcher_instance_id or "").strip() == str(self.instance_id or "").strip())
-        runtime_supported_locally = self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
+        runtime_supported_locally = bool(
+            row_owner_is_local
+            and runtime_lease is not None
+            and self._runtime_lease_is_active(runtime_lease)
+            and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+        )
         fake_local_owner = bool(
             row_owner_is_local
             and task_status in active_task_statuses
@@ -3046,6 +3052,7 @@ class TaskReadModelServiceMixin:
 
     def _build_task_list_manual_operation_state(
         self: TaskManager,
+        db: Session,
         task,
         *,
         stage_summaries,
@@ -3054,7 +3061,7 @@ class TaskReadModelServiceMixin:
         from app.service import task_manager as task_manager_module
 
         if active_operation is not None:
-            return self._manual_operation_state_from_active_operation(task, active_operation)
+            return self._manual_operation_state_from_active_operation(db, task, active_operation)
         running_statuses = {"pending", "dispatching", "running"}
         running = str(task.status or "").strip() in running_statuses
         has_failed_stage = any(summary.status in {"failed", "downstream_missing", "cancelled"} for summary in stage_summaries)
@@ -3178,7 +3185,7 @@ class TaskReadModelServiceMixin:
 
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
-            return self._manual_operation_state_from_active_operation(task, active_operation)
+            return self._manual_operation_state_from_active_operation(db, task, active_operation)
         has_stage_retry = any(bool(summary.retry_full_supported) for summary in stage_summaries)
         has_stage_retry_failed = any(bool(summary.retry_failed_supported) for summary in stage_summaries)
         has_item_level_stage_retry_failed = self._has_retryable_failed_stage_items(db, task)
@@ -3320,6 +3327,7 @@ class TaskReadModelServiceMixin:
             stale_synced_item_count,
         ) = self._task_sync_status_view(stage_items)
         manual_operation_state = self._build_task_list_manual_operation_state(
+            db,
             task,
             stage_summaries=stage_summaries,
             active_operation=active_operation,
@@ -3532,7 +3540,7 @@ class TaskReadModelServiceMixin:
         status = str(task.status or "")
         if self._task_is_waiting_for_manual_confirmation(task, stage_summaries):
             return None
-        if status in {"success", "pending", "queued", "running", "dispatching", "ready_to_start", "pending_upload", "uploading"}:
+        if status in {"success", "pending", "queued", "running", "dispatching", "pending_upload", "uploading"}:
             return None
         if status == "cancelled":
             return self._build_abnormal_reason(
@@ -3663,6 +3671,18 @@ class TaskReadModelServiceMixin:
             run = runs_by_stage.get(stage_name)
             stage_items = items_by_stage.get(stage_name, [])
             stage_snapshot = workflow_snapshots.get(stage_name, {})
+            rebuild_state = (
+                self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=run)
+                if stage_name == "entry_analysis"
+                else {
+                    "required": False,
+                    "reason": None,
+                    "historical_child_count": 0,
+                    "current_stage_item_count": len(stage_items),
+                }
+            )
+            if stage_name == "entry_analysis":
+                self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
             current_downstream_status_counts = dict((downstream_status_counts or {}).get(stage_name, {}))
             if not current_downstream_status_counts:
                 for item in stage_items:
@@ -3694,6 +3714,7 @@ class TaskReadModelServiceMixin:
                 stage_name=stage_name,
                 sequence_no=run.sequence_no if run else index,
                 status=self._business_stage_status(task, stage_name, run, stage_items, db=db),
+                status_label="待补建" if rebuild_state.get("required") else None,
                 stage_terminalization_ready=bool(stage_snapshot.get("ready_for_terminalization")),
                 stage_failure_escalation_ready=bool(stage_snapshot.get("ready_for_failure_escalation")),
                 previous_stages_terminal=bool(stage_snapshot.get("previous_stages_terminal")),
@@ -3716,6 +3737,10 @@ class TaskReadModelServiceMixin:
                 downstream_status_counts=current_downstream_status_counts,
                 started_at=run.started_at if run else None,
                 finished_at=run.finished_at if run else None,
+                authoritative_items_missing=bool(stage_name == "entry_analysis" and not stage_items and rebuild_state.get("historical_child_count", 0) > 0),
+                authoritative_rebuild_required=bool(rebuild_state.get("required")),
+                authoritative_rebuild_reason=self._string_or_none(rebuild_state.get("reason")),
+                historical_child_count=int(rebuild_state.get("historical_child_count") or 0),
                 last_error=(
                     run.last_error
                     if run and run.last_error
@@ -3841,7 +3866,8 @@ class TaskReadModelServiceMixin:
                 latest_error=next((job.error_message for job in reversed(stage_jobs) if job.archive_status == "failed" and job.error_message), None),
                 jobs=stage_jobs,
             )
-            archive_status = self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
+            virtual_archive_status = self._virtual_archive_stage_status(db, task, stage_name)
+            archive_status = virtual_archive_status or self._aggregate_archive_stage_status([job.archive_status for job in stage_jobs])
             terminal_item_count = sum(
                 1 for item in current_stage_items if (self._normalize_downstream_status(item.status) or item.status) in {"success", "failed", "partial_success", "cancelled"}
             )
@@ -3849,7 +3875,7 @@ class TaskReadModelServiceMixin:
                 (self._normalize_downstream_status(item.status) or item.status) not in {"success", "failed", "partial_success", "cancelled"}
                 for item in current_stage_items
             )
-            if archive_status == "success" and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
+            if archive_status == "success" and not virtual_archive_status and (has_non_terminal_items or len(stage_jobs) < terminal_item_count):
                 archive_status = "pending"
             if stage_name == "system_analysis" and summary.status == "waiting_confirmation":
                 archive_status = "pending"

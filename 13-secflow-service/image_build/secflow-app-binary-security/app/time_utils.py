@@ -22,3 +22,14 @@ def isoformat_local(dt: datetime | None) -> str | None:
     if local_dt is None:
         return None
     return local_dt.replace(tzinfo=UTC_PLUS_8).isoformat()
+
+
+def parse_local_iso_datetime(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        return ensure_local(datetime.fromisoformat(normalized))
+    except ValueError:
+        return None

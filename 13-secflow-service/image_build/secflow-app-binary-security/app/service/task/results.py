@@ -365,7 +365,13 @@ class TaskResultServiceMixin:
                 "timeline_event_count": int(db.query(func.count(BinarySecurityEvent.id)).filter(BinarySecurityEvent.task_id == task.id).scalar() or 0),
                 "state_event_count": int(db.query(func.count(BinarySecurityStateEvent.id)).filter(BinarySecurityStateEvent.task_id == task.id).scalar() or 0),
             }
-        non_zero = {key: value for key, value in checks.items() if int(value or 0) > 0}
+        blocking_keys = {
+            "stage_item_count",
+            "stage_run_count",
+            "archive_job_count",
+            "state_event_count",
+        }
+        non_zero = {key: value for key, value in checks.items() if key in blocking_keys and int(value or 0) > 0}
         if non_zero:
             raise ValidationError(f"硬重启清理未完成，仍有残留: {non_zero}")
         return checks

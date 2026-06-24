@@ -37,6 +37,7 @@ from app.schemas import (
     BinarySecuritySyncEventResponse,
     BinarySecurityTimelineResponse,
 )
+from . import shared as task_shared
 
 from . import read_model
 
@@ -713,8 +714,8 @@ class TaskQueryServiceMixin:
                 payload = dict(first_event.payload or {})
                 payload["compressed_event_ids"] = [item.id for item in grouped]
                 payload["compressed_repeat_count"] = len(grouped)
-                payload["compressed_first_created_at"] = first_event.created_at.isoformat() if first_event.created_at else None
-                payload["compressed_last_created_at"] = last_event.created_at.isoformat() if last_event.created_at else None
+                payload["compressed_first_created_at"] = task_shared._isoformat_or_none(first_event.created_at)
+                payload["compressed_last_created_at"] = task_shared._isoformat_or_none(last_event.created_at)
                 payload["compressed_event_type"] = first_event.event_type
                 first_event._timeline_payload = payload
                 first_event._timeline_compressed = True

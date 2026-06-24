@@ -16,6 +16,7 @@ from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySec
 from app.observability import observe_downstream_reconcile_observation, observe_task_readless_reconcile
 from app.service.readless_sync import ReadlessSyncStats
 from app.schemas import BinarySecurityActionResponse
+from app.time_utils import now_local, parse_local_iso_datetime
 
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager, _TaskStateSnapshot
@@ -53,7 +54,7 @@ class TaskItemSyncServiceMixin:
         if not candidates:
             return False
         stale_threshold_seconds = self._stage_item_sync_stale_seconds()
-        now_value = datetime.now()
+        now_value = now_local()
         for item in candidates:
             sync_at = self._stage_item_sync_attempt_at_value(item)
             if sync_at is None:
@@ -61,10 +62,7 @@ class TaskItemSyncServiceMixin:
             if sync_at is None:
                 raw = dict(getattr(item, "result", {}) or {}).get("downstream_status_synced_at")
                 if isinstance(raw, str) and raw.strip():
-                    try:
-                        sync_at = datetime.fromisoformat(raw)
-                    except ValueError:
-                        sync_at = None
+                    sync_at = parse_local_iso_datetime(raw)
             if sync_at is None:
                 continue
             if (now_value - sync_at).total_seconds() >= stale_threshold_seconds:
@@ -210,7 +208,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -237,7 +235,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -249,7 +247,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -284,7 +282,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -298,7 +296,7 @@ class TaskItemSyncServiceMixin:
         if not isinstance(raw, str) or not raw.strip():
             return None
         try:
-            return datetime.fromisoformat(raw)
+            return parse_local_iso_datetime(raw)
         except ValueError:
             return None
 
@@ -915,18 +913,27 @@ class TaskItemSyncServiceMixin:
             if item is None or task is None:
                 session.rollback()
                 return
+            observed_at = task_manager_module._now()
             downstream_status = str(payload.get("status") or "").strip().lower() or None
             mapped_status = self._map_downstream_status(downstream_status or "")
             if not mapped_status:
-                self._refresh_stage_item_downstream_observation(
-                    item,
+                self._persist_child_sync_observation(
+                    session,
+                    task=task,
+                    item=item,
+                    change_source="poll_until_terminal",
                     sync_status="observed",
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                     status_raw=downstream_status,
                     mapped_status=None,
                     downstream_status=downstream_status,
                     state_applied=False,
-                    downstream_payload=payload,
+                    last_sync_result="success",
+                    clear_error_state=True,
+                    extra_payload={
+                        "operation": "poll_until_terminal",
+                        "downstream_payload_source": "owned_execution_poll",
+                    },
                 )
                 session.commit()
                 return
@@ -941,30 +948,44 @@ class TaskItemSyncServiceMixin:
                     mapped_status=mapped_status,
                     downstream_payload=payload,
                     error_message=None,
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                 )
-                self._mark_stage_item_sync_observation(
-                    item,
+                self._persist_child_sync_observation(
+                    session,
+                    task=task,
+                    item=item,
+                    change_source="poll_until_terminal",
                     sync_status="synced",
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                     status_raw=downstream_status,
                     mapped_status=mapped_status,
                     downstream_status=downstream_status,
                     state_applied=True,
-                    downstream_payload=payload,
+                    last_sync_result="success",
                     clear_error_state=True,
+                    extra_payload={
+                        "operation": "poll_until_terminal",
+                        "downstream_payload_source": "owned_execution_poll",
+                    },
                 )
             else:
-                self._refresh_stage_item_downstream_observation(
-                    item,
+                self._persist_child_sync_observation(
+                    session,
+                    task=task,
+                    item=item,
+                    change_source="poll_until_terminal",
                     sync_status="observed",
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                     status_raw=downstream_status,
                     mapped_status=mapped_status,
                     downstream_status=downstream_status,
                     state_applied=False,
-                    downstream_payload=payload,
+                    last_sync_result="success",
                     clear_error_state=True,
+                    extra_payload={
+                        "operation": "poll_until_terminal",
+                        "downstream_payload_source": "owned_execution_poll",
+                    },
                 )
             session.commit()
         except Exception:

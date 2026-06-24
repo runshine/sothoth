@@ -46,3 +46,22 @@ class KnowledgeGraphEntryFetchStageHandler(BinarySecurityStageHandler):
     ) -> list[dict[str, Any]]:
         del summary_key
         return [manager._compact_entry_summary_item(row) for row in rows if isinstance(row, dict)]
+
+    def has_authoritative_success_payload(
+        self,
+        manager: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        del db
+        return bool(manager._knowledge_graph_entry_results(task)) and bool(manager._entry_results(task))
+
+    def archive_virtual_status(
+        self,
+        manager: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> str | None:
+        if not self.has_authoritative_success_payload(manager, db, task):
+            return None
+        return "success"

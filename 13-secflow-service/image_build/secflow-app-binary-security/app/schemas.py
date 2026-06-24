@@ -5,19 +5,24 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.model import PIPELINE_PROFILE_DEFAULT, STAGE_SEQUENCE, TASK_TYPE_BINARY
+from app.time_utils import isoformat_local
 
 
-class TokenUser(BaseModel):
+class BinarySecurityBaseModel(BaseModel):
+    model_config = ConfigDict(json_encoders={datetime: isoformat_local})
+
+
+class TokenUser(BinarySecurityBaseModel):
     user_id: Optional[str] = None
     username: Optional[str] = None
     token_type: Optional[str] = None
     machine_code: Optional[str] = None
 
 
-class BinarySecurityInputFile(BaseModel):
+class BinarySecurityInputFile(BinarySecurityBaseModel):
     filename: str = Field(..., min_length=1)
     size: Optional[int] = Field(default=None, ge=0)
     content_type: Optional[str] = None
@@ -25,13 +30,13 @@ class BinarySecurityInputFile(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class StageOptions(BaseModel):
+class StageOptions(BinarySecurityBaseModel):
     enabled: bool = True
     mode: Optional[str] = None
     engine: Optional[str] = None
 
 
-class TaskPolicyOverrides(BaseModel):
+class TaskPolicyOverrides(BinarySecurityBaseModel):
     pipeline_mode: Optional[str] = None
     pipeline_profile: Optional[str] = None
     max_stage_parallelism: Optional[int] = Field(default=None, ge=1, le=32)
@@ -50,7 +55,7 @@ class TaskPolicyOverrides(BaseModel):
     knowledge_graph_module: Optional[str] = None
 
 
-class BinarySecurityTaskCreate(BaseModel):
+class BinarySecurityTaskCreate(BinarySecurityBaseModel):
     task_id: Optional[str] = None
     task_type: str = Field(default=TASK_TYPE_BINARY)
     name: str = Field(..., min_length=1)
@@ -71,15 +76,15 @@ class BinarySecurityTaskCreate(BaseModel):
     task_key_source: Optional[str] = None
 
 
-class BinarySecurityUploadCompletePayload(BaseModel):
+class BinarySecurityUploadCompletePayload(BinarySecurityBaseModel):
     files: list[BinarySecurityInputFile] = Field(default_factory=list)
 
 
-class BinarySecurityTaskConcurrencyUpdatePayload(BaseModel):
+class BinarySecurityTaskConcurrencyUpdatePayload(BinarySecurityBaseModel):
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
 
 
-class BinarySecurityTaskRuntimePolicyUpdatePayload(BaseModel):
+class BinarySecurityTaskRuntimePolicyUpdatePayload(BinarySecurityBaseModel):
     expected_version: int = Field(default=0, ge=0)
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
     dispatch_throttle: dict[str, dict[str, int]] = Field(default_factory=dict)
@@ -89,7 +94,7 @@ class BinarySecurityTaskRuntimePolicyUpdatePayload(BaseModel):
     updated_by: Optional[str] = None
 
 
-class BinarySecurityTaskPolicyUpdatePayload(BaseModel):
+class BinarySecurityTaskPolicyUpdatePayload(BinarySecurityBaseModel):
     pipeline_mode: Optional[str] = None
     stage_options: dict[str, StageOptions] = Field(default_factory=dict)
     max_retries_per_item: Optional[int] = Field(default=None, ge=0, le=20)
@@ -100,14 +105,15 @@ class BinarySecurityTaskPolicyUpdatePayload(BaseModel):
     module_risk_levels: Optional[list[str]] = None
 
 
-class BinarySecurityTaskPrepareResponse(BaseModel):
+class BinarySecurityTaskPrepareResponse(BinarySecurityBaseModel):
     task_id: str
 
 
-class BinarySecurityStageSummary(BaseModel):
+class BinarySecurityStageSummary(BinarySecurityBaseModel):
     stage_name: str
     sequence_no: int
     status: str
+    status_label: Optional[str] = None
     stage_terminalization_ready: bool = False
     stage_failure_escalation_ready: bool = False
     previous_stages_terminal: bool = False
@@ -131,16 +137,20 @@ class BinarySecurityStageSummary(BaseModel):
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
     last_error: Optional[str] = None
+    authoritative_items_missing: bool = False
+    authoritative_rebuild_required: bool = False
+    authoritative_rebuild_reason: Optional[str] = None
+    historical_child_count: int = 0
     abnormal_reason: Optional["BinarySecurityAbnormalReason"] = None
 
 
-class BinarySecurityAbnormalEvidence(BaseModel):
+class BinarySecurityAbnormalEvidence(BinarySecurityBaseModel):
     key: str
     label: str
     value: str
 
 
-class BinarySecurityAbnormalReason(BaseModel):
+class BinarySecurityAbnormalReason(BinarySecurityBaseModel):
     is_abnormal: bool = True
     category: str
     code: str
@@ -161,13 +171,13 @@ class BinarySecurityAbnormalReason(BaseModel):
     related_event_ids: list[str] = Field(default_factory=list)
 
 
-class BinarySecurityAbnormalReasonEventSummary(BaseModel):
+class BinarySecurityAbnormalReasonEventSummary(BinarySecurityBaseModel):
     event_id: str
     created_at: datetime
     reason: BinarySecurityAbnormalReason
 
 
-class BinarySecurityTaskResponse(BaseModel):
+class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     id: str
     project_id: str
     task_type: str = TASK_TYPE_BINARY
@@ -269,7 +279,7 @@ class BinarySecurityTaskResponse(BaseModel):
     cleanup_state: dict[str, Any] = Field(default_factory=dict)
 
 
-class BinarySecurityTaskOperationResponse(BaseModel):
+class BinarySecurityTaskOperationResponse(BinarySecurityBaseModel):
     id: str
     task_id: str
     project_id: str
@@ -296,12 +306,12 @@ class BinarySecurityTaskOperationResponse(BaseModel):
     finished_at: Optional[datetime] = None
 
 
-class BinarySecurityTaskOperationPageResponse(BaseModel):
+class BinarySecurityTaskOperationPageResponse(BinarySecurityBaseModel):
     task_id: str
     items: list[BinarySecurityTaskOperationResponse] = Field(default_factory=list)
 
 
-class BinarySecurityProjectStats(BaseModel):
+class BinarySecurityProjectStats(BinarySecurityBaseModel):
     total: int = 0
     running: int = 0
     success: int = 0
@@ -318,7 +328,7 @@ class BinarySecurityProjectStats(BaseModel):
     failed_firmware_count: int = 0
 
 
-class BinarySecurityProjectStageBusinessAggregate(BaseModel):
+class BinarySecurityProjectStageBusinessAggregate(BinarySecurityBaseModel):
     task_count: int = 0
     total_items: int = 0
     success_items: int = 0
@@ -329,7 +339,7 @@ class BinarySecurityProjectStageBusinessAggregate(BaseModel):
     status_counts: dict[str, int] = Field(default_factory=dict)
 
 
-class BinarySecurityProjectStageArchiveAggregate(BaseModel):
+class BinarySecurityProjectStageArchiveAggregate(BinarySecurityBaseModel):
     job_count: int = 0
     success_count: int = 0
     failed_count: int = 0
@@ -339,14 +349,14 @@ class BinarySecurityProjectStageArchiveAggregate(BaseModel):
     status_counts: dict[str, int] = Field(default_factory=dict)
 
 
-class BinarySecurityProjectStageAggregate(BaseModel):
+class BinarySecurityProjectStageAggregate(BinarySecurityBaseModel):
     stage_name: str
     sequence_no: int
     business: BinarySecurityProjectStageBusinessAggregate = Field(default_factory=BinarySecurityProjectStageBusinessAggregate)
     archive: BinarySecurityProjectStageArchiveAggregate = Field(default_factory=BinarySecurityProjectStageArchiveAggregate)
 
 
-class BinarySecurityReducerEventSummaryResponse(BaseModel):
+class BinarySecurityReducerEventSummaryResponse(BinarySecurityBaseModel):
     pending_count: int = 0
     processing_count: int = 0
     retryable_count: int = 0
@@ -359,7 +369,7 @@ class BinarySecurityReducerEventSummaryResponse(BaseModel):
     avg_processing_duration_ms: Optional[float] = None
 
 
-class BinarySecurityReducerEventRecordResponse(BaseModel):
+class BinarySecurityReducerEventRecordResponse(BinarySecurityBaseModel):
     event_id: str
     task_id: str
     project_id: str
@@ -385,7 +395,7 @@ class BinarySecurityReducerEventRecordResponse(BaseModel):
     idempotency_key: Optional[str] = None
 
 
-class BinarySecurityReducerEventPageResponse(BaseModel):
+class BinarySecurityReducerEventPageResponse(BinarySecurityBaseModel):
     total: int = 0
     page: int = 1
     page_size: int = 50
@@ -394,7 +404,7 @@ class BinarySecurityReducerEventPageResponse(BaseModel):
     summary: BinarySecurityReducerEventSummaryResponse = Field(default_factory=BinarySecurityReducerEventSummaryResponse)
 
 
-class BinarySecurityTaskListResponse(BaseModel):
+class BinarySecurityTaskListResponse(BinarySecurityBaseModel):
     total: int
     page: int = 1
     page_size: int = 50
@@ -408,7 +418,7 @@ class BinarySecurityTaskListResponse(BaseModel):
     items: list[BinarySecurityTaskResponse] = Field(default_factory=list)
 
 
-class BinarySecurityStageItemResponse(BaseModel):
+class BinarySecurityStageItemResponse(BinarySecurityBaseModel):
     id: str
     stage_name: str
     item_key: str
@@ -460,7 +470,7 @@ class BinarySecurityStageItemResponse(BaseModel):
     finished_at: Optional[datetime] = None
 
 
-class BinarySecurityArchiveJobResponse(BaseModel):
+class BinarySecurityArchiveJobResponse(BinarySecurityBaseModel):
     id: str
     stage_name: str
     item_id: str
@@ -488,7 +498,7 @@ class BinarySecurityArchiveJobResponse(BaseModel):
     copy_stats: dict[str, Any] = Field(default_factory=dict)
 
 
-class BinarySecurityOverviewBusinessDetail(BaseModel):
+class BinarySecurityOverviewBusinessDetail(BinarySecurityBaseModel):
     total_items: int = 0
     success_items: int = 0
     failed_items: int = 0
@@ -503,7 +513,7 @@ class BinarySecurityOverviewBusinessDetail(BaseModel):
     representative_downstream_task_id: Optional[str] = None
 
 
-class BinarySecurityOverviewArchiveDetail(BaseModel):
+class BinarySecurityOverviewArchiveDetail(BinarySecurityBaseModel):
     job_count: int = 0
     success_count: int = 0
     failed_count: int = 0
@@ -517,7 +527,7 @@ class BinarySecurityOverviewArchiveDetail(BaseModel):
     jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
 
 
-class BinarySecurityOverviewNode(BaseModel):
+class BinarySecurityOverviewNode(BinarySecurityBaseModel):
     node_id: str
     node_type: str
     stage_name: str
@@ -539,12 +549,12 @@ class BinarySecurityOverviewNode(BaseModel):
     detail: BinarySecurityOverviewBusinessDetail | BinarySecurityOverviewArchiveDetail
 
 
-class BinarySecurityRuntimeHealthEvidence(BaseModel):
+class BinarySecurityRuntimeHealthEvidence(BinarySecurityBaseModel):
     label: str
     value: Optional[str] = None
 
 
-class BinarySecurityRuntimeHealthUnit(BaseModel):
+class BinarySecurityRuntimeHealthUnit(BinarySecurityBaseModel):
     unit_key: str
     unit_label: str
     unit_kind: str
@@ -559,7 +569,7 @@ class BinarySecurityRuntimeHealthUnit(BaseModel):
     evidence: list[BinarySecurityRuntimeHealthEvidence] = Field(default_factory=list)
 
 
-class BinarySecurityRuntimeHealthSpotlightItem(BaseModel):
+class BinarySecurityRuntimeHealthSpotlightItem(BinarySecurityBaseModel):
     slot_key: str
     title: str
     subtitle: Optional[str] = None
@@ -572,7 +582,7 @@ class BinarySecurityRuntimeHealthSpotlightItem(BaseModel):
     evidence: list[BinarySecurityRuntimeHealthEvidence] = Field(default_factory=list)
 
 
-class BinarySecurityRuntimeHealthGroup(BaseModel):
+class BinarySecurityRuntimeHealthGroup(BinarySecurityBaseModel):
     group_key: str
     group_label: str
     description: Optional[str] = None
@@ -581,7 +591,7 @@ class BinarySecurityRuntimeHealthGroup(BaseModel):
     units: list[BinarySecurityRuntimeHealthUnit] = Field(default_factory=list)
 
 
-class BinarySecurityRuntimeHealthSnapshotCard(BaseModel):
+class BinarySecurityRuntimeHealthSnapshotCard(BinarySecurityBaseModel):
     card_key: str
     title: str
     subtitle: Optional[str] = None
@@ -590,7 +600,7 @@ class BinarySecurityRuntimeHealthSnapshotCard(BaseModel):
     rows: list[BinarySecurityRuntimeHealthEvidence] = Field(default_factory=list)
 
 
-class BinarySecurityRuntimeHealthLoopSnapshot(BaseModel):
+class BinarySecurityRuntimeHealthLoopSnapshot(BinarySecurityBaseModel):
     loop_key: str
     loop_label: str
     status: str = "unknown"
@@ -603,7 +613,7 @@ class BinarySecurityRuntimeHealthLoopSnapshot(BaseModel):
     message: Optional[str] = None
 
 
-class BinarySecurityRuntimeHealthSummary(BaseModel):
+class BinarySecurityRuntimeHealthSummary(BinarySecurityBaseModel):
     overall_status: str = "unknown"
     active_unit_count: int = 0
     healthy_unit_count: int = 0
@@ -613,7 +623,7 @@ class BinarySecurityRuntimeHealthSummary(BaseModel):
     message: Optional[str] = None
 
 
-class BinarySecurityRuntimeHealthResponse(BaseModel):
+class BinarySecurityRuntimeHealthResponse(BinarySecurityBaseModel):
     summary: BinarySecurityRuntimeHealthSummary = Field(default_factory=BinarySecurityRuntimeHealthSummary)
     spotlight: list[BinarySecurityRuntimeHealthSpotlightItem] = Field(default_factory=list)
     snapshot_cards: list[BinarySecurityRuntimeHealthSnapshotCard] = Field(default_factory=list)
@@ -622,7 +632,7 @@ class BinarySecurityRuntimeHealthResponse(BaseModel):
     units: list[BinarySecurityRuntimeHealthUnit] = Field(default_factory=list)
 
 
-class BinarySecurityRootTaskKeySnapshot(BaseModel):
+class BinarySecurityRootTaskKeySnapshot(BinarySecurityBaseModel):
     id: Optional[str] = None
     name: Optional[str] = None
     prefix: Optional[str] = None
@@ -631,7 +641,7 @@ class BinarySecurityRootTaskKeySnapshot(BaseModel):
     used: bool = False
 
 
-class BinarySecurityWorkKeySnapshot(BaseModel):
+class BinarySecurityWorkKeySnapshot(BinarySecurityBaseModel):
     stage_name: Optional[str] = None
     service: Optional[str] = None
     stage_item_id: Optional[str] = None
@@ -645,7 +655,7 @@ class BinarySecurityWorkKeySnapshot(BaseModel):
     created_at: Optional[datetime] = None
 
 
-class BinarySecurityTaskKeySnapshot(BaseModel):
+class BinarySecurityTaskKeySnapshot(BinarySecurityBaseModel):
     root_task_key: BinarySecurityRootTaskKeySnapshot = Field(default_factory=BinarySecurityRootTaskKeySnapshot)
     work_keys: list[BinarySecurityWorkKeySnapshot] = Field(default_factory=list)
 
@@ -676,7 +686,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     task_key_snapshot: BinarySecurityTaskKeySnapshot = Field(default_factory=BinarySecurityTaskKeySnapshot)
 
 
-class BinarySecurityStageItemPageResponse(BaseModel):
+class BinarySecurityStageItemPageResponse(BinarySecurityBaseModel):
     task_id: str
     stage_name: str
     total: int = 0
@@ -685,7 +695,7 @@ class BinarySecurityStageItemPageResponse(BaseModel):
     items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
 
 
-class BinarySecurityArchiveJobPageResponse(BaseModel):
+class BinarySecurityArchiveJobPageResponse(BinarySecurityBaseModel):
     task_id: str
     stage_name: Optional[str] = None
     total: int = 0
@@ -694,17 +704,17 @@ class BinarySecurityArchiveJobPageResponse(BaseModel):
     items: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
 
 
-class BinarySecurityOverviewResponse(BaseModel):
+class BinarySecurityOverviewResponse(BinarySecurityBaseModel):
     task_id: str
     nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
 
 
-class BinarySecurityAbnormalReasonHistoryResponse(BaseModel):
+class BinarySecurityAbnormalReasonHistoryResponse(BinarySecurityBaseModel):
     task_id: str
     items: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
 
 
-class BinarySecurityTaskEventResponse(BaseModel):
+class BinarySecurityTaskEventResponse(BinarySecurityBaseModel):
     id: str
     stage_name: Optional[str] = None
     item_id: Optional[str] = None
@@ -728,7 +738,7 @@ class BinarySecurityTaskEventResponse(BaseModel):
     created_at: datetime
 
 
-class BinarySecurityTimelineResponse(BaseModel):
+class BinarySecurityTimelineResponse(BinarySecurityBaseModel):
     task_id: str
     total: int = 0
     page: int = 1
@@ -737,7 +747,7 @@ class BinarySecurityTimelineResponse(BaseModel):
     events: list[BinarySecurityTaskEventResponse] = Field(default_factory=list)
 
 
-class BinarySecuritySyncEventResponse(BaseModel):
+class BinarySecuritySyncEventResponse(BinarySecurityBaseModel):
     id: str
     stage_name: Optional[str] = None
     item_id: Optional[str] = None
@@ -767,7 +777,7 @@ class BinarySecuritySyncEventResponse(BaseModel):
     created_at: datetime
 
 
-class BinarySecuritySyncEventPageResponse(BaseModel):
+class BinarySecuritySyncEventPageResponse(BinarySecurityBaseModel):
     task_id: str
     total: int = 0
     page: int = 1
@@ -775,12 +785,12 @@ class BinarySecuritySyncEventPageResponse(BaseModel):
     items: list[BinarySecuritySyncEventResponse] = Field(default_factory=list)
 
 
-class BinarySecurityArtifactEntry(BaseModel):
+class BinarySecurityArtifactEntry(BinarySecurityBaseModel):
     path: str
     size: int
 
 
-class BinarySecurityArtifactIndexedEntry(BaseModel):
+class BinarySecurityArtifactIndexedEntry(BinarySecurityBaseModel):
     relative_path: str
     kind: str
     size: int = 0
@@ -790,7 +800,7 @@ class BinarySecurityArtifactIndexedEntry(BaseModel):
     attempt_no: Optional[int] = None
 
 
-class BinarySecurityArtifactGroup(BaseModel):
+class BinarySecurityArtifactGroup(BinarySecurityBaseModel):
     module_key: str
     module_name: Optional[str] = None
     source_root: Optional[str] = None
@@ -803,7 +813,7 @@ class BinarySecurityArtifactGroup(BaseModel):
     artifacts: list[BinarySecurityArtifactIndexedEntry] = Field(default_factory=list)
 
 
-class BinarySecurityArtifactsResponse(BaseModel):
+class BinarySecurityArtifactsResponse(BinarySecurityBaseModel):
     task_id: str
     workspace_root: str
     output_root: str
@@ -820,7 +830,7 @@ class BinarySecurityArtifactsResponse(BaseModel):
 BinarySecurityTaskDetailResponse.model_rebuild()
 
 
-class BinarySecurityActionResponse(BaseModel):
+class BinarySecurityActionResponse(BinarySecurityBaseModel):
     status: str = "ok"
     task_id: str
     operation_id: Optional[str] = None
@@ -840,13 +850,13 @@ class BinarySecurityActionResponse(BaseModel):
     revival_rejected_count: int = 0
 
 
-class BinarySecurityDownstreamStatusSyncPayload(BaseModel):
+class BinarySecurityDownstreamStatusSyncPayload(BinarySecurityBaseModel):
     stage_name: Optional[str] = None
     item_id: Optional[str] = None
     force: bool = False
 
 
-class BinarySecurityModuleSelectionResponse(BaseModel):
+class BinarySecurityModuleSelectionResponse(BinarySecurityBaseModel):
     task_id: str
     status: str
     selection_mode: str = "auto"
@@ -857,7 +867,7 @@ class BinarySecurityModuleSelectionResponse(BaseModel):
     selected_modules: list[dict[str, Any]] = Field(default_factory=list)
 
 
-class BinarySecurityModuleReportDetailResponse(BaseModel):
+class BinarySecurityModuleReportDetailResponse(BinarySecurityBaseModel):
     task_id: str
     module_key: str
     module_name: str
@@ -872,11 +882,11 @@ class BinarySecurityModuleReportDetailResponse(BaseModel):
     error_message: Optional[str] = None
 
 
-class BinarySecurityModuleSelectionConfirmPayload(BaseModel):
+class BinarySecurityModuleSelectionConfirmPayload(BinarySecurityBaseModel):
     selected_module_keys: list[str] = Field(default_factory=list)
 
 
-class BinarySecurityEntrySelectionResponse(BaseModel):
+class BinarySecurityEntrySelectionResponse(BinarySecurityBaseModel):
     task_id: str
     status: str
     selection_mode: str = "auto"
@@ -888,11 +898,11 @@ class BinarySecurityEntrySelectionResponse(BaseModel):
     confirmed_at: Optional[datetime] = None
 
 
-class BinarySecurityEntrySelectionConfirmPayload(BaseModel):
+class BinarySecurityEntrySelectionConfirmPayload(BinarySecurityBaseModel):
     selected_entry_keys: list[str] = Field(default_factory=list)
 
 
-class BinarySecurityTaskPolicyConfigPayload(BaseModel):
+class BinarySecurityTaskPolicyConfigPayload(BinarySecurityBaseModel):
     pipeline_mode: str = Field(default="mixed_streaming")
     max_stage_parallelism: int = Field(default=5, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
@@ -912,7 +922,7 @@ class BinarySecurityTaskPolicyConfigPayload(BaseModel):
     )
 
 
-class BinarySecurityTaskPolicyConfigResponse(BaseModel):
+class BinarySecurityTaskPolicyConfigResponse(BinarySecurityBaseModel):
     project_id: str
     config: BinarySecurityTaskPolicyConfigPayload
 
@@ -925,17 +935,17 @@ class BinarySecurityProjectConfigResponse(BinarySecurityTaskPolicyConfigResponse
     """Backward-compatible alias for the global task policy config response."""
 
 
-class BinarySecurityServiceConfigPayload(BaseModel):
+class BinarySecurityServiceConfigPayload(BinarySecurityBaseModel):
     max_concurrent_tasks: int = Field(default=20, ge=1, le=200)
     dispatch_timeout_seconds: int = Field(default=60, ge=10, le=600)
     lease_timeout_seconds: int = Field(default=90, ge=15, le=1800)
 
 
-class BinarySecurityServiceConfigResponse(BaseModel):
+class BinarySecurityServiceConfigResponse(BinarySecurityBaseModel):
     config: BinarySecurityServiceConfigPayload
 
 
-class BinarySecurityGlobalConfigPayload(BaseModel):
+class BinarySecurityGlobalConfigPayload(BinarySecurityBaseModel):
     max_concurrent_tasks: int = Field(default=20, ge=1, le=200)
     dispatch_timeout_seconds: int = Field(default=60, ge=10, le=600)
     lease_timeout_seconds: int = Field(default=90, ge=15, le=1800)
@@ -958,5 +968,5 @@ class BinarySecurityGlobalConfigPayload(BaseModel):
     )
 
 
-class BinarySecurityGlobalConfigResponse(BaseModel):
+class BinarySecurityGlobalConfigResponse(BinarySecurityBaseModel):
     config: BinarySecurityGlobalConfigPayload

@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime
 from unittest.mock import patch
 
 import httpx
@@ -439,6 +440,18 @@ class _RouteManagerStub:
 
 
 class TaskApiRouteTests(unittest.TestCase):
+    def test_schema_datetime_serializes_with_utc_plus_8_offset(self):
+        summary = BinarySecurityStageSummary(
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="running",
+            started_at=datetime(2026, 6, 23, 19, 23, 37),
+        )
+
+        payload = summary.model_dump(mode="json")
+
+        self.assertEqual("2026-06-23T19:23:37+08:00", payload["started_at"])
+
     def test_owner_only_schema_drops_legacy_reconcile_and_operation_lease_fields(self):
         task_fields = BinarySecurityTaskResponse.model_fields
         operation_fields = BinarySecurityTaskOperationResponse.model_fields

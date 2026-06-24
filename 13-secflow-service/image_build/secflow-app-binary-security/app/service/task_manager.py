@@ -357,7 +357,7 @@ __all__ = [
 
 
 STAGE_RETRY_ALLOWED_STATUSES = {"success", "failed", "partial_success", "cancelled"}
-STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading", "ready_to_start"}
+STAGE_RETRY_BLOCKED_TASK_STATUSES = {"pending", "dispatching", "running", "pending_upload", "uploading"}
 TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 TASK_STATUS_PENDING_ENTRY_CONFIRMATION = "pending_entry_confirmation"
 TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
@@ -388,9 +388,23 @@ TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
     TASK_ACTION_RETRY_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FULL,
+    TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+    TASK_ACTION_RETRY_ARCHIVE_FULL,
     TASK_ACTION_CANCEL,
     TASK_ACTION_DELETE,
     "force_reset_to_pending",
+}
+TASK_OPERATION_REQUEUE_APPLIED_TYPES = {
+    TASK_ACTION_CONTINUE,
+    TASK_ACTION_RETRY,
+    TASK_ACTION_RETRY_FAILED_ITEMS,
+    TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+    TASK_ACTION_RETRY_STAGE_FULL,
+    TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+    TASK_ACTION_RETRY_ARCHIVE_FULL,
+}
+TASK_OPERATION_OWNER_GUARDED_TYPES = {
+    *TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES,
 }
 TASK_OPERATION_ACTIVE_STATUSES = {"requested", "accepted", "queued", "claimed", "running"}
 TASK_OPERATION_TERMINAL_STATUSES = {"succeeded", "failed", "superseded", "cancelled"}
@@ -1276,6 +1290,23 @@ class TaskManager(
         payload: dict[str, Any],
         event_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._record_stage_item_sync_audit(
+            db,
+            task=task,
+            item=item,
+            stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
+            downstream_service=service,
+            operation="downstream_create",
+            event_type="requested",
+            sync_status="requested",
+            outcome="requested",
+            state_applied=False,
+            payload={
+                "service": str(service or ""),
+                "request_payload_keys": sorted([str(key) for key in dict(payload or {}).keys()]),
+                **(event_payload or {}),
+            },
+        )
         active_delete_operation = self._active_delete_operation(db, task.id)
         if active_delete_operation is not None:
             self._record_event(
@@ -1350,7 +1381,7 @@ class TaskManager(
                     "agent_task_key_source": work_key_payload.get("agent_task_key_source"),
                 },
             )
-        return await self._downstream_tasks().create_child_task(
+        created = await self._downstream_tasks().create_child_task(
             db,
             task,
             item,
@@ -1359,6 +1390,25 @@ class TaskManager(
             payload=effective_payload,
             event_payload=event_payload,
         )
+        self._record_stage_item_sync_audit(
+            db,
+            task=task,
+            item=item,
+            stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
+            downstream_service=service,
+            operation="downstream_create",
+            event_type="applied",
+            sync_status="observed",
+            outcome="success",
+            state_applied=True,
+            payload={
+                "service": str(service or ""),
+                "created_task_id": created.get("task_id") or created.get("id"),
+                "created_status": created.get("status"),
+                **(event_payload or {}),
+            },
+        )
+        return created
 
     async def _downstream_control_existing_task(
         self,
@@ -1659,6 +1709,8 @@ class TaskManager(
             if handle is None or handle.cancel_requested or handle.runner_task.done():
                 return
             try:
+                if await self._handoff_active_serial_control_operation_from_runtime(task_id):
+                    return
                 await asyncio.to_thread(self._touch_task_heartbeat, task_id)
                 handle.last_progress_at = _now()
                 failure_count = 0
@@ -1673,6 +1725,66 @@ class TaskManager(
                         handle.runner_task.cancel()
                     return
             await asyncio.sleep(interval_seconds)
+
+    async def _handoff_active_serial_control_operation_from_runtime(self, task_id: str) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        handle = self._runtime_handle(normalized_task_id)
+        if (
+            handle is None
+            or handle.done()
+            or handle.cancel_requested
+            or not handle.active_commit_succeeded
+            or not handle.lease_established
+        ):
+            return False
+        session = get_session_factory()()
+        try:
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == normalized_task_id).first()
+            if task is None:
+                return False
+            if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+                return False
+            lease = self._runtime_lease_for_task(session, normalized_task_id)
+            if not (
+                self._runtime_lease_is_active(lease)
+                and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+            ):
+                return False
+            operation = self._task_active_operation(session, task)
+            if operation is None:
+                return False
+            operation_status = str(getattr(operation, "status", "") or "").strip().lower()
+            operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+            if operation_status not in TASK_OPERATION_ACTIVE_STATUSES:
+                return False
+            if operation_type not in TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES:
+                return False
+            if not self._operation_blocks_runtime_resume(operation):
+                return False
+            if self._local_operation_worker_alive(getattr(operation, "id", None)):
+                return False
+            self._record_event(
+                session,
+                task,
+                "runtime_yielded_for_serial_control_operation",
+                "检测到串行控制操作已入队，当前 owner business runtime 已让位给 owner inbox",
+                level="info",
+                stage_name=str(getattr(operation, "target_stage", "") or getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                    "operation_type": operation_type or None,
+                    "operation_status": operation_status or None,
+                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                },
+            )
+            session.commit()
+        finally:
+            session.close()
+        await self._request_local_worker_cancel(normalized_task_id, wait_for_runner=False)
+        self._enqueue_task(normalized_task_id)
+        return True
 
     def _collect_heartbeat_candidates(self) -> list[str]:
         with self._task_execution_owner_lock:
@@ -1752,30 +1864,12 @@ class TaskManager(
         task_id = str(getattr(task, "id", "") or "").strip()
         if not task_id:
             return False
-        if self._task_execution_owner_count(task_id) > 0:
-            return True
-        now_value = _now()
         runtime_lease = (
             db.query(BinarySecurityTaskRuntimeLease)
             .filter(BinarySecurityTaskRuntimeLease.task_id == task_id)
             .first()
         )
-        if runtime_lease is not None and getattr(runtime_lease, "lease_expires_at", None) and runtime_lease.lease_expires_at > now_value:
-            return True
-        active_operation = None
-        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
-        if current_operation_id:
-            active_operation = (
-                db.query(BinarySecurityTaskOperation)
-                .filter(BinarySecurityTaskOperation.id == current_operation_id)
-                .first()
-            )
-        if active_operation is not None:
-            operation_type = str(getattr(active_operation, "operation_type", "") or "").strip()
-            operation_status = str(getattr(active_operation, "status", "") or "").strip()
-            if operation_type != TASK_ACTION_DELETE and operation_status in {"pending", "queued", "running"}:
-                return True
-        return False
+        return bool(self._runtime_lease_is_active(runtime_lease))
 
     async def _wait_for_task_workspace_quiesce(
         self,
@@ -2246,19 +2340,26 @@ class TaskManager(
     def _should_keep_task_heartbeat(self, db: Session, task: BinarySecurityTask | None) -> bool:
         if task is None:
             return False
-        if not self._task_row_owner_is_supported_locally(task):
-            return False
-        if str(task.status or "").strip().lower() != "running":
-            return False
-        if str(task.status or "").strip() == TASK_STATUS_CANCELLING:
-            return False
         if task.finished_at is not None:
             return False
-        if self._task_has_active_cancel_operation(db, task):
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
-        if not self._has_local_task_execution_owner(task.id) and not self._task_has_active_streaming_stage_workers(task.id):
-            return False
-        return True
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        if runtime_lease is not None and bool(
+            self._runtime_lease_is_active(runtime_lease)
+            and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+        ):
+            return True
+        # Heartbeat is also the bootstrap path that materializes the authoritative
+        # runtime lease for a newly claimed local execution before reclaim logic
+        # starts trusting it.
+        return bool(
+            self._has_local_task_execution_owner(task.id)
+            or self._task_has_active_streaming_stage_workers(task.id)
+        )
 
     def _local_operation_worker_alive(self, operation_id: str | None) -> bool:
         normalized_operation_id = str(operation_id or "").strip()
@@ -2305,6 +2406,43 @@ class TaskManager(
             "recent_progress": recent_progress,
         }
 
+    def _control_operation_takeover_window_active(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> bool:
+        if task is None:
+            return False
+        operation = active_operation
+        if operation is None:
+            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            if current_operation_id:
+                operation = (
+                    db.query(BinarySecurityTaskOperation)
+                    .filter(BinarySecurityTaskOperation.id == current_operation_id)
+                    .first()
+                )
+        snapshot = self._operation_runtime_snapshot(operation)
+        if snapshot["operation_status"] not in TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        if snapshot["operation_id"] != str(getattr(task, "current_operation_id", "") or "").strip():
+            return False
+        if snapshot["operation_type"] not in TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES:
+            return False
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
+            return False
+        takeover_window_seconds = max(30, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
+        dispatch_started_at = getattr(task, "dispatch_started_at", None)
+        dispatch_age_seconds = _elapsed_seconds_since(dispatch_started_at)
+        if dispatch_age_seconds is not None and dispatch_age_seconds <= takeover_window_seconds:
+            return True
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        return False
+
     def _task_has_supported_control_operation_runtime(
         self,
         db: Session,
@@ -2328,21 +2466,16 @@ class TaskManager(
             return False
         if snapshot["operation_id"] != str(getattr(task, "current_operation_id", "") or "").strip():
             return False
+        if snapshot["operation_type"] not in TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES:
+            return False
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
-        if not snapshot["local_operation_worker_alive"]:
-            return False
-        if not snapshot["recent_progress"]:
-            return False
-        if snapshot["operation_type"] != TASK_ACTION_CANCEL:
-            return True
-        return snapshot["current_step"] in {
-            TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
-            TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
-            TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
-            TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
-        }
+        runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        return bool(
+            self._runtime_lease_is_active(runtime_lease)
+            and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+        )
 
     def _task_owner_runtime_supported_locally(
         self,
@@ -2352,33 +2485,18 @@ class TaskManager(
     ) -> bool:
         if task is None:
             return False
-        task_id = str(getattr(task, "id", "") or "").strip()
-        if not task_id:
+        del active_operation
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
-        handle = self._runtime_handle(task_id)
-        if handle is not None and not handle.done():
-            return True
-        if self._has_local_task_execution_owner(task_id):
-            return True
-        if self._task_has_active_streaming_stage_workers(task_id):
-            return True
-        operation = active_operation
-        if operation is None:
-            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
-            if current_operation_id:
-                session = get_session_factory()()
-                try:
-                    operation = session.query(BinarySecurityTaskOperation).filter(
-                        BinarySecurityTaskOperation.id == current_operation_id
-                    ).first()
-                finally:
-                    session.close()
-        if operation is None:
-            return False
-        operation_status = str(getattr(operation, "status", "") or "").strip().lower()
-        if operation_status not in TASK_OPERATION_ACTIVE_STATUSES:
-            return False
-        return self._local_operation_worker_alive(str(getattr(operation, "id", "") or "").strip())
+        session = get_session_factory()()
+        try:
+            runtime_lease = self._runtime_lease_for_task(session, getattr(task, "id", None))
+            if runtime_lease is not None and self._runtime_lease_is_active(runtime_lease):
+                return str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+            return self._task_runtime_transition_guard_owned_by_current_instance(task)
+        finally:
+            session.close()
 
     def _task_row_owner_is_supported_locally(
         self,
@@ -2390,8 +2508,6 @@ class TaskManager(
             return False
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id != str(self.instance_id or "").strip():
-            return True
-        if str(getattr(task, "status", "") or "").strip().lower() not in {"dispatching", "running"}:
             return True
         return self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
 
@@ -2415,39 +2531,14 @@ class TaskManager(
                 )
         operation_status = str(getattr(operation, "status", "") or "").strip().lower() if operation is not None else ""
         has_active_operation = operation_status in TASK_OPERATION_ACTIVE_STATUSES
-        current_status = str(getattr(task, "status", "") or "").strip().lower()
-        if current_status not in {"dispatching", "running"} and not has_active_operation:
-            return True
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if not dispatcher_instance_id:
             return not has_active_operation
-        if dispatcher_instance_id == str(self.instance_id or "").strip():
-            if self._task_has_supported_control_operation_runtime(db, task, active_operation=operation):
-                return True
-            return self._task_owner_runtime_supported_locally(task, active_operation=operation)
-        if current_status in {"dispatching", "running"}:
-            dispatch_started_at = getattr(task, "dispatch_started_at", None)
-            dispatch_age_seconds = _elapsed_seconds_since(dispatch_started_at)
-            lease_remaining_seconds = _seconds_until(getattr(task, "lease_expires_at", None))
-            if (
-                dispatch_started_at is not None
-                and dispatch_age_seconds is not None
-                and dispatch_age_seconds < 15
-                and lease_remaining_seconds is not None
-                and lease_remaining_seconds > 0
-            ):
-                return True
         lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
-        if (
+        return bool(
             self._runtime_lease_is_active(lease)
             and str(getattr(lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
-        ):
-            return True
-        if current_status == "dispatching" or has_active_operation:
-            return False
-        if operation_status in TASK_OPERATION_ACTIVE_STATUSES:
-            return False
-        return True
+        )
 
     def _release_unsupported_task_row_owner(
         self,
@@ -2465,6 +2556,23 @@ class TaskManager(
             else None
         )
         if previous_dispatcher_instance_id is None and active_runtime_lease_owner is None:
+            return False
+        if self._task_has_supported_control_operation_runtime(db, task, active_operation=active_operation):
+            self._record_event(
+                db,
+                task,
+                "task_owner_release_deferred_for_control_operation_takeover",
+                "检测到控制操作仍由有效 runtime lease 持有，本次不释放 owner",
+                level="info",
+                stage_name=task.current_stage,
+                payload={
+                    "reason": reason,
+                    "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    "dispatcher_instance_id": previous_dispatcher_instance_id,
+                    "active_runtime_lease_owner": active_runtime_lease_owner,
+                    "operation_runtime": self._operation_runtime_snapshot(active_operation),
+                },
+            )
             return False
         if self._task_row_owner_is_runtime_supported(db, task, active_operation=active_operation):
             return False
@@ -2529,7 +2637,6 @@ class TaskManager(
     def _write_task_heartbeat(self, session: Session, task_id: str, *, now_value: datetime, source: str) -> bool:
         task = session.query(BinarySecurityTask).filter(
             BinarySecurityTask.id == task_id,
-            BinarySecurityTask.status == "running",
         ).first()
         if task is not None:
             self._upsert_runtime_lease(
@@ -2681,7 +2788,7 @@ class TaskManager(
     ) -> BinarySecurityTaskDetailResponse:
         del updated_by, authorization_token
         task = self._task_or_404(db, project_id, task_id)
-        if task.status not in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status not in {"pending_upload", "uploading", "pending"}:
             raise ValidationError(f"当前状态不允许确认上传完成: {task.status}")
         declared = self._normalize_input_files(
             payload.files or [BinarySecurityInputFile(**item) for item in task.summary.get("input_files") or []],
@@ -2755,10 +2862,12 @@ class TaskManager(
         self._set_task_status(
             db,
             task,
-            "ready_to_start",
-            reason="输入文件上传完成，任务已就绪",
+            "pending",
+            reason="输入文件上传完成，任务已进入调度队列",
             source="task_manager",
+            stage_name=self._stage_sequence_for_task(task)[0],
         )
+        task.current_stage = self._stage_sequence_for_task(task)[0]
         task.dispatcher_instance_id = None
         task.dispatch_started_at = None
         task.lease_expires_at = None
@@ -2786,15 +2895,16 @@ class TaskManager(
                 else {}
             ),
         }
-        await self._write_task_metadata_async(task, input_dir / "task-metadata.json", status="ready_to_start")
+        await self._write_task_metadata_async(task, input_dir / "task-metadata.json", status="pending")
         self._record_event(db, task, "task_upload_completed", "输入文件上传完成", payload={"uploaded_files": len(actual_files)})
-        self._record_event(db, task, "task_ready_to_start", "任务已就绪，准备自动启动")
+        self._record_event(db, task, "task_start_requested", "输入文件已就绪，任务已自动进入调度队列")
         db.commit()
-        return self.start_task(db, project_id=project_id, task_id=task_id)
+        self._enqueue_task(task.id)
+        return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def start_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
         task = self._task_or_404(db, project_id, task_id)
-        if task.status not in {"ready_to_start", "failed", "partial_success"}:
+        if task.status not in {"failed", "partial_success"}:
             if task.status in {"pending", "running"}:
                 return self.get_task_detail(db, project_id=project_id, task_id=task_id)
             raise ValidationError(f"当前状态不允许启动任务: {task.status}")
@@ -3345,7 +3455,13 @@ class TaskManager(
         item.claim_execution_token = None
         item.claim_started_at = None
 
-    def _stage_item_claim_matches_task_execution(self, item: BinarySecurityStageItem, task: BinarySecurityTask) -> bool:
+    def _stage_item_claim_matches_task_execution(
+        self,
+        item: BinarySecurityStageItem,
+        task: BinarySecurityTask,
+        *,
+        db: Session | None = None,
+    ) -> bool:
         claim_owner = str(getattr(item, "claim_owner_instance_id", "") or "").strip()
         claim_token = self._stage_item_claim_token(item)
         task_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
@@ -3356,7 +3472,7 @@ class TaskManager(
             claim_owner == task_owner
             and claim_token == task_token
             and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            and self._lease_is_active(task)
+            and self._lease_is_active(task, db=db)
         )
 
     def _bind_execution_token(self, task: BinarySecurityTask) -> None:
@@ -3378,7 +3494,6 @@ class TaskManager(
             current_token = row.dispatch_started_at.isoformat() if row and row.dispatch_started_at else None
             if (
                 row is None
-                or row.status not in {"dispatching", "running"}
                 or row.dispatcher_instance_id != expected_dispatcher_id
                 or current_token != expected_token
                 or not self._lease_is_active(row)
@@ -3732,9 +3847,7 @@ class TaskManager(
         *,
         allow_dispatching: bool = False,
     ) -> bool:
-        expected_statuses = {"running", "dispatching"} if allow_dispatching else {"running"}
-        if str(getattr(task, "status", "") or "").strip() not in expected_statuses:
-            return False
+        del allow_dispatching
         if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
             return False
         if not self._lease_is_active(task, db=db):
@@ -3848,7 +3961,7 @@ class TaskManager(
         task.last_error = None
         self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         task.tail_reconcile_state = "idle"
-        if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status):
+        if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status, db=db):
             task.dispatcher_instance_id = None
             task.dispatch_started_at = None
             task.lease_expires_at = None
@@ -4208,6 +4321,234 @@ class TaskManager(
     def _entry_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         return [dict(item) for item in (task.summary.get("entry_results") or []) if isinstance(item, dict)]
 
+    def _entry_result_module_kind(self, task: BinarySecurityTask) -> str:
+        return "knowledge_graph_module" if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN else "source_module"
+
+    def _entry_result_module_key(self, task: BinarySecurityTask, module: dict[str, Any] | None = None) -> str:
+        payload = dict(module or {})
+        key = str(payload.get("module_key") or payload.get("source_project_key") or "").strip()
+        if key:
+            return key
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return "knowledge-graph-source-project"
+        return ""
+
+    def _entry_result_module_name(self, task: BinarySecurityTask, module: dict[str, Any] | None = None) -> str:
+        payload = dict(module or {})
+        name = str(payload.get("module_name") or payload.get("source_project_name") or "").strip()
+        if name:
+            return name
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return "source-project"
+        return ""
+
+    def _entry_result_source_stage(self, task: BinarySecurityTask) -> str:
+        return "knowledge_graph_entry_fetch" if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN else "entry_analysis"
+
+    def _entry_result_execution_epoch(self, task: BinarySecurityTask) -> int:
+        return int((task.summary or {}).get("execution_epoch") or getattr(task, "execution_epoch", 0) or 0)
+
+    def _normalize_entry_result_module(
+        self,
+        task: BinarySecurityTask,
+        row: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = dict(row or {})
+        entries = [dict(entry) for entry in list(payload.get("entries") or []) if isinstance(entry, dict)]
+        if not entries:
+            entries = [dict(entry) for entry in list(payload.get("entries_preview") or []) if isinstance(entry, dict)]
+        module_key = self._entry_result_module_key(task, payload)
+        module_name = self._entry_result_module_name(task, payload)
+        if not module_key and entries:
+            first_entry = dict(entries[0])
+            module_key = (
+                str(first_entry.get("module_key") or "").strip()
+                or str(first_entry.get("entry_key") or "").strip()
+            )
+        if not module_name and entries:
+            first_entry = dict(entries[0])
+            module_name = (
+                str(first_entry.get("module_name") or "").strip()
+                or str(first_entry.get("function_name") or "").strip()
+            )
+        completion_state = str(payload.get("completion_state") or "").strip() or (
+            "success" if entries else "pending"
+        )
+        normalized = {
+            **payload,
+            "module_key": module_key,
+            "module_name": module_name,
+            "module_kind": str(payload.get("module_kind") or self._entry_result_module_kind(task)).strip(),
+            "source_stage": str(payload.get("source_stage") or self._entry_result_source_stage(task)).strip(),
+            "execution_epoch": int(payload.get("execution_epoch") or self._entry_result_execution_epoch(task)),
+            "completion_state": completion_state,
+            "completion_ready": bool(payload.get("completion_ready")) if "completion_ready" in payload else completion_state in {"success", "failed", "orchestration_failed", "cancelled"},
+            "entries": entries,
+            "entry_count": int(payload.get("entry_count") or len(entries)),
+            "error_message": str(payload.get("error_message") or "").strip() or None,
+            "downstream_task_id": str(payload.get("downstream_task_id") or "").strip() or None,
+            "artifact_ready": bool(payload.get("artifact_ready")) if "artifact_ready" in payload else bool(entries),
+        }
+        return normalized
+
+    def _normalized_entry_result_modules(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        modules: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for row in self._entry_results(task):
+            normalized = self._normalize_entry_result_module(task, row)
+            key = (
+                str(normalized.get("module_key") or "").strip(),
+                int(normalized.get("execution_epoch") or 0),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            modules.append(normalized)
+        return modules
+
+    def _entry_result_modules_for_current_epoch(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        current_epoch = self._entry_result_execution_epoch(task)
+        return [
+            module
+            for module in self._normalized_entry_result_modules(task)
+            if int(module.get("execution_epoch") or 0) == current_epoch
+        ]
+
+    def _entry_result_success_modules(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        return [
+            module
+            for module in self._entry_result_modules_for_current_epoch(task)
+            if str(module.get("completion_state") or "").strip() == "success"
+            and bool(module.get("completion_ready"))
+        ]
+
+    def _entry_result_terminal_modules(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        terminal_states = {"success", "failed", "orchestration_failed", "cancelled"}
+        return [
+            module
+            for module in self._entry_result_modules_for_current_epoch(task)
+            if str(module.get("completion_state") or "").strip() in terminal_states
+            and bool(module.get("completion_ready"))
+        ]
+
+    def _expected_entry_modules(self, task: BinarySecurityTask, db: Session) -> list[dict[str, Any]]:
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            source_dir = str((task.summary or {}).get("input_dir") or "").strip()
+            if not source_dir:
+                return []
+            kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
+            return [
+                {
+                    "module_key": "knowledge-graph-source-project",
+                    "module_name": "source-project",
+                    "module_kind": "knowledge_graph_module",
+                    "source_stage": "knowledge_graph_entry_fetch",
+                    "execution_epoch": self._entry_result_execution_epoch(task),
+                    "completion_expected": bool(kg_state),
+                }
+            ]
+        return [
+            {
+                "module_key": self._entry_result_module_key(task, module),
+                "module_name": self._entry_result_module_name(task, module),
+                "module_kind": "source_module",
+                "source_stage": "entry_analysis",
+                "execution_epoch": self._entry_result_execution_epoch(task),
+            }
+            for module in self._entry_analysis_inputs(db, task)
+            if self._entry_result_module_key(task, module)
+        ]
+
+    def _entry_module_completion_state(self, task: BinarySecurityTask, db: Session | None) -> dict[str, Any]:
+        expected = self._expected_entry_modules(task, db) if db is not None else (
+            [
+                {
+                    "module_key": self._entry_result_module_key(task, module),
+                    "module_name": self._entry_result_module_name(task, module),
+                    "module_kind": "source_module",
+                    "source_stage": "entry_analysis",
+                    "execution_epoch": self._entry_result_execution_epoch(task),
+                }
+                for module in list((task.summary or {}).get("selected_modules") or [])
+                if isinstance(module, dict) and self._entry_result_module_key(task, module)
+            ]
+            if self._pipeline_profile(task) != PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN
+            else (
+                [
+                    {
+                        "module_key": "knowledge-graph-source-project",
+                        "module_name": "source-project",
+                        "module_kind": "knowledge_graph_module",
+                        "source_stage": "knowledge_graph_entry_fetch",
+                        "execution_epoch": self._entry_result_execution_epoch(task),
+                    }
+                ]
+                if str((task.summary or {}).get("input_dir") or "").strip()
+                else []
+            )
+        )
+        materialized = self._entry_result_terminal_modules(task)
+        expected_keys = {str(module.get("module_key") or "").strip() for module in expected if str(module.get("module_key") or "").strip()}
+        materialized_keys = {str(module.get("module_key") or "").strip() for module in materialized if str(module.get("module_key") or "").strip()}
+        missing = sorted(key for key in expected_keys if key not in materialized_keys)
+        return {
+            "expected_modules": expected,
+            "materialized_modules": materialized,
+            "expected_module_count": len(expected_keys),
+            "materialized_module_count": len(materialized_keys),
+            "successful_module_count": len(
+                [module for module in materialized if str(module.get("completion_state") or "").strip() == "success"]
+            ),
+            "failed_module_count": len(
+                [module for module in materialized if str(module.get("completion_state") or "").strip() in {"failed", "orchestration_failed", "cancelled"}]
+            ),
+            "missing_module_keys": missing,
+            "complete": bool(expected_keys) and len(expected_keys) == len(materialized_keys),
+        }
+
+    def _entry_module_completion_gate(self, task: BinarySecurityTask, db: Session) -> bool:
+        return bool(self._entry_module_completion_state(task, db).get("complete"))
+
+    def _entry_module_flow_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for module in self._entry_result_success_modules(task):
+            module_key = str(module.get("module_key") or "").strip()
+            module_name = str(module.get("module_name") or "").strip()
+            module_kind = str(module.get("module_kind") or "").strip()
+            execution_epoch = int(module.get("execution_epoch") or 0)
+            for entry in list(module.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                entries.append(
+                    {
+                        **dict(entry),
+                        "module_key": module_key or str(entry.get("module_key") or "").strip(),
+                        "module_name": module_name or str(entry.get("module_name") or "").strip(),
+                        "module_kind": module_kind or str(entry.get("module_kind") or "").strip(),
+                        "execution_epoch": execution_epoch,
+                    }
+                )
+        return entries
+
+    def _clear_entry_result_state(self, task: BinarySecurityTask) -> None:
+        summary = dict(task.summary or {})
+        summary["entry_results"] = []
+        summary["entry_selection"] = {}
+        task.summary = summary
+        metrics = dict(task.metrics or {})
+        metrics.update(
+            {
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                "expected_entry_module_count": 0,
+                "materialized_entry_module_count": 0,
+                "successful_entry_module_count": 0,
+                "failed_entry_module_count": 0,
+            }
+        )
+        task.metrics = metrics
+
     def _knowledge_graph_entry_results(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         return [dict(item) for item in (task.summary.get("knowledge_graph_entry_results") or []) if isinstance(item, dict)]
 
@@ -4247,8 +4588,11 @@ class TaskManager(
         snapshot = self._entry_selection_snapshot(task)
         candidate_entries = snapshot.get("candidate_entries")
         if isinstance(candidate_entries, list) and candidate_entries:
-            return [dict(item) for item in candidate_entries if isinstance(item, dict)]
-        return self._entry_results(task)
+            return self._materialized_flow_entries(
+                task,
+                [dict(item) for item in candidate_entries if isinstance(item, dict)],
+            )
+        return self._entry_module_flow_inputs(task)
 
     def _selected_entry_keys(self, task: BinarySecurityTask) -> list[str]:
         snapshot = self._entry_selection_snapshot(task)
@@ -4260,7 +4604,10 @@ class TaskManager(
 
     def _selected_entries(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
         snapshot = self._entry_selection_snapshot(task)
-        return [dict(item) for item in (snapshot.get("selected_entries") or []) if isinstance(item, dict)]
+        return self._materialized_flow_entries(
+            task,
+            [dict(item) for item in (snapshot.get("selected_entries") or []) if isinstance(item, dict)],
+        )
 
     def _mark_selected_entries(self, entries: list[dict[str, Any]], *, selected_by: str, selected_at: str | None = None) -> list[dict[str, Any]]:
         timestamp = selected_at or _now().isoformat()
@@ -4289,10 +4636,162 @@ class TaskManager(
         ]
 
     def _entry_selection_metrics(self, task: BinarySecurityTask) -> dict[str, int]:
+        module_state = self._entry_module_completion_state(task, None)
         return {
             "candidate_entry_count": len(self._entry_candidates(task)),
             "selected_entry_count": len(self._effective_entry_inputs(task)) if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task)),
+            "expected_entry_module_count": int(module_state.get("expected_module_count") or 0),
+            "materialized_entry_module_count": int(module_state.get("materialized_module_count") or 0),
+            "successful_entry_module_count": int(module_state.get("successful_module_count") or 0),
+            "failed_entry_module_count": int(module_state.get("failed_module_count") or 0),
         }
+
+    def _entry_module_result_from_stage_item(
+        self,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> dict[str, Any]:
+        payload = {
+            **dict(item.input_ref or {}),
+            **dict(item.output_ref or {}),
+            **self._load_stage_item_result_payload(item),
+        }
+        normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        completion_state = {
+            "success": "success",
+            "partial_success": "success",
+            "failed": "failed",
+            "downstream_missing": "failed",
+            "cancelled": "cancelled",
+        }.get(normalized_status, "orchestration_failed")
+        normalized = self._normalize_entry_result_module(
+            task,
+            {
+                **payload,
+                "module_key": self._entry_result_module_key(task, payload) or str(item.item_key or "").strip(),
+                "module_name": self._entry_result_module_name(task, payload) or str(item.item_name or "").strip(),
+                "source_dir": self._resolve_entry_source_dir(payload) or str(task.firmware_path or "").strip() or None,
+                "completion_state": completion_state,
+                "completion_ready": self._is_terminal_item_status(item.status),
+                "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                "error_message": str(item.error_message or "").strip() or None,
+                "artifact_ready": bool(self._stage_item_artifact_root(item)),
+            },
+        )
+        if completion_state == "success":
+            module_payload = dict(normalized)
+            artifact_root_value = self._stage_item_artifact_root(item)
+            entries = [dict(entry) for entry in payload.get("entries") or [] if isinstance(entry, dict)]
+            if artifact_root_value:
+                artifact_root = Path(str(artifact_root_value))
+                parsed_entries = self._parse_entries(artifact_root, module_payload)
+                if parsed_entries:
+                    entries = parsed_entries
+                    normalized["artifact_root"] = str(artifact_root)
+            if not entries:
+                entries = [dict(entry) for entry in payload.get("entries_preview") or [] if isinstance(entry, dict)]
+            normalized_entries: list[dict[str, Any]] = []
+            for entry in entries:
+                row = dict(entry)
+                row["source_dir"] = self._resolve_entry_source_dir({**module_payload, **row}) or module_payload.get("source_dir")
+                normalized_entries.append(row)
+            normalized["entries"] = _deduplicate_entry_keys(normalized_entries)
+            normalized["entry_count"] = len(normalized["entries"])
+            normalized["artifact_ready"] = bool(self._stage_item_artifact_root(item))
+        else:
+            normalized["entries"] = []
+            normalized["entry_count"] = 0
+        return normalized
+
+    def _materialized_flow_entries(self, task: BinarySecurityTask, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        flattened: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            entry_key = str(row.get("entry_key") or "").strip()
+            if entry_key:
+                flattened.append(dict(row))
+                continue
+            module_key = str(row.get("module_key") or "").strip()
+            module_name = str(row.get("module_name") or "").strip()
+            module_kind = str(row.get("module_kind") or "").strip()
+            execution_epoch = int(row.get("execution_epoch") or self._entry_result_execution_epoch(task))
+            for entry in list(row.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                flattened.append(
+                    {
+                        **dict(entry),
+                        "module_key": str(entry.get("module_key") or "").strip() or module_key,
+                        "module_name": str(entry.get("module_name") or "").strip() or module_name,
+                        "module_kind": str(entry.get("module_kind") or "").strip() or module_kind,
+                        "execution_epoch": int(entry.get("execution_epoch") or execution_epoch),
+                    }
+                )
+        return _deduplicate_entry_keys(flattened)
+
+    def _rebuild_entry_result_modules_from_stage_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> list[dict[str, Any]]:
+        modules: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in self._stage_items(db, task.id, "entry_analysis"):
+            module_key = str(item.item_key or "").strip()
+            if not module_key or module_key in seen:
+                continue
+            seen.add(module_key)
+            modules.append(self._entry_module_result_from_stage_item(task, item))
+        task.summary = {**(task.summary or {}), "entry_results": modules}
+        metrics = dict(task.metrics or {})
+        metrics.update(self._entry_selection_metrics(task))
+        metrics["entry_count"] = sum(int(module.get("entry_count") or 0) for module in modules)
+        task.metrics = metrics
+        if stage_run is not None:
+            self._persist_stage_run_output_summary(
+                task,
+                stage_run,
+                {
+                    "items": self._compact_stage_success_items_for_db("entry_results", modules),
+                    "entry_count": metrics["entry_count"],
+                    "expected_entry_module_count": int(metrics.get("expected_entry_module_count") or 0),
+                    "materialized_entry_module_count": int(metrics.get("materialized_entry_module_count") or 0),
+                    "successful_entry_module_count": int(metrics.get("successful_entry_module_count") or 0),
+                    "failed_entry_module_count": int(metrics.get("failed_entry_module_count") or 0),
+                    "status_synced": True,
+                    "sync_status": stage_run.status,
+                    **(stage_run.counts or {}),
+                },
+            )
+        return modules
+
+    def _build_knowledge_graph_entry_result_module(
+        self,
+        task: BinarySecurityTask,
+        *,
+        entries: list[dict[str, Any]],
+        completion_state: str,
+        completion_ready: bool,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+        return self._normalize_entry_result_module(
+            task,
+            {
+                "module_key": "knowledge-graph-source-project",
+                "module_name": "source-project",
+                "module_kind": "knowledge_graph_module",
+                "source_stage": "knowledge_graph_entry_fetch",
+                "execution_epoch": self._entry_result_execution_epoch(task),
+                "completion_state": completion_state,
+                "completion_ready": completion_ready,
+                "entries": [dict(entry) for entry in entries if isinstance(entry, dict)] if completion_state == "success" else [],
+                "entry_count": len(entries) if completion_state == "success" else 0,
+                "error_message": error_message,
+                "artifact_ready": completion_state == "success",
+            },
+        )
 
     def _knowledge_graph_entry_reason(self, entry: dict[str, Any]) -> str:
         parts: list[str] = []
@@ -4322,6 +4821,7 @@ class TaskManager(
     ) -> dict[str, Any]:
         input_dir = str((task.summary or {}).get("input_dir") or "").strip()
         source_file = str(raw.get("file_path") or "").strip().replace("\\", "/")
+        source_file_exists = self._knowledge_graph_source_file_exists(input_dir, source_file)
         line_hint = str(raw.get("start_line") or "").strip()
         function_name = str(raw.get("name") or "").strip()
         entry_key = str(raw.get("source_id") or "").strip()
@@ -4346,6 +4846,10 @@ class TaskManager(
             "line_no": line_hint,
             "definition_line": line_hint,
             "definition_kind": "unknown",
+            "is_definition_found": source_file_exists,
+            "source_file_exists": source_file_exists,
+            "entry_execution_status": "ready" if source_file_exists else "source_file_missing",
+            "entry_execution_reason": "source file is accessible" if source_file_exists else "source file is missing under source_root_path",
             "function_description": str(raw.get("function_purpose") or "").strip(),
             "function_description_source": "knowledge_graph_audit_sources",
             "entry_reason": str(raw.get("entry_evidence") or "").strip() or self._knowledge_graph_entry_reason(raw),
@@ -4370,6 +4874,41 @@ class TaskManager(
             "callees": [dict(item) for item in list(raw.get("callees") or []) if isinstance(item, dict)],
             "task_type": TASK_TYPE_SOURCE,
         }
+
+    def _knowledge_graph_source_file_exists(self, source_root_path: str, source_file: str) -> bool:
+        normalized_root = str(source_root_path or "").strip()
+        normalized_file = str(source_file or "").strip().replace("\\", "/")
+        if not normalized_root or not normalized_file:
+            return False
+        try:
+            root_path = Path(normalized_root).resolve()
+            candidate = (root_path / normalized_file).resolve()
+            candidate.relative_to(root_path)
+        except Exception:
+            return False
+        return candidate.is_file()
+
+    def _filter_executable_knowledge_graph_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            dict(entry)
+            for entry in entries
+            if isinstance(entry, dict) and self._is_executable_knowledge_graph_entry(entry)
+        ]
+
+    def _knowledge_graph_entry_execution_metrics(self, entries: list[dict[str, Any]]) -> dict[str, int]:
+        total = len([entry for entry in entries if isinstance(entry, dict)])
+        executable = len([entry for entry in entries if isinstance(entry, dict) and self._is_executable_knowledge_graph_entry(entry)])
+        return {
+            "knowledge_graph_executable_entry_count": executable,
+            "knowledge_graph_missing_source_file_count": max(0, total - executable),
+        }
+
+    def _is_executable_knowledge_graph_entry(self, entry: dict[str, Any] | None) -> bool:
+        if not isinstance(entry, dict):
+            return False
+        if "source_file_exists" not in entry:
+            return True
+        return bool(entry.get("source_file_exists"))
 
     def _knowledge_graph_source_endpoint(self, *, upload_id: str | None, db_name: str | None) -> str:
         cfg = self.cfg.services.knowledge_graph_audit
@@ -4513,11 +5052,28 @@ class TaskManager(
         self._mark_loop_heartbeat("readless_reconcile")
         return True
 
+    def _latest_stage_run(self, db: Session, task_id: str, stage_name: str) -> BinarySecurityStageRun | None:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_task_id or not normalized_stage_name:
+            return None
+        return (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == normalized_task_id,
+                BinarySecurityStageRun.stage_name == normalized_stage_name,
+            )
+            .order_by(
+                BinarySecurityStageRun.sequence_no.desc(),
+                BinarySecurityStageRun.updated_at.desc(),
+                BinarySecurityStageRun.created_at.desc(),
+                BinarySecurityStageRun.id.desc(),
+            )
+            .first()
+        )
+
     def _ensure_stage_run(self, db: Session, task: BinarySecurityTask, stage_name: str) -> BinarySecurityStageRun:
-        stage_run = db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == stage_name,
-        ).first()
+        stage_run = self._latest_stage_run(db, task.id, stage_name)
         if stage_run:
             return stage_run
         stage_run = BinarySecurityStageRun(
@@ -4536,10 +5092,7 @@ class TaskManager(
                     db.flush()
                 return stage_run
             except IntegrityError:
-                existing = db.query(BinarySecurityStageRun).filter(
-                    BinarySecurityStageRun.task_id == task.id,
-                    BinarySecurityStageRun.stage_name == stage_name,
-                ).first()
+                existing = self._latest_stage_run(db, task.id, stage_name)
                 if existing is None:
                     raise
                 return existing
@@ -6269,7 +6822,6 @@ class TaskManager(
             "running",
             "pending_upload",
             "uploading",
-            "ready_to_start",
             TASK_STATUS_PENDING_MODULE_CONFIRMATION,
         }
         stats = BinarySecurityProjectStats(total=len(tasks))
@@ -6324,7 +6876,6 @@ class TaskManager(
             "running",
             "pending_upload",
             "uploading",
-            "ready_to_start",
             TASK_STATUS_PENDING_MODULE_CONFIRMATION,
         )
         if not hasattr(base_query, "with_entities"):
@@ -7066,7 +7617,7 @@ class TaskManager(
         normalized = (status or "").lower()
         if normalized in {"downstream_missing", "not_found", "missing", "task_not_found"}:
             return "downstream_missing"
-        if normalized in {"pending", "queued", "created", "ready", "ready_to_start", "awaiting_takeover", "retry_preparing"}:
+        if normalized in {"pending", "queued", "created", "ready", "awaiting_takeover", "retry_preparing"}:
             return "pending"
         if normalized == "dispatching":
             return "dispatching"
@@ -7283,79 +7834,7 @@ class TaskManager(
         task: BinarySecurityTask,
         stage_run: BinarySecurityStageRun | None = None,
     ) -> list[dict[str, Any]]:
-        """Rebuild full entry_results after downstream sync only updated stage items.
-
-        Stage item result_json intentionally stores only entries_preview to keep DB rows
-        small, so the authoritative source for full entries is the archived artifact.
-        """
-        items = [
-            item
-            for item in self._stage_items(db, task.id, "entry_analysis")
-            if item.status == "success"
-        ]
-        rebuilt: list[dict[str, Any]] = []
-        for item in items:
-            result = self._load_stage_item_result_payload(item)
-            input_ref = dict(item.input_ref or {})
-            output_ref = dict(item.output_ref or {})
-            module = {
-                **input_ref,
-                **result,
-                "module_key": str(result.get("module_key") or input_ref.get("module_key") or item.item_key or ""),
-                "module_name": str(result.get("module_name") or input_ref.get("module_name") or item.item_name or ""),
-                "source_dir": self._resolve_entry_source_dir({**input_ref, **result}) or str(task.firmware_path or ""),
-            }
-            if not module["module_key"] or not module["module_name"]:
-                continue
-            artifact_root_value = self._stage_item_artifact_root(item)
-            entries = [dict(entry) for entry in result.get("entries") or [] if isinstance(entry, dict)]
-            if artifact_root_value:
-                artifact_root = Path(str(artifact_root_value))
-                parsed_entries = self._parse_entries(artifact_root, module)
-                if parsed_entries:
-                    entries = parsed_entries
-                    module["artifact_root"] = str(artifact_root)
-            if not entries:
-                entries = [dict(entry) for entry in result.get("entries_preview") or [] if isinstance(entry, dict)]
-            if not entries:
-                continue
-            normalized_entries = []
-            for entry in entries:
-                row = dict(entry)
-                row["source_dir"] = self._resolve_entry_source_dir({**module, **row}) or module["source_dir"]
-                normalized_entries.append(row)
-            rebuilt.append(self._compact_entry_summary_item({**module, "entries": normalized_entries}))
-
-        summary = {**(task.summary or {}), "entry_results": rebuilt}
-        task.summary = summary
-        entry_count = self._entry_count_for_summary("entry_results", rebuilt)
-        task.metrics = {**(task.metrics or {}), "entry_count": entry_count}
-        if stage_run is not None:
-            stage_summary = {
-                "items": self._compact_stage_success_items_for_db("entry_results", rebuilt),
-                "failed_items": [
-                    self._lightweight_stage_failure(
-                        {
-                            "item": {
-                                **dict(item.input_ref or {}),
-                                **self._load_stage_item_result_payload(item),
-                            },
-                            "error": item.error_message,
-                        }
-                    )
-                    for item in self._stage_items(db, task.id, "entry_analysis")
-                    if item.status in {"failed", "cancelled", "downstream_missing"}
-                ],
-                "success_count": len(rebuilt),
-                "failed_count": int((stage_run.counts or {}).get("failed_items") or 0),
-                "cancelled_count": int((stage_run.counts or {}).get("cancelled_items") or 0),
-                "entry_count": entry_count,
-                "status_synced": True,
-                "sync_status": stage_run.status,
-                **(stage_run.counts or {}),
-            }
-            self._persist_stage_run_output_summary(task, stage_run, stage_summary)
-        return rebuilt
+        return self._rebuild_entry_result_modules_from_stage_items(db, task, stage_run)
 
     def _refresh_system_analysis_stage_from_synced_items(self, db: Session, task: BinarySecurityTask) -> None:
         handler = self._stage_handler("system_analysis")
@@ -7416,21 +7895,21 @@ class TaskManager(
         return summary
 
     def _should_skip_readless_reconcile_for_active_task(self, task: BinarySecurityTask) -> bool:
-        status = str(task.status or "").strip()
-        active_statuses = {"running", "dispatching"}
-        if status not in active_statuses:
-            return False
         if not str(task.dispatcher_instance_id or "").strip():
             return False
         return self._lease_is_active(task)
 
-    def _should_preserve_task_dispatch_ownership(self, task: BinarySecurityTask, *, previous_status: str | None = None) -> bool:
-        status = str(previous_status if previous_status is not None else task.status or "").strip()
-        if status not in {"running", "dispatching"}:
-            return False
+    def _should_preserve_task_dispatch_ownership(
+        self,
+        task: BinarySecurityTask,
+        *,
+        previous_status: str | None = None,
+        db: Session | None = None,
+    ) -> bool:
+        del previous_status
         if not str(task.dispatcher_instance_id or "").strip():
             return False
-        return self._lease_is_active(task)
+        return self._lease_is_active(task, db=db)
 
     def _stage_items(self, db: Session, task_id: str, stage_name: str) -> list[BinarySecurityStageItem]:
         stage_name = normalize_stage_name(stage_name)
@@ -7840,10 +8319,11 @@ class TaskManager(
         observed_payload: dict[str, Any] | None = None,
     ) -> tuple[str, str | None]:
         hard_reset_verified = bool(task is not None and self._retry_cleanup_is_hard_reset_verified(task))
+        bound_downstream_task_id = str(item.downstream_task_id or "").strip() or None
         if active_payload is not None:
             status = self._map_downstream_status(str(active_payload.get("status") or ""))
             if status in {"pending", "queued", "dispatching", "running"}:
-                if hard_reset_verified:
+                if hard_reset_verified or not bound_downstream_task_id:
                     return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, status
                 return RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, status
         payload = observed_payload if isinstance(observed_payload, dict) else None
@@ -7852,6 +8332,8 @@ class TaskManager(
             raw_status = self._status_from_downstream_payload(payload, success_statuses={"success", "partial_success", "completed", "passed", "succeeded"})
         mapped_status = raw_status or self._latest_observed_downstream_status(item) or str(item.status or "").strip().lower() or None
         mapped_status = self._map_downstream_status(str(mapped_status or "")) or (str(mapped_status or "").strip().lower() or None)
+        if not bound_downstream_task_id and mapped_status in {"success", "pending", "queued", "dispatching", "running"}:
+            return RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL, mapped_status
         if mapped_status == "success":
             return RETRY_CHILD_STRATEGY_REUSE_SUCCESS, mapped_status
         if mapped_status in {"pending", "queued", "dispatching", "running"}:
@@ -8882,7 +9364,7 @@ class TaskManager(
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status in {"pending_upload", "uploading"}:
             return False, "当前任务尚未完成输入准备，不能重试", None
         blocked_statuses = {"pending", "dispatching", "running"}
         if task.status in blocked_statuses:
@@ -8928,6 +9410,202 @@ class TaskManager(
                 self._refresh_knowledge_graph_entry_fetch_summary(task)
             else:
                 self._rebuild_entry_results_from_stage_items(db, task)
+
+    def _entry_analysis_historical_child_count(self, db: Session, task: BinarySecurityTask) -> int:
+        if hasattr(db, "ea_tasks") and isinstance(getattr(db, "ea_tasks"), list):
+            return len(
+                [
+                    row
+                    for row in list(getattr(db, "ea_tasks") or [])
+                    if str(getattr(row, "parent_task_id", "") or "").strip() == str(task.id or "").strip()
+                    and str(getattr(row, "parent_stage_name", "") or "").strip() == "entry_analysis"
+                ]
+            )
+        try:
+            result = db.execute(
+                text(
+                    """
+                    SELECT COUNT(*)
+                    FROM secflow_app_ea_tasks
+                    WHERE parent_task_id = :parent_task_id
+                      AND parent_stage_name = :parent_stage_name
+                    """
+                ),
+                {"parent_task_id": task.id, "parent_stage_name": "entry_analysis"},
+            )
+            scalar = result.scalar() if result is not None else 0
+            return max(0, int(scalar or 0))
+        except Exception:
+            return 0
+
+    def _entry_analysis_authoritative_rebuild_required(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> dict[str, Any]:
+        stage_name = "entry_analysis"
+        normalized_stage_name = normalize_stage_name(stage_name)
+        current_items = self._stage_items(db, task.id, normalized_stage_name)
+        current_stage_item_count = len(current_items)
+        resolved_stage_run = stage_run
+        if resolved_stage_run is None:
+            resolved_stage_run = db.query(BinarySecurityStageRun).filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == normalized_stage_name,
+            ).first()
+        stage_run_status = str(getattr(resolved_stage_run, "status", "") or "").strip() or None
+        inputs = self._entry_analysis_inputs(db, task)
+        input_count = len(inputs)
+        active_operation = self._task_active_operation(db, task)
+        historical_child_count = self._entry_analysis_historical_child_count(db, task)
+        reason = None
+        required = False
+        if resolved_stage_run is None:
+            reason = "stage_run_missing"
+        elif stage_run_status not in {"pending", "queued"}:
+            reason = "stage_run_not_pending"
+        elif current_stage_item_count > 0:
+            reason = "authoritative_items_present"
+        elif input_count <= 0:
+            reason = "missing_entry_analysis_inputs"
+        elif active_operation is not None:
+            reason = "active_operation_in_progress"
+        elif historical_child_count <= 0:
+            reason = "no_historical_entry_analysis_children"
+        else:
+            reason = "historical_children_exist_but_authoritative_items_missing"
+            required = True
+        return {
+            "required": required,
+            "reason": reason,
+            "stage_name": normalized_stage_name,
+            "input_count": input_count,
+            "historical_child_count": historical_child_count,
+            "current_stage_item_count": current_stage_item_count,
+            "stage_run_status": stage_run_status,
+        }
+
+    def _mark_entry_analysis_authoritative_rebuild_summary(
+        self,
+        task: BinarySecurityTask,
+        rebuild_state: dict[str, Any],
+    ) -> None:
+        stage_name = "entry_analysis"
+        stage_summary = dict(task.stage_summary or {})
+        current_summary = dict(stage_summary.get(stage_name) or {})
+        current_summary.update(
+            {
+                "authoritative_items_missing": bool(rebuild_state.get("current_stage_item_count", 0) == 0),
+                "authoritative_rebuild_required": bool(rebuild_state.get("required")),
+                "authoritative_rebuild_reason": rebuild_state.get("reason"),
+                "historical_child_count": int(rebuild_state.get("historical_child_count") or 0),
+            }
+        )
+        if rebuild_state.get("required"):
+            current_summary["status_label"] = "待补建"
+        stage_summary[stage_name] = current_summary
+        task.stage_summary = stage_summary
+
+    def _rebuild_missing_entry_analysis_stage_items_from_inputs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> dict[str, Any]:
+        rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
+        self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
+        if not rebuild_state.get("required"):
+            if rebuild_state.get("reason") not in {
+                "authoritative_items_present",
+                "missing_entry_analysis_inputs",
+                "stage_run_missing",
+            }:
+                self._record_event(
+                    db,
+                    task,
+                    "entry_analysis_authoritative_items_rebuild_skipped",
+                    "入口分析 authoritative item 补建已跳过",
+                    stage_name="entry_analysis",
+                    payload=dict(rebuild_state),
+                )
+            return {"rebuilt": False, "rebuilt_item_count": 0, **rebuild_state}
+        resolved_stage_run = stage_run or self._ensure_stage_run(db, task, "entry_analysis")
+        self._record_event(
+            db,
+            task,
+            "entry_analysis_authoritative_items_missing_detected",
+            "检测到入口分析 authoritative item 丢失，准备补建",
+            stage_name="entry_analysis",
+            level="warning",
+            payload=dict(rebuild_state),
+        )
+        self._record_event(
+            db,
+            task,
+            "entry_analysis_authoritative_items_rebuild_started",
+            "入口分析 authoritative item 补建开始",
+            stage_name="entry_analysis",
+            payload=dict(rebuild_state),
+        )
+        rebuilt_item_count = 0
+        try:
+            for module in self._entry_analysis_inputs(db, task):
+                item = self._upsert_stage_item(
+                    db,
+                    task=task,
+                    stage_run=resolved_stage_run,
+                    stage_name="entry_analysis",
+                    item_key=module["module_key"],
+                    item_name=module["module_name"],
+                    parent_key=module.get("firmware_key"),
+                    downstream_service="entry_analyse",
+                    input_ref=module,
+                    retrying=False,
+                    auto_retrying=False,
+                )
+                item.status = "pending"
+                item.downstream_task_id = None
+                item.started_at = None
+                item.finished_at = None
+                item.error_message = None
+                rebuilt_item_count += 1
+            resolved_stage_run.counts = self._stage_counts(db, resolved_stage_run)
+            completed_state = {
+                **rebuild_state,
+                "required": False,
+                "reason": "authoritative_items_rebuilt",
+                "current_stage_item_count": rebuilt_item_count,
+                "rebuilt_item_count": rebuilt_item_count,
+            }
+            self._mark_entry_analysis_authoritative_rebuild_summary(task, completed_state)
+            self._record_event(
+                db,
+                task,
+                "entry_analysis_authoritative_items_rebuild_finished",
+                "入口分析 authoritative item 补建完成",
+                stage_name="entry_analysis",
+                payload=dict(completed_state),
+            )
+            return {"rebuilt": True, **completed_state}
+        except Exception as exc:
+            failed_state = {
+                **rebuild_state,
+                "rebuilt_item_count": rebuilt_item_count,
+                "error": str(exc),
+            }
+            self._record_event(
+                db,
+                task,
+                "entry_analysis_authoritative_items_rebuild_failed",
+                "入口分析 authoritative item 补建失败",
+                stage_name="entry_analysis",
+                level="error",
+                payload=failed_state,
+            )
+            raise
 
     def _rebuild_summary_results_from_stage_items(
         self,
@@ -9013,11 +9691,11 @@ class TaskManager(
 
     def _continue_stage_input_error(self, db: Session, task: BinarySecurityTask, stage_name: str) -> str | None:
         self._ensure_stage_inputs_available(db, task, stage_name)
+        summary = dict(task.summary or {})
         handler = self._stage_handler(stage_name)
         if handler is not None and normalize_stage_name(stage_name) in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis", "knowledge_graph_entry_fetch", "dataflow_vuln_scan"}:
             handler_reason = handler.continue_stage_input_error(self, db, task)
             return handler_reason
-        summary = dict(task.summary or {})
         if stage_name == "binary_to_source":
             inputs = list(summary.get("selected_modules") or [])
             if not inputs:
@@ -9044,7 +9722,7 @@ class TaskManager(
                 return "源码任务缺少输入目录，不能继续知识图谱入口获取阶段"
             return None
         if normalize_stage_name(stage_name) == "dataflow_vuln_scan":
-            inputs = list(summary.get("entry_results") or [])
+            inputs = list(self._entry_results(task) or [])
             if not inputs:
                 if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
                     return "知识图谱入口获取尚未产出可用入口结果，不能继续数据流漏洞挖掘阶段"
@@ -9182,6 +9860,18 @@ class TaskManager(
         if handler is not None:
             return handler.has_authoritative_success_payload(self, db, task)
         return False
+
+    def _virtual_archive_stage_status(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> str | None:
+        normalized_stage = normalize_stage_name(stage_name)
+        handler = self._stage_handler(normalized_stage)
+        if handler is None:
+            return None
+        return handler.archive_virtual_status(self, db, task)
 
     def _descendant_stages_for_stage(self, task: BinarySecurityTask, stage_name: str) -> list[str]:
         normalized_stage_name = str(stage_name or "").strip()
@@ -10043,10 +10733,21 @@ class TaskManager(
             cleanup_scope=cleanup_scope,
         )
 
+    async def _drain_owner_inbox_during_polling(self, task: BinarySecurityTask) -> None:
+        operation_passes = 0
+        while await self._run_current_task_operation(task.id):
+            operation_passes += 1
+        if operation_passes <= 0:
+            return
+        if await self._is_task_cancelled_async(task.id):
+            return
+        await self._ensure_task_execution_current_async(task)
+
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         while True:
             try:
                 await self._ensure_task_execution_current_async(task)
+                await self._drain_owner_inbox_during_polling(task)
                 await self._touch_task_heartbeat_async(task.id)
                 payload = await fetcher()
                 await self._ensure_task_execution_current_async(task)
@@ -10229,46 +10930,6 @@ class TaskManager(
             all_modules.extend(result.get("modules", []))
         candidate_modules = self._filter_candidate_modules(all_modules, self._module_selection_candidate_levels(task))
         module_metrics = self._module_metrics(all_modules, candidate_modules, [])
-        if status in {"success", "partial_success"} and success and not failed_like and not candidate_modules:
-            failure = _no_candidate_modules_failure()
-            task.summary = {
-                **task.summary,
-                "system_analysis_results": self._lightweight_system_analysis_items(success),
-                "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
-                "system_analysis_module_count": len(all_modules),
-                "candidate_modules": [],
-                "selected_modules": [],
-                "high_risk_modules": [],
-                **failure,
-            }
-            task.metrics = {
-                **task.metrics,
-                **self._module_metrics(all_modules, [], []),
-            }
-            task.last_error = failure["failure_message"]
-            self._record_event(
-                db,
-                task,
-                "system_analysis_no_candidate_modules",
-                failure["failure_message"],
-                level="error",
-                stage_name=stage_run.stage_name,
-                payload=failure,
-            )
-            db.commit()
-            return "failed", {
-                "items": self._lightweight_system_analysis_items(success),
-                "failed_items": aggregate_summary.get("failed_items", []),
-                "success_count": len(success),
-                "failed_count": int(aggregate_summary.get("failed_count") or 0),
-                "module_count": len(all_modules),
-                "high_risk_module_count": module_metrics["high_risk_module_count"],
-                "medium_risk_module_count": module_metrics["medium_risk_module_count"],
-                "low_risk_module_count": module_metrics["low_risk_module_count"],
-                "candidate_module_count": 0,
-                "selected_module_count": 0,
-                **failure,
-            }
         selection_mode = self._module_selection_mode(task)
         selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if selection_mode == MODULE_SELECTION_MODE_AUTO else []
         module_metrics = self._module_metrics(all_modules, candidate_modules, selected_modules)
@@ -10281,12 +10942,32 @@ class TaskManager(
             "selected_modules": selected_modules,
             "high_risk_modules": selected_modules,
         }
+        self._clear_entry_result_state(task)
         task.metrics = {
             **task.metrics,
             **self._module_metrics(all_modules, candidate_modules, selected_modules),
         }
         task.last_error = None
         db.commit()
+        if status in {"success", "partial_success"} and selection_mode == MODULE_SELECTION_MODE_AUTO and not candidate_modules:
+            self._record_event(
+                db,
+                task,
+                "system_analysis_no_candidate_modules",
+                "系统分析已完成，但未发现匹配所选风险等级的风险模块，任务自然结束",
+                level="info",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "candidate_module_count": 0,
+                    "selected_module_count": 0,
+                    "module_count": len(all_modules),
+                    "high_risk_module_count": module_metrics["high_risk_module_count"],
+                    "medium_risk_module_count": module_metrics["medium_risk_module_count"],
+                    "low_risk_module_count": module_metrics["low_risk_module_count"],
+                    "selection_mode": selection_mode,
+                    "terminal": True,
+                },
+            )
         if status in {"success", "partial_success"} and selection_mode == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
             self._set_task_status(
                 db,
@@ -10376,6 +11057,7 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
+        self._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task, stage_run=stage_run)
         b2s_success = self._entry_analysis_inputs(db, task)
         if not b2s_success:
             return "failed", {"error": self._missing_entry_analysis_input_reason(db, task)}
@@ -10406,10 +11088,18 @@ class TaskManager(
             initial_retry=retry_existing,
         )
         status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
+        entry_results = self._rebuild_entry_result_modules_from_stage_items(db, task, stage_run)
         entry_mode = self._entry_selection_mode(task)
-        entry_results = self._entry_results(task)
         candidate_entries = self._entry_candidates(task)
         selected_entries = candidate_entries if entry_mode == ENTRY_SELECTION_MODE_AUTO else self._effective_entry_inputs(task)
+        summary = {
+            **summary,
+            "entry_results": entry_results,
+            "candidate_entry_count": len(candidate_entries),
+            "selected_entry_count": len(selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
+            "entry_count": sum(1 for _entry in selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
+            **self._entry_selection_metrics(task),
+        }
         if entry_mode == ENTRY_SELECTION_MODE_MANUAL_CONFIRM and status in {"success", "partial_success"}:
             task.summary = {
                 **(task.summary or {}),
@@ -10427,6 +11117,7 @@ class TaskManager(
                 "candidate_entry_count": len(candidate_entries),
                 "selected_entry_count": 0,
                 "entry_count": 0,
+                **self._entry_selection_metrics(task),
             }
             self._set_task_status(
                 db,
@@ -10479,7 +11170,14 @@ class TaskManager(
                 **(task.metrics or {}),
                 "candidate_entry_count": len(candidate_entries),
                 "selected_entry_count": len(selected_entries),
-                "entry_count": sum(len(entry.get("entries") or []) for entry in selected_entries if isinstance(entry, dict)),
+                "entry_count": len(selected_entries),
+                **self._entry_selection_metrics(task),
+            }
+            summary = {
+                **summary,
+                "entry_selection": dict((task.summary or {}).get("entry_selection") or {}),
+                "selected_entry_count": len(selected_entries),
+                "entry_count": len(selected_entries),
             }
         return status, summary
 
@@ -10528,15 +11226,23 @@ class TaskManager(
                     "error_message": str(exc),
                 },
             )
+            failed_module = self._build_knowledge_graph_entry_result_module(
+                task,
+                entries=[],
+                completion_state="failed",
+                completion_ready=True,
+                error_message=str(exc),
+            )
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": [],
-                "entry_results": [],
+                "entry_results": [failed_module],
                 "knowledge_graph_state": {},
             }
             task.metrics = {
                 **(task.metrics or {}),
                 **STAGE_METRIC_RESETTERS["knowledge_graph_entry_fetch"],
+                **self._entry_selection_metrics(task),
             }
             failure_summary = {
                 "error": str(exc),
@@ -10557,12 +11263,27 @@ class TaskManager(
         graph_status = str(meta.get("graph_status") or "").strip()
         identification_state = str(meta.get("identification_state") or "").strip()
         accumulated_entries = self._merge_knowledge_graph_entry_results(task, entries)
-        accumulated_compact_entries = self._compact_knowledge_graph_entry_results(accumulated_entries)
         accumulated_selected_entry_count = len(accumulated_entries)
+        executable_entries = self._filter_executable_knowledge_graph_entries(accumulated_entries)
+        executable_compact_entries = self._compact_knowledge_graph_entry_results(executable_entries)
+        executable_entry_count = len(executable_entries)
         current_poll_selected_entry_count = len(entries)
         state_summary = self._knowledge_graph_poll_state_summary(
             meta,
             accumulated_selected_entry_count=accumulated_selected_entry_count,
+        )
+        execution_metrics = self._knowledge_graph_entry_execution_metrics(accumulated_entries)
+        success_module = self._build_knowledge_graph_entry_result_module(
+            task,
+            entries=executable_entries,
+            completion_state="success",
+            completion_ready=True,
+        )
+        pending_module = self._build_knowledge_graph_entry_result_module(
+            task,
+            entries=executable_entries,
+            completion_state="success",
+            completion_ready=False,
         )
         if graph_status == "failed" or identification_state == "failed" or graph_status == "superseded":
             reason = "知识图谱入口识别失败"
@@ -10580,10 +11301,17 @@ class TaskManager(
                     **meta,
                 },
             )
+            failed_module = self._build_knowledge_graph_entry_result_module(
+                task,
+                entries=[],
+                completion_state="failed",
+                completion_ready=True,
+                error_message=reason,
+            )
             task.summary = {
                 **(task.summary or {}),
-                "knowledge_graph_entry_results": [],
-                "entry_results": [],
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": [failed_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10592,22 +11320,25 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             failure_summary = {
                 "error": reason,
-                "items": accumulated_compact_entries,
+                "items": [failed_module],
                 "success_count": 0,
                 "failed_count": 1,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
@@ -10630,7 +11361,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": [pending_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10638,19 +11369,22 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             waiting_summary = {
                 "status": "waiting_for_graph",
-                "items": accumulated_compact_entries,
+                "items": [pending_module],
                 "success_count": 0,
                 "failed_count": 0,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
@@ -10673,7 +11407,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": [pending_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10681,19 +11415,22 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             waiting_summary = {
                 "status": "waiting_for_identification",
-                "items": accumulated_compact_entries,
+                "items": [pending_module],
                 "success_count": 0,
                 "failed_count": 0,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 **state_summary,
@@ -10718,7 +11455,7 @@ class TaskManager(
             task.summary = {
                 **(task.summary or {}),
                 "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": [pending_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
@@ -10726,36 +11463,60 @@ class TaskManager(
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             waiting_summary = {
                 "status": "polling_partial",
-                "items": accumulated_compact_entries,
-                "success_count": accumulated_selected_entry_count,
+                "items": [pending_module],
+                "success_count": executable_entry_count,
                 "failed_count": 0,
-                "candidate_entry_count": accumulated_selected_entry_count,
-                "selected_entry_count": accumulated_selected_entry_count,
-                "entry_count": accumulated_selected_entry_count,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
-                "entry_results": accumulated_compact_entries,
+                "entry_results": [pending_module],
                 **state_summary,
                 **meta,
             }
             self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
             return "running", waiting_summary
-        if not accumulated_entries:
+        if not accumulated_entries or not executable_entries:
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                self._record_event(
+                    db,
+                    task,
+                    "knowledge_graph_entry_dispatch_skipped",
+                    "知识图谱入口文件不存在，跳过数据流任务创建",
+                    stage_name=stage_run.stage_name,
+                    payload={
+                        "source_id": str(entry.get("source_id") or entry.get("entry_key") or "").strip() or None,
+                        "function_id": str(entry.get("function_id") or "").strip() or None,
+                        "function_name": str(entry.get("function_name") or "").strip() or None,
+                        "source_file": str(entry.get("source_file") or "").strip() or None,
+                        "start_line": str(entry.get("definition_line") or entry.get("line_no") or "").strip() or None,
+                        "source_file_exists": bool(entry.get("source_file_exists")),
+                        "entry_execution_status": str(entry.get("entry_execution_status") or "").strip() or None,
+                        "entry_execution_reason": str(entry.get("entry_execution_reason") or "").strip() or None,
+                    },
+                )
+            error_message = "知识图谱入口识别完成，但没有可访问的源码入口文件" if accumulated_entries else "知识图谱入口识别完成，但没有可用入口"
             self._record_event(
                 db,
                 task,
                 "knowledge_graph_entry_fetch_empty_after_done",
-                "知识图谱入口识别完成，但没有可用入口",
+                error_message,
                 level="warning",
                 stage_name=stage_run.stage_name,
                 payload={
@@ -10763,33 +11524,43 @@ class TaskManager(
                     **meta,
                 },
             )
+            failed_module = self._build_knowledge_graph_entry_result_module(
+                task,
+                entries=[],
+                completion_state="failed",
+                completion_ready=True,
+                error_message=error_message,
+            )
             task.summary = {
                 **(task.summary or {}),
-                "knowledge_graph_entry_results": [],
-                "entry_results": [],
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": [failed_module],
                 "knowledge_graph_state": state_summary,
             }
             task.metrics = {
                 **(task.metrics or {}),
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 "candidate_entry_count": 0,
                 "selected_entry_count": 0,
                 "entry_count": 0,
                 **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
             }
             failure_summary = {
-                "error": "知识图谱入口识别完成，但没有可用入口",
-                "items": [],
+                "error": error_message,
+                "items": [failed_module],
                 "success_count": 0,
                 "failed_count": 1,
                 "candidate_entry_count": 0,
                 "selected_entry_count": 0,
                 "entry_count": 0,
                 "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": 0,
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
                 **state_summary,
                 **meta,
             }
@@ -10798,7 +11569,7 @@ class TaskManager(
         task.summary = {
             **(task.summary or {}),
             "knowledge_graph_entry_results": accumulated_entries,
-            "entry_results": accumulated_compact_entries,
+            "entry_results": [success_module],
             "knowledge_graph_state": state_summary,
         }
         task.metrics = {
@@ -10806,10 +11577,12 @@ class TaskManager(
             "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
             "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
             "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-            "candidate_entry_count": accumulated_selected_entry_count,
-            "selected_entry_count": accumulated_selected_entry_count,
-            "entry_count": accumulated_selected_entry_count,
+            "candidate_entry_count": executable_entry_count,
+            "selected_entry_count": executable_entry_count,
+            "entry_count": executable_entry_count,
+            **execution_metrics,
             **self._knowledge_graph_analysis_metrics(meta),
+            **self._entry_selection_metrics(task),
         }
         self._record_event(
             db,
@@ -10821,22 +11594,46 @@ class TaskManager(
                 "provider": "knowledge_graph_audit_sources",
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_executable_entry_count": executable_entry_count,
                 **meta,
             },
         )
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            event_type = "knowledge_graph_entry_dispatch_ready" if bool(entry.get("source_file_exists")) else "knowledge_graph_entry_dispatch_skipped"
+            message = "知识图谱入口文件可访问，准备创建数据流任务" if bool(entry.get("source_file_exists")) else "知识图谱入口文件不存在，跳过数据流任务创建"
+            self._record_event(
+                db,
+                task,
+                event_type,
+                message,
+                stage_name=stage_run.stage_name,
+                payload={
+                    "source_id": str(entry.get("source_id") or entry.get("entry_key") or "").strip() or None,
+                    "function_id": str(entry.get("function_id") or "").strip() or None,
+                    "function_name": str(entry.get("function_name") or "").strip() or None,
+                    "source_file": str(entry.get("source_file") or "").strip() or None,
+                    "start_line": str(entry.get("definition_line") or entry.get("line_no") or "").strip() or None,
+                    "source_file_exists": bool(entry.get("source_file_exists")),
+                    "entry_execution_status": str(entry.get("entry_execution_status") or "").strip() or None,
+                    "entry_execution_reason": str(entry.get("entry_execution_reason") or "").strip() or None,
+                },
+            )
         success_summary = {
-            "items": accumulated_compact_entries,
-            "success_count": accumulated_selected_entry_count,
+            "items": [success_module],
+            "success_count": executable_entry_count,
             "failed_count": 0,
-            "candidate_entry_count": accumulated_selected_entry_count,
-            "selected_entry_count": accumulated_selected_entry_count,
-            "entry_count": accumulated_selected_entry_count,
+            "candidate_entry_count": executable_entry_count,
+            "selected_entry_count": executable_entry_count,
+            "entry_count": executable_entry_count,
             "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
             "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
             "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+            **execution_metrics,
             "current_poll_selected_entry_count": current_poll_selected_entry_count,
             "accumulated_selected_entry_count": accumulated_selected_entry_count,
-            "entry_results": accumulated_compact_entries,
+            "entry_results": [success_module],
             **state_summary,
             **meta,
         }
@@ -10851,15 +11648,39 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        entry_results = self._effective_entry_inputs(task)
-        if not entry_results:
+        flow_inputs = self._effective_entry_inputs(task)
+        if not flow_inputs:
             self._rebuild_entry_results_from_stage_items(db, task)
-            entry_results = self._effective_entry_inputs(task)
-        entries: list[dict[str, Any]] = []
-        for result in entry_results:
-            entries.extend(result.get("entries", []))
-        entries = _deduplicate_entry_keys(entries)
+            flow_inputs = self._effective_entry_inputs(task)
+        entries = _deduplicate_entry_keys(flow_inputs)
         if not entries:
+            module_state = self._entry_module_completion_state(task, db)
+            if not bool(module_state.get("complete")):
+                payload = {
+                    "expected_entry_module_count": int(module_state.get("expected_module_count") or 0),
+                    "materialized_entry_module_count": int(module_state.get("materialized_module_count") or 0),
+                    "missing_module_keys": list(module_state.get("missing_module_keys") or []),
+                }
+                self._record_event(
+                    db,
+                    task,
+                    "dataflow_waiting_for_entry_modules_complete",
+                    "入口模块尚未收敛完成，等待更多模块结果",
+                    stage_name=stage_run.stage_name,
+                    payload=payload,
+                )
+                waiting_summary = {
+                    "status": "waiting_for_entry_modules_complete",
+                    "items": [],
+                    "success_count": 0,
+                    "failed_count": 0,
+                    "candidate_entry_count": 0,
+                    "selected_entry_count": 0,
+                    "entry_count": 0,
+                    **payload,
+                }
+                self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
+                return "running", waiting_summary
             return "failed", {"error": "没有可用于数据流漏洞挖掘的入口"}
         executable_inputs = self._prepare_stage_items_for_execution(
             db,

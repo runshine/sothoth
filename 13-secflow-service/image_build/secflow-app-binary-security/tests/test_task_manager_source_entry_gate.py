@@ -124,7 +124,7 @@ def test_source_task_does_not_advance_to_dataflow_when_selected_modules_are_miss
     should_skip = manager._should_finalize_without_entries(db, task, "dataflow_vuln_scan")
     next_stage = manager._next_incomplete_stage(db, task)
 
-    assert should_skip is True
+    assert should_skip is False
     assert next_stage is None
 
 

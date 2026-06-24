@@ -65,6 +65,15 @@ class BinarySecurityStageHandler:
         del manager, db, task
         return False
 
+    def archive_virtual_status(
+        self,
+        manager: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> str | None:
+        del manager, db, task
+        return None
+
     def downstream_service(self) -> str | None:
         return None
 

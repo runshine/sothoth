@@ -10,6 +10,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy.orm.exc import ObjectDeletedError
 from sqlalchemy.orm import Session
 
 from app.exception import ValidationError
@@ -25,17 +26,65 @@ if TYPE_CHECKING:
 
 
 class TaskOperationServiceMixin:
-    def _capture_blocking_operation_task_snapshot(
+    def _finalize_delete_operation_after_task_row_removed(
+        self: TaskManager,
+        db: Session,
+        operation: BinarySecurityTaskOperation | None,
+        *,
+        task_id: str | None = None,
+        log_prefix: str,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if operation is None:
+            return False
+        if str(getattr(operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_DELETE:
+            return False
+        if str(getattr(operation, "status", "") or "").strip().lower() in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+            return False
+        task_row_exists = (
+            db.query(task_manager_module.BinarySecurityTask.id)
+            .filter(task_manager_module.BinarySecurityTask.id == getattr(operation, "task_id", task_id))
+            .first()
+            is not None
+        )
+        if task_row_exists:
+            return False
+        operation.status = "succeeded"
+        operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+        operation.finished_at = task_manager_module._now()
+        operation.updated_at = operation.finished_at
+        operation.error_code = None
+        operation.error_message = None
+        db.commit()
+        task_manager_module.logger.info(
+            "%s: task_id=%s operation_id=%s",
+            log_prefix,
+            str(getattr(operation, "task_id", task_id) or "").strip() or None,
+            str(getattr(operation, "id", "") or "").strip() or None,
+        )
+        task_manager_module.observe_control_operation(
+            str(getattr(operation, "operation_type", "") or "").strip() or "delete",
+            "succeeded",
+        )
+        return True
+
+    def _operation_uses_task_state_snapshot(
+        self: TaskManager,
+        operation: BinarySecurityTaskOperation | None,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if operation is None:
+            return False
+        operation_type = str(getattr(operation, "operation_type", "") or "").strip()
+        return operation_type in task_manager_module.TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES
+
+    def _blocking_operation_task_snapshot_payload(
         self: TaskManager,
         task: BinarySecurityTask,
-        operation: BinarySecurityTaskOperation,
-    ) -> None:
-        if not self._operation_blocks_runtime_resume(operation):
-            return
-        payload = dict(getattr(operation, "request_payload", None) or {})
-        if isinstance(payload.get("task_state_snapshot"), dict):
-            return
-        payload["task_state_snapshot"] = {
+    ) -> dict[str, Any]:
+        return {
             "status": str(getattr(task, "status", "") or "").strip() or None,
             "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
             "runtime_phase": self._task_runtime_phase(task),
@@ -44,6 +93,18 @@ class TaskOperationServiceMixin:
             "execution_mode": str(getattr(task, "execution_mode", "") or "").strip() or None,
             "target_stage_name": str(getattr(task, "target_stage_name", "") or "").strip() or None,
         }
+
+    def _capture_blocking_operation_task_snapshot(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> None:
+        if not self._operation_uses_task_state_snapshot(operation):
+            return
+        payload = dict(getattr(operation, "request_payload", None) or {})
+        if isinstance(payload.get("task_state_snapshot"), dict):
+            return
+        payload["task_state_snapshot"] = self._blocking_operation_task_snapshot_payload(task)
         operation.request_payload = payload
 
     def _restore_failed_blocking_operation_task_snapshot(
@@ -53,7 +114,7 @@ class TaskOperationServiceMixin:
     ) -> None:
         from app.service import task_manager as task_manager_module
 
-        if not self._operation_blocks_runtime_resume(operation):
+        if not self._operation_uses_task_state_snapshot(operation):
             return
         payload = dict(getattr(operation, "request_payload", None) or {})
         snapshot = dict(payload.get("task_state_snapshot") or {})
@@ -347,9 +408,12 @@ class TaskOperationServiceMixin:
             created_at=task_manager_module._now(),
             updated_at=task_manager_module._now(),
         )
+        payload = dict(request_payload or {})
+        if self._operation_uses_task_state_snapshot(operation) and not isinstance(payload.get("task_state_snapshot"), dict):
+            payload["task_state_snapshot"] = self._blocking_operation_task_snapshot_payload(task)
         self._persist_operation_request_payload(
             operation,
-            dict(request_payload or {}),
+            payload,
             workspace_root=task.workspace_root,
         )
         db.add(operation)
@@ -2082,6 +2146,63 @@ class TaskOperationServiceMixin:
     async def _prepare_delete_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> None:
         from app.service import task_manager as task_manager_module
 
+        def _ensure_force_delete_fallback(
+            *,
+            failure_reason: str,
+            failure_message: str,
+            payload: dict[str, Any] | None = None,
+        ) -> bool:
+            nonlocal force_delete, event_prefix, request_payload
+            if force_delete:
+                return False
+            force_delete = True
+            event_prefix = "task_force_delete"
+            request_payload = {**request_payload, "force": True, "force_delete": True, "auto_force_delete_fallback": True}
+            if operation is not None:
+                merged_request_payload = dict(getattr(operation, "request_payload", None) or {})
+                merged_request_payload.update(
+                    {
+                        "force": True,
+                        "force_delete": True,
+                        "auto_force_delete_fallback": True,
+                        "force_delete_fallback_reason": failure_reason,
+                    }
+                )
+                operation.request_payload = merged_request_payload
+                self._update_operation_result_payload(
+                    operation,
+                    {
+                        "force_delete_fallback": {
+                            "applied": True,
+                            "reason": failure_reason,
+                            "message": failure_message,
+                        }
+                    },
+                    workspace_root=task.workspace_root,
+                )
+            self._record_event(
+                db,
+                task,
+                "task_delete_auto_force_delete_fallback",
+                f"普通删除失败，已自动降级为强制删除: {failure_message}",
+                stage_name=task.current_stage,
+                level="warning",
+                payload={
+                    "failure_reason": failure_reason,
+                    "failure_message": failure_message,
+                    "source_force_delete": False,
+                    "fallback_force_delete": True,
+                    **dict(payload or {}),
+                },
+            )
+            task_manager_module.logger.warning(
+                "binary-security delete fell back to force delete: task_id=%s reason=%s message=%s",
+                task.id,
+                failure_reason,
+                failure_message,
+            )
+            return True
+
         operation = None
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
         if current_operation_id:
@@ -2182,31 +2303,52 @@ class TaskOperationServiceMixin:
 
         quiesced = await self._wait_for_task_workspace_quiesce(db, task)
         if not quiesced:
-            self._clear_task_delete_in_progress(task)
-            self._set_task_status(
-                db,
-                task,
-                task_manager_module.TASK_STATUS_DELETE_FAILED,
-                reason="删除任务前等待后台工作目录写入静默失败",
-                source="task_operation",
-                stage_name=task.current_stage,
-            )
-            task.finished_at = task_manager_module._now()
-            task.last_error = "删除前静默收敛失败"
-            self._record_event(
-                db,
-                task,
-                "task_delete_quiesce_failed",
-                "删除失败，任务目录写入尚未静默收敛",
-                stage_name=task.current_stage,
-                level="error",
-                payload={
-                    "force_delete": force_delete,
-                    "workspace_root": str(task.workspace_root or "").strip() or None,
-                },
-            )
-            db.commit()
-            raise ValidationError("删除失败，任务目录写入尚未静默收敛")
+            if _ensure_force_delete_fallback(
+                failure_reason="workspace_quiesce_failed",
+                failure_message="删除前静默收敛失败",
+                payload={"workspace_root": str(task.workspace_root or "").strip() or None},
+            ):
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_quiesce_failed",
+                    "普通删除等待静默收敛失败，已自动降级为强制删除",
+                    stage_name=task.current_stage,
+                    level="warning",
+                    payload={
+                        "force_delete": False,
+                        "auto_force_delete_fallback": True,
+                        "workspace_root": str(task.workspace_root or "").strip() or None,
+                    },
+                )
+                db.commit()
+                quiesced = True
+            else:
+                self._clear_task_delete_in_progress(task)
+                self._set_task_status(
+                    db,
+                    task,
+                    task_manager_module.TASK_STATUS_DELETE_FAILED,
+                    reason="删除任务前等待后台工作目录写入静默失败",
+                    source="task_operation",
+                    stage_name=task.current_stage,
+                )
+                task.finished_at = task_manager_module._now()
+                task.last_error = "删除前静默收敛失败"
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_quiesce_failed",
+                    "删除失败，任务目录写入尚未静默收敛",
+                    stage_name=task.current_stage,
+                    level="error",
+                    payload={
+                        "force_delete": force_delete,
+                        "workspace_root": str(task.workspace_root or "").strip() or None,
+                    },
+                )
+                db.commit()
+                raise ValidationError("删除失败，任务目录写入尚未静默收敛")
 
         self._record_event(
             db,
@@ -2223,46 +2365,86 @@ class TaskOperationServiceMixin:
 
         cleanup_status = await self._cleanup_task_workspace(task, token=token)
         if cleanup_status != "deleted":
-            self._clear_task_delete_in_progress(task)
-            self._set_task_status(
-                db,
-                task,
-                task_manager_module.TASK_STATUS_DELETE_FAILED,
-                reason="删除任务时任务目录清理失败",
-                source="task_operation",
-                stage_name=task.current_stage,
-            )
-            task.finished_at = task_manager_module._now()
-            task.last_error = "任务目录清理失败"
-            self._record_event(
-                db,
-                task,
-                "task_delete_failed",
-                "删除失败，任务目录清理失败",
-                stage_name=task.current_stage,
-                level="error",
+            if _ensure_force_delete_fallback(
+                failure_reason="workspace_cleanup_failed",
+                failure_message="任务目录清理失败",
                 payload={
-                    "force_delete": force_delete,
                     "workspace_root": str(task.workspace_root or "").strip() or None,
                     "workspace_cleanup_status": cleanup_status,
                 },
-            )
-            if cleanup_status == "recreated_during_delete":
+            ):
                 self._record_event(
                     db,
                     task,
-                    "task_delete_workspace_recreated_during_cleanup",
-                    "删除期间任务目录被并发重建",
+                    "task_delete_failed",
+                    "普通删除任务目录清理失败，已自动降级为强制删除",
                     stage_name=task.current_stage,
                     level="warning",
+                    payload={
+                        "force_delete": False,
+                        "auto_force_delete_fallback": True,
+                        "workspace_root": str(task.workspace_root or "").strip() or None,
+                        "workspace_cleanup_status": cleanup_status,
+                    },
+                )
+                if cleanup_status == "recreated_during_delete":
+                    self._record_event(
+                        db,
+                        task,
+                        "task_delete_workspace_recreated_during_cleanup",
+                        "删除期间任务目录被并发重建，已自动降级为强制删除",
+                        stage_name=task.current_stage,
+                        level="warning",
+                        payload={
+                            "force_delete": False,
+                            "auto_force_delete_fallback": True,
+                            "workspace_root": str(task.workspace_root or "").strip() or None,
+                            "workspace_cleanup_status": cleanup_status,
+                        },
+                    )
+                cleanup_status = f"force_deleted_after_{cleanup_status}"
+                db.commit()
+            else:
+                self._clear_task_delete_in_progress(task)
+                self._set_task_status(
+                    db,
+                    task,
+                    task_manager_module.TASK_STATUS_DELETE_FAILED,
+                    reason="删除任务时任务目录清理失败",
+                    source="task_operation",
+                    stage_name=task.current_stage,
+                )
+                task.finished_at = task_manager_module._now()
+                task.last_error = "任务目录清理失败"
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_failed",
+                    "删除失败，任务目录清理失败",
+                    stage_name=task.current_stage,
+                    level="error",
                     payload={
                         "force_delete": force_delete,
                         "workspace_root": str(task.workspace_root or "").strip() or None,
                         "workspace_cleanup_status": cleanup_status,
                     },
                 )
-            db.commit()
-            raise ValidationError("任务目录清理失败")
+                if cleanup_status == "recreated_during_delete":
+                    self._record_event(
+                        db,
+                        task,
+                        "task_delete_workspace_recreated_during_cleanup",
+                        "删除期间任务目录被并发重建",
+                        stage_name=task.current_stage,
+                        level="warning",
+                        payload={
+                            "force_delete": force_delete,
+                            "workspace_root": str(task.workspace_root or "").strip() or None,
+                            "workspace_cleanup_status": cleanup_status,
+                        },
+                    )
+                db.commit()
+                raise ValidationError("任务目录清理失败")
 
         deleted_downstream_count = sum(
             1
@@ -2287,7 +2469,6 @@ class TaskOperationServiceMixin:
             )
 
         if downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs:
-            self._clear_task_delete_in_progress(task)
             cleanup_error = next(
                 (
                     str(row.get("error") or row.get("deferred_reason") or "").strip()
@@ -2296,27 +2477,48 @@ class TaskOperationServiceMixin:
                 ),
                 None,
             ) or "下游删除未完成"
-            self._set_task_status(
-                db,
-                task,
-                task_manager_module.TASK_STATUS_DELETE_FAILED,
-                reason="删除任务时下游子任务尚未完成删除确认",
-                source="task_operation",
-                stage_name=task.current_stage,
-            )
-            task.finished_at = task_manager_module._now()
-            task.last_error = cleanup_error
-            self._record_event(
-                db,
-                task,
-                "task_delete_failed",
-                "删除失败，下游子任务尚未完成删除确认",
-                stage_name=task.current_stage,
-                level="error",
+            if _ensure_force_delete_fallback(
+                failure_reason="downstream_cleanup_incomplete",
+                failure_message=cleanup_error,
                 payload=cleanup_result,
-            )
-            db.commit()
-            raise ValidationError("删除失败，下游子任务尚未完成删除确认")
+            ):
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_failed",
+                    "普通删除下游清理未完成，已自动降级为强制删除",
+                    stage_name=task.current_stage,
+                    level="warning",
+                    payload={
+                        **cleanup_result,
+                        "force_delete": False,
+                        "auto_force_delete_fallback": True,
+                    },
+                )
+                db.commit()
+            else:
+                self._clear_task_delete_in_progress(task)
+                self._set_task_status(
+                    db,
+                    task,
+                    task_manager_module.TASK_STATUS_DELETE_FAILED,
+                    reason="删除任务时下游子任务尚未完成删除确认",
+                    source="task_operation",
+                    stage_name=task.current_stage,
+                )
+                task.finished_at = task_manager_module._now()
+                task.last_error = cleanup_error
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_failed",
+                    "删除失败，下游子任务尚未完成删除确认",
+                    stage_name=task.current_stage,
+                    level="error",
+                    payload=cleanup_result,
+                )
+                db.commit()
+                raise ValidationError("删除失败，下游子任务尚未完成删除确认")
 
         db.delete(task)
         self._record_event(
@@ -2498,6 +2700,24 @@ class TaskOperationServiceMixin:
                 .first()
             )
             if task is None:
+                orphan_delete_operation = (
+                    db.query(task_manager_module.BinarySecurityTaskOperation)
+                    .filter(
+                        task_manager_module.BinarySecurityTaskOperation.task_id == task_id,
+                        task_manager_module.BinarySecurityTaskOperation.status.in_(
+                            list(task_manager_module.TASK_OPERATION_ACTIVE_STATUSES)
+                        ),
+                    )
+                    .order_by(task_manager_module.BinarySecurityTaskOperation.created_at.desc())
+                    .first()
+                )
+                if self._finalize_delete_operation_after_task_row_removed(
+                    db,
+                    orphan_delete_operation,
+                    task_id=task_id,
+                    log_prefix="binary-security task owner finalized orphan delete operation after task row was already removed",
+                ):
+                    return True
                 return False
             self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             workset = self._task_runtime_workset(task)
@@ -2603,6 +2823,8 @@ class TaskOperationServiceMixin:
 
         session_factory = task_manager_module.get_session_factory()
         db = session_factory()
+        operation_worker_registered = False
+        local_operation_worker = asyncio.current_task()
         started = time.perf_counter()
         operation_type = "unknown"
         task_deleted = False
@@ -2665,6 +2887,20 @@ class TaskOperationServiceMixin:
                 return False
 
             operation_type = operation.operation_type
+            normalized_operation_id = str(getattr(operation, "id", "") or "").strip()
+            async with self._operation_worker_lock:
+                existing_worker = self._operation_workers.get(normalized_operation_id)
+                if existing_worker is not None and existing_worker is not local_operation_worker and not existing_worker.done():
+                    task_manager_module.logger.info(
+                        "binary-security task owner skipped duplicate operation execution because a local worker is already active: "
+                        "task_id=%s operation_id=%s operation_type=%s",
+                        task_id,
+                        normalized_operation_id or None,
+                        str(operation.operation_type or "").strip() or None,
+                    )
+                    return False
+                self._operation_workers[normalized_operation_id] = local_operation_worker
+                operation_worker_registered = True
             should_record_start = str(getattr(operation, "status", "") or "").strip().lower() != "running"
             now_value = task_manager_module._now()
             self._capture_blocking_operation_task_snapshot(task, operation)
@@ -2695,6 +2931,20 @@ class TaskOperationServiceMixin:
             )
 
             await self._run_task_operation_steps(db, task, operation)
+            if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
+                task_deleted = (
+                    db.query(task_manager_module.BinarySecurityTask.id)
+                    .filter(task_manager_module.BinarySecurityTask.id == operation.task_id)
+                    .first()
+                    is None
+                )
+                if self._finalize_delete_operation_after_task_row_removed(
+                    db,
+                    operation,
+                    task_id=task_id,
+                    log_prefix="binary-security task owner finalized delete operation after task row disappeared",
+                ):
+                    return True
             if self._can_finalize_requeue_applied_operation_inline(db, task, operation):
                 finalized_inline = self._finalize_task_operation_after_requeue(
                     db,
@@ -2738,14 +2988,6 @@ class TaskOperationServiceMixin:
                     return True
                 raise
 
-            if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
-                task_deleted = (
-                    db.query(task_manager_module.BinarySecurityTask.id)
-                    .filter(task_manager_module.BinarySecurityTask.id == operation.task_id)
-                    .first()
-                    is None
-                )
-
             operation.status = "succeeded"
             operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
             operation.finished_at = task_manager_module._now()
@@ -2757,6 +2999,48 @@ class TaskOperationServiceMixin:
                 )
                 if refreshed_task is not None and str(getattr(refreshed_task, "current_operation_id", "") or "").strip() == operation.id:
                     refreshed_task.current_operation_id = None
+                if (
+                    refreshed_task is not None
+                    and operation.operation_type in {
+                        task_manager_module.TASK_ACTION_CANCEL,
+                        task_manager_module.TASK_ACTION_DELETE,
+                    }
+                    and (
+                        (
+                            operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                            and str(getattr(refreshed_task, "status", "") or "").strip() != "cancelled"
+                        )
+                        or (
+                            operation.operation_type == task_manager_module.TASK_ACTION_DELETE
+                            and str(getattr(refreshed_task, "status", "") or "").strip().lower() in {"running", "dispatching"}
+                        )
+                        or self._task_runtime_phase(refreshed_task) != task_manager_module.TASK_RUNTIME_PHASE_TERMINAL
+                        or getattr(refreshed_task, "dispatcher_instance_id", None) is not None
+                        or getattr(refreshed_task, "dispatch_started_at", None) is not None
+                        or getattr(refreshed_task, "lease_expires_at", None) is not None
+                    )
+                ):
+                    self._apply_task_main_state_update(
+                        db,
+                        refreshed_task,
+                        source="task_operation",
+                        reason=(
+                            "取消操作完成后统一收敛任务到取消终态"
+                            if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                            else "删除操作完成后统一清理控制面 owner 与 lease"
+                        ),
+                        status=(
+                            "cancelled"
+                            if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                            else str(getattr(refreshed_task, "status", "") or "").strip() or None
+                        ),
+                        stage_name=operation.target_stage or refreshed_task.current_stage,
+                        runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
+                        finished_at=getattr(refreshed_task, "finished_at", None) or task_manager_module._now(),
+                        last_error=None,
+                        clear_runtime_owner=True,
+                    )
+                    self._invalidate_task_execution(refreshed_task)
                 if refreshed_task is not None:
                     if operation.operation_type in self._operation_requeue_family_types():
                         self._record_operation_event(
@@ -2789,7 +3073,14 @@ class TaskOperationServiceMixin:
             )
             task_manager_module.observe_control_operation(operation_type, "succeeded")
             return True
-        except task_manager_module.StaleTaskExecution:
+        except (task_manager_module.StaleTaskExecution, ObjectDeletedError):
+            if "operation" in locals() and self._finalize_delete_operation_after_task_row_removed(
+                db,
+                operation,
+                task_id=task_id,
+                log_prefix="binary-security task owner treated delete operation as succeeded after task row was already removed",
+            ):
+                return True
             task_manager_module.logger.warning(
                 "binary-security task owner stopped operation consumption because task ownership became stale: "
                 "task_id=%s current_operation_id=%s",
@@ -2870,6 +3161,12 @@ class TaskOperationServiceMixin:
             task_manager_module.observe_control_operation(operation_type, "failed")
             return True
         finally:
+            if operation_worker_registered:
+                normalized_operation_id = str(getattr(operation, "id", "") or "").strip() if "operation" in locals() and operation is not None else ""
+                if normalized_operation_id:
+                    existing_worker = self._operation_workers.get(normalized_operation_id)
+                    if existing_worker is local_operation_worker:
+                        self._operation_workers.pop(normalized_operation_id, None)
             task_manager_module.observe_control_operation_duration(
                 operation_type=operation_type,
                 status="finished",
@@ -2880,13 +3177,7 @@ class TaskOperationServiceMixin:
     def _operation_requeue_family_types(self: TaskManager) -> set[str]:
         from app.service import task_manager as task_manager_module
 
-        return {
-            task_manager_module.TASK_ACTION_CONTINUE,
-            task_manager_module.TASK_ACTION_RETRY,
-            task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
-            task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
-            task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
-        }
+        return set(task_manager_module.TASK_OPERATION_REQUEUE_APPLIED_TYPES)
 
     def _operation_stale_threshold_seconds(self: TaskManager) -> int:
         configured = int(getattr(self.cfg.scheduler, "stale_operation_requeue_interval_seconds", 30) or 30)
@@ -2965,6 +3256,8 @@ class TaskOperationServiceMixin:
         self: TaskManager,
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
+        *,
+        db: Session | None = None,
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
@@ -2986,7 +3279,15 @@ class TaskOperationServiceMixin:
             if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
                 return False
         elif task_status != "pending":
-            return False
+            # Requeue-family operations may already have resumed normal owned execution
+            # before the operation row itself is finalized. Treat that takeover window as
+            # "requeue applied" when a live runtime lease proves healthy progress.
+            if task_status not in {"running", "dispatching"}:
+                return False
+            if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                return False
+            if not self._lease_is_active(task, db=db):
+                return False
         if target_stage and str(task.current_stage or "").strip() != target_stage:
             return False
         if task.last_error not in {None, ""}:
@@ -3001,7 +3302,7 @@ class TaskOperationServiceMixin:
     ) -> bool:
         if str(getattr(operation, "operation_type", "") or "").strip() not in self._operation_requeue_family_types():
             return False
-        if not self._operation_requeue_applied(task, operation):
+        if not self._operation_requeue_applied(task, operation, db=db):
             return False
         if str(getattr(task, "current_operation_id", "") or "").strip() != str(getattr(operation, "id", "") or "").strip():
             return False
@@ -3044,7 +3345,7 @@ class TaskOperationServiceMixin:
             return False
         if str(getattr(refreshed_task, "current_operation_id", "") or "").strip() not in {"", operation_id}:
             return False
-        if not self._operation_requeue_applied(refreshed_task, refreshed_operation) and str(getattr(refreshed_operation, "current_step", "") or "").strip() != task_manager_module.TASK_OPERATION_STEP_SUCCEEDED:
+        if not self._operation_requeue_applied(refreshed_task, refreshed_operation, db=db) and str(getattr(refreshed_operation, "current_step", "") or "").strip() != task_manager_module.TASK_OPERATION_STEP_SUCCEEDED:
             return False
         refreshed_operation.status = "succeeded"
         refreshed_operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
@@ -3099,7 +3400,7 @@ class TaskOperationServiceMixin:
         if age_seconds is None or age_seconds < float(self._operation_stale_threshold_seconds()):
             return False
         task_manager_module.observe_control_operation_stale(operation_type, age_seconds=age_seconds)
-        if self._operation_requeue_applied(task, operation):
+        if self._operation_requeue_applied(task, operation, db=db):
             finalized = self._finalize_task_operation_after_requeue(
                 db,
                 task_id=task.id,
@@ -3113,7 +3414,7 @@ class TaskOperationServiceMixin:
                 task_manager_module.observe_control_operation_auto_reconciled(operation_type, "succeeded", age_seconds=age_seconds)
             return finalized
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
-        if current_operation_id in {"", operation.id} and str(getattr(task, "status", "") or "").strip() in {"pending", "dispatching", "running"}:
+        if current_operation_id in {"", operation.id}:
             self._enqueue_task(task.id)
             self._record_operation_event(
                 db,
@@ -3128,6 +3429,7 @@ class TaskOperationServiceMixin:
                     "current_step": operation.current_step,
                     "task_status": str(getattr(task, "status", "") or "").strip(),
                     "runtime_phase": self._task_runtime_phase(task),
+                    "current_operation_bound": bool(current_operation_id == operation.id),
                     "auto_reconciled": True,
                 },
             )
@@ -3401,13 +3703,17 @@ class TaskOperationServiceMixin:
         self: TaskManager,
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
+        *,
+        db: Session | None = None,
     ) -> bool:
-        return self._operation_requeue_applied(task, operation)
+        return self._operation_requeue_applied(task, operation, db=db)
 
     def _can_resume_retry_operation_in_place(
         self: TaskManager,
         task: BinarySecurityTask,
         operation: BinarySecurityTaskOperation,
+        *,
+        db: Session,
     ) -> bool:
         operation_type = str(getattr(operation, "operation_type", "") or "").strip()
         if operation_type not in {
@@ -3419,9 +3725,9 @@ class TaskOperationServiceMixin:
             return False
         if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
             return False
-        if not self._lease_is_active(task, db=None):
+        if not self._lease_is_active(task, db=db):
             return False
-        return self._task_owner_runtime_supported_locally(task, active_operation=operation)
+        return True
 
     def _requeue_task_after_retry_operation(
         self: TaskManager,
@@ -3441,7 +3747,7 @@ class TaskOperationServiceMixin:
             payload={"operation_id": operation.id},
         )
         resume_decision.event_type = "task_requeued"
-        if self._can_resume_retry_operation_in_place(task, operation):
+        if self._can_resume_retry_operation_in_place(task, operation, db=db):
             self._set_task_status(
                 db,
                 task,
@@ -3746,7 +4052,7 @@ class TaskOperationServiceMixin:
                     task_manager_module.BinarySecurityTaskOperation.id == operation.id
                 ).first()
                 if task_refreshed is not None:
-                    task.status = task_refreshed.status
+                    setattr(task, "status", task_refreshed.status)
                     task.current_operation_id = task_refreshed.current_operation_id
                     task.updated_at = task_refreshed.updated_at
                 if operation_refreshed is not None:

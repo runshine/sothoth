@@ -346,7 +346,8 @@ class TaskStateMachineMixin:
             return None
         if self._task_type(task) != TASK_TYPE_SOURCE:
             return None
-        if self._entry_results(task):
+        module_state = self._entry_module_completion_state(task, db)
+        if self._entry_results(task) or not bool(module_state.get("complete")):
             return None
         stage_run = self._ensure_stage_run(db, task, stage_name)
         failure_message = "entry_analysis 未产出 entry_results，无法继续进入 dataflow_vuln_scan"
@@ -521,7 +522,11 @@ class TaskStateMachineMixin:
             if not self._streaming_mode_enabled(task):
                 return False
             gate = self._build_streaming_dataflow_completion_gate(db, task)
-            return bool(gate.get("missing_entry_count") or 0) > 0 or not bool(gate.get("counts_aligned"))
+            return (
+                not bool(gate.get("module_counts_aligned"))
+                or bool(gate.get("missing_entry_count") or 0) > 0
+                or not bool(gate.get("counts_aligned"))
+            )
         if stage_run is not None and self._task_status_is_terminal(self._normalize_stage_terminal_status(stage_run.status)):
             return False
         if (
@@ -1295,6 +1300,9 @@ class TaskStateMachineMixin:
         if normalized_stage == "entry_analysis":
             return not bool(self._entry_analysis_inputs(db, task))
         if normalized_stage == "dataflow_vuln_scan":
+            module_state = self._entry_module_completion_state(task, db)
+            if not bool(module_state.get("complete")):
+                return False
             if self._task_type(task) == TASK_TYPE_SOURCE and not bool(self._effective_entry_inputs(task)):
                 return True
             return not bool(self._entry_results(task))
@@ -1606,6 +1614,15 @@ class TaskStateMachineMixin:
             BinarySecurityStageRun.stage_name == normalized_stage,
         ).first()
         if existing_run is not None:
+            if normalized_stage == "entry_analysis":
+                rebuild_state = self._entry_analysis_authoritative_rebuild_required(
+                    db,
+                    task,
+                    stage_run=existing_run,
+                )
+                self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
+                if rebuild_state.get("required"):
+                    return False
             normalized_status = self._normalize_downstream_status(existing_run.status) or str(existing_run.status or "").strip()
             if normalized_status in {"pending", "queued", "running", "dispatching", "applying"}:
                 return True
@@ -1656,7 +1673,7 @@ class TaskStateMachineMixin:
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None, []
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status in {"pending_upload", "uploading"}:
             return False, "当前任务尚未完成输入准备，不能重试失败项", None, []
         blocked_statuses = {"pending", "dispatching", "running"}
         if task.status in blocked_statuses:
@@ -1707,7 +1724,7 @@ class TaskStateMachineMixin:
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None:
             return False, f"当前任务已有进行中的操作: {active_operation.operation_type}", None
-        if task.status in {"pending_upload", "uploading", "ready_to_start"}:
+        if task.status in {"pending_upload", "uploading"}:
             return False, f"当前任务状态不允许继续: {task.status}", None
         blocked_statuses = {"pending", "dispatching", "running"}
         if task.status in blocked_statuses:
@@ -1826,14 +1843,30 @@ class TaskStateMachineMixin:
             decision.message = f"阶段失败，停止后续推进: {stage_name}"
             decision.level = "error"
             return decision
-        next_stage = self._next_incomplete_stage(db, task)
         if (
-            next_stage is None
-            and normalize_stage_name(stage_name) == "system_analysis"
-            and status == "success"
-            and self._entry_analysis_inputs(db, task)
+            normalize_stage_name(stage_name) == "system_analysis"
+            and status in {"success", "partial_success"}
+            and str(self._module_selection_mode(task) or "").strip() == "auto"
         ):
-            next_stage = "entry_analysis"
+            candidate_modules = list(
+                (summary or {}).get("candidate_modules")
+                or (task.summary or {}).get("candidate_modules")
+                or []
+            )
+            if not candidate_modules:
+                decision.action = "finalize_success"
+                decision.event_type = "task_completed_without_candidate_modules"
+                decision.message = "系统分析已完成且未选出可推进模块，任务直接结束"
+                decision.level = "info"
+                decision.payload = {
+                    "state_event_id": state_event_id,
+                    "completed_stage": stage_name,
+                    "selection_mode": "auto",
+                    "candidate_module_count": 0,
+                    "selected_module_count": 0,
+                }
+                return decision
+        next_stage = self._next_incomplete_stage(db, task)
         if next_stage and not self._should_auto_advance_to_stage(db, task, next_stage):
             blocked_reason = self._continue_stage_input_error(db, task, next_stage)
             decision.action = "advance_blocked"
@@ -2594,7 +2627,11 @@ class TaskStateMachineMixin:
         )
         active_run = next((run for run in stage_runs if run.status in {"running", "dispatching"}), None)
         active_stage_name = active_run.stage_name if active_run and active_run.stage_name else task.current_stage
-        preserve_dispatch = self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status)
+        preserve_dispatch = self._should_preserve_task_dispatch_ownership(
+            task,
+            previous_status=previous_status,
+            db=db,
+        )
         next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
         if not preserve_dispatch:
             task.tail_reconcile_state = "idle"

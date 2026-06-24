@@ -42,7 +42,8 @@ class EntryAnalysisStageHandler(BinarySecurityStageHandler):
         return None
 
     def refresh_summary_from_items(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> None:
-        manager._refresh_stage_run_from_items(db, task, self.stage_name)
+        stage_run = manager._refresh_stage_run_from_items(db, task, self.stage_name)
+        manager._rebuild_entry_results_from_stage_items(db, task, stage_run)
 
     def compact_success_items(
         self,
@@ -59,7 +60,8 @@ class EntryAnalysisStageHandler(BinarySecurityStageHandler):
         ]
 
     def archive_input_signature(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> dict[str, Any]:
-        entry_results = manager._effective_entry_inputs(task)
+        del db
+        entry_results = manager._entry_results(task)
         entries: list[dict[str, Any]] = []
         for row in entry_results:
             if isinstance(row, dict):

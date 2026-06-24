@@ -368,7 +368,7 @@ class TaskArchiveServiceMixin:
             return f"当前任务正在执行 {active_operation.operation_type}，请稍后重试"
         if task.status in {"dispatching", "running"}:
             return f"当前任务正在执行中，当前状态 {task.status} 下不可手工重试归档"
-        if task.status in {"pending_upload", "uploading", "ready_to_start", "pending"}:
+        if task.status in {"pending_upload", "uploading", "pending"}:
             return f"当前任务状态不允许重试归档: {task.status}"
         return None
 

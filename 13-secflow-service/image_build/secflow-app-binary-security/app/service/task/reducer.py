@@ -73,7 +73,7 @@ class TaskReducerServiceMixin:
             **dict(stage_summary.get(stage_name) or {}),
             "status": "running",
             "counts": stage_run.counts,
-            "started_at": stage_run.started_at.isoformat() if stage_run.started_at else None,
+            "started_at": task_shared._isoformat_or_none(stage_run.started_at),
             "finished_at": None,
         }
         task.stage_summary = stage_summary

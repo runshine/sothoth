@@ -14,27 +14,6 @@ if TYPE_CHECKING:
 
 
 class TaskStageRuntimeMixin:
-    def _streaming_dataflow_expected_entry_keys(
-        self: TaskManager,
-        task: BinarySecurityTask,
-    ) -> list[str]:
-        if not self._streaming_mode_enabled(task):
-            return []
-        keys: list[str] = []
-        seen: set[str] = set()
-        for row in list(self._effective_entry_inputs(task) or []):
-            if not isinstance(row, dict):
-                continue
-            for entry in list(row.get("entries") or []):
-                if not isinstance(entry, dict):
-                    continue
-                entry_key = str(entry.get("entry_key") or "").strip()
-                if not entry_key or entry_key in seen:
-                    continue
-                seen.add(entry_key)
-                keys.append(entry_key)
-        return keys
-
     def _streaming_dataflow_materialized_item_keys(
         self: TaskManager,
         db: Session,
@@ -57,30 +36,25 @@ class TaskStageRuntimeMixin:
         db: Session,
         task: BinarySecurityTask,
     ) -> dict[str, object]:
-        entry_run = (
-            db.query(BinarySecurityStageRun)
-            .filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == "entry_analysis",
-            )
-            .first()
-        )
-        entry_status = self._normalize_downstream_status(getattr(entry_run, "status", None)) or str(getattr(entry_run, "status", "") or "").strip()
-        entry_analysis_terminal = self._task_status_is_terminal(entry_status)
-        expected_entry_keys = self._streaming_dataflow_expected_entry_keys(task)
+        module_state = self._entry_module_completion_state(task, db)
         materialized_item_keys = self._streaming_dataflow_materialized_item_keys(db, task)
-        expected_key_set = set(expected_entry_keys)
         materialized_key_set = set(materialized_item_keys)
+        expected_entry_keys = [
+            str(entry.get("entry_key") or "").strip()
+            for entry in list(self._effective_entry_inputs(task) or [])
+            if isinstance(entry, dict) and str(entry.get("entry_key") or "").strip()
+        ]
+        expected_key_set = set(expected_entry_keys)
         missing_entry_keys = [key for key in expected_entry_keys if key not in materialized_key_set]
         counts_aligned = len(expected_key_set) == len(materialized_key_set)
         ready_for_terminal_status = bool(
-            entry_analysis_terminal
+            bool(module_state.get("complete"))
             and counts_aligned
             and not missing_entry_keys
         )
         return {
-            "entry_analysis_status": entry_status or None,
-            "entry_analysis_terminal": entry_analysis_terminal,
+            "entry_analysis_status": None,
+            "entry_analysis_terminal": bool(module_state.get("complete")),
             "expected_entry_keys": expected_entry_keys,
             "expected_entry_count": len(expected_key_set),
             "materialized_item_keys": materialized_item_keys,
@@ -88,6 +62,10 @@ class TaskStageRuntimeMixin:
             "counts_aligned": counts_aligned,
             "missing_entry_keys": missing_entry_keys,
             "missing_entry_count": len(missing_entry_keys),
+            "expected_entry_module_count": int(module_state.get("expected_module_count") or 0),
+            "materialized_entry_module_count": int(module_state.get("materialized_module_count") or 0),
+            "missing_module_keys": list(module_state.get("missing_module_keys") or []),
+            "module_counts_aligned": bool(module_state.get("complete")),
             "ready_for_terminal_status": ready_for_terminal_status,
         }
 
@@ -139,7 +117,13 @@ class TaskStageRuntimeMixin:
     ) -> None:
         self._refresh_stage_run_from_items(db, task, stage_name)
         if stage_name == "entry_analysis":
-            self._rebuild_entry_results_from_stage_items(db, task)
+            stage_run = self._latest_stage_run(db, task.id, stage_name)
+            try:
+                self._rebuild_entry_results_from_stage_items(db, task, stage_run)
+            except TypeError:
+                # Keep older test doubles and monkeypatches working when they still use the
+                # historical 2-arg helper signature.
+                self._rebuild_entry_results_from_stage_items(db, task)
         elif normalize_stage_name(stage_name) == "dataflow_vuln_scan":
             self._rebuild_summary_results_from_stage_items(db, task, "dataflow_vuln_scan", "dataflow_results")
 
@@ -156,10 +140,7 @@ class TaskStageRuntimeMixin:
             self._refresh_streaming_tail_stage_state(db, task, stage_name)
         else:
             self._refresh_stage_run_from_items(db, task, stage_name)
-        return db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == stage_name,
-        ).first()
+        return self._latest_stage_run(db, task.id, stage_name)
 
     def _refresh_stage_from_authoritative_items(
         self: TaskManager,
@@ -222,15 +203,9 @@ class TaskStageRuntimeMixin:
         handler = self._stage_handler(normalized_stage_name)
         if handler is not None and handler.manages_stage_refresh():
             handler.refresh_summary_from_items(self, db, task)
-            return db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == normalized_stage_name,
-            ).first()
+            return self._latest_stage_run(db, task.id, normalized_stage_name)
         self._refresh_stage_run_from_items(db, task, normalized_stage_name)
-        return db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == normalized_stage_name,
-        ).first()
+        return self._latest_stage_run(db, task.id, normalized_stage_name)
 
     def _reconcile_retry_affected_stages_in_session(
         self: TaskManager,
@@ -258,10 +233,7 @@ class TaskStageRuntimeMixin:
     ) -> None:
         from app.service import task_manager as task_manager_module
 
-        stage_run = db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == stage_name,
-        ).first()
+        stage_run = self._latest_stage_run(db, task.id, stage_name)
         if not stage_run:
             return
         items = self._stage_items(db, task.id, stage_name)

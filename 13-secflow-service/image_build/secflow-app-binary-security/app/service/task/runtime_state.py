@@ -50,8 +50,8 @@ class TaskRuntimeStateServiceMixin:
             "from_stage": str(from_stage or "").strip() or None,
             "to_stage": str(to_stage or "").strip() or None,
             "reason": str(reason or "").strip() or None,
-            "created_at": now_value.isoformat(),
-            "expires_at": (now_value + task_manager_module.timedelta(seconds=ttl_seconds)).isoformat(),
+            "created_at": task_shared._isoformat_or_none(now_value),
+            "expires_at": task_shared._isoformat_or_none(now_value + task_manager_module.timedelta(seconds=ttl_seconds)),
         }
         summary = dict(getattr(task, "summary", None) or {})
         summary["runtime_transition_guard"] = guard
@@ -88,13 +88,11 @@ class TaskRuntimeStateServiceMixin:
         if dispatcher_instance_id and dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
         lease = self._runtime_lease_for_task(db, task.id)
-        if lease is not None:
-            if not self._runtime_lease_is_active(lease):
-                return False
-            return str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
-        if dispatcher_instance_id == str(self.instance_id or "").strip():
-            return self._lease_is_active(task, db=db)
-        return False
+        return bool(
+            lease is not None
+            and self._runtime_lease_is_active(lease)
+            and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+        )
 
     def _task_main_state_write_allowed(
         self: TaskManager,
@@ -468,18 +466,25 @@ class TaskRuntimeStateServiceMixin:
     def _lease_is_active(self: TaskManager, task: BinarySecurityTask, db: Session | None = None) -> bool:
         from app.service import task_manager as task_manager_module
 
+        task_id = str(getattr(task, "id", "") or "").strip()
+        if not task_id:
+            return False
         lease: BinarySecurityTaskRuntimeLease | None = None
         if db is not None:
-            lease = self._runtime_lease_for_task(db, task.id)
-        elif getattr(task, "lease_expires_at", None) is None:
+            lease = self._runtime_lease_for_task(db, task_id)
+        else:
             session = task_manager_module.get_session_factory()()
             try:
-                lease = self._runtime_lease_for_task(session, task.id)
+                lease = self._runtime_lease_for_task(session, task_id)
             finally:
                 session.close()
         if lease is not None:
             return self._runtime_lease_is_active(lease)
-        remaining = task_manager_module._seconds_until(task.lease_expires_at)
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        lease_expires_at = getattr(task, "lease_expires_at", None)
+        if not dispatcher_instance_id or lease_expires_at is None:
+            return False
+        remaining = task_shared._seconds_until(lease_expires_at)
         return remaining is not None and remaining > 0
 
     def _next_lease_expiry(
@@ -530,14 +535,7 @@ class TaskRuntimeStateServiceMixin:
                 lease.owner_boot_id,
                 lease.generation,
             )
-        return (
-            str(task.dispatcher_instance_id or "").strip() or None,
-            task.lease_expires_at,
-            "legacy_task_row" if task.lease_expires_at is not None else None,
-            None,
-            None,
-            None,
-        )
+        return (None, None, None, None, None, None)
 
     def _is_terminal_tail_item_with_only_residual_binding(self: TaskManager, item) -> bool:
         normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
@@ -765,6 +763,30 @@ class TaskRuntimeStateServiceMixin:
             return False
         return has_runnable_work or has_authoritative_active_stage
 
+    def _task_has_authoritative_active_stage_context(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str | None = None,
+    ) -> bool:
+        normalized_stage_name = str(stage_name or getattr(task, "current_stage", "") or "").strip()
+        if not normalized_stage_name:
+            return False
+        stage_run = self._latest_stage_run(db, task.id, normalized_stage_name)
+        normalized_stage_status = (
+            self._normalize_downstream_status(getattr(stage_run, "status", None))
+            or str(getattr(stage_run, "status", "") or "").strip().lower()
+        ) if stage_run is not None else ""
+        if normalized_stage_status in {"pending", "queued", "running", "dispatching", "applying"}:
+            return True
+        items = self._stage_items(db, task.id, normalized_stage_name)
+        if any(self._is_active_item_status(getattr(item, "status", None)) for item in items):
+            return True
+        if any(str(getattr(item, "downstream_task_id", "") or "").strip() for item in items):
+            return True
+        return self._stage_has_real_runnable_work(db, task, normalized_stage_name)
+
     def _requeue_owned_execution_takeover(
         self: TaskManager,
         db: Session,
@@ -988,26 +1010,16 @@ class TaskRuntimeStateServiceMixin:
             return False
         if self._running_task_has_valid_runtime_ownership(db, task):
             return False
-        local_runtime_handle_state = self._local_runtime_handle_state(task.id)
-        if (
-            self._task_runtime_owner_matches_current_instance(db, task)
-            or self._has_local_task_execution_owner(task.id)
-            or self._local_runtime_handle_protects_dispatching_reclaim(
-                task.id,
-                dispatch_started_at=getattr(task, "dispatch_started_at", None),
-            )
-        ):
+        if self._task_runtime_owner_matches_current_instance(db, task):
             self._record_event(
                 db,
                 task,
                 "running_without_active_lease_repair_suppressed",
-                "检测到当前实例仍持有本地执行上下文，暂不执行 lease invariant 修复",
+                "检测到当前实例 runtime lease 仍具权威性，暂不执行 lease invariant 修复",
                 level="warning",
                 stage_name=stage_name or str(task.current_stage or "").strip() or None,
                 payload={
                     "reason": reason,
-                    "local_runtime_handle_state": local_runtime_handle_state,
-                    "local_task_execution_owner": self._has_local_task_execution_owner(task.id),
                     "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
                     **(event_payload or {}),
                 },
@@ -1039,7 +1051,7 @@ class TaskRuntimeStateServiceMixin:
         self._apply_task_main_state_update(
             db,
             task,
-            source="runtime_state",
+            source="runtime_reclaim",
             reason="检测到运行中任务缺少有效租约，重置为待执行",
             status="pending",
             stage_name=next_stage_name,
