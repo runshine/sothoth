@@ -505,6 +505,7 @@ class TaskRuntimeServiceMixin:
             if elapsed < interval_seconds:
                 return
         queue = task_manager_module.get_task_queue()
+        pending_positions = await queue.queue_positions(self.cfg.queue.task_queue_key, context="queue_reconcile_snapshot")
         seed_batch_size = max(1, int(getattr(self.cfg.queue, "seed_batch_size", 20) or 20))
         task_rows = (
             db.query(task_manager_module.BinarySecurityTask)
@@ -519,9 +520,92 @@ class TaskRuntimeServiceMixin:
         )
         for task in task_rows:
             current_status = str(getattr(task, "status", "") or "").strip().lower()
-            if current_status != "pending" and self._task_row_owner_is_runtime_supported(db, task):
+            normalized_task_id = str(getattr(task, "id", "") or "").strip()
+            if not normalized_task_id:
                 continue
-            await queue.push_task(str(task.id))
+            if current_status == "pending":
+                queue_state, recoverable_reason = self._task_queue_state(
+                    task,
+                    {"pending_positions": pending_positions},
+                    db=db,
+                )
+                if queue_state == "db_pending_not_enqueued":
+                    task_manager_module.logger.warning(
+                        "binary-security pending task not enqueued detected: task_id=%s task_status=%s queue_state=%s "
+                        "recoverable_reason=%s dispatcher_instance_id=%s lease_expires_at=%s current_operation_id=%s",
+                        normalized_task_id,
+                        current_status,
+                        queue_state,
+                        recoverable_reason,
+                        str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                        task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
+                        str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    )
+                    self._enqueue_state_event(
+                        db,
+                        task_id=task.id,
+                        project_id=task.project_id,
+                        event_type="pending_task_not_enqueued_detected",
+                        idempotency_key=f"pending_task_not_enqueued_detected:{task.id}:{int(now_value.timestamp()) // interval_seconds}",
+                        payload={
+                            "task_status": current_status,
+                            "queue_state": queue_state,
+                            "recoverable_reason": recoverable_reason,
+                            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                            "lease_expires_at": task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
+                            "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                            "enqueue_context": "queue_reconcile",
+                        },
+                        task=task,
+                    )
+                    try:
+                        await queue.force_requeue_task(normalized_task_id, context="queue_reconcile_pending_reenqueue")
+                        self._enqueue_state_event(
+                            db,
+                            task_id=task.id,
+                            project_id=task.project_id,
+                            event_type="pending_task_reenqueued_by_reconcile",
+                            idempotency_key=f"pending_task_reenqueued_by_reconcile:{task.id}:{int(now_value.timestamp()) // interval_seconds}",
+                            payload={
+                                "task_status": current_status,
+                                "queue_state": queue_state,
+                                "recoverable_reason": recoverable_reason,
+                                "enqueue_context": "queue_reconcile",
+                            },
+                            task=task,
+                        )
+                    except Exception as exc:
+                        task_manager_module.logger.exception(
+                            "binary-security pending task reenqueue failed: task_id=%s task_status=%s queue_state=%s "
+                            "error_type=%s error=%s",
+                            normalized_task_id,
+                            current_status,
+                            queue_state,
+                            exc.__class__.__name__,
+                            exc,
+                        )
+                        self._enqueue_state_event(
+                            db,
+                            task_id=task.id,
+                            project_id=task.project_id,
+                            event_type="pending_task_reenqueue_failed",
+                            idempotency_key=f"pending_task_reenqueue_failed:{task.id}:{int(now_value.timestamp()) // interval_seconds}",
+                            payload={
+                                "task_status": current_status,
+                                "queue_state": queue_state,
+                                "recoverable_reason": recoverable_reason,
+                                "error_type": exc.__class__.__name__,
+                                "error": str(exc),
+                                "enqueue_context": "queue_reconcile",
+                            },
+                            task=task,
+                        )
+                    continue
+                await queue.push_task(normalized_task_id)
+                continue
+            if self._task_row_owner_is_runtime_supported(db, task):
+                continue
+            await queue.push_task(normalized_task_id)
         operation_rows = (
             db.query(task_manager_module.BinarySecurityTaskOperation.task_id)
             .filter(task_manager_module.BinarySecurityTaskOperation.status.in_(["pending", "queued", "running", "accepted"]))

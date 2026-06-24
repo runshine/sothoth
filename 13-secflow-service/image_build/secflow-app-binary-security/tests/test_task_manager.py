@@ -1493,6 +1493,18 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertFalse((Path(tmp) / "input" / "task-metadata.json").exists())
 
+    def test_enqueue_task_without_running_loop_uses_asyncio_run(self):
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def push_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
+                pushed.append((task_id, context))
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            self.manager._enqueue_task("task-123")
+
+        self.assertEqual([("task-123", "task_enqueue")], pushed)
+
     def test_deduplicate_entry_keys_handles_long_duplicate_suffixes(self):
         long_signature = (
             "VeryLongNamespace::VeryLongClassName::VeryLongMethodNameWithExtremelyLongSuffix("
@@ -38338,7 +38350,7 @@ def _test_finalize_gate_blocked_active_path_does_not_restore_running_after_autho
         stage_items=[system_item],
     )
     self.assertFalse(decision.allowed)
-    self.assertEqual("active_children_present", decision.reason_code)
+    self.assertEqual("workflow_not_ready_for_finalization", decision.reason_code)
 
     with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
         handled = manager._handle_finalize_gate_blocked_active_path(
@@ -38689,6 +38701,703 @@ def _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_m
     self.assertIsNone(task.finished_at)
     self.assertEqual("running", task.status)
     self.assertEqual("system_analysis", task.current_stage)
+
+
+def _test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-streaming-stage-boundary-1",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "selected_modules": [
+            {
+                "module_key": "m1",
+                "module_name": "module-a",
+                "firmware_key": "source_project",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/module-a",
+                "module_dir": "/src/project/module-a",
+            }
+        ]
+    }
+    system_run = BinarySecurityStageRun(
+        id="sr-stream-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-stream-entry-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-stream-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=system_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-1",
+        result={"modules": [{"module_key": "m1"}], "system_analysis_result": {"available": True}},
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-stream-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_id=system_item.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, entry_run],
+        stage_items=[system_item],
+        archive_jobs=[archive_job],
+        events=[],
+    )
+
+    decision = manager._decide_task_action_after_stage_terminal(
+        db,
+        task,
+        stage_name="system_analysis",
+        status="success",
+        summary={"candidate_modules": [{"module_key": "m1"}]},
+        payload={},
+        state_event_id="se-1",
+    )
+
+    self.assertEqual("requeue_next_stage", decision.action)
+    self.assertEqual("entry_analysis", decision.next_stage)
+
+
+def _test_stage_terminal_after_system_analysis_archive_does_not_activate_dataflow_before_entry_analysis_materializes(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-streaming-stage-boundary-2",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "selected_modules": [
+            {
+                "module_key": "m1",
+                "module_name": "module-a",
+                "firmware_key": "source_project",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/module-a",
+                "module_dir": "/src/project/module-a",
+            }
+        ]
+    }
+    system_run = BinarySecurityStageRun(
+        id="sr-stream2-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-stream2-entry-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-stream2-dataflow-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="pending",
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-stream2-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=system_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-1",
+        result={"modules": [{"module_key": "m1"}], "system_analysis_result": {"available": True}},
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-stream2-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_id=system_item.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, entry_run, dataflow_run],
+        stage_items=[system_item],
+        archive_jobs=[archive_job],
+        events=[],
+    )
+
+    self.assertFalse(manager._should_auto_advance_to_stage(db, task, "dataflow_vuln_scan"))
+
+
+def _test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_streaming(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-streaming-stage-boundary-3",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "selected_modules": [
+            {
+                "module_key": "m1",
+                "module_name": "module-a",
+                "firmware_key": "source_project",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/module-a",
+                "module_dir": "/src/project/module-a",
+            }
+        ],
+        "entry_results": [
+            {
+                "entry_key": "e1",
+                "function_name": "main",
+                "module_key": "m1",
+                "source_file": "a.c",
+                "line_no": 12,
+            }
+        ],
+    }
+    system_run = BinarySecurityStageRun(
+        id="sr-stream3-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-stream3-entry-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="success",
+        finished_at=_now(),
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-stream3-dataflow-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="pending",
+    )
+    entry_item = BinarySecurityStageItem(
+        id="si-stream3-entry-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=entry_run.id,
+        stage_name="entry_analysis",
+        item_key="m1",
+        item_name="module-a",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+        result={
+            "module_key": "m1",
+            "module_name": "module-a",
+            "entry_results": [
+                {
+                    "entry_key": "e1",
+                    "function_name": "main",
+                    "module_key": "m1",
+                    "source_file": "a.c",
+                    "line_no": 12,
+                }
+            ],
+        },
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-stream3-entry-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        item_id=entry_item.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, entry_run, dataflow_run],
+        stage_items=[entry_item],
+        archive_jobs=[archive_job],
+        events=[],
+    )
+
+    self.assertTrue(manager._should_auto_advance_to_stage(db, task, "dataflow_vuln_scan"))
+
+    decision = manager._decide_task_action_after_stage_terminal(
+        db,
+        task,
+        stage_name="entry_analysis",
+        status="success",
+        summary={"entry_results": task.summary["entry_results"]},
+        payload={},
+        state_event_id="se-3",
+    )
+
+    self.assertEqual("activate_streaming_tail", decision.action)
+    self.assertEqual("dataflow_vuln_scan", decision.next_stage)
+
+
+def _test_stage_terminal_after_system_analysis_can_still_activate_streaming_tail_for_non_default_source_profile(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-streaming-stage-boundary-4",
+        project_id="p1",
+        name="source-kg",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="knowledge_graph_entry_fetch",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "pipeline_profile": "kg_source_vuln_scan"}),
+    )
+    kg_run = BinarySecurityStageRun(
+        id="sr-stream4-kg-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="knowledge_graph_entry_fetch",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-stream4-dataflow-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=2,
+        status="pending",
+    )
+    task.summary = {
+        "entry_results": [
+            {
+                "entry_key": "e1",
+                "function_name": "main",
+                "source_file": "a.c",
+                "line_no": 12,
+            }
+        ]
+    }
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[kg_run, dataflow_run],
+        stage_items=[],
+        archive_jobs=[],
+        events=[],
+    )
+
+    decision = manager._decide_task_action_after_stage_terminal(
+        db,
+        task,
+        stage_name="knowledge_graph_entry_fetch",
+        status="success",
+        summary={"entry_results": task.summary["entry_results"]},
+        payload={},
+        state_event_id="se-4",
+    )
+
+    self.assertEqual("activate_streaming_tail", decision.action)
+    self.assertEqual("dataflow_vuln_scan", decision.next_stage)
+
+
+def _test_streaming_tail_stage_names_for_binary_firmware_task_start_from_binary_to_source(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-binary-streaming-tail-1",
+        project_id="p1",
+        name="firmware",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+
+    self.assertEqual(
+        ("binary_to_source", "entry_analysis", "dataflow_vuln_scan"),
+        manager._streaming_tail_stage_names(task),
+    )
+
+
+def _test_streaming_tail_stage_names_for_binary_module_task_cover_full_pipeline(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-binary-streaming-tail-2",
+        project_id="p1",
+        name="module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/mod.so",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+
+    self.assertEqual(
+        ("binary_to_source", "entry_analysis", "dataflow_vuln_scan"),
+        manager._streaming_tail_stage_names(task),
+    )
+
+
+def _test_stage_terminal_after_system_analysis_archive_keeps_binary_to_source_as_current_stage_for_binary_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-binary-stage-boundary-1",
+        project_id="p1",
+        name="firmware",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "selected_modules": [
+            {
+                "module_key": "m1",
+                "module_name": "mod-a",
+                "firmware_key": "fw1",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/mod-a",
+                "module_dir": "/src/project/mod-a",
+            }
+        ]
+    }
+    system_run = BinarySecurityStageRun(
+        id="sr-bin-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="success",
+        finished_at=_now(),
+    )
+    b2s_run = BinarySecurityStageRun(
+        id="sr-bin-b2s-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="binary_to_source",
+        sequence_no=3,
+        status="pending",
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-bin-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=system_run.id,
+        stage_name="system_analysis",
+        item_key="fw1",
+        item_name="firmware-1",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-bin-1",
+        result={"modules": [{"module_key": "m1"}], "system_analysis_result": {"available": True}},
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-bin-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_id=system_item.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, b2s_run],
+        stage_items=[system_item],
+        archive_jobs=[archive_job],
+        events=[],
+    )
+
+    decision = manager._decide_task_action_after_stage_terminal(
+        db,
+        task,
+        stage_name="system_analysis",
+        status="success",
+        summary={"candidate_modules": [{"module_key": "m1"}]},
+        payload={},
+        state_event_id="se-bin-1",
+    )
+
+    self.assertEqual("requeue_next_stage", decision.action)
+    self.assertEqual("binary_to_source", decision.next_stage)
+
+
+def _test_stage_terminal_after_binary_to_source_archive_can_activate_entry_analysis_streaming_for_binary_task(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-binary-stage-boundary-2",
+        project_id="p1",
+        name="firmware",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "b2s_results": [
+            {
+                "module_key": "m1",
+                "module_name": "mod-a",
+                "source_dir": "/src/project/mod-a",
+                "module_dir": "/src/project/mod-a",
+                "source_root": "/src/project",
+                "entry_descriptor_ready": True,
+                "entry_files_list": "/src/project/mod-a/files.list",
+            }
+        ]
+    }
+    fw_run = BinarySecurityStageRun(
+        id="sr-bin2-fw-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    sys_run = BinarySecurityStageRun(
+        id="sr-bin2-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="success",
+        finished_at=_now(),
+    )
+    b2s_run = BinarySecurityStageRun(
+        id="sr-bin2-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="binary_to_source",
+        sequence_no=3,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-bin2-entry-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=4,
+        status="pending",
+    )
+    b2s_item = BinarySecurityStageItem(
+        id="si-bin2-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=b2s_run.id,
+        stage_name="binary_to_source",
+        item_key="m1",
+        item_name="mod-a",
+        status="success",
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s-1",
+        result={
+            "module_key": "m1",
+            "module_name": "mod-a",
+            "source_dir": "/src/project/mod-a",
+            "module_dir": "/src/project/mod-a",
+            "source_root": "/src/project",
+            "entry_descriptor_ready": True,
+            "entry_files_list": "/src/project/mod-a/files.list",
+        },
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-bin2-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="binary_to_source",
+        item_id=b2s_item.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[fw_run, sys_run, b2s_run, entry_run],
+        stage_items=[b2s_item],
+        archive_jobs=[archive_job],
+        events=[],
+    )
+
+    self.assertTrue(manager._should_auto_advance_to_stage(db, task, "entry_analysis"))
+
+    decision = manager._decide_task_action_after_stage_terminal(
+        db,
+        task,
+        stage_name="binary_to_source",
+        status="success",
+        summary={"items": [dict(b2s_item.result or {})]},
+        payload={},
+        state_event_id="se-bin-2",
+    )
+
+    self.assertEqual("activate_streaming_tail", decision.action)
+    self.assertEqual("entry_analysis", decision.next_stage)
+
+
+def _test_binary_module_task_can_activate_entry_analysis_streaming_after_binary_to_source_archive(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-binary-module-stage-boundary-1",
+        project_id="p1",
+        name="module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/mod.so",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "b2s_results": [
+            {
+                "module_key": "m1",
+                "module_name": "mod-a",
+                "source_dir": "/src/project/mod-a",
+                "module_dir": "/src/project/mod-a",
+                "source_root": "/src/project",
+                "entry_descriptor_ready": True,
+                "entry_files_list": "/src/project/mod-a/files.list",
+            }
+        ]
+    }
+    b2s_run = BinarySecurityStageRun(
+        id="sr-bmod-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="binary_to_source",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-bmod-entry-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    b2s_item = BinarySecurityStageItem(
+        id="si-bmod-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=b2s_run.id,
+        stage_name="binary_to_source",
+        item_key="m1",
+        item_name="mod-a",
+        status="success",
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s-mod-1",
+        result={
+            "module_key": "m1",
+            "module_name": "mod-a",
+            "source_dir": "/src/project/mod-a",
+            "module_dir": "/src/project/mod-a",
+            "source_root": "/src/project",
+            "entry_descriptor_ready": True,
+            "entry_files_list": "/src/project/mod-a/files.list",
+        },
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-bmod-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="binary_to_source",
+        item_id=b2s_item.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[b2s_run, entry_run],
+        stage_items=[b2s_item],
+        archive_jobs=[archive_job],
+        events=[],
+    )
+
+    decision = manager._decide_task_action_after_stage_terminal(
+        db,
+        task,
+        stage_name="binary_to_source",
+        status="success",
+        summary={"items": [dict(b2s_item.result or {})]},
+        payload={},
+        state_event_id="se-bmod-1",
+    )
+
+    self.assertEqual("activate_streaming_tail", decision.action)
+    self.assertEqual("entry_analysis", decision.next_stage)
 
 
 def _test_refresh_task_status_after_sync_does_not_terminalize_failed_stage_when_finalize_gate_blocks(self):
@@ -43605,6 +44314,15 @@ TaskManagerTests.test_finalize_gate_blocks_when_active_children_exist = _test_fi
 TaskManagerTests.test_finalize_gate_allows_when_workflow_terminal_and_children_terminal = _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal
 TaskManagerTests.test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure = _test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure
 TaskManagerTests.test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized = _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized
+TaskManagerTests.test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode = _test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode
+TaskManagerTests.test_stage_terminal_after_system_analysis_archive_does_not_activate_dataflow_before_entry_analysis_materializes = _test_stage_terminal_after_system_analysis_archive_does_not_activate_dataflow_before_entry_analysis_materializes
+TaskManagerTests.test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_streaming = _test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_streaming
+TaskManagerTests.test_stage_terminal_after_system_analysis_can_still_activate_streaming_tail_for_non_default_source_profile = _test_stage_terminal_after_system_analysis_can_still_activate_streaming_tail_for_non_default_source_profile
+TaskManagerTests.test_streaming_tail_stage_names_for_binary_firmware_task_start_from_binary_to_source = _test_streaming_tail_stage_names_for_binary_firmware_task_start_from_binary_to_source
+TaskManagerTests.test_streaming_tail_stage_names_for_binary_module_task_cover_full_pipeline = _test_streaming_tail_stage_names_for_binary_module_task_cover_full_pipeline
+TaskManagerTests.test_stage_terminal_after_system_analysis_archive_keeps_binary_to_source_as_current_stage_for_binary_task = _test_stage_terminal_after_system_analysis_archive_keeps_binary_to_source_as_current_stage_for_binary_task
+TaskManagerTests.test_stage_terminal_after_binary_to_source_archive_can_activate_entry_analysis_streaming_for_binary_task = _test_stage_terminal_after_binary_to_source_archive_can_activate_entry_analysis_streaming_for_binary_task
+TaskManagerTests.test_binary_module_task_can_activate_entry_analysis_streaming_after_binary_to_source_archive = _test_binary_module_task_can_activate_entry_analysis_streaming_after_binary_to_source_archive
 TaskManagerTests.test_reducer_activate_tail_reconciliation_defers_to_owner_worker = _test_reducer_activate_tail_reconciliation_defers_to_owner_worker
 TaskManagerTests.test_record_downstream_sync_event_trims_per_item_bucket_to_20 = _test_record_downstream_sync_event_trims_per_item_bucket_to_20
 TaskManagerTests.test_record_downstream_sync_event_trims_each_item_bucket_independently = _test_record_downstream_sync_event_trims_each_item_bucket_independently

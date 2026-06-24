@@ -1312,6 +1312,24 @@ class TaskStateMachineMixin:
         db: Session,
         task: BinarySecurityTask,
     ) -> str | None:
+        if (
+            self._source_entry_analysis_barrier_enabled(task)
+            and self._stage_has_archived_success_progress(db, task, "system_analysis")
+            and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+        ):
+            return "entry_analysis"
+        if (
+            self._binary_system_analysis_binary_to_source_barrier_enabled(task)
+            and self._stage_has_archived_success_progress(db, task, "system_analysis")
+            and not self._stage_has_archived_success_progress(db, task, "binary_to_source")
+        ):
+            return "binary_to_source"
+        if (
+            self._binary_entry_analysis_barrier_enabled(task)
+            and self._stage_has_archived_success_progress(db, task, "binary_to_source")
+            and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+        ):
+            return "entry_analysis"
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
@@ -1658,6 +1676,15 @@ class TaskStateMachineMixin:
         normalized_stage = str(next_stage or "").strip()
         if not normalized_stage:
             return False
+        if (
+            normalized_stage == "dataflow_vuln_scan"
+            and (
+                self._source_entry_analysis_barrier_enabled(task)
+                or self._binary_entry_analysis_barrier_enabled(task)
+            )
+            and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+        ):
+            return False
         existing_items = self._stage_items(db, task.id, normalized_stage)
         if existing_items:
             return True
@@ -1950,6 +1977,24 @@ class TaskStateMachineMixin:
             and next_stage
             and self._streaming_mode_enabled(task)
             and self._is_streaming_tail_stage(task, next_stage)
+            and not (
+                next_stage == "entry_analysis"
+                and stage_name == "system_analysis"
+                and self._source_entry_analysis_barrier_enabled(task)
+            )
+            and not (
+                next_stage == "binary_to_source"
+                and stage_name == "system_analysis"
+                and self._binary_system_analysis_binary_to_source_barrier_enabled(task)
+            )
+            and not (
+                next_stage == "dataflow_vuln_scan"
+                and (
+                    self._source_entry_analysis_barrier_enabled(task)
+                    or self._binary_entry_analysis_barrier_enabled(task)
+                )
+                and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+            )
         ):
             decision.action = "activate_streaming_tail"
             decision.next_stage = next_stage

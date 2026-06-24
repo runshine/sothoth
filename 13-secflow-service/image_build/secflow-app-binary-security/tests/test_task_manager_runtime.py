@@ -142,7 +142,10 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
         with patch("app.service.task_queue.Redis.from_url") as from_url:
             from_url.return_value = object()
-            queue._new_client()
+            async def _exercise():
+                queue._new_client()
+
+            asyncio.run(_exercise())
 
         kwargs = from_url.call_args.kwargs
         self.assertEqual(REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, kwargs["socket_connect_timeout"])
@@ -474,6 +477,85 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.manager = TaskManager()
+
+    async def test_reconcile_work_queues_force_reenqueues_pending_task_missing_from_redis(self):
+        task = BinarySecurityTask(
+            id="task-pending",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        reenqueued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                reenqueued.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                reenqueued.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
+
+        self.assertEqual([("task-pending", "queue_reconcile_pending_reenqueue")], reenqueued)
+        self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.state_events])
+        self.assertIn("pending_task_reenqueued_by_reconcile", [row.event_type for row in db.state_events])
+
+    async def test_reconcile_work_queues_does_not_force_reenqueue_pending_task_already_in_redis(self):
+        task = BinarySecurityTask(
+            id="task-pending",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {task.id: 1}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
+
+        self.assertEqual([("task-pending", None)], pushed)
+        self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.state_events])
 
     def test_reclaim_stale_running_prefers_requeue_when_runnable_work_exists(self):
         task = BinarySecurityTask(

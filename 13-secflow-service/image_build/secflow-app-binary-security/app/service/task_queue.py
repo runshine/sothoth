@@ -25,21 +25,38 @@ DEFAULT_QUEUE_CONTEXT = "unspecified"
 class TaskQueue:
     def __init__(self) -> None:
         self.config = get_config().queue
-        self._client: Redis | None = None
+        self._clients_by_loop_id: dict[int, Redis] = {}
+
+    def _current_loop_id(self) -> int:
+        return id(asyncio.get_running_loop())
+
+    def _forget_client(self, client: Redis, *, loop_id: int | None = None) -> None:
+        if loop_id is not None:
+            current = self._clients_by_loop_id.get(loop_id)
+            if current is client:
+                self._clients_by_loop_id.pop(loop_id, None)
+            return
+        stale_loop_ids = [cached_loop_id for cached_loop_id, cached in self._clients_by_loop_id.items() if cached is client]
+        for cached_loop_id in stale_loop_ids:
+            self._clients_by_loop_id.pop(cached_loop_id, None)
 
     def _new_client(self, *, context: str = DEFAULT_QUEUE_CONTEXT) -> Redis:
-        if self._client is not None:
-            return self._client
+        loop_id = self._current_loop_id()
+        existing = self._clients_by_loop_id.get(loop_id)
+        if existing is not None:
+            return existing
         logger.info(
-            "binary-security task queue creating redis client: context=%s redis_url=%s task_queue_key=%s "
-            "socket_connect_timeout=%s socket_timeout=%s",
+            "binary-security task queue creating redis client: context=%s loop_id=%s redis_url=%s task_queue_key=%s "
+            "socket_connect_timeout=%s socket_timeout=%s active_loop_client_count=%s",
             str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            loop_id,
             str(self.config.redis_url or "").strip() or None,
             str(self.config.task_queue_key or "").strip() or None,
             REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
             REDIS_SOCKET_TIMEOUT_SECONDS,
+            len(self._clients_by_loop_id),
         )
-        self._client = Redis.from_url(
+        client = Redis.from_url(
             self.config.redis_url,
             decode_responses=True,
             socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
@@ -47,7 +64,8 @@ class TaskQueue:
             health_check_interval=30,
             socket_keepalive=True,
         )
-        return self._client
+        self._clients_by_loop_id[loop_id] = client
+        return client
 
     async def ping(self, *, context: str = "startup_warmup") -> None:
         client = self._new_client(context=context)
@@ -170,13 +188,17 @@ class TaskQueue:
         return await self._consume_result(client, self.config.task_queue_key, result)
 
     async def _close_client(self, client: Redis) -> None:
+        loop_id = None
+        try:
+            loop_id = self._current_loop_id()
+        except RuntimeError:
+            loop_id = None
         try:
             await client.aclose()
         except Exception:
             logger.debug("failed closing redis client", exc_info=True)
         finally:
-            if self._client is not None and self._client is client:
-                self._client = None
+            self._forget_client(client, loop_id=loop_id)
 
     async def _push_unique(self, client: Redis, queue_key: str, task_id: str) -> None:
         value = str(task_id or "").strip()
@@ -259,6 +281,19 @@ class TaskQueue:
             "oldest_age_seconds": oldest_age_seconds,
         }
 
+    async def queue_positions(self, queue_key: str, *, context: str = "queue_snapshot") -> dict[str, int]:
+        client = self._new_client(context=context)
+        try:
+            task_ids = [str(value or "").strip() for value in list(await client.lrange(queue_key, 0, -1) or [])]
+        except (RedisTimeoutError, RedisConnectionError, OSError):
+            await self._close_client(client)
+            return {}
+        positions: dict[str, int] = {}
+        for index, task_id in enumerate(task_ids, start=1):
+            if task_id and task_id not in positions:
+                positions[task_id] = index
+        return positions
+
     async def snapshot(self) -> dict[str, dict[str, float | int]]:
         task_queue = await self.queue_stats(self.config.task_queue_key, context="queue_snapshot")
         return {
@@ -331,10 +366,13 @@ class TaskQueue:
             }
 
     async def close(self) -> None:
-        client = self._client
-        self._client = None
-        if client is not None:
-            await self._close_client(client)
+        clients = list(dict.fromkeys(self._clients_by_loop_id.values()))
+        self._clients_by_loop_id.clear()
+        for client in clients:
+            try:
+                await client.aclose()
+            except Exception:
+                logger.debug("failed closing redis client", exc_info=True)
 
     def _task_sync_queue_base(self, task_id: str) -> str:
         prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"

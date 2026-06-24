@@ -2025,10 +2025,20 @@ class TaskManager(
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            logger.info(
+                "binary-security enqueue without running loop started: task_id=%s context=%s",
+                normalized_task_id,
+                "task_enqueue",
+            )
             try:
                 asyncio.run(get_task_queue().push_task(normalized_task_id, context="task_enqueue"))
             except Exception:
-                logger.warning("failed to enqueue task without running loop", extra={"task_id": normalized_task_id}, exc_info=True)
+                logger.warning(
+                    "binary-security enqueue without running loop failed: task_id=%s context=%s",
+                    normalized_task_id,
+                    "task_enqueue",
+                    exc_info=True,
+                )
             return
         async def _push() -> None:
             try:
@@ -2751,6 +2761,21 @@ class TaskManager(
         else:
             profile = PIPELINE_PROFILE_DEFAULT
         return list(TASK_PIPELINE_PROFILE_SEQUENCES.get((task_type, profile), TASK_STAGE_SEQUENCES[task_type]))
+
+    def _source_entry_analysis_barrier_enabled(self, task: BinarySecurityTask | dict[str, Any] | None) -> bool:
+        return self._task_type(task) == TASK_TYPE_SOURCE and self._pipeline_profile(task) == PIPELINE_PROFILE_DEFAULT
+
+    def _binary_system_analysis_binary_to_source_barrier_enabled(
+        self,
+        task: BinarySecurityTask | dict[str, Any] | None,
+    ) -> bool:
+        return self._task_type(task) == TASK_TYPE_BINARY
+
+    def _binary_entry_analysis_barrier_enabled(
+        self,
+        task: BinarySecurityTask | dict[str, Any] | None,
+    ) -> bool:
+        return self._task_type(task) in {TASK_TYPE_BINARY, TASK_TYPE_BINARY_MODULE}
 
     def _stage_handler(self, stage_name: str | None):
         return self._stage_registry.get(stage_name)
@@ -4210,10 +4235,16 @@ class TaskManager(
         return self._pipeline_mode(task) == PIPELINE_MODE_MIXED_STREAMING
 
     def _streaming_tail_stage_names(self, task: BinarySecurityTask) -> tuple[str, ...]:
+        stage_sequence = self._stage_sequence_for_task(task)
+        task_type = self._task_type(task)
+        if task_type in {TASK_TYPE_BINARY, TASK_TYPE_BINARY_MODULE}:
+            candidate_tail_stages = ("binary_to_source", "entry_analysis", "dataflow_vuln_scan")
+        else:
+            candidate_tail_stages = STREAMING_TAIL_STAGES
         return tuple(
             stage_name
-            for stage_name in STREAMING_TAIL_STAGES
-            if stage_name in self._stage_sequence_for_task(task) and self._stage_enabled(task, stage_name)
+            for stage_name in candidate_tail_stages
+            if stage_name in stage_sequence and self._stage_enabled(task, stage_name)
         )
 
     def _is_streaming_tail_stage(self, task: BinarySecurityTask, stage_name: str | None) -> bool:

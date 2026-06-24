@@ -38,6 +38,12 @@ class _FakeRedis:
     async def llen(self, key):
         return len(self.lists.get(key) or [])
 
+    async def lrange(self, key, start, stop):
+        values = list(self.lists.get(key) or [])
+        if stop == -1:
+            stop = len(values) - 1
+        return values[start : stop + 1]
+
     async def zrange(self, key, start, stop, withscores=False):
         del start, stop
         bucket = self.sorted_sets.get(key) or {}
@@ -130,14 +136,21 @@ class _FakeRedisPingFlaky(_FakeRedis):
         return True
 
 
+async def _bind_client_for_current_loop(queue: TaskQueue, client) -> None:
+    queue._clients_by_loop_id[id(asyncio.get_running_loop())] = client
+
+
 class TaskQueueTests(unittest.TestCase):
     def test_push_task_dedupes_same_task_id(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
 
-        asyncio.run(queue.push_task("task-1"))
-        asyncio.run(queue.push_task("task-1"))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            await queue.push_task("task-1")
+            await queue.push_task("task-1")
+
+        asyncio.run(_exercise())
 
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
         self.assertEqual({"task-1"}, fake.sets[f"{queue.config.task_queue_key}:dedupe"])
@@ -145,10 +158,13 @@ class TaskQueueTests(unittest.TestCase):
     def test_force_requeue_restores_orphaned_task(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
         fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
 
-        asyncio.run(queue.force_requeue_task("task-1"))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            await queue.force_requeue_task("task-1")
+
+        asyncio.run(_exercise())
 
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
         self.assertEqual({"task-1"}, fake.sets[f"{queue.config.task_queue_key}:dedupe"])
@@ -156,10 +172,13 @@ class TaskQueueTests(unittest.TestCase):
     def test_dedupe_orphans_reports_set_without_list(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
         fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
 
-        snapshot = asyncio.run(queue.dedupe_orphans(queue.config.task_queue_key))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.dedupe_orphans(queue.config.task_queue_key)
+
+        snapshot = asyncio.run(_exercise())
 
         self.assertEqual(1, snapshot["orphan_count"])
         self.assertEqual(["task-1"], snapshot["orphan_ids"])
@@ -167,11 +186,14 @@ class TaskQueueTests(unittest.TestCase):
     def test_dedupe_orphans_restores_missing_timestamp_for_live_entry(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
         fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
         fake.lists[queue.config.task_queue_key] = ["task-1"]
 
-        snapshot = asyncio.run(queue.dedupe_orphans(queue.config.task_queue_key))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.dedupe_orphans(queue.config.task_queue_key)
+
+        snapshot = asyncio.run(_exercise())
 
         self.assertEqual(0, snapshot["orphan_count"])
         self.assertEqual(1, snapshot["missing_timestamp_count"])
@@ -181,11 +203,14 @@ class TaskQueueTests(unittest.TestCase):
     def test_cleanup_dedupe_orphans_removes_orphan_members(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
         fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
         fake.sorted_sets[f"{queue.config.task_queue_key}:enqueued_at"] = {"task-1": 1.0}
 
-        snapshot = asyncio.run(queue.cleanup_dedupe_orphans(queue.config.task_queue_key))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.cleanup_dedupe_orphans(queue.config.task_queue_key)
+
+        snapshot = asyncio.run(_exercise())
 
         self.assertEqual(1, snapshot["removed_orphan_count"])
         self.assertEqual(["task-1"], snapshot["removed_orphan_ids"])
@@ -195,76 +220,93 @@ class TaskQueueTests(unittest.TestCase):
     def test_pop_task_removes_dedupe_marker(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
 
-        asyncio.run(queue.push_task("task-1"))
-        popped = asyncio.run(queue.pop_task(timeout_seconds=1))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            await queue.push_task("task-1")
+            return await queue.pop_task(timeout_seconds=1)
+
+        popped = asyncio.run(_exercise())
 
         self.assertEqual("task-1", popped)
         self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
-        self.assertIs(fake, queue._client)
+        self.assertEqual(1, len(queue._clients_by_loop_id))
 
     def test_pop_task_treats_redis_timeout_as_empty_poll(self):
         queue = TaskQueue()
         fake = _FakeRedisTimeout()
-        queue._client = fake
 
-        popped = asyncio.run(queue.pop_task(timeout_seconds=1))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.pop_task(timeout_seconds=1)
+
+        popped = asyncio.run(_exercise())
 
         self.assertIsNone(popped)
         self.assertTrue(fake.closed)
-        self.assertIsNone(queue._client)
+        self.assertEqual({}, queue._clients_by_loop_id)
 
     def test_queue_stats_returns_empty_snapshot_after_connection_error(self):
         queue = TaskQueue()
         fake = _FakeRedisStatsConnectionError()
-        queue._client = fake
 
-        stats = asyncio.run(queue.queue_stats(queue.config.task_queue_key))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.queue_stats(queue.config.task_queue_key)
+
+        stats = asyncio.run(_exercise())
 
         self.assertEqual({"length": 0, "oldest_age_seconds": 0.0}, stats)
         self.assertTrue(fake.closed)
-        self.assertIsNone(queue._client)
+        self.assertEqual({}, queue._clients_by_loop_id)
 
     def test_snapshot_marks_operation_queue_disabled_under_owner_only_runtime(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
         fake.lists[queue.config.task_queue_key] = ["task-1"]
 
-        snapshot = asyncio.run(queue.snapshot())
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.snapshot()
+
+        snapshot = asyncio.run(_exercise())
 
         self.assertEqual(1, snapshot["task_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["enabled"])
-        self.assertIs(fake, queue._client)
+        self.assertEqual(1, len(queue._clients_by_loop_id))
 
     def test_wait_until_ready_succeeds_after_ping(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
 
-        asyncio.run(queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            await queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1)
+
+        asyncio.run(_exercise())
 
         self.assertEqual(1, fake.ping_calls)
 
     def test_wait_until_ready_retries_until_ping_succeeds(self):
         queue = TaskQueue()
         fake = _FakeRedisPingFlaky(failures_before_success=2)
-        queue._client = fake
 
         async def _no_sleep(_seconds):
             return None
 
         with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
-            asyncio.run(queue.wait_until_ready(timeout_seconds=3, retry_interval_seconds=1))
+            async def _exercise():
+                await _bind_client_for_current_loop(queue, fake)
+                await queue.wait_until_ready(timeout_seconds=3, retry_interval_seconds=1)
+
+            asyncio.run(_exercise())
 
         self.assertEqual(3, fake.ping_calls)
 
     def test_wait_until_ready_times_out_when_ping_never_recovers(self):
         queue = TaskQueue()
         fake = _FakeRedisPingFlaky(failures_before_success=99)
-        queue._client = fake
 
         async def _no_sleep(_seconds):
             return None
@@ -276,44 +318,89 @@ class TaskQueueTests(unittest.TestCase):
             side_effect=lambda: next(monotonic_values),
         ):
             with self.assertRaises(TimeoutError):
-                asyncio.run(queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1))
+                async def _exercise():
+                    await _bind_client_for_current_loop(queue, fake)
+                    await queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1)
 
-    def test_new_client_is_cached_after_first_creation(self):
+                asyncio.run(_exercise())
+
+    def test_new_client_is_cached_within_same_loop(self):
         queue = TaskQueue()
 
         with mock.patch("app.service.task_queue.Redis.from_url") as from_url:
             fake_client = object()
             from_url.return_value = fake_client
 
-            first = queue._new_client(context="startup_warmup")
-            second = queue._new_client(context="startup_seed")
+            async def _exercise():
+                first = queue._new_client(context="startup_warmup")
+                second = queue._new_client(context="startup_seed")
+                return first, second
+
+            first, second = asyncio.run(_exercise())
 
         self.assertIs(fake_client, first)
         self.assertIs(fake_client, second)
-        self.assertIs(fake_client, queue._client)
+        self.assertEqual(1, len(queue._clients_by_loop_id))
         from_url.assert_called_once()
+
+    def test_new_client_is_isolated_per_event_loop(self):
+        queue = TaskQueue()
+
+        with mock.patch("app.service.task_queue.Redis.from_url") as from_url:
+            fake_first = object()
+            fake_second = object()
+            from_url.side_effect = [fake_first, fake_second]
+
+            async def _create():
+                return queue._new_client(context="startup_seed")
+
+            first = asyncio.run(_create())
+            second = asyncio.run(_create())
+
+        self.assertIs(fake_first, first)
+        self.assertIs(fake_second, second)
+        self.assertEqual(2, from_url.call_count)
 
     def test_push_task_keeps_cached_client_alive(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
 
-        asyncio.run(queue.push_task("task-1", context="startup_seed"))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            await queue.push_task("task-1", context="startup_seed")
 
-        self.assertIs(fake, queue._client)
+        asyncio.run(_exercise())
+
+        self.assertEqual(1, len(queue._clients_by_loop_id))
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
+
+    def test_queue_positions_returns_current_queue_membership(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+        fake.lists[queue.config.task_queue_key] = ["task-1", "task-2", "task-1"]
+
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.queue_positions(queue.config.task_queue_key)
+
+        positions = asyncio.run(_exercise())
+
+        self.assertEqual({"task-1": 1, "task-2": 2}, positions)
 
     def test_dedupe_orphans_keeps_cached_client_alive_on_success(self):
         queue = TaskQueue()
         fake = _FakeRedis()
-        queue._client = fake
         fake.sets[f"{queue.config.task_queue_key}:dedupe"] = {"task-1"}
         fake.lists[queue.config.task_queue_key] = ["task-1"]
 
-        snapshot = asyncio.run(queue.dedupe_orphans(queue.config.task_queue_key))
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            return await queue.dedupe_orphans(queue.config.task_queue_key)
+
+        snapshot = asyncio.run(_exercise())
 
         self.assertEqual(0, snapshot["orphan_count"])
-        self.assertIs(fake, queue._client)
+        self.assertEqual(1, len(queue._clients_by_loop_id))
 
 
 if __name__ == "__main__":
