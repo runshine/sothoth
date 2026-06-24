@@ -1322,7 +1322,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
@@ -1414,7 +1414,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 

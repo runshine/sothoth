@@ -467,52 +467,56 @@ class TaskArchiveServiceMixin:
         preserve_active_state: bool = False,
     ) -> None:
         next_status = "running" if preserve_active_state else "pending"
-        self._set_task_status(
+        self._apply_task_status_only_update(
             db,
             task,
-            next_status,
+            status=next_status,
             reason="归档重试后重新排队" if not preserve_active_state else "归档重试后保持当前阶段活跃执行",
             source="archive_worker",
             stage_name=stage_name,
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            finished_at=None,
+            last_error=None,
+            clear_runtime_owner=not preserve_active_state,
         )
-        task.current_stage = stage_name
         task.execution_mode = None
         task.target_stage_name = None
-        task.last_error = None
         self._clear_task_abnormal_reason_snapshot(db, task)
-        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         task.tail_reconcile_state = "idle"
-        clear_decision = self._can_reopen_parent_task_after_lease_loss(
-            db,
-            task,
-            reason="archive_retry_requeue",
-        )
-        if clear_decision.allowed:
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            self._record_parent_runtime_lease_decision(
+        clear_owner_for_requeue = not preserve_active_state
+        clear_decision = None
+        if not clear_owner_for_requeue:
+            clear_decision = self._can_reopen_parent_task_after_lease_loss(
                 db,
                 task,
-                event_type="parent_runtime_reopen_allowed_after_lease_expiry",
-                message="父任务租约已过期，允许归档重试后重新排队",
-                decision=clear_decision,
                 reason="archive_retry_requeue",
-                stage_name=stage_name,
-                level="warning",
             )
-        else:
-            self._record_parent_runtime_lease_decision(
-                db,
-                task,
-                event_type="retry_takeover_suppressed_active_lease",
-                message="父任务租约仍有效，当前不允许归档重试时清理租约",
-                decision=clear_decision,
-                reason="archive_retry_requeue",
-                stage_name=stage_name,
-            )
+            if clear_decision.allowed:
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                self._record_parent_runtime_lease_decision(
+                    db,
+                    task,
+                    event_type="parent_runtime_reopen_allowed_after_lease_expiry",
+                    message="父任务租约已过期，允许归档重试后重新排队",
+                    decision=clear_decision,
+                    reason="archive_retry_requeue",
+                    stage_name=stage_name,
+                    level="warning",
+                )
+            else:
+                self._record_parent_runtime_lease_decision(
+                    db,
+                    task,
+                    event_type="retry_takeover_suppressed_active_lease",
+                    message="父任务租约仍有效，当前不允许归档重试时清理租约",
+                    decision=clear_decision,
+                    reason="archive_retry_requeue",
+                    stage_name=stage_name,
+                )
         task.finished_at = None
-        if clear_decision.allowed:
+        if clear_owner_for_requeue or bool(clear_decision and clear_decision.allowed):
             self._clear_runtime_lease(db, task.id)
             self._release_tail_reconcile_owner(task.id)
             self._enqueue_task(task.id)

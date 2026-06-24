@@ -2129,12 +2129,12 @@ class TaskOperationServiceMixin:
             Path(task.workspace_root) / "input" / "task-metadata.json",
             status=task_manager_module.TASK_STATUS_CANCELLING,
         )
-        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
         for item in running_items:
             if str(item.downstream_task_id or "").strip():
                 await self._cancel_downstream(item, token)
         if downstream_refs:
             await self._cancel_downstream_refs(db, task, downstream_refs, token)
+        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
         return sorted(
             {
                 str(stage_run.stage_name or "").strip()
@@ -2229,7 +2229,6 @@ class TaskOperationServiceMixin:
             len(downstream_refs),
             force_delete,
         )
-        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
         if downstream_refs:
             with suppress(Exception):
                 task_manager_module.logger.info(
@@ -2256,6 +2255,7 @@ class TaskOperationServiceMixin:
                 task.id,
                 len(list(getattr(self, "_last_downstream_cleanup_results", []) or [])),
             )
+        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
 
         downstream_cleanup_results = [
             dict(result)
@@ -2720,6 +2720,41 @@ class TaskOperationServiceMixin:
                     return True
                 return False
             self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
+            handle = self._runtime_handle(task_id)
+            if (
+                handle is not None
+                and bool(getattr(handle, "control_wakeup_requested", False))
+                and str(getattr(task, "current_operation_id", "") or "").strip()
+            ):
+                operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
+                operation_type = str(getattr(handle, "pending_operation_type", "") or "").strip() or None
+                self._clear_local_worker_control_wakeup(task_id)
+                db.commit()
+                changed = await self._run_current_task_operation(task_id)
+                followup_db = session_factory()
+                try:
+                    followup_task = (
+                        followup_db.query(task_manager_module.BinarySecurityTask)
+                        .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                        .first()
+                    )
+                    if followup_task is not None:
+                        self._record_event(
+                            followup_db,
+                            followup_task,
+                            "local_owner_control_wakeup_requested",
+                            "当前 owner 已收到控制唤醒并开始消费控制操作",
+                            stage_name=followup_task.current_stage,
+                            payload={
+                                "operation_id": operation_id,
+                                "operation_type": operation_type,
+                                "dispatcher_instance_id": str(getattr(followup_task, "dispatcher_instance_id", "") or "").strip() or None,
+                            },
+                        )
+                        followup_db.commit()
+                finally:
+                    followup_db.close()
+                return changed or True
             workset = self._task_runtime_workset(task)
             if not workset:
                 return False
@@ -3734,7 +3769,7 @@ class TaskOperationServiceMixin:
         )
         requeue_applied = False
         if self._is_retry_like_operation_type(getattr(operation, "operation_type", None)):
-            requeue_applied = self._apply_owner_release_and_requeue_after_retry_operation(
+            requeue_applied = self._apply_retry_like_in_place_resume(
                 db,
                 task,
                 target_stage=operation.target_stage or task.current_stage,
@@ -3800,8 +3835,108 @@ class TaskOperationServiceMixin:
         *,
         db: Session,
     ) -> bool:
-        del task, operation, db
-        return False
+        del task, db
+        return self._is_retry_like_operation_type(getattr(operation, "operation_type", None))
+
+    def _apply_retry_like_in_place_resume(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        target_stage: str | None,
+        operation: BinarySecurityTaskOperation,
+        resume_decision,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        resolved_stage = str(
+            getattr(resume_decision, "next_stage", None)
+            or target_stage
+            or task.current_stage
+            or ""
+        ).strip() or None
+        if not bool(getattr(resume_decision, "should_resume", False)) or not resolved_stage:
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_in_place_resume_blocked",
+                f"重试类控制操作清空完成，但当前不满足原地恢复条件: {operation.operation_type}",
+                level="error",
+                stage_name=target_stage or task.current_stage,
+                payload={
+                    "operation_id": operation.id,
+                    "target_stage": target_stage or task.current_stage,
+                    "in_place_runtime_resume": False,
+                    "owner_release_and_requeue": False,
+                },
+            )
+            operation.status = "failed"
+            operation.current_step = task_manager_module.TASK_OPERATION_STEP_FAILED
+            operation.finished_at = task_manager_module._now()
+            operation.updated_at = operation.finished_at
+            operation.error_code = "retry_in_place_resume_blocked"
+            operation.error_message = "后台操作完成，但当前仍不满足原地恢复条件"
+            return False
+
+        self._apply_task_main_state_update(
+            db,
+            task,
+            source="task_operation",
+            reason="重试类控制操作完成，当前 owner 原地恢复执行",
+            status="running",
+            stage_name=resolved_stage,
+            runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            finished_at=None,
+            last_error=None,
+            clear_runtime_owner=False,
+        )
+        task.current_stage = resolved_stage
+        task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
+        self._clear_task_abnormal_reason_snapshot(db, task)
+        self._update_operation_result_payload(
+            operation,
+            {},
+            workspace_root=task.workspace_root,
+        )
+        self._mark_operation_requeue_applied(
+            db,
+            task,
+            operation,
+            target_stage=resolved_stage,
+            in_place_runtime_resume=True,
+            extra_payload={
+                "task_status_before": "retry_operation_succeeded",
+                "resume_reason": getattr(resume_decision, "resume_reason", None),
+                "source": getattr(resume_decision, "source", None),
+                "owner_release_and_requeue": False,
+            },
+            record_event=True,
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "retry_in_place_resume_applied",
+            f"重试类控制操作完成，当前 owner 已原地恢复执行: {operation.operation_type}",
+            stage_name=resolved_stage or operation.target_stage,
+            payload={
+                "operation_id": operation.id,
+                "next_stage": resolved_stage,
+                "resume_reason": getattr(resume_decision, "resume_reason", None),
+                "source": getattr(resume_decision, "source", None),
+                "owner_release_and_requeue": False,
+                "in_place_runtime_resume": True,
+            },
+        )
+        handle = self._runtime_handle(task.id)
+        if handle is not None:
+            handle.control_wakeup_requested = True
+            handle.control_wakeup_reason = str(getattr(operation, "operation_type", "") or "").strip() or None
+            handle.pending_operation_id = str(getattr(operation, "id", "") or "").strip() or None
+            handle.pending_operation_type = str(getattr(operation, "operation_type", "") or "").strip() or None
+            handle.last_wakeup_at = task_manager_module._now()
+        return True
 
     def _apply_owner_release_and_requeue_after_retry_operation(
         self: TaskManager,
@@ -4015,7 +4150,7 @@ class TaskOperationServiceMixin:
         )
         resume_decision.event_type = "task_requeued"
         if self._is_retry_like_operation_type(getattr(operation, "operation_type", None)):
-            self._apply_owner_release_and_requeue_after_retry_operation(
+            self._apply_retry_like_in_place_resume(
                 db,
                 task,
                 target_stage=target_stage,

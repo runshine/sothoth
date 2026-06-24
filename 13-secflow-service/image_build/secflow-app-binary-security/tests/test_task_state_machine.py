@@ -182,7 +182,7 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-        self.assertEqual(2, record_event.call_count)
+        self.assertEqual(3, record_event.call_count)
         enqueue_task.assert_called_once_with(task.id)
 
     def test_decide_owned_execution_requeue_uses_authoritative_active_stage(self):
@@ -457,7 +457,7 @@ class TaskStateMachineTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        record_event.assert_called_once()
+        self.assertEqual(2, record_event.call_count)
 
     def test_finalize_task_marks_terminal_success(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="dataflow_vuln_scan", workspace_root="/tmp/ws", output_root="/tmp/out")
@@ -478,7 +478,7 @@ class TaskStateMachineTests(unittest.TestCase):
 
         self.assertIn(task.status, {"success", "partial_success"})
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
-        self.assertEqual(2, record_event.call_count)
+        self.assertEqual(3, record_event.call_count)
 
     def test_refresh_task_status_after_sync_active_operation_returns_early(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="failed", workspace_root="/tmp/ws", output_root="/tmp/out")

@@ -524,6 +524,43 @@ class TaskRuntimeStateServiceMixin:
         )
         return True
 
+    def _apply_task_status_only_update(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        status: str,
+        reason: str,
+        source: str,
+        stage_name: str | None = None,
+        runtime_phase: str | None = None,
+        finished_at: Any = _MAIN_STATE_UNSET,
+        last_error: Any = _MAIN_STATE_UNSET,
+        clear_runtime_owner: bool = False,
+        status_event_type: str = "task_status_changed",
+        status_message: str | None = None,
+        status_level: str = "info",
+        status_payload: dict[str, Any] | None = None,
+        record_blocked_event: bool = True,
+    ) -> bool:
+        return self._apply_task_main_state_update(
+            db,
+            task,
+            source=source,
+            reason=reason,
+            status=status,
+            stage_name=stage_name,
+            runtime_phase=runtime_phase,
+            finished_at=finished_at,
+            last_error=last_error,
+            clear_runtime_owner=clear_runtime_owner,
+            status_event_type=status_event_type,
+            status_message=status_message,
+            status_level=status_level,
+            status_payload=status_payload,
+            record_blocked_event=record_blocked_event,
+        )
+
     def _record_main_state_write_blocked(
         self: TaskManager,
         db: Session,

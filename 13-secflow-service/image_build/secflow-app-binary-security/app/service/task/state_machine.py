@@ -1751,14 +1751,12 @@ class TaskStateMachineMixin:
             ).first()
             blocked_by_task_status = bool(task.status in task_manager_module.STAGE_RETRY_BLOCKED_TASK_STATUSES)
             blocked_by_stage_status = bool(stage_run and stage_run.status not in task_manager_module.STAGE_RETRY_ALLOWED_STATUSES)
-            if not blocked_by_task_status and not blocked_by_stage_status:
+            blocked_by_full_retry_upstream_only = "不能完全重试当前阶段" in str(reason or "")
+            if not blocked_by_task_status and not blocked_by_stage_status and not blocked_by_full_retry_upstream_only:
                 return False, reason, []
         upstream_retried, upstream_stage = self._upstream_stage_retried(db, task, stage_name)
         if upstream_retried:
             return False, f"上游阶段 {task_manager_module.STAGE_TITLES.get(upstream_stage or '', upstream_stage or '')} 已发生重试，当前阶段不能只重试失败项", []
-        reason = self._continue_stage_input_error(db, task, stage_name)
-        if reason:
-            return False, reason, []
         return True, None, items
 
     def _task_retry_failed_items_support(
@@ -1789,9 +1787,6 @@ class TaskStateMachineMixin:
                     f"阶段 {task_manager_module.STAGE_TITLES.get(stage_name, stage_name)} 的上游阶段 "
                     f"{task_manager_module.STAGE_TITLES.get(upstream_stage or '', upstream_stage or '')} 已发生重试，不能只重试失败项"
                 ), None, []
-            reason = self._continue_stage_input_error(db, task, stage_name)
-            if reason:
-                return False, reason, stage_name, []
             return True, None, stage_name, items
 
         reason: str | None = None

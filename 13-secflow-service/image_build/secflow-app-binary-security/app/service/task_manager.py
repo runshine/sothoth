@@ -634,6 +634,12 @@ class TaskRuntimeHandle:
     last_runner_exit_at: datetime | None = None
     last_lease_refresh_at: datetime | None = None
     takeover_observed: bool = False
+    control_wakeup_requested: bool = False
+    control_wakeup_reason: str | None = None
+    pending_operation_id: str | None = None
+    pending_operation_type: str | None = None
+    runner_generation: int = 0
+    last_wakeup_at: datetime | None = None
 
     def done(self) -> bool:
         return self.runner_task.done()
@@ -1719,6 +1725,109 @@ class TaskManager(
         handle.owner_active = False
         handle.takeover_observed = bool(takeover_observed)
 
+    async def _request_local_worker_control_wakeup(
+        self,
+        task_id: str,
+        operation_type: str,
+        *,
+        operation_id: str | None = None,
+        wait_for_runner: bool = False,
+    ) -> bool:
+        del wait_for_runner
+        async with self._worker_lock:
+            return self._request_local_worker_control_wakeup_nowait(
+                task_id,
+                operation_type,
+                operation_id=operation_id,
+            )
+
+    async def _request_local_worker_retry_like_wakeup(
+        self,
+        task_id: str,
+        operation_type: str,
+        *,
+        operation_id: str | None = None,
+    ) -> bool:
+        return await self._request_local_worker_control_wakeup(
+            task_id,
+            operation_type,
+            operation_id=operation_id,
+            wait_for_runner=False,
+        )
+
+    def _clear_local_worker_control_wakeup(self, task_id: str) -> None:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return
+        handle.control_wakeup_requested = False
+        handle.control_wakeup_reason = None
+        handle.pending_operation_id = None
+        handle.pending_operation_type = None
+
+    def _request_local_worker_control_wakeup_nowait(
+        self,
+        task_id: str,
+        operation_type: str,
+        *,
+        operation_id: str | None = None,
+    ) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_operation_type = str(operation_type or "").strip() or "unknown"
+        if not normalized_task_id:
+            return False
+        handle = self._workers.get(normalized_task_id)
+        if handle is None:
+            return False
+        handle.control_wakeup_requested = True
+        handle.control_wakeup_reason = normalized_operation_type
+        handle.pending_operation_id = str(operation_id or "").strip() or None
+        handle.pending_operation_type = normalized_operation_type
+        handle.last_wakeup_at = _now()
+        handle.owner_active = True
+        handle.release_requested = False
+        return True
+
+    async def _restart_local_runtime_for_active_owner(self, task_id: str) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        async with self._worker_lock:
+            existing = self._workers.get(normalized_task_id)
+            if existing is not None and not existing.done() and not existing.cancel_requested:
+                return False
+            runner_task = asyncio.create_task(
+                self._run_task(normalized_task_id),
+                name=f"binary-security-{normalized_task_id}-restart",
+            )
+            heartbeat_task = asyncio.create_task(
+                self._run_task_heartbeat(normalized_task_id),
+                name=f"binary-security-heartbeat-{normalized_task_id}-restart",
+            )
+            generation = int(getattr(existing, "runner_generation", 0) or 0) + 1
+            handle = TaskRuntimeHandle(
+                task_id=normalized_task_id,
+                runner_task=runner_task,
+                heartbeat_task=heartbeat_task,
+                claimed_at=_now(),
+                execution_token=getattr(existing, "execution_token", None),
+                lease_owner_instance_id=str(self.instance_id or "").strip() or None,
+                cancel_requested=False,
+                owner_active=True,
+                release_requested=False,
+                release_reason=None,
+                last_runner_exit_at=getattr(existing, "last_runner_exit_at", None),
+                last_lease_refresh_at=getattr(existing, "last_lease_refresh_at", None),
+                takeover_observed=False,
+                control_wakeup_requested=bool(getattr(existing, "control_wakeup_requested", False)),
+                control_wakeup_reason=getattr(existing, "control_wakeup_reason", None),
+                pending_operation_id=getattr(existing, "pending_operation_id", None),
+                pending_operation_type=getattr(existing, "pending_operation_type", None),
+                runner_generation=generation,
+                last_wakeup_at=getattr(existing, "last_wakeup_at", None),
+            )
+            self._workers[normalized_task_id] = handle
+            return True
+
     def _task_should_remain_owned_without_active_runner(
         self,
         db: Session,
@@ -1734,6 +1843,8 @@ class TaskManager(
         if self._task_runtime_transition_guard_owned_by_current_instance(task):
             return True
         if self._task_runtime_owner_matches_current_instance(db, task):
+            return True
+        if bool(getattr(handle, "control_wakeup_requested", False)):
             return True
         active_operation = self._task_active_operation(db, task)
         operation_status = str(getattr(active_operation, "status", "") or "").strip().lower() if active_operation is not None else ""
@@ -2723,38 +2834,42 @@ class TaskManager(
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         if previous_status == "running":
-            self._set_task_status(
+            self._apply_task_status_only_update(
                 db,
                 task,
-                "pending",
-                reason="检测到任务 owner 元数据漂移，释放 owner 并等待重新调度",
+                status="running",
+                reason="检测到任务 owner 元数据漂移，释放 owner 但保持任务运行态等待重新接管",
                 source="task_manager",
                 stage_name=task.current_stage,
+                clear_runtime_owner=True,
+                finished_at=None,
+                last_error=None,
             )
         elif previous_status == "dispatching":
-            self._set_task_status(
+            self._apply_task_status_only_update(
                 db,
                 task,
-                "pending",
+                status="pending",
                 reason="检测到 dispatching 任务 owner 元数据漂移，释放 owner 并等待重新调度",
                 source="task_manager",
                 stage_name=task.current_stage,
+                clear_runtime_owner=True,
+                finished_at=None,
+                last_error=None,
             )
         elif previous_status == TASK_STATUS_CANCELLING:
-            self._set_task_status(
+            self._apply_task_status_only_update(
                 db,
                 task,
-                TASK_STATUS_CANCELLING,
+                status=TASK_STATUS_CANCELLING,
                 reason="任务取消中但 owner 元数据漂移，保留取消状态并释放 owner",
                 source="task_manager",
                 stage_name=task.current_stage,
-                allow_noop=True,
+                clear_runtime_owner=True,
+                finished_at=None,
+                last_error=None,
+                record_blocked_event=False,
             )
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
-        task.lease_expires_at = None
-        task.finished_at = None
-        task.last_error = None
         self._clear_runtime_lease(db, task.id, owner_instance_id=previous_dispatcher_instance_id)
         self._record_parent_runtime_lease_decision(
             db,
@@ -3037,18 +3152,15 @@ class TaskManager(
                         "path": f"{task.summary.get('input_dir')}/{relative_path}",
                     }
                 )
-        self._set_task_status(
+        self._apply_task_status_only_update(
             db,
             task,
-            "pending",
+            status="pending",
             reason="输入文件上传完成，任务已进入调度队列",
             source="task_manager",
             stage_name=self._stage_sequence_for_task(task)[0],
+            clear_runtime_owner=True,
         )
-        task.current_stage = self._stage_sequence_for_task(task)[0]
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
-        task.lease_expires_at = None
         task.summary = {
             **task.summary,
             "input_files": actual_files,
@@ -3089,21 +3201,19 @@ class TaskManager(
         input_files = task.summary.get("input_files") or []
         if not input_files:
             raise ValidationError("没有可用的输入文件")
-        self._set_task_status(
+        self._apply_task_status_only_update(
             db,
             task,
-            "pending",
+            status="pending",
             reason="任务启动请求已受理，进入待调度",
             source="task_manager",
             stage_name=self._stage_sequence_for_task(task)[0],
+            clear_runtime_owner=True,
+            finished_at=None,
+            last_error=None,
         )
-        task.current_stage = self._stage_sequence_for_task(task)[0]
         task.execution_mode = None
         task.target_stage_name = None
-        task.last_error = None
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
-        task.lease_expires_at = None
         task.started_at = None
         task.finished_at = None
         task.summary = {
@@ -4126,23 +4236,19 @@ class TaskManager(
             return False
         previous_status = str(task.status or "").strip()
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
-        self._set_task_status(
+        self._apply_task_status_only_update(
             db,
             task,
-            "running",
+            status="running",
             reason="流式尾段存在活跃子项，父任务恢复为运行态",
             source="task_manager",
             stage_name=active_stage_name or task.current_stage,
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            finished_at=None,
+            last_error=None,
+            clear_runtime_owner=not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status, db=db),
         )
-        task.current_stage = active_stage_name or task.current_stage
-        task.finished_at = None
-        task.last_error = None
-        self._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         task.tail_reconcile_state = "idle"
-        if not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status, db=db):
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
         self._clear_task_abnormal_reason_snapshot(db, task)
         if record_event:
             self._record_event(
@@ -4188,20 +4294,17 @@ class TaskManager(
             return False
         previous_status = str(task.status or "").strip() or "running"
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
-        self._set_task_status(
+        self._apply_task_status_only_update(
             db,
             task,
-            "pending",
+            status="pending",
             reason="运行实例租约失效，父任务释放并重新排队等待接管",
             source="task_manager",
             stage_name=active_stage_name or task.current_stage,
+            clear_runtime_owner=True,
+            finished_at=None,
+            last_error=None,
         )
-        task.current_stage = active_stage_name or task.current_stage
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
-        task.lease_expires_at = None
-        task.finished_at = None
-        task.last_error = None
         lease_clear_result = self._clear_runtime_lease(db, task.id, swallow_lock_error=True)
         self._clear_task_abnormal_reason_snapshot(db, task)
         release_event_type = "dispatching_execution_released_for_takeover" if previous_status == "dispatching" else "running_execution_released_for_takeover"
@@ -4815,6 +4918,28 @@ class TaskManager(
             [dict(item) for item in (snapshot.get("selected_entries") or []) if isinstance(item, dict)],
         )
 
+    def _legacy_entry_input_rows(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        flattened: list[dict[str, Any]] = []
+        for row in self._entry_results(task):
+            if not isinstance(row, dict):
+                continue
+            entry_key = str(row.get("entry_key") or "").strip()
+            if entry_key:
+                flattened.append(dict(row))
+                continue
+            for entry in list(row.get("entries") or []):
+                if isinstance(entry, dict):
+                    flattened.append(dict(entry))
+        deduped: dict[str, dict[str, Any]] = {}
+        fallback_index = 0
+        for entry in flattened:
+            key = str(entry.get("entry_key") or "").strip()
+            if not key:
+                key = f"entry-{fallback_index}"
+                fallback_index += 1
+            deduped[key] = dict(entry)
+        return list(deduped.values())
+
     def _mark_selected_entries(self, entries: list[dict[str, Any]], *, selected_by: str, selected_at: str | None = None) -> list[dict[str, Any]]:
         timestamp = selected_at or _now().isoformat()
         return [
@@ -4827,19 +4952,22 @@ class TaskManager(
         ]
 
     def _effective_entry_inputs(self, task: BinarySecurityTask, db: Session | None = None) -> list[dict[str, Any]]:
+        legacy_rows = self._legacy_entry_input_rows(task)
         if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_AUTO:
-            return self._entry_candidates(task, db)
+            candidates = self._entry_candidates(task, db)
+            return candidates or legacy_rows
         selected_entries = self._selected_entries(task)
         if selected_entries:
             return selected_entries
         selected_keys = set(self._selected_entry_keys(task))
         if not selected_keys:
-            return []
-        return [
+            return legacy_rows
+        selected = [
             entry
             for entry in self._entry_candidates(task, db)
             if str(entry.get("entry_key") or "").strip() in selected_keys
         ]
+        return selected or legacy_rows
 
     def _entry_selection_metrics(self, task: BinarySecurityTask, db: Session | None = None) -> dict[str, int]:
         module_state = self._entry_module_completion_state(task, None)

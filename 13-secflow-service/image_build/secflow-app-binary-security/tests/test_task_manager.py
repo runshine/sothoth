@@ -9294,8 +9294,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._decide_task_resume_after_stage_reset = original_decide
 
         self.assertEqual([], prepare_calls)
-        self.assertEqual(["t1"], queued)
-        self.assertEqual("pending", task.status)
+        self.assertEqual([], queued)
+        self.assertEqual("running", task.status)
 
     def test_run_task_operation_steps_requeue_step_is_idempotent_when_state_already_applied(self):
         task = BinarySecurityTask(
@@ -9396,7 +9396,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], queued)
         event_types = [row.event_type for row in db.events]
-        self.assertIn("retry_requeue_blocked_after_cleanup", event_types)
+        self.assertIn("retry_in_place_resume_blocked", event_types)
         self.assertEqual("failed", operation.status)
 
     def test_mark_task_waiting_for_archive_retry_clears_latest_abnormal_reason(self):
@@ -10993,7 +10993,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("pending", task.status)
             self.assertEqual("system_analysis", task.current_stage)
 
-    def test_cancel_task_cancels_local_worker(self):
+    def test_cancel_task_requests_local_control_wakeup(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -11022,22 +11022,23 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             status="running",
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
-        cancelled: list[str] = []
+        wakeups: list[str] = []
         enqueued: list[str] = []
 
         async def fake_write_task_metadata_async(*args, **kwargs):
             return None
 
-        async def fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
-            cancelled.append(f"{task_id}:{wait_for_runner}")
+        async def fake_request_local_worker_control_wakeup(task_id: str, operation_type: str, *, operation_id=None, wait_for_runner: bool):
+            wakeups.append(f"{task_id}:{operation_type}:{wait_for_runner}:{bool(operation_id)}")
+            return True
 
         self.manager._write_task_metadata_async = fake_write_task_metadata_async
-        self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
+        self.manager._request_local_worker_control_wakeup = fake_request_local_worker_control_wakeup
         self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
 
         response = asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
 
-        self.assertEqual(["t1:False"], cancelled)
+        self.assertEqual(["t1:cancel:False:True"], wakeups)
         self.assertGreaterEqual(len(enqueued), 1)
         self.assertTrue(all(task_id == "t1" for task_id in enqueued))
         self.assertEqual("cancelling", task.status)
@@ -11047,12 +11048,11 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_cancel_accepted", event_types)
         asyncio.run(self.manager._prepare_cancel_task(db, task))
 
-        self.assertEqual(["t1:False", "t1:False"], cancelled)
         self.assertEqual("cancelling", task.status)
         self.assertEqual("cancelled", stage_run.status)
         self.assertEqual("cancelled", item.status)
 
-    def test_delete_task_requests_local_worker_cancel_on_accept(self):
+    def test_delete_task_requests_local_control_wakeup_on_accept(self):
         task = BinarySecurityTask(
             id="t-del",
             project_id="p1",
@@ -11067,13 +11067,14 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             dispatcher_instance_id="worker-a",
         )
         db = _ModelAwareDb(tasks=[task], operations=[])
-        cancelled: list[str] = []
+        wakeups: list[str] = []
         enqueued: list[str] = []
 
-        async def fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
-            cancelled.append(f"{task_id}:{wait_for_runner}")
+        async def fake_request_local_worker_control_wakeup(task_id: str, operation_type: str, *, operation_id=None, wait_for_runner: bool):
+            wakeups.append(f"{task_id}:{operation_type}:{wait_for_runner}:{bool(operation_id)}")
+            return True
 
-        self.manager._request_local_worker_cancel = fake_request_local_worker_cancel
+        self.manager._request_local_worker_control_wakeup = fake_request_local_worker_control_wakeup
         self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
 
         response = asyncio.run(self.manager.delete_task(db, project_id="p1", task_id="t-del"))
@@ -11081,7 +11082,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(response.accepted)
         self.assertEqual("accepted", response.status)
         self.assertEqual("delete", response.action)
-        self.assertEqual(["t-del:False"], cancelled)
+        self.assertEqual(["t-del:delete:False:True"], wakeups)
         self.assertGreaterEqual(len(enqueued), 1)
         self.assertTrue(all(task_id == "t-del" for task_id in enqueued))
         self.assertIsNotNone(response.operation_id)
@@ -11140,7 +11141,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         asyncio.run(self.manager._prepare_cancel_task(db, task))
 
         self.assertEqual(
-            ["write_metadata", "cancel_worker", "cancel_downstream"],
+            ["write_metadata", "cancel_downstream", "cancel_worker"],
             order,
         )
 
@@ -16402,10 +16403,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._decide_task_resume_after_stage_reset = original_decide
 
         self.assertEqual(
-            [("collect", "task1"), ("cleanup", "task1"), ("requeue", "task1")],
+            [("collect", "task1"), ("cleanup", "task1")],
             calls,
         )
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual("requeue_task", operation.current_step)
         self.assertEqual("operation_succeeded", dict(operation.resume_cursor or {}).get("current_step"))
@@ -16416,7 +16417,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         event_types = [row.event_type for row in db.events]
         self.assertIn("operation_step_started", event_types)
         self.assertIn("operation_step_succeeded", event_types)
-        self.assertIn("task_requeued", event_types)
+        self.assertIn("retry_in_place_resume_applied", event_types)
 
     def test_run_task_operation_steps_retry_verifies_cleanup_before_requeue(self):
         now_value = _now()
@@ -16518,10 +16519,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._decide_task_resume_after_stage_reset = original_decide
 
         self.assertEqual(
-            [("cleanup", "task1"), ("verify", "task1"), ("requeue", "task1")],
+            [("cleanup", "task1"), ("verify", "task1")],
             calls,
         )
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("firmware_unpack", task.current_stage)
         step_payload = dict(operation.step_payload or {})
         self.assertEqual("succeeded", step_payload["collect_cleanup_plan"]["status"])
@@ -21875,7 +21876,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         rows = self.manager._entry_analysis_inputs(db, task)
 
-        self.assertEqual([], rows)
+        self.assertEqual(1, len(rows))
+        self.assertEqual("m1", rows[0]["module_key"])
 
     def test_binary_module_entry_analysis_inputs_require_binary_to_source_archive_success(self):
         task = BinarySecurityTask(
@@ -21960,7 +21962,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         rows = self.manager._effective_entry_inputs(task, db)
 
-        self.assertEqual([], rows)
+        self.assertEqual([{"entry_key": "e1", "function_name": "main"}], rows)
 
     def test_stage_entry_analysis_precreates_all_selected_modules_as_queued_items(self):
         task = BinarySecurityTask(
@@ -32288,7 +32290,7 @@ def _test_requeue_orphaned_owned_execution_locked_recovers_orphan(self):
         self.manager._enqueue_task = original_enqueue
 
     self.assertTrue(reclaimed)
-    self.assertEqual("running", task.status)
+    self.assertEqual("pending", task.status)
     self.assertEqual([], queued)
     requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
     self.assertFalse(requeue_events)
@@ -32379,7 +32381,7 @@ def _test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):
     claimed = manager._dispatch_task_by_id(db, task.id)
 
     self.assertEqual(task.id, claimed)
-    self.assertEqual("dispatching", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual("local-worker", task.dispatcher_instance_id)
     self.assertIsNotNone(task.dispatch_started_at)
     self.assertIsNotNone(task.lease_expires_at)
@@ -32437,7 +32439,7 @@ def _test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runt
         self.manager._enqueue_task = original_enqueue
 
     self.assertTrue(reclaimed)
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertIsNone(task.dispatch_started_at)
     self.assertIsNone(task.lease_expires_at)
@@ -33091,13 +33093,13 @@ def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
         self.manager._enqueue_task = original_enqueue
         self.manager._should_auto_advance_to_stage = original_should_auto
 
-    self.assertEqual(["task1"], queued)
+    self.assertEqual([], queued)
     self.assertEqual([], applied)
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
-    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
+    self.assertEqual("worker-1", task.dispatcher_instance_id)
+    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+    self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
 
 
 def _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry(self):
@@ -33155,7 +33157,7 @@ def _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_r
         self.manager._enqueue_task = original_enqueue
         self.manager._should_auto_advance_to_stage = original_should_auto
 
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertEqual(["task1"], queued)
     self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("requested")))
@@ -33347,16 +33349,12 @@ def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
         self.manager._enqueue_task = original_enqueue
         self.manager._should_auto_advance_to_stage = original_should_auto
 
-    self.assertEqual(["task-op-requeue"], queued)
+    self.assertEqual([], queued)
     self.assertEqual([], applied)
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.lease_expires_at)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("retry_owner_release_requeue_started", event_types)
-    self.assertIn("retry_owner_release_requeue_applied", event_types)
-    self.assertIn("task_requeued", event_types)
+    self.assertIn("retry_in_place_resume_applied", event_types)
 
 
 def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_state_without_requeue_marker(self):
@@ -33421,16 +33419,12 @@ def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_st
         self.manager._enqueue_task = original_enqueue
         self.manager._should_auto_advance_to_stage = original_should_auto
 
-    self.assertEqual(["task-op-hard-retry"], queued)
+    self.assertEqual([], queued)
     self.assertEqual([], applied)
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual("system_analysis", task.current_stage)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.lease_expires_at)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("retry_owner_release_requeue_started", event_types)
-    self.assertIn("retry_owner_release_requeue_applied", event_types)
-    self.assertIn("task_requeued", event_types)
+    self.assertIn("retry_in_place_resume_applied", event_types)
 
 
 def _test_run_task_operation_steps_requeue_fails_without_owner_release_permission(self):
@@ -33485,8 +33479,7 @@ def _test_run_task_operation_steps_requeue_fails_without_owner_release_permissio
     self.assertEqual("other-worker", task.dispatcher_instance_id)
     self.assertTrue(any(lease.task_id == task.id for lease in db.runtime_leases))
     event_types = [event.event_type for event in db.events]
-    self.assertIn("retry_owner_release_requeue_suppressed", event_types)
-    self.assertIn("retry_requeue_blocked_after_cleanup", event_types)
+    self.assertIn("retry_in_place_resume_blocked", event_types)
 
 
 def _test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision(self):
@@ -34125,7 +34118,7 @@ def _test_run_task_layer_reconcile_signal_archive_apply_advances_system_analysis
 
     self.assertTrue(changed)
     self.assertEqual("entry_analysis", task.current_stage)
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual(["task-archive-owner-advance"], queued)
     if applied:
         self.assertEqual("entry_analysis", applied[0]["next_stage"])
@@ -34235,7 +34228,7 @@ def _test_run_task_layer_reconcile_signal_archive_apply_keeps_streaming_entry_pa
         self.manager._write_task_metadata_async = original_write
 
     self.assertFalse(changed)
-    self.assertEqual("running", task.status)
+    self.assertEqual("pending", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
     self.assertEqual([("refresh", "entry_analysis", "running")], calls)
     self.assertTrue(any(event.event_type == "task_layer_reconcile_noop" for event in db.events))
@@ -35080,7 +35073,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
         manager._refresh_task_status_after_sync(db, task)
 
-    self.assertEqual("running", task.status)
+    self.assertEqual("pending", task.status)
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertFalse(bool(task.dispatch_started_at))
@@ -35247,7 +35240,7 @@ def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_ta
         manager._fetch_downstream_task_payload = original_fetch
         manager._enqueue_task = original_enqueue
 
-    self.assertEqual("running", task.status)
+    self.assertEqual("pending", task.status)
     self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
     self.assertEqual([], queued)
     self.assertEqual([], db.runtime_leases)
@@ -39178,8 +39171,8 @@ def _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_m
 
     self.assertNotEqual("failed", task.status)
     self.assertIsNone(task.finished_at)
-    self.assertEqual("running", task.status)
-    self.assertEqual("system_analysis", task.current_stage)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
 
 
 def _test_refresh_task_status_after_sync_blocks_plain_pending_resume_for_unmaterialized_entry_analysis(self):

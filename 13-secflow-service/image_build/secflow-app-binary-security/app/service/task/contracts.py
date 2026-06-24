@@ -448,8 +448,6 @@ class TaskContractServiceMixin:
         from app.service import task_manager as task_manager_module
 
         if self._task_type(task) == task_manager_module.TASK_TYPE_SOURCE:
-            if not self._stage_has_archived_success_progress(db, task, "system_analysis"):
-                return []
             selected_modules = [dict(module) for module in (task.summary.get("selected_modules") or []) if isinstance(module, dict)]
             archived_modules = self._system_analysis_modules_for_task(db, task)
             archived_module_map = {

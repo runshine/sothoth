@@ -716,6 +716,47 @@ class TaskRuntimeServiceMixin:
         owner_guarded_control_operation = bool(
             has_active_operation and active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES
         )
+        local_handle = self._runtime_handle(task_id)
+        local_handle_present = local_handle is not None
+        local_handle_done = bool(local_handle.done()) if local_handle is not None else False
+        local_handle_cancel_requested = bool(getattr(local_handle, "cancel_requested", False)) if local_handle is not None else False
+        same_owner_active_lease = bool(
+            str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+            and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
+        )
+        if owner_guarded_control_operation and same_owner_active_lease:
+            if local_handle_present and not local_handle_done and not local_handle_cancel_requested:
+                if asyncio.get_event_loop().is_running():
+                    asyncio.create_task(
+                        self._request_local_worker_control_wakeup(
+                            task.id,
+                            active_operation_type,
+                            operation_id=str(getattr(current_operation, "id", "") or "").strip() or None,
+                            wait_for_runner=False,
+                        )
+                    )
+                return None
+            if (not local_handle_present) or local_handle_done or local_handle_cancel_requested:
+                if asyncio.get_event_loop().is_running():
+                    asyncio.create_task(
+                        self._restart_local_runtime_for_active_owner(task.id)
+                    )
+                self._record_event(
+                    db,
+                    task,
+                    "local_owner_runtime_restart_started",
+                    "当前 owner 的本地 runtime 缺失，已请求在本实例内重建执行协程",
+                    stage_name=task.current_stage,
+                    payload={
+                        "operation_id": str(getattr(current_operation, "id", "") or "").strip() or None,
+                        "operation_type": active_operation_type or None,
+                        "local_handle_present": local_handle_present,
+                        "local_handle_done": local_handle_done,
+                        "local_handle_cancel_requested": local_handle_cancel_requested,
+                    },
+                )
+                db.commit()
+                return None
         if operation_requires_runtime_handle and self._release_unsupported_task_row_owner(
             db,
             task,
@@ -2071,7 +2112,14 @@ class TaskRuntimeServiceMixin:
                 cleanup_db.close()
             async with self._worker_lock:
                 current_handle = self._workers.get(task_id)
-                if current_handle is not None and not bool(current_handle.owner_active):
+                if current_handle is not None and current_handle.runner_task is asyncio.current_task():
+                    current_handle.owner_active = False
+                    if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
+                        current_handle.heartbeat_task.cancel()
+                        with suppress(asyncio.CancelledError, Exception):
+                            await current_handle.heartbeat_task
+                    self._workers.pop(task_id, None)
+                elif current_handle is not None and not bool(current_handle.owner_active):
                     if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
                         current_handle.heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError, Exception):

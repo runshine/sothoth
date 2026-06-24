@@ -154,13 +154,15 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
             elif has_confirmed_manual_selection:
                 selected_modules = confirmed_selected_modules
             else:
-                manager._set_task_status(
+                manager._apply_task_status_only_update(
                     db,
                     task,
-                    TASK_STATUS_PENDING_MODULE_CONFIRMATION,
+                    status=TASK_STATUS_PENDING_MODULE_CONFIRMATION,
                     reason="系统分析完成，等待人工确认模块",
                     source="stage_system_analysis",
                     stage_name=self.stage_name,
+                    finished_at=None,
+                    last_error=None,
                 )
                 manager._record_event(
                     db,
