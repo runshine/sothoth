@@ -803,6 +803,60 @@ class TaskRuntimeServiceMixin:
             return None
         if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not operation_allows_runtime_resume and not has_active_operation:
             return None
+        lease_takeover_decision = self._can_take_over_parent_control_operation(
+            db,
+            task,
+            reason="dispatch_claim_takeover_gate",
+        )
+        if not lease_takeover_decision.allowed and (
+            str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+            or getattr(task, "lease_expires_at", None) is not None
+        ):
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type=(
+                    "cancel_takeover_suppressed_active_lease"
+                    if active_operation_type == task_manager_module.TASK_ACTION_CANCEL
+                    else "delete_takeover_suppressed_active_lease"
+                    if active_operation_type == task_manager_module.TASK_ACTION_DELETE
+                    else "retry_takeover_suppressed_active_lease"
+                    if str(active_operation_type or "").startswith("retry")
+                    or active_operation_type in {task_manager_module.TASK_ACTION_CONTINUE, "force_reset_to_pending"}
+                    else "claim_suppressed_active_runtime_lease"
+                ),
+                message="父任务租约仍有效，当前 worker 不允许接管并重新 claim",
+                decision=lease_takeover_decision,
+                reason="dispatch_claim_takeover_gate",
+                stage_name=task.current_stage,
+            )
+            return None
+        active_runtime_lease = self._runtime_lease_for_task(db, task_id)
+        if self._runtime_lease_is_active(active_runtime_lease):
+            decision = self._can_take_over_parent_control_operation(
+                db,
+                task,
+                reason="dispatch_claim_blocked_by_active_runtime_lease",
+            )
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type=(
+                    "cancel_takeover_suppressed_active_lease"
+                    if active_operation_type == task_manager_module.TASK_ACTION_CANCEL
+                    else "delete_takeover_suppressed_active_lease"
+                    if active_operation_type == task_manager_module.TASK_ACTION_DELETE
+                    else "retry_takeover_suppressed_active_lease"
+                    if str(active_operation_type or "").startswith("retry")
+                    or active_operation_type in {task_manager_module.TASK_ACTION_CONTINUE, "force_reset_to_pending"}
+                    else "claim_suppressed_active_runtime_lease"
+                ),
+                message="父任务 authoritative runtime lease 仍有效，当前 worker 不允许重新 claim",
+                decision=decision,
+                reason="dispatch_claim_blocked_by_active_runtime_lease",
+                stage_name=task.current_stage,
+            )
+            return None
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
         next_task_status = "dispatching"
@@ -1834,6 +1888,23 @@ class TaskRuntimeServiceMixin:
                     and task.dispatcher_instance_id == self.instance_id
                     and str(task.status or "").strip().lower() in {"dispatching", "running"}
                 ):
+                    decision = self._can_reopen_parent_task_after_lease_loss(
+                        db,
+                        task,
+                        reason="dispatching_active_commit_failed_without_runtime_lease",
+                    )
+                    if not decision.allowed:
+                        self._record_parent_runtime_lease_decision(
+                            db,
+                            task,
+                            event_type="parent_runtime_reopen_suppressed_active_lease",
+                            message="父任务租约仍有效，active commit 失败后暂不允许重新排队",
+                            decision=decision,
+                            reason="dispatching_active_commit_failed_without_runtime_lease",
+                            stage_name=task.current_stage,
+                        )
+                        db.commit()
+                        return
                     self._apply_task_main_state_update(
                         db,
                         task,
@@ -1849,6 +1920,16 @@ class TaskRuntimeServiceMixin:
                         task.id,
                         owner_instance_id=self.instance_id,
                         swallow_lock_error=True,
+                    )
+                    self._record_parent_runtime_lease_decision(
+                        db,
+                        task,
+                        event_type="parent_runtime_reopen_allowed_after_lease_expiry",
+                        message="父任务 authoritative runtime lease 已过期，允许 active commit 失败后重新排队",
+                        decision=decision,
+                        reason="dispatching_active_commit_failed_without_runtime_lease",
+                        stage_name=task.current_stage,
+                        level="warning",
                     )
                     self._signal_owned_execution_takeover(
                         db,

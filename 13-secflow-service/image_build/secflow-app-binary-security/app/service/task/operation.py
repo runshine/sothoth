@@ -3020,6 +3020,15 @@ class TaskOperationServiceMixin:
                         or getattr(refreshed_task, "lease_expires_at", None) is not None
                     )
                 ):
+                    clear_decision = self._can_clear_parent_runtime_ownership(
+                        db,
+                        refreshed_task,
+                        reason=(
+                            "cancel_operation_terminal_cleanup"
+                            if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                            else "delete_operation_terminal_cleanup"
+                        ),
+                    )
                     self._apply_task_main_state_update(
                         db,
                         refreshed_task,
@@ -3038,8 +3047,37 @@ class TaskOperationServiceMixin:
                         runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
                         finished_at=getattr(refreshed_task, "finished_at", None) or task_manager_module._now(),
                         last_error=None,
-                        clear_runtime_owner=True,
+                        clear_runtime_owner=clear_decision.allowed,
                     )
+                    if clear_decision.allowed:
+                        self._record_parent_runtime_lease_decision(
+                            db,
+                            refreshed_task,
+                            event_type="parent_runtime_lease_clear_allowed",
+                            message="任务已进入终态，当前 authoritative owner 允许清理父任务租约",
+                            decision=clear_decision,
+                            reason=(
+                                "cancel_operation_terminal_cleanup"
+                                if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                                else "delete_operation_terminal_cleanup"
+                            ),
+                            stage_name=operation.target_stage or refreshed_task.current_stage,
+                            level="info",
+                        )
+                    else:
+                        self._record_parent_runtime_lease_decision(
+                            db,
+                            refreshed_task,
+                            event_type="parent_runtime_lease_clear_suppressed",
+                            message="父任务租约仍有效或当前实例非 owner，本次不清理租约",
+                            decision=clear_decision,
+                            reason=(
+                                "cancel_operation_terminal_cleanup"
+                                if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL
+                                else "delete_operation_terminal_cleanup"
+                            ),
+                            stage_name=operation.target_stage or refreshed_task.current_stage,
+                        )
                     self._invalidate_task_execution(refreshed_task)
                 if refreshed_task is not None:
                     if operation.operation_type in self._operation_requeue_family_types():
@@ -4075,9 +4113,35 @@ class TaskOperationServiceMixin:
             task.finished_at = task_manager_module._now()
             task.last_error = None
             self._invalidate_task_execution(task)
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
+            clear_decision = self._can_clear_parent_runtime_ownership(
+                db,
+                task,
+                reason="cancel_operation_confirmed_cleanup",
+            )
+            if clear_decision.allowed:
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                task.lease_expires_at = None
+                self._record_parent_runtime_lease_decision(
+                    db,
+                    task,
+                    event_type="parent_runtime_lease_clear_allowed",
+                    message="取消终态已确认，当前 authoritative owner 允许清理父任务租约",
+                    decision=clear_decision,
+                    reason="cancel_operation_confirmed_cleanup",
+                    stage_name=operation.target_stage,
+                    level="info",
+                )
+            else:
+                self._record_parent_runtime_lease_decision(
+                    db,
+                    task,
+                    event_type="parent_runtime_lease_clear_suppressed",
+                    message="取消终态已确认，但当前不允许清理父任务租约",
+                    decision=clear_decision,
+                    reason="cancel_operation_confirmed_cleanup",
+                    stage_name=operation.target_stage,
+                )
             self._record_operation_event(
                 db,
                 task,

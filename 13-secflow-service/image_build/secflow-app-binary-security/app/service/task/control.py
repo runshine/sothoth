@@ -1243,8 +1243,34 @@ class TaskControlServiceMixin:
         task.tail_reconcile_state = "idle"
         self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         self._invalidate_task_execution(task)
-        self._clear_runtime_lease(db, task.id)
-        self._release_tail_reconcile_owner(task.id)
+        clear_decision = self._can_reopen_parent_task_after_lease_loss(
+            db,
+            task,
+            reason="force_reset_to_pending_requested",
+        )
+        if clear_decision.allowed:
+            self._clear_runtime_lease(db, task.id)
+            self._release_tail_reconcile_owner(task.id)
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type="parent_runtime_reopen_allowed_after_lease_expiry",
+                message="父任务租约已过期，允许强制重置后重新进入待调度",
+                decision=clear_decision,
+                reason="force_reset_to_pending_requested",
+                stage_name=task.current_stage,
+                level="warning",
+            )
+        else:
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type="retry_takeover_suppressed_active_lease",
+                message="父任务租约仍有效，当前不允许强制重置时清理租约",
+                decision=clear_decision,
+                reason="force_reset_to_pending_requested",
+                stage_name=task.current_stage,
+            )
         self._clear_task_abnormal_reason_snapshot(db, task)
         self._record_event(
             db,

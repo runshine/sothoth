@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from dataclasses import dataclass, field
 
-from sqlalchemy import Integer, and_, case, cast, func, or_, text
+from sqlalchemy import Integer, and_, case, cast, exists, func, or_, text
 from sqlalchemy.exc import IntegrityError, OperationalError, TimeoutError as SATimeoutError
 from sqlalchemy.orm import Session, load_only
 
@@ -901,9 +901,18 @@ class TaskManager(
             return _mark_downstream_binding_created
         if item == "_lease_filter_available":
             def _lease_filter_available():
-                return or_(
-                    BinarySecurityTask.lease_expires_at.is_(None),
-                    BinarySecurityTask.lease_expires_at < _now(),
+                active_runtime_lease_exists = exists().where(
+                    and_(
+                        BinarySecurityTaskRuntimeLease.task_id == BinarySecurityTask.id,
+                        BinarySecurityTaskRuntimeLease.lease_expires_at >= _now(),
+                    )
+                )
+                return and_(
+                    or_(
+                        BinarySecurityTask.lease_expires_at.is_(None),
+                        BinarySecurityTask.lease_expires_at < _now(),
+                    ),
+                    ~active_runtime_lease_exists,
                 )
             return _lease_filter_available
         if item == "_mark_downstream_binding_creating":
@@ -2604,6 +2613,18 @@ class TaskManager(
             return False
         if self._task_row_owner_is_runtime_supported(db, task, active_operation=active_operation):
             return False
+        decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
+        if not decision.allowed:
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type="parent_runtime_reopen_suppressed_active_lease",
+                message="父任务 authoritative runtime lease 仍有效，不释放任务 owner",
+                decision=decision,
+                reason=reason,
+                stage_name=task.current_stage,
+            )
+            return False
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         if previous_status == "running":
@@ -2640,6 +2661,16 @@ class TaskManager(
         task.finished_at = None
         task.last_error = None
         self._clear_runtime_lease(db, task.id, owner_instance_id=previous_dispatcher_instance_id)
+        self._record_parent_runtime_lease_decision(
+            db,
+            task,
+            event_type="parent_runtime_reopen_allowed_after_lease_expiry",
+            message="父任务 authoritative runtime lease 已过期，允许释放任务 owner 并重新调度",
+            decision=decision,
+            reason=reason,
+            stage_name=task.current_stage,
+            level="warning",
+        )
         self._repair_active_operations_for_task(db, task)
         self._record_event(
             db,

@@ -35250,7 +35250,7 @@ def _test_build_task_runtime_health_marks_fake_local_owner_unhealthy(self):
     self.assertEqual("unhealthy", snapshot_cards["local_task_runtime"]["status"])
 
 
-def _test_dispatch_task_by_id_releases_fake_local_owner_without_runtime(self):
+def _test_dispatch_task_by_id_suppresses_fake_local_owner_without_expired_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     task = BinarySecurityTask(
@@ -35281,11 +35281,10 @@ def _test_dispatch_task_by_id_releases_fake_local_owner_without_runtime(self):
 
     claimed = manager._dispatch_task_by_id(db, task.id)
 
-    self.assertEqual(task.id, claimed)
+    self.assertIsNone(claimed)
     self.assertEqual("dispatching", task.status)
     self.assertEqual("local-worker", task.dispatcher_instance_id)
-    self.assertIsNotNone(task.dispatch_started_at)
-    self.assertIsNotNone(task.lease_expires_at)
+    self.assertTrue(any(event.event_type == "retry_takeover_suppressed_active_lease" for event in db.events))
 
 
 def _test_dispatch_task_by_id_claims_ownerless_active_operation(self):
@@ -35399,7 +35398,7 @@ def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     self.assertEqual(operation.id, task.current_operation_id)
 
 
-def _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation(self):
+def _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     task = BinarySecurityTask(
@@ -35430,15 +35429,14 @@ def _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_ope
 
     claimed = manager._dispatch_task_by_id(db, task.id)
 
-    self.assertEqual(task.id, claimed)
+    self.assertIsNone(claimed)
     self.assertEqual("dispatching", task.status)
-    self.assertEqual("local-worker", task.dispatcher_instance_id)
-    self.assertIsNotNone(task.dispatch_started_at)
-    self.assertIsNotNone(task.lease_expires_at)
+    self.assertEqual("old-worker", task.dispatcher_instance_id)
     self.assertEqual(operation.id, task.current_operation_id)
+    self.assertTrue(any(event.event_type == "retry_takeover_suppressed_active_lease" for event in db.events))
 
 
-def _test_dispatch_task_by_id_claims_foreign_owner_delete_operation_without_runtime_lease(self):
+def _test_dispatch_task_by_id_suppresses_foreign_owner_delete_operation_without_expired_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     task = BinarySecurityTask(
@@ -35469,17 +35467,15 @@ def _test_dispatch_task_by_id_claims_foreign_owner_delete_operation_without_runt
 
     claimed = manager._dispatch_task_by_id(db, task.id)
 
-    self.assertEqual(task.id, claimed)
-    self.assertEqual("dispatching", task.status)
-    self.assertEqual("local-worker", task.dispatcher_instance_id)
+    self.assertIsNone(claimed)
+    self.assertEqual("running", task.status)
+    self.assertEqual("old-worker", task.dispatcher_instance_id)
     self.assertEqual(operation.id, task.current_operation_id)
-    self.assertIsNotNone(task.dispatch_started_at)
-    self.assertIsNotNone(task.lease_expires_at)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("owned_execution_takeover_requeued", event_types)
+    self.assertIn("delete_takeover_suppressed_active_lease", event_types)
 
 
-def _test_release_unsupported_task_row_owner_repairs_stale_active_operations(self):
+def _test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     task = BinarySecurityTask(
@@ -35526,17 +35522,13 @@ def _test_release_unsupported_task_row_owner_repairs_stale_active_operations(sel
         reason="unit_test_owner_drift",
     )
 
-    self.assertTrue(released)
-    self.assertEqual("pending", task.status)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
-    self.assertEqual("op-new", task.current_operation_id)
-    self.assertEqual("superseded", older.status)
-    self.assertEqual("op-new", older.superseded_by_operation_id)
+    self.assertFalse(released)
+    self.assertEqual("running", task.status)
+    self.assertEqual("old-worker", task.dispatcher_instance_id)
+    self.assertEqual("op-old", task.current_operation_id)
+    self.assertEqual("accepted", older.status)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("task_operation_binding_repaired", event_types)
-    self.assertIn("task_row_owner_released_without_local_runtime", event_types)
+    self.assertIn("parent_runtime_reopen_suppressed_active_lease", event_types)
 
 
 def _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches(self):
@@ -40516,7 +40508,7 @@ def _test_reclaim_stale_running_streaming_tail_requeues_for_takeover(self):
     self.assertFalse(any(event.event_type == "main_state_write_blocked" for event in db.events))
 
 
-def _test_repair_running_lease_invariant_requeues_without_owner_write_block(self):
+def _test_repair_running_lease_invariant_suppresses_requeue_without_expired_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "worker-new"
     task = BinarySecurityTask(
@@ -40545,15 +40537,52 @@ def _test_repair_running_lease_invariant_requeues_without_owner_write_block(self
         event_payload={"source": "unit_test"},
     )
 
-    self.assertTrue(repaired)
-    self.assertEqual("pending", task.status)
+    self.assertFalse(repaired)
+    self.assertEqual("running", task.status)
     self.assertEqual("dataflow_vuln_scan", task.current_stage)
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
-    self.assertTrue(any(event.event_type == "running_without_active_lease_requeued" for event in db.events))
+    self.assertEqual("worker-dead", task.dispatcher_instance_id)
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
     self.assertFalse(any(event.event_type == "main_state_write_blocked" for event in db.events))
+
+
+def _test_repair_running_lease_invariant_requeues_after_runtime_lease_expired(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-new"
+    task = BinarySecurityTask(
+        id="task-running-lease-expired",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-dead",
+    )
+    task.lease_expires_at = _now() - timedelta(minutes=1)
+    expired_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-dead",
+        lease_expires_at=_now() - timedelta(minutes=1),
+        heartbeat_at=_now() - timedelta(minutes=1),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[expired_lease], events=[])
+
+    repaired = manager._repair_running_lease_invariant(
+        db,
+        task,
+        reason="unit_test_running_with_expired_lease",
+        stage_name="dataflow_vuln_scan",
+    )
+
+    self.assertTrue(repaired)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))
 
 
 def _test_run_task_records_takeover_resume_event_for_streaming_tail(self):
@@ -41429,13 +41458,13 @@ TaskManagerTests.test_refresh_task_status_after_sync_fails_owner_lost_child_afte
 TaskManagerTests.test_reclaim_stale_dispatching_skips_failed_streaming_task = _test_reclaim_stale_dispatching_skips_failed_streaming_task
 TaskManagerTests.test_reclaim_stale_dispatching_protects_active_tail_with_live_owner = _test_reclaim_stale_dispatching_protects_active_tail_with_live_owner
 TaskManagerTests.test_reclaim_stale_dispatching_releases_owner_lost_active_tail = _test_reclaim_stale_dispatching_releases_owner_lost_active_tail
-TaskManagerTests.test_dispatch_task_by_id_releases_fake_local_owner_without_runtime = _test_dispatch_task_by_id_releases_fake_local_owner_without_runtime
+TaskManagerTests.test_dispatch_task_by_id_suppresses_fake_local_owner_without_expired_runtime_lease = _test_dispatch_task_by_id_suppresses_fake_local_owner_without_expired_runtime_lease
 TaskManagerTests.test_dispatch_task_by_id_claims_ownerless_active_operation = _test_dispatch_task_by_id_claims_ownerless_active_operation
 TaskManagerTests.test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle = _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle
 TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _test_refresh_task_status_after_sync_clears_fake_local_owner
-TaskManagerTests.test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation = _test_dispatch_task_by_id_releases_unsupported_foreign_owner_with_queued_operation
-TaskManagerTests.test_dispatch_task_by_id_claims_foreign_owner_delete_operation_without_runtime_lease = _test_dispatch_task_by_id_claims_foreign_owner_delete_operation_without_runtime_lease
-TaskManagerTests.test_release_unsupported_task_row_owner_repairs_stale_active_operations = _test_release_unsupported_task_row_owner_repairs_stale_active_operations
+TaskManagerTests.test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry = _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry
+TaskManagerTests.test_dispatch_task_by_id_suppresses_foreign_owner_delete_operation_without_expired_runtime_lease = _test_dispatch_task_by_id_suppresses_foreign_owner_delete_operation_without_expired_runtime_lease
+TaskManagerTests.test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease = _test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel = _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel
 TaskManagerTests.test_dispatch_task_by_id_skips_non_pending_task_when_active_runtime_lease_matches_owner = _test_dispatch_task_by_id_skips_non_pending_task_when_active_runtime_lease_matches_owner
@@ -44365,6 +44394,120 @@ def _test_control_operation_runtime_lease_coverage_matches_supported_operation_s
     )
 
 
+def _test_apply_task_main_state_update_records_parent_task_state_transition_for_status_stage_and_runtime_owner(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-parent-transition",
+        project_id="p1",
+        name="demo",
+        status="pending",
+        current_stage="system_analysis",
+        runtime_phase="queued",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(
+        tasks=[task],
+        runtime_leases=[
+            BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                owner_instance_id="worker-a",
+                lease_expires_at=now_value + timedelta(minutes=5),
+                heartbeat_at=now_value,
+            )
+        ],
+        events=[],
+    )
+
+    updated = manager._apply_task_main_state_update(
+        db,
+        task,
+        source="runtime_worker",
+        reason="unit_test_parent_transition",
+        status="running",
+        stage_name="entry_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+
+    self.assertTrue(updated)
+    transition_events = [event for event in db.events if event.event_type == "parent_task_state_transition"]
+    self.assertEqual(1, len(transition_events))
+    payload = transition_events[0].payload or {}
+    self.assertEqual("unit_test_parent_transition", payload.get("reason"))
+    self.assertEqual("runtime_worker", payload.get("source"))
+    self.assertEqual(
+        ["status", "current_stage", "runtime_phase"],
+        payload.get("changed_fields"),
+    )
+    self.assertEqual({"status": "pending", "current_stage": "system_analysis", "runtime_phase": "queued"}, payload.get("before"))
+    self.assertEqual(
+        {"status": "running", "current_stage": "entry_analysis", "runtime_phase": TASK_RUNTIME_PHASE_OWNED_EXECUTION},
+        payload.get("after"),
+    )
+    self.assertTrue(any(event.event_type == "task_status_changed" for event in db.events))
+
+
+def _test_apply_task_main_state_update_records_parent_task_state_transition_when_runtime_owner_is_cleared(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-parent-owner-clear",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = now_value - timedelta(seconds=10)
+    task.lease_expires_at = now_value + timedelta(minutes=5)
+    db = _ModelAwareDb(
+        tasks=[task],
+        runtime_leases=[
+            BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                owner_instance_id="worker-a",
+                lease_expires_at=now_value + timedelta(minutes=5),
+                heartbeat_at=now_value,
+            )
+        ],
+        events=[],
+    )
+
+    updated = manager._apply_task_main_state_update(
+        db,
+        task,
+        source="runtime_worker",
+        reason="unit_test_clear_owner",
+        clear_runtime_owner=True,
+    )
+
+    self.assertTrue(updated)
+    transition_events = [event for event in db.events if event.event_type == "parent_task_state_transition"]
+    self.assertEqual(1, len(transition_events))
+    payload = transition_events[0].payload or {}
+    self.assertEqual(
+        ["dispatcher_instance_id", "dispatch_started_at", "lease_expires_at"],
+        payload.get("changed_fields"),
+    )
+    self.assertEqual("worker-a", payload.get("before", {}).get("dispatcher_instance_id"))
+    self.assertIsNone(payload.get("after", {}).get("dispatcher_instance_id"))
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+
+
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
@@ -44374,7 +44517,8 @@ TaskManagerTests.test_run_current_task_operation_skips_duplicate_local_operation
 TaskManagerTests.test_run_current_task_operation_treats_delete_as_succeeded_when_task_row_removed = _test_run_current_task_operation_treats_delete_as_succeeded_when_task_row_removed
 TaskManagerTests.test_owned_execution_takeover_requeue_uses_stage_name_for_main_state = _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state
 TaskManagerTests.test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window = _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window
-TaskManagerTests.test_repair_running_lease_invariant_requeues_without_owner_write_block = _test_repair_running_lease_invariant_requeues_without_owner_write_block
+TaskManagerTests.test_repair_running_lease_invariant_suppresses_requeue_without_expired_runtime_lease = _test_repair_running_lease_invariant_suppresses_requeue_without_expired_runtime_lease
+TaskManagerTests.test_repair_running_lease_invariant_requeues_after_runtime_lease_expired = _test_repair_running_lease_invariant_requeues_after_runtime_lease_expired
 TaskManagerTests.test_clear_runtime_lease_returns_retry_later_for_lock_timeout = _test_clear_runtime_lease_returns_retry_later_for_lock_timeout
 TaskManagerTests.test_run_task_active_commit_failure_releases_fake_dispatching_owner = _test_run_task_active_commit_failure_releases_fake_dispatching_owner
 TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status = _test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status
@@ -44410,6 +44554,8 @@ TaskManagerTests.test_drain_task_sync_queue_retries_failed_entry = _test_drain_t
 TaskManagerTests.test_migrate_legacy_pending_downstream_sync_to_redis_queue = _test_migrate_legacy_pending_downstream_sync_to_redis_queue
 TaskManagerTests.test_migrate_legacy_pending_binding_repair_to_redis_queue = _test_migrate_legacy_pending_binding_repair_to_redis_queue
 TaskManagerTests.test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task = _test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task
+TaskManagerTests.test_apply_task_main_state_update_records_parent_task_state_transition_for_status_stage_and_runtime_owner = _test_apply_task_main_state_update_records_parent_task_state_transition_for_status_stage_and_runtime_owner
+TaskManagerTests.test_apply_task_main_state_update_records_parent_task_state_transition_when_runtime_owner_is_cleared = _test_apply_task_main_state_update_records_parent_task_state_transition_when_runtime_owner_is_cleared
 TaskManagerTests.test_control_operation_runtime_lease_coverage_matches_supported_operation_set = _test_control_operation_runtime_lease_coverage_matches_supported_operation_set
 TaskManagerTests.test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease = _test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease
 
