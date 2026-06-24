@@ -19,15 +19,6 @@ TASK_STATUS_PENDING_MODULE_CONFIRMATION = "pending_module_confirmation"
 NO_CANDIDATE_MODULES_FAILURE_MESSAGE = "系统分析已完成，但未发现匹配所选风险等级的风险模块"
 
 
-def _no_candidate_modules_failure() -> dict[str, str]:
-    return {
-        "failure_code": "no_candidate_modules",
-        "failure_category": "business",
-        "failure_message": NO_CANDIDATE_MODULES_FAILURE_MESSAGE,
-        "error": NO_CANDIDATE_MODULES_FAILURE_MESSAGE,
-    }
-
-
 class SystemAnalysisStageHandler(BinarySecurityStageHandler):
     def __init__(self) -> None:
         super().__init__(stage_name="system_analysis")
@@ -190,11 +181,7 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
                 and str(run.status or "").strip() in {"running", "dispatching", "pending", "queued", "applying", "success", "partial_success"}
                 for run in downstream_stage_runs
             )
-        no_candidate_modules_failure = status == "success" and not failed and not candidate_modules and not has_active_downstream_stage
-        if no_candidate_modules_failure:
-            failure = _no_candidate_modules_failure()
-            status = "failed"
-            failed = failed or [{"status": "failed", **failure}]
+        no_candidate_modules = status == "success" and not failed and not candidate_modules and not has_active_downstream_stage
         summary.update(
             {
                 "system_analysis_results": manager._lightweight_system_analysis_items(success),
@@ -203,7 +190,6 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
                 "candidate_modules": candidate_modules,
                 "selected_modules": selected_modules,
                 "high_risk_modules": selected_modules,
-                **(_no_candidate_modules_failure() if no_candidate_modules_failure else {}),
             }
         )
         task.summary = summary
@@ -217,16 +203,20 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
         stage_run.started_at = stage_run.started_at or now_local()
         stage_run.counts = manager._stage_counts(db, stage_run)
         stage_run.last_error = failed[0].get("error") if failed and status == "failed" else None
-        if no_candidate_modules_failure and stage_run.last_error == NO_CANDIDATE_MODULES_FAILURE_MESSAGE:
-            task.last_error = stage_run.last_error
+        if no_candidate_modules:
+            task.last_error = None
             manager._record_event(
                 db,
                 task,
                 "system_analysis_no_candidate_modules",
                 NO_CANDIDATE_MODULES_FAILURE_MESSAGE,
-                level="error",
+                level="info",
                 stage_name=self.stage_name,
-                payload=_no_candidate_modules_failure(),
+                payload={
+                    "candidate_module_count": 0,
+                    "selected_module_count": 0,
+                    "reason": "no_modules_match_policy",
+                },
             )
         else:
             task.last_error = None
@@ -247,7 +237,6 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
                 "status_synced": True,
                 "sync_status": stage_run.status,
                 "error": stage_run.last_error,
-                **(_no_candidate_modules_failure() if no_candidate_modules_failure else {}),
                 **stage_run.counts,
             },
         )
