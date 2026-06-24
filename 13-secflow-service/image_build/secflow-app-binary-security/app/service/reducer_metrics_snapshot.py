@@ -31,6 +31,7 @@ class ReducerMetricsSnapshotStore:
     def __init__(self) -> None:
         self._redis_url = get_config().queue.redis_url
         self._lock = asyncio.Lock()
+        self._client: Redis | None = None
 
     def _new_client(self, *, context: str = "reducer_metrics_snapshot") -> Redis:
         logger.info(
@@ -50,7 +51,10 @@ class ReducerMetricsSnapshotStore:
         )
 
     async def _client_or_create(self, *, context: str = "reducer_metrics_snapshot") -> Redis:
-        return self._new_client(context=context)
+        async with self._lock:
+            if self._client is None:
+                self._client = self._new_client(context=context)
+            return self._client
 
     async def write_snapshot(
         self,
@@ -68,15 +72,17 @@ class ReducerMetricsSnapshotStore:
         }
         try:
             await client.set(_SNAPSHOT_KEY, json.dumps(payload, ensure_ascii=True), ex=_SNAPSHOT_TTL_SECONDS)
-        finally:
+        except Exception:
             await self._close_client(client)
+            raise
 
     async def read_snapshot(self) -> dict[str, Any] | None:
         client = await self._client_or_create(context="reducer_metrics_snapshot")
         try:
             raw = await client.get(_SNAPSHOT_KEY)
-        finally:
+        except Exception:
             await self._close_client(client)
+            raise
         if not raw:
             return None
         try:
@@ -138,13 +144,21 @@ class ReducerMetricsSnapshotStore:
         return ("\n".join(line for line in lines if line).strip() + "\n").encode("utf-8"), CONTENT_TYPE_LATEST
 
     async def close(self) -> None:
-        return
+        async with self._lock:
+            client = self._client
+            self._client = None
+        if client is not None:
+            await self._close_client(client)
 
     async def _close_client(self, client: Redis) -> None:
         try:
             await client.aclose()
         except Exception:
             pass
+        finally:
+            async with self._lock:
+                if self._client is client:
+                    self._client = None
 
 
 def _escape_label_value(value: str) -> str:
