@@ -1906,6 +1906,7 @@ class TaskReadModelServiceMixin:
         workflow_blocked_by_stage = self._workflow_blocked_on_stage(task, workflow_snapshots)
         kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
         active_operation = self._active_operation(db, task.id)
+        delete_state = self._task_delete_queue_state(task)
         if (
             active_operation is not None
             and str(active_operation.operation_type or "").strip() != task_manager_module.TASK_ACTION_CANCEL
@@ -1924,6 +1925,12 @@ class TaskReadModelServiceMixin:
             runtime_phase=runtime_phase,
             task_control_mode=task_control_mode,
             current_operation_id=task.current_operation_id,
+            delete_queued=bool(delete_state.get("delete_queued")),
+            delete_in_progress=bool(delete_state.get("delete_in_progress")),
+            delete_mode=self._string_or_none(delete_state.get("delete_mode")),
+            delete_operation_id=self._string_or_none(delete_state.get("delete_operation_id")),
+            delete_requested_at=self._string_or_none(delete_state.get("delete_requested_at")),
+            delete_last_error=self._string_or_none(delete_state.get("delete_last_error")),
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
             workflow_terminalization_ready=workflow_terminalization_ready,
@@ -3356,6 +3363,7 @@ class TaskReadModelServiceMixin:
             ),
         )
         terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
+        delete_state = self._task_delete_queue_state(task)
         return task_manager_module.BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -3366,6 +3374,12 @@ class TaskReadModelServiceMixin:
             runtime_phase=runtime_phase,
             task_control_mode=task_control_mode,
             current_operation_id=task.current_operation_id,
+            delete_queued=bool(delete_state.get("delete_queued")),
+            delete_in_progress=bool(delete_state.get("delete_in_progress")),
+            delete_mode=self._string_or_none(delete_state.get("delete_mode")),
+            delete_operation_id=self._string_or_none(delete_state.get("delete_operation_id")),
+            delete_requested_at=self._string_or_none(delete_state.get("delete_requested_at")),
+            delete_last_error=self._string_or_none(delete_state.get("delete_last_error")),
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
             last_error=task.last_error,

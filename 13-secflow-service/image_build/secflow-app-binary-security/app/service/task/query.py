@@ -88,6 +88,17 @@ class TaskQueryServiceMixin:
                     base_query = base_query.filter(BinarySecurityTask.task_type == normalized_task_type)
             if normalized_pipeline_profile and normalized_task_type == TASK_TYPE_SOURCE:
                 base_query = self._apply_pipeline_profile_filter(base_query, normalized_pipeline_profile)
+            base_query = base_query.filter(
+                or_(
+                    BinarySecurityTask.cleanup_snapshot_json.is_(None),
+                    ~BinarySecurityTask.cleanup_snapshot_json.like('%"delete_queued": true%'),
+                )
+            ).filter(
+                or_(
+                    BinarySecurityTask.cleanup_snapshot_json.is_(None),
+                    ~BinarySecurityTask.cleanup_snapshot_json.like('%"delete_in_progress": true%'),
+                )
+            )
             observe_task_list_query_stage(
                 stage="build_base_query",
                 task_type=metrics_task_type,

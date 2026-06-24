@@ -140,6 +140,23 @@ class TaskQueue:
             )
             raise
 
+    async def push_delete_task(self, task_id: str, *, context: str = "task_delete_enqueue") -> None:
+        client = self._new_client(context=context)
+        queue_key = str(getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue").strip()
+        try:
+            await self._push_unique(client, queue_key, str(task_id))
+        except Exception as exc:
+            logger.exception(
+                "binary-security delete queue push failed: context=%s task_id=%s redis_url=%s delete_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(task_id or "").strip() or None,
+                str(self.config.redis_url or "").strip() or None,
+                queue_key or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+
     async def force_requeue_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
         client = self._new_client(context=context)
         try:
@@ -151,6 +168,23 @@ class TaskQueue:
                 str(task_id or "").strip() or None,
                 str(self.config.redis_url or "").strip() or None,
                 str(self.config.task_queue_key or "").strip() or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+
+    async def force_requeue_delete_task(self, task_id: str, *, context: str = "task_delete_enqueue") -> None:
+        client = self._new_client(context=context)
+        queue_key = str(getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue").strip()
+        try:
+            await self._force_requeue(client, queue_key, str(task_id))
+        except Exception as exc:
+            logger.exception(
+                "binary-security delete queue force requeue failed: context=%s task_id=%s redis_url=%s delete_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(task_id or "").strip() or None,
+                str(self.config.redis_url or "").strip() or None,
+                queue_key or None,
                 exc.__class__.__name__,
                 exc,
             )
@@ -186,6 +220,38 @@ class TaskQueue:
             await self._close_client(client)
             return None
         return await self._consume_result(client, self.config.task_queue_key, result)
+
+    async def pop_delete_task(self, timeout_seconds: int | None = None, *, context: str = "task_delete_dispatch_pop") -> Optional[str]:
+        client = self._new_client(context=context)
+        queue_key = str(getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue").strip()
+        try:
+            result = await client.blpop(
+                queue_key,
+                timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
+            )
+        except RedisTimeoutError as exc:
+            logger.debug(
+                "binary-security delete queue pop timeout: context=%s redis_url=%s delete_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(self.config.redis_url or "").strip() or None,
+                queue_key or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            await self._close_client(client)
+            return None
+        except (RedisConnectionError, OSError) as exc:
+            logger.warning(
+                "binary-security delete queue pop failed: context=%s redis_url=%s delete_queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(self.config.redis_url or "").strip() or None,
+                queue_key or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            await self._close_client(client)
+            return None
+        return await self._consume_result(client, queue_key, result)
 
     async def _close_client(self, client: Redis) -> None:
         loop_id = None

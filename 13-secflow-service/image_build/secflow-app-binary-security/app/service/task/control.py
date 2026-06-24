@@ -33,6 +33,110 @@ if TYPE_CHECKING:
 
 
 class TaskControlServiceMixin:
+    def _task_delete_snapshot_state(self: TaskManager, task) -> dict[str, Any]:
+        snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def _task_delete_queue_state(self: TaskManager, task) -> dict[str, Any]:
+        snapshot = self._task_delete_snapshot_state(task)
+        return {
+            "delete_queued": bool(snapshot.get("delete_queued")),
+            "delete_in_progress": bool(snapshot.get("delete_in_progress")),
+            "delete_mode": str(snapshot.get("delete_mode") or "").strip() or None,
+            "delete_operation_id": str(snapshot.get("delete_operation_id") or "").strip() or None,
+            "delete_requested_at": str(snapshot.get("delete_queue_requested_at") or "").strip() or None,
+            "delete_last_error": str(snapshot.get("delete_last_error") or "").strip() or None,
+        }
+
+    def _task_is_hidden_by_delete_queue(self: TaskManager, task) -> bool:
+        delete_state = self._task_delete_queue_state(task)
+        return bool(delete_state["delete_queued"] or delete_state["delete_in_progress"])
+
+    def _mark_task_delete_queued(
+        self: TaskManager,
+        task,
+        *,
+        operation_id: str,
+        force_delete: bool,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        snapshot = self._task_delete_snapshot_state(task)
+        snapshot["delete_queued"] = True
+        snapshot["delete_in_progress"] = False
+        snapshot["delete_mode"] = "force_delete" if force_delete else "delete"
+        snapshot["delete_operation_id"] = str(operation_id or "").strip() or None
+        snapshot["delete_queue_requested_at"] = task_manager_module._now().isoformat()
+        snapshot["delete_last_error"] = None
+        task.cleanup_snapshot = snapshot
+
+    def _mark_task_delete_consumer_started(
+        self: TaskManager,
+        task,
+        *,
+        operation_id: str,
+        force_delete: bool,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        snapshot = self._task_delete_snapshot_state(task)
+        snapshot["delete_queued"] = True
+        snapshot["delete_in_progress"] = True
+        snapshot["delete_mode"] = "force_delete" if force_delete else "delete"
+        snapshot["delete_operation_id"] = str(operation_id or "").strip() or None
+        snapshot["delete_started_at"] = task_manager_module._now().isoformat()
+        task.cleanup_snapshot = snapshot
+
+    def _mark_task_delete_terminal_failure(
+        self: TaskManager,
+        task,
+        *,
+        operation_id: str | None,
+        force_delete: bool,
+        error_message: str,
+    ) -> None:
+        snapshot = self._task_delete_snapshot_state(task)
+        snapshot["delete_queued"] = False
+        snapshot["delete_in_progress"] = False
+        snapshot["delete_mode"] = "force_delete" if force_delete else "delete"
+        snapshot["delete_operation_id"] = str(operation_id or "").strip() or None
+        snapshot["delete_last_error"] = str(error_message or "").strip() or None
+        task.cleanup_snapshot = snapshot
+
+    def _enqueue_delete_task(self: TaskManager, task_id: str) -> None:
+        from app.service import task_manager as task_manager_module
+
+        async def _push() -> None:
+            await task_manager_module.get_task_queue().push_delete_task(task_id, context="task_delete_enqueue")
+
+        loop = self._loop_task.get_loop() if self._loop_task is not None else None
+        if loop and loop.is_running():
+            loop.create_task(_push())
+            return
+        asyncio.create_task(_push())
+
+    def _force_requeue_delete_task(self: TaskManager, task_id: str) -> None:
+        from app.service import task_manager as task_manager_module
+
+        async def _push() -> None:
+            await task_manager_module.get_task_queue().force_requeue_delete_task(task_id, context="task_delete_enqueue")
+
+        loop = self._loop_task.get_loop() if self._loop_task is not None else None
+        if loop and loop.is_running():
+            loop.create_task(_push())
+            return
+        asyncio.create_task(_push())
+
+    def _reject_if_delete_queued(
+        self: TaskManager,
+        task,
+        *,
+        action: str,
+    ) -> None:
+        if not self._task_is_hidden_by_delete_queue(task):
+            return
+        raise ValidationError(f"任务已进入异步删除流程，当前不支持执行 {action}")
+
     def _active_delete_operation(self: TaskManager, db: Session, task_id: str):
         from app.service import task_manager as task_manager_module
 
@@ -1047,6 +1151,7 @@ class TaskControlServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        self._reject_if_delete_queued(task, action="cancel")
         active_cancel_operation = self._active_operation(db, task.id)
         if active_cancel_operation is not None and str(active_cancel_operation.operation_type or "").strip() == task_manager_module.TASK_ACTION_CANCEL:
             task_manager_module.observe_task_operation("cancel", "already_queued")
@@ -1140,6 +1245,7 @@ class TaskControlServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        delete_state = self._task_delete_queue_state(task)
         normalized_requested_by = str(requested_by or getattr(task, "created_by", None) or "").strip() or None
         normalized_request_source = str(request_source or "api").strip() or "api"
         normalized_token_type = str(request_token_type or "").strip() or None
@@ -1176,28 +1282,38 @@ class TaskControlServiceMixin:
         )
         operation.request_source = normalized_request_source
         task.current_operation_id = operation.id
-        db.commit()
-        wakeup_requested = await self._request_local_worker_control_wakeup(
-            task.id,
-            task_manager_module.TASK_ACTION_DELETE,
+        self._mark_task_delete_queued(
+            task,
             operation_id=operation.id,
-            wait_for_runner=False,
+            force_delete=bool(force),
         )
-        if wakeup_requested:
-            self._record_event(
-                db,
-                task,
-                "local_owner_control_wakeup_requested",
-                "已通知当前 owner 原地处理删除控制操作",
-                stage_name=task.current_stage,
-                payload={
-                    "operation_id": operation.id,
-                    "operation_type": task_manager_module.TASK_ACTION_DELETE,
-                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                },
-            )
-            db.commit()
-        self._enqueue_task(task.id)
+        self._record_event(
+            db,
+            task,
+            "task_force_delete_queue_accepted" if bool(force) else "task_delete_queue_accepted",
+            "任务删除已加入异步删除队列",
+            stage_name=task.current_stage,
+            payload={
+                "operation_id": operation.id,
+                "force_delete": bool(force),
+                "delete_queued": True,
+                "delete_in_progress": False,
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "task_delete_hidden_from_default_listing",
+            "任务已从默认列表隐藏，等待异步删除队列处理",
+            stage_name=task.current_stage,
+            payload={
+                "operation_id": operation.id,
+                "force_delete": bool(force),
+                "delete_mode": "force_delete" if bool(force) else "delete",
+            },
+        )
+        db.commit()
+        self._enqueue_delete_task(task.id)
         task_manager_module.observe_task_operation("delete", "accepted")
         return BinarySecurityActionResponse(
             task_id=task_id,
@@ -1205,7 +1321,7 @@ class TaskControlServiceMixin:
             accepted=True,
             action="delete",
             status="accepted",
-            message="任务删除已受理，后台正在清理任务及下游资源",
+            message="任务删除已受理，后台正在异步删除队列中清理任务及下游资源",
             task_status_after_accept=task.status,
         )
 
@@ -1220,6 +1336,7 @@ class TaskControlServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        self._reject_if_delete_queued(task, action="force_reset_to_pending")
         previous_status = str(getattr(task, "status", "") or "").strip()
         normalized_requested_by = str(requested_by or getattr(task, "created_by", None) or "").strip() or None
         if previous_status.lower() in {"success", "cancelled"}:
@@ -1414,6 +1531,7 @@ class TaskControlServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        self._reject_if_delete_queued(task, action="continue")
         supported, reason, target_stage = self._task_continue_support(db, task)
         if not supported:
             task_manager_module.observe_task_operation("continue", "rejected")
@@ -1446,6 +1564,7 @@ class TaskControlServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        self._reject_if_delete_queued(task, action="retry")
         supported, reason, stage_name = self._task_retry_support(db, task)
         if not supported or not stage_name:
             task_manager_module.observe_task_operation("retry", "rejected")
@@ -1478,6 +1597,7 @@ class TaskControlServiceMixin:
         from app.service import task_manager as task_manager_module
 
         task = self._task_or_404(db, project_id, task_id)
+        self._reject_if_delete_queued(task, action="retry_failed_items")
         supported, reason, stage_name, items = self._task_retry_failed_items_support(db, task)
         if supported and stage_name and not items:
             operation = self._queue_task_operation(

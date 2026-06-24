@@ -364,6 +364,7 @@ TASK_STATUS_HARD_RESTART_FAILED = "hard_restart_failed"
 TASK_STATUS_CANCELLING = "cancelling"
 TASK_STATUS_CANCEL_FAILED = "cancel_failed"
 TASK_STATUS_DELETE_FAILED = "delete_failed"
+TASK_STATUS_FORCE_DELETE_FAILED = "force_delete_failed"
 TASK_ACTION_CONTINUE = "continue"
 TASK_ACTION_RETRY = "retry"
 TASK_ACTION_RETRY_FAILED_ITEMS = "retry_failed_items"
@@ -693,6 +694,7 @@ class TaskManager(
         self._running = False
         self._loop_task: Optional[asyncio.Task] = None
         self._archive_loop_task: Optional[asyncio.Task] = None
+        self._delete_loop_task: Optional[asyncio.Task] = None
         self._downstream_reconcile_task: Optional[asyncio.Task] = None
         self._readless_reconcile_task: Optional[asyncio.Task] = None
         self._stage_item_sync_reconcile_task: Optional[asyncio.Task] = None
@@ -1590,6 +1592,7 @@ class TaskManager(
                 logger.info("binary-security task manager starting dispatch loops")
                 self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
                 self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
+                self._delete_loop_task = asyncio.create_task(self._delete_dispatch_loop(), name="binary-security-delete-dispatcher")
                 self._stage_item_loop_task = asyncio.create_task(
                     self._stage_item_dispatch_loop(),
                     name="binary-security-stage-item-dispatcher",
@@ -1627,6 +1630,7 @@ class TaskManager(
         self._running = False
         await self._cancel_loop_task(self._loop_task)
         await self._cancel_loop_task(self._archive_loop_task)
+        await self._cancel_loop_task(self._delete_loop_task)
         await self._cancel_loop_task(self._stage_item_loop_task)
         await self._cancel_loop_task(self._task_heartbeat_loop_task)
         await self._cancel_loop_task(self._state_reducer_loop_task)

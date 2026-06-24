@@ -15,6 +15,152 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    async def _delete_dispatch_loop(self: TaskManager) -> None:
+        from app.service import task_manager as task_manager_module
+
+        session_factory = task_manager_module.get_session_factory()
+        while self._running:
+            db = session_factory()
+            try:
+                with task_manager_module.observe_scheduler_loop("task_delete_dispatch"):
+                    self._mark_loop_heartbeat("task_delete_dispatch")
+                    task_id = await task_manager_module.get_task_queue().pop_delete_task(
+                        self.cfg.queue.block_timeout_seconds,
+                        context="task_delete_dispatch_pop",
+                    )
+                    if task_id:
+                        await self._consume_delete_queue_task(db, task_id)
+                    self._mark_loop_heartbeat("task_delete_dispatch")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._recover_loop_db_error("task_delete_dispatch", db, exc)
+                task_manager_module.logger.exception("binary-security delete dispatch loop crashed and recovered")
+                await asyncio.sleep(1)
+            finally:
+                with suppress(Exception):
+                    db.close()
+
+    async def _consume_delete_queue_task(self: TaskManager, db: Session, task_id: str) -> None:
+        from app.service import task_manager as task_manager_module
+
+        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == task_id).first()
+        if task is None:
+            return
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is None or str(getattr(active_operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_DELETE:
+            self._record_event(
+                db,
+                task,
+                "task_delete_queue_consumption_dropped",
+                "删除队列任务缺少活跃 delete operation，已忽略",
+                stage_name=task.current_stage,
+                level="warning",
+                payload={"task_id": task.id},
+            )
+            db.commit()
+            return
+        force_delete = bool(dict(active_operation.request_payload or {}).get("force_delete"))
+        if not self._task_is_hidden_by_delete_queue(task):
+            self._mark_task_delete_queued(task, operation_id=active_operation.id, force_delete=force_delete)
+        if self._runtime_lease_is_active(self._runtime_lease_for_task(db, task.id)):
+            self._force_requeue_delete_task(task.id)
+            return
+        started_at = task_manager_module._now()
+        task.dispatcher_instance_id = self.instance_id
+        task.dispatch_started_at = started_at
+        task.lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
+        self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
+        self._mark_task_delete_consumer_started(
+            task,
+            operation_id=active_operation.id,
+            force_delete=force_delete,
+        )
+        self._record_event(
+            db,
+            task,
+            "task_delete_queue_consumption_started",
+            "异步删除队列已开始处理任务删除",
+            stage_name=task.current_stage,
+            payload={
+                "operation_id": active_operation.id,
+                "force_delete": force_delete,
+                "queue_name": str(getattr(self.cfg.queue, "delete_queue_key", "") or "binary_security_delete_queue"),
+                "dispatcher_instance_id": self.instance_id,
+                "runtime_phase": self._task_runtime_phase(task),
+                "delete_queued": True,
+                "delete_in_progress": True,
+            },
+        )
+        db.commit()
+        try:
+            await self._prepare_delete_task(db, task)
+        except Exception as exc:
+            refreshed = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == task_id).first()
+            if refreshed is not None:
+                operation = self._active_operation(db, task_id) or active_operation
+                force_delete = bool(dict(getattr(operation, "request_payload", {}) or {}).get("force_delete"))
+                self._mark_task_delete_terminal_failure(
+                    refreshed,
+                    operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+                    force_delete=force_delete,
+                    error_message=str(exc),
+                )
+                self._set_task_status(
+                    db,
+                    refreshed,
+                    task_manager_module.TASK_STATUS_FORCE_DELETE_FAILED if force_delete else task_manager_module.TASK_STATUS_DELETE_FAILED,
+                    reason="异步删除执行失败",
+                    source="delete_queue",
+                    stage_name=refreshed.current_stage,
+                )
+                refreshed.last_error = str(exc)
+                if operation is not None:
+                    operation.status = "failed"
+                    operation.error_message = str(exc)
+                    operation.finished_at = task_manager_module._now()
+                self._record_event(
+                    db,
+                    refreshed,
+                    "task_delete_queue_consumption_failed",
+                    "异步删除队列处理失败，任务已进入删除失败态",
+                    stage_name=refreshed.current_stage,
+                    level="error",
+                    payload={
+                        "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                        "force_delete": force_delete,
+                        "last_error": str(exc),
+                        "delete_queued": False,
+                        "delete_in_progress": False,
+                    },
+                )
+                self._record_event(
+                    db,
+                    refreshed,
+                    "task_delete_failed_terminalized",
+                    "删除失败已收口，等待后续再次显式发起删除",
+                    stage_name=refreshed.current_stage,
+                    level="warning",
+                    payload={
+                        "force_delete": force_delete,
+                        "last_error": str(exc),
+                    },
+                )
+                self._release_task_delete_runtime_state(db, refreshed)
+                db.commit()
+            return
+        self._record_event(
+            db,
+            task,
+            "task_delete_queue_consumption_succeeded",
+            "异步删除队列处理完成，任务已物理删除",
+            stage_name=task.current_stage,
+            payload={
+                "operation_id": active_operation.id,
+                "force_delete": force_delete,
+            },
+        )
+
     def _sync_task_row_lease_view_from_owner(
         self: TaskManager,
         db: Session,
@@ -698,6 +844,8 @@ class TaskRuntimeServiceMixin:
             task_manager_module.BinarySecurityTask.id == task_id
         ).first()
         if task is None:
+            return None
+        if self._task_is_hidden_by_delete_queue(task):
             return None
         current_operation = None
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()

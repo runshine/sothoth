@@ -189,6 +189,12 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     tail_reconcile_state: str = "idle"
     task_control_mode: str = "owned_execution"
     current_operation_id: Optional[str] = None
+    delete_queued: bool = False
+    delete_in_progress: bool = False
+    delete_mode: Optional[str] = None
+    delete_operation_id: Optional[str] = None
+    delete_requested_at: Optional[str] = None
+    delete_last_error: Optional[str] = None
     execution_epoch: int = 0
     current_stage: Optional[str] = None
     workflow_terminalization_ready: bool = False

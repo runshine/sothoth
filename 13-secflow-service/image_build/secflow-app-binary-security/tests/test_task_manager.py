@@ -11241,7 +11241,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("cancelled", stage_run.status)
         self.assertEqual("cancelled", item.status)
 
-    def test_delete_task_requests_local_control_wakeup_on_accept(self):
+    def test_delete_task_enqueues_async_delete_queue_on_accept(self):
         task = BinarySecurityTask(
             id="t-del",
             project_id="p1",
@@ -11256,22 +11256,17 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             dispatcher_instance_id="worker-a",
         )
         db = _ModelAwareDb(tasks=[task], operations=[])
-        wakeups: list[str] = []
         enqueued: list[str] = []
 
-        async def fake_request_local_worker_control_wakeup(task_id: str, operation_type: str, *, operation_id=None, wait_for_runner: bool):
-            wakeups.append(f"{task_id}:{operation_type}:{wait_for_runner}:{bool(operation_id)}")
-            return True
-
-        self.manager._request_local_worker_control_wakeup = fake_request_local_worker_control_wakeup
-        self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
+        self.manager._enqueue_delete_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
 
         response = asyncio.run(self.manager.delete_task(db, project_id="p1", task_id="t-del"))
 
         self.assertTrue(response.accepted)
         self.assertEqual("accepted", response.status)
         self.assertEqual("delete", response.action)
-        self.assertEqual(["t-del:delete:False:True"], wakeups)
+        self.assertTrue(task.cleanup_snapshot.get("delete_queued"))
+        self.assertFalse(task.cleanup_snapshot.get("delete_in_progress"))
         self.assertGreaterEqual(len(enqueued), 1)
         self.assertTrue(all(task_id == "t-del" for task_id in enqueued))
         self.assertIsNotNone(response.operation_id)
@@ -11282,6 +11277,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task_manager_module.TASK_ACTION_DELETE, operations[0].operation_type)
         event_types = [getattr(event, "event_type", "") for event in db.added]
         self.assertIn("task_delete_accepted", event_types)
+        self.assertIn("task_delete_queue_accepted", event_types)
 
     def test_cancel_task_holds_lock_during_async_cleanup(self):
         task = BinarySecurityTask(
