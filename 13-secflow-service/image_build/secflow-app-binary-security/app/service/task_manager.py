@@ -4302,7 +4302,6 @@ class TaskManager(
                 if normalize_stage_name(run.stage_name) == normalize_stage_name(stage_name)
             ]
             if not stage_candidates:
-                active_candidates.append((stage_name, "pending"))
                 continue
             for run in sorted(stage_candidates, key=lambda row: int(getattr(row, "sequence_no", 0) or 0)):
                 normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()

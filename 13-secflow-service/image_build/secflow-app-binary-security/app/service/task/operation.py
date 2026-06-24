@@ -3543,6 +3543,25 @@ class TaskOperationServiceMixin:
                         await self._prepare_archive_retry_failed_items(db, task, str(operation.target_stage or "").strip())
                     elif operation.operation_type == task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL:
                         await self._prepare_archive_retry_full(db, task, str(operation.target_stage or "").strip())
+                    elif operation.operation_type == "force_reset_to_pending":
+                        await self._apply_force_reset_to_pending_now(
+                            db,
+                            task,
+                            requested_by=str(getattr(operation, "requested_by", None) or "").strip() or None,
+                            operation=operation,
+                        )
+                        self._record_operation_step_finished(
+                            db,
+                            task,
+                            operation,
+                            step_name=prepare_step,
+                            message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                            stage_name=operation.target_stage,
+                            next_step=task_manager_module.TASK_OPERATION_STEP_SUCCEEDED,
+                        )
+                        operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+                        db.commit()
+                        return
                     elif operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
                         await self._prepare_delete_task(db, task)
                         self._record_operation_step_finished(

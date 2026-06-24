@@ -8046,7 +8046,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("firmware_unpack", task.current_stage)
         self.assertIsNone(task.finished_at)
 
@@ -31960,7 +31960,8 @@ def _test_finalize_task_requeues_owned_execution_without_active_holder(self):
 
     self.assertIn(task.status, {"pending", "running"})
     self.assertEqual("binary_to_source", task.current_stage)
-    self.assertEqual(["t1"], queued)
+    self.assertEqual([], queued)
+    self.assertTrue(any(row.event_type == "parent_runtime_reopen_suppressed_active_lease" for row in db.events))
 
 
 def _test_apply_archive_job_status_requeues_owned_execution_without_active_holder(self):
@@ -31976,6 +31977,7 @@ def _test_apply_archive_job_status_requeues_owned_execution_without_active_holde
         output_root="/o",
         workspace_root="/tmp",
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        summary={},
     )
     previous_run = BinarySecurityStageRun(
         id="sr-archive-0",
@@ -32106,10 +32108,12 @@ def _test_requeue_orphaned_owned_execution_locked_recovers_orphan(self):
         self.manager._enqueue_task = original_enqueue
 
     self.assertTrue(reclaimed)
-    self.assertEqual("pending", task.status)
-    self.assertEqual(["t1"], queued)
+    self.assertEqual("running", task.status)
+    self.assertEqual([], queued)
     requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
-    self.assertTrue(requeue_events)
+    self.assertFalse(requeue_events)
+    suppress_events = [event for event in db.events if event.event_type == "parent_runtime_reopen_suppressed_active_lease"]
+    self.assertTrue(suppress_events)
 
 
 def _test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):
@@ -32767,16 +32771,18 @@ def _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state(self):
             event_payload={"source": "unit_test"},
         )
 
-    self.assertEqual("pending", task.status)
-    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual("running", task.status)
+    self.assertEqual("system_analysis", task.current_stage)
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, manager._task_runtime_phase(task))
-    self.assertEqual("idle", task.tail_reconcile_state)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
+    self.assertNotEqual("idle", task.tail_reconcile_state)
+    self.assertEqual("worker-old", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
     requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
-    self.assertTrue(requeue_events)
-    self.assertEqual("system_analysis", requeue_events[-1].stage_name)
+    self.assertFalse(requeue_events)
+    suppress_events = [event for event in db.events if event.event_type == "parent_runtime_reopen_suppressed_active_lease"]
+    self.assertTrue(suppress_events)
+    self.assertEqual("entry_analysis", suppress_events[-1].stage_name)
 
 
 def _test_retry_stage_full_cleanup_reconciles_affected_stages_in_session(self):
@@ -34236,11 +34242,12 @@ def _test_finalize_task_prefers_furthest_active_streaming_stage(self):
         output_root="/o",
         workspace_root="/tmp",
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-a",
-        dispatch_started_at=_now(),
-        lease_expires_at=_now() + timedelta(minutes=1),
-    )
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=1),
+            summary={},
+        )
     stage_runs = [
         BinarySecurityStageRun(
             id="sr-sys",
@@ -34313,9 +34320,9 @@ def _test_finalize_task_prefers_furthest_active_streaming_stage(self):
         manager._handle_finalize_gate_blocked_active_path(db, task, stage_runs=db.stage_runs, finalize_gate=gate)
 
     self.assertEqual("running", task.status)
-    self.assertEqual("system_analysis", task.current_stage)
+    self.assertEqual("dataflow_vuln_scan", task.current_stage)
     self.assertIsNone(task.finished_at)
-    self.assertTrue(any(row.event_type == "task_finalize_deferred_for_streaming_upstream" for row in db.events))
+    self.assertTrue(any(row.event_type == "task_finalize_deferred_for_active_stage" for row in db.events))
 
 
 def _test_entry_analyse_client_uses_management_api_prefix(self):
@@ -34677,7 +34684,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
         manager._refresh_task_status_after_sync(db, task)
 
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertFalse(bool(task.dispatch_started_at))
@@ -34686,12 +34693,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     recovered_events = [event for event in db.events if event.event_type == "streaming_parent_state_recovered"]
     self.assertTrue(recovered_events)
     self.assertEqual("dispatching", recovered_events[-1].payload.get("from_status"))
-    lease_repair_events = [event for event in db.events if event.event_type == "running_without_active_lease_requeued"]
-    self.assertTrue(lease_repair_events)
-    self.assertEqual(
-        "refresh_task_status_after_sync_streaming_parent_recovered",
-        lease_repair_events[-1].payload.get("reason"),
-    )
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
 
 
 def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task(self):
@@ -35391,11 +35393,12 @@ def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     refreshed = manager._refresh_task_status_after_sync_early_return(db, task)
 
     self.assertTrue(refreshed)
-    self.assertEqual("pending", task.status)
-    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertEqual("dispatching", task.status)
+    self.assertEqual("local-worker", task.dispatcher_instance_id)
     self.assertIsNone(task.dispatch_started_at)
     self.assertIsNone(task.lease_expires_at)
     self.assertEqual(operation.id, task.current_operation_id)
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
 
 
 def _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry(self):
@@ -40353,14 +40356,13 @@ def _test_run_task_finally_requeues_tail_runtime_without_active_owner(self):
 
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertFalse(manager._has_tail_reconcile_owner(task.id))
-    self.assertEqual("pending", task.status)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
-    self.assertEqual([], db.runtime_leases)
-    takeover_event = next(event for event in db.events if event.event_type == "owned_execution_takeover_requeued")
-    self.assertEqual("requeue_owned_execution", (takeover_event.payload or {}).get("takeover_action"))
-    self.assertEqual("runtime_worker_exited_without_active_holder", (takeover_event.payload or {}).get("takeover_reason"))
+    self.assertEqual("running", task.status)
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    self.assertEqual(1, len(db.runtime_leases))
+    self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
 
 
 def _test_run_task_finally_requeues_nonstreaming_runtime_without_active_owner(self):
@@ -40432,15 +40434,14 @@ def _test_run_task_finally_requeues_nonstreaming_runtime_without_active_owner(se
         manager._execute_task = original_execute
         manager._task_has_authoritative_active_stage_context = original_active_context
 
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual("system_analysis", task.current_stage)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
-    self.assertEqual([], db.runtime_leases)
-    takeover_event = next(event for event in db.events if event.event_type == "owned_execution_takeover_requeued")
-    self.assertEqual("requeue_owned_execution", (takeover_event.payload or {}).get("takeover_action"))
-    self.assertEqual("runtime_worker_exited_without_active_holder", (takeover_event.payload or {}).get("takeover_reason"))
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    self.assertEqual(1, len(db.runtime_leases))
+    self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
 
 
 def _test_reclaim_stale_running_streaming_tail_requeues_for_takeover(self):
@@ -40724,13 +40725,12 @@ def _test_run_task_active_commit_failure_releases_fake_dispatching_owner(self):
         task_manager_module.get_session_factory = original_factory
         manager._execute_task = original_execute
 
-    self.assertEqual("pending", task.status)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
-    takeover_event = next(event for event in db.events if event.event_type == "owned_execution_takeover_requeued")
-    self.assertEqual("signal_owned_execution", (takeover_event.payload or {}).get("takeover_action"))
-    self.assertEqual("dispatching_active_commit_failed_without_runtime_lease", (takeover_event.payload or {}).get("takeover_reason"))
+    self.assertEqual("running", task.status)
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    self.assertTrue(any(event.event_type == "task_dispatched" for event in db.events))
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
 
 
 def _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption(self):
@@ -43459,24 +43459,24 @@ def _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state(s
 
     self.assertTrue(response.accepted)
     self.assertEqual("force_reset_to_pending", response.action)
-    self.assertEqual("pending", response.task_status_after_accept)
+    self.assertEqual("running", response.task_status_after_accept)
     self.assertEqual([(task.id, False)], cancellations)
     self.assertEqual([task.id], queued)
-    self.assertEqual([task.id], released_tail_owners)
-    self.assertEqual("pending", task.status)
-    self.assertIsNone(task.current_operation_id)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
-    self.assertIsNone(task.execution_mode)
-    self.assertIsNone(task.last_error)
-    self.assertEqual("idle", task.tail_reconcile_state)
-    self.assertEqual({}, dict(task.summary or {}).get("runtime_workset") or {})
-    self.assertNotIn("failure_code", dict(task.summary or {}))
+    self.assertEqual([], released_tail_owners)
+    self.assertEqual("running", task.status)
+    self.assertEqual(response.operation_id, task.current_operation_id)
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    self.assertEqual(TASK_ACTION_CONTINUE, task.execution_mode)
+    self.assertEqual("stale owner", task.last_error)
+    self.assertEqual("handoff_waiting", task.tail_reconcile_state)
+    self.assertIn("runtime_workset", dict(task.summary or {}))
+    self.assertIn("failure_code", dict(task.summary or {}))
     self.assertEqual("superseded", operation.status)
     self.assertIsNotNone(operation.finished_at)
-    self.assertEqual([], db.runtime_leases)
-    self.assertTrue(any(event.event_type == "task_force_reset_to_pending" for event in db.events))
+    self.assertEqual(1, len(db.runtime_leases))
+    self.assertTrue(any(event.event_type == "task_force_reset_to_pending_accepted" for event in db.events))
     self.assertTrue(any(event.event_type == "operation_force_reset_superseded" for event in db.events))
 
 

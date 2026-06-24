@@ -2460,6 +2460,7 @@ class TaskStateMachineMixin:
             return
         if any(str(run.status or "").strip() == "running" for run in stage_runs):
             task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
+            self._clear_task_abnormal_reason_snapshot(db, task)
         authoritative_failure = self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
         if authoritative_failure is None:
             authoritative_failure = self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)

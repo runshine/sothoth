@@ -1174,12 +1174,97 @@ class TaskControlServiceMixin:
 
         task = self._task_or_404(db, project_id, task_id)
         previous_status = str(getattr(task, "status", "") or "").strip()
+        normalized_requested_by = str(requested_by or getattr(task, "created_by", None) or "").strip() or None
         if previous_status.lower() in {"success", "cancelled"}:
             task_manager_module.observe_task_operation("force_reset", "rejected")
             raise ValidationError(f"当前任务状态不支持强制重置: {task.status}")
-
+        active_operations = (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.task_id == task.id)
+            .all()
+        )
+        reset_at = task_manager_module._now()
+        for candidate in active_operations:
+            operation_status = str(getattr(candidate, "status", "") or "").strip().lower()
+            if operation_status in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+                continue
+            if str(getattr(candidate, "operation_type", "") or "").strip() == "force_reset_to_pending":
+                task_manager_module.observe_task_operation("force_reset", "already_queued")
+                return BinarySecurityActionResponse(
+                    task_id=task_id,
+                    operation_id=candidate.id,
+                    accepted=True,
+                    action="force_reset_to_pending",
+                    status="accepted",
+                    message="任务强制重置已受理，后台将等待当前 owner 或租约过期后处理",
+                    task_status_after_accept=task.status,
+                )
+            candidate.status = "superseded"
+            candidate.finished_at = reset_at
+            candidate.superseded_by_operation_id = None
+            operation_payload = dict(self._operation_result_data(candidate) or {})
+            operation_payload["force_reset"] = {
+                "requested": True,
+                "requested_by": normalized_requested_by,
+                "reset_at": reset_at.isoformat(),
+                "task_status_after": str(getattr(task, "status", "") or "").strip(),
+            }
+            self._persist_operation_result_payload(
+                candidate,
+                operation_payload,
+                workspace_root=task.workspace_root,
+            )
+            self._record_operation_event(
+                db,
+                task,
+                candidate,
+                "operation_force_reset_superseded",
+                "人工强制重置请求已受理，原后台操作已转为 superseded",
+                level="warning",
+                stage_name=candidate.target_stage,
+                payload={
+                    "source": "manual_force_reset_request",
+                    "requested_by": normalized_requested_by,
+                    "task_status_after": str(getattr(task, "status", "") or "").strip(),
+                },
+            )
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type="force_reset_to_pending",
+            target_stage=task.current_stage,
+            requested_by=normalized_requested_by,
+            request_payload={
+                "current_stage": task.current_stage,
+                "requested_by": normalized_requested_by,
+                "previous_status": previous_status,
+            },
+            accepted_event_type="task_force_reset_to_pending_accepted",
+            accepted_message="任务强制重置已受理，后台将等待当前 owner 或租约过期后处理",
+        )
         await self._request_local_worker_cancel(task.id, wait_for_runner=False)
+        task_manager_module.observe_task_operation("force_reset", "accepted")
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id=operation.id,
+            accepted=True,
+            action="force_reset_to_pending",
+            status="accepted",
+            message="任务强制重置已受理，后台将等待当前 owner 或租约过期后处理",
+            task_status_after_accept=task.status,
+        )
 
+    async def _apply_force_reset_to_pending_now(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        requested_by: str | None = None,
+        operation: BinarySecurityTaskOperation | None = None,
+    ) -> dict[str, Any]:
+        from app.service import task_manager as task_manager_module
+
+        previous_status = str(getattr(task, "status", "") or "").strip()
         active_operations = (
             db.query(task_manager_module.BinarySecurityTaskOperation)
             .filter(task_manager_module.BinarySecurityTaskOperation.task_id == task.id)
@@ -1189,16 +1274,21 @@ class TaskControlServiceMixin:
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         current_operation_type: str | None = None
         superseded_operation_count = 0
-        for operation in active_operations:
-            operation_status = str(getattr(operation, "status", "") or "").strip().lower()
+        executing_operation_id = str(getattr(operation, "id", "") or "").strip() or None
+        for candidate in active_operations:
+            operation_status = str(getattr(candidate, "status", "") or "").strip().lower()
             if operation_status in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
                 continue
-            if current_operation_id and str(getattr(operation, "id", "") or "").strip() == current_operation_id:
-                current_operation_type = str(getattr(operation, "operation_type", "") or "").strip() or None
-            operation.status = "superseded"
-            operation.finished_at = reset_at
-            operation.superseded_by_operation_id = None
-            operation_payload = dict(self._operation_result_data(operation) or {})
+            candidate_id = str(getattr(candidate, "id", "") or "").strip() or None
+            if executing_operation_id and candidate_id == executing_operation_id:
+                current_operation_type = str(getattr(candidate, "operation_type", "") or "").strip() or None
+                continue
+            if current_operation_id and candidate_id == current_operation_id:
+                current_operation_type = str(getattr(candidate, "operation_type", "") or "").strip() or None
+            candidate.status = "superseded"
+            candidate.finished_at = reset_at
+            candidate.superseded_by_operation_id = executing_operation_id
+            operation_payload = dict(self._operation_result_data(candidate) or {})
             operation_payload["force_reset"] = {
                 "requested": True,
                 "requested_by": str(requested_by or "").strip() or None,
@@ -1206,22 +1296,23 @@ class TaskControlServiceMixin:
                 "task_status_after": "pending",
             }
             self._persist_operation_result_payload(
-                operation,
+                candidate,
                 operation_payload,
                 workspace_root=task.workspace_root,
             )
             self._record_operation_event(
                 db,
                 task,
-                operation,
+                candidate,
                 "operation_force_reset_superseded",
                 "人工强制重置任务状态，已终止当前后台操作",
                 level="warning",
-                stage_name=operation.target_stage,
+                stage_name=candidate.target_stage,
                 payload={
                     "source": "manual_force_reset",
                     "requested_by": str(requested_by or "").strip() or None,
                     "task_status_after": "pending",
+                    "superseded_by_operation_id": executing_operation_id,
                 },
             )
             superseded_operation_count += 1
@@ -1243,34 +1334,8 @@ class TaskControlServiceMixin:
         task.tail_reconcile_state = "idle"
         self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         self._invalidate_task_execution(task)
-        clear_decision = self._can_reopen_parent_task_after_lease_loss(
-            db,
-            task,
-            reason="force_reset_to_pending_requested",
-        )
-        if clear_decision.allowed:
-            self._clear_runtime_lease(db, task.id)
-            self._release_tail_reconcile_owner(task.id)
-            self._record_parent_runtime_lease_decision(
-                db,
-                task,
-                event_type="parent_runtime_reopen_allowed_after_lease_expiry",
-                message="父任务租约已过期，允许强制重置后重新进入待调度",
-                decision=clear_decision,
-                reason="force_reset_to_pending_requested",
-                stage_name=task.current_stage,
-                level="warning",
-            )
-        else:
-            self._record_parent_runtime_lease_decision(
-                db,
-                task,
-                event_type="retry_takeover_suppressed_active_lease",
-                message="父任务租约仍有效，当前不允许强制重置时清理租约",
-                decision=clear_decision,
-                reason="force_reset_to_pending_requested",
-                stage_name=task.current_stage,
-            )
+        self._clear_runtime_lease(db, task.id)
+        self._release_tail_reconcile_owner(task.id)
         self._clear_task_abnormal_reason_snapshot(db, task)
         self._record_event(
             db,
@@ -1287,20 +1352,16 @@ class TaskControlServiceMixin:
                 "previous_operation_type": current_operation_type,
                 "superseded_operation_count": superseded_operation_count,
                 "task_status_after": "pending",
+                "executed_via_operation_id": executing_operation_id,
             },
         )
         self._enqueue_task(task.id)
-        db.commit()
-        task_manager_module.observe_task_operation("force_reset", "accepted")
-        return BinarySecurityActionResponse(
-            task_id=task_id,
-            operation_id=current_operation_id,
-            accepted=True,
-            action="force_reset_to_pending",
-            status="accepted",
-            message="任务已强制重置为待调度，调度器将重新接管",
-            task_status_after_accept="pending",
-        )
+        return {
+            "previous_status": previous_status,
+            "previous_current_operation_id": current_operation_id,
+            "previous_operation_type": current_operation_type,
+            "superseded_operation_count": superseded_operation_count,
+        }
 
     async def continue_task(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskOperation:
         from app.service import task_manager as task_manager_module
