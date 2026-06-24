@@ -3129,6 +3129,12 @@ class TaskReadModelServiceMixin:
             if bool(target.get("blocking")) and str(target.get("terminal_observation_status") or "") not in {"cancelled", "success", "failed", "missing"}
         ]
         blocking_preview = blocking_targets[: task_manager_module.TASK_CANCEL_BLOCKING_TARGETS_PREVIEW_LIMIT]
+        ignored_blocking_targets = [
+            dict(target)
+            for target in list(result_payload.get("ignored_blocking_targets") or [])
+            if isinstance(target, dict)
+        ]
+        ignored_preview = ignored_blocking_targets[: task_manager_module.TASK_CANCEL_BLOCKING_TARGETS_PREVIEW_LIMIT]
         return {
             "operation_id": operation.id,
             "operation_type": operation.operation_type,
@@ -3145,6 +3151,11 @@ class TaskReadModelServiceMixin:
             "blocking_targets": blocking_preview,
             "blocking_targets_preview_count": len(blocking_preview),
             "blocking_targets_truncated": len(blocking_targets) > len(blocking_preview),
+            "cancel_verify_attempt_count": int(result_payload.get("cancel_verify_attempt_count") or 0),
+            "cancel_verify_max_attempts": int(result_payload.get("cancel_verify_max_attempts") or 0),
+            "cancel_force_finalize": bool(result_payload.get("force_cancelled_after_verify_retries")),
+            "cancel_ignored_targets_count": len(ignored_blocking_targets),
+            "cancel_ignored_targets_preview": ignored_preview,
             "last_progress_at": result_payload.get("last_progress_at") or task_shared._isoformat_or_none(operation.updated_at),
         }
 

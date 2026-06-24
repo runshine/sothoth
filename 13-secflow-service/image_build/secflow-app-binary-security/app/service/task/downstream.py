@@ -1384,6 +1384,25 @@ class TaskDownstreamServiceMixin:
     def _archive_job_is_active(self, archive_status: str | None) -> bool:
         return str(archive_status or "").strip() in {"pending", "running", "archived", "applying", "success"}
 
+    def _archive_job_is_old_child_retire_candidate(
+        self,
+        job: BinarySecurityArchiveJob,
+        *,
+        old_downstream_task_id: str | None,
+    ) -> bool:
+        old_task_id = str(old_downstream_task_id or "").strip()
+        if not old_task_id:
+            return False
+        if self._archive_job_bound_downstream_task_id(job) != old_task_id:
+            return False
+        return str(getattr(job, "archive_status", "") or "").strip() in {
+            "pending",
+            "running",
+            "archived",
+            "applying",
+            "success",
+        }
+
     def _supersede_archive_jobs_for_downstream_task(
         self,
         db: Session,
@@ -1400,7 +1419,6 @@ class TaskDownstreamServiceMixin:
             db.query(BinarySecurityArchiveJob)
             .filter(
                 BinarySecurityArchiveJob.item_id == item.id,
-                BinarySecurityArchiveJob.archive_status.in_(["pending", "running", "archived", "applying"]),
             )
             .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
             .all()
@@ -1408,7 +1426,10 @@ class TaskDownstreamServiceMixin:
         superseded: list[BinarySecurityArchiveJob] = []
         now = task_manager_module._now()
         for job in jobs:
-            if self._archive_job_bound_downstream_task_id(job) != old_task_id:
+            if not self._archive_job_is_old_child_retire_candidate(
+                job,
+                old_downstream_task_id=old_task_id,
+            ):
                 continue
             job.archive_status = "superseded"
             job.error_message = None
@@ -1448,6 +1469,61 @@ class TaskDownstreamServiceMixin:
                 },
             )
         return superseded
+
+    def _cleanup_superseded_archive_roots(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        old_downstream_task_id: str | None,
+        new_downstream_task_id: str | None,
+        superseded_jobs: list[BinarySecurityArchiveJob],
+        reason: str,
+    ) -> list[str]:
+        deleted_roots = self._delete_archive_roots_for_jobs(task, superseded_jobs)
+        deleted_set = set(deleted_roots)
+        failed_roots = [
+            str(getattr(job, "archive_root", "") or "").strip()
+            for job in superseded_jobs
+            if str(getattr(job, "archive_root", "") or "").strip()
+            and str(getattr(job, "archive_root", "") or "").strip() not in deleted_set
+        ]
+        if deleted_roots:
+            self._record_event(
+                db,
+                task,
+                "superseded_archive_roots_deleted",
+                "旧 child 绑定的归档目录已删除",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "old_downstream_task_id": str(old_downstream_task_id or "").strip() or None,
+                    "new_downstream_task_id": str(new_downstream_task_id or "").strip() or None,
+                    "archive_job_ids": [job.id for job in superseded_jobs],
+                    "deleted_archive_roots": deleted_roots,
+                    "reason": reason,
+                },
+            )
+        if failed_roots:
+            self._record_event(
+                db,
+                task,
+                "superseded_archive_root_delete_failed",
+                "旧 child 绑定的归档目录删除失败，后续将继续补偿清理",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "old_downstream_task_id": str(old_downstream_task_id or "").strip() or None,
+                    "new_downstream_task_id": str(new_downstream_task_id or "").strip() or None,
+                    "archive_job_ids": [job.id for job in superseded_jobs],
+                    "failed_archive_roots": failed_roots,
+                    "reason": reason,
+                },
+            )
+        return deleted_roots
 
     async def _replace_active_child_binding(
         self,
@@ -1501,7 +1577,7 @@ class TaskDownstreamServiceMixin:
             verification_status="pending",
             transition_type=normalized_transition_type,
         )
-        self._supersede_archive_jobs_for_downstream_task(
+        superseded_jobs = self._supersede_archive_jobs_for_downstream_task(
             db,
             task,
             item,
@@ -1539,6 +1615,15 @@ class TaskDownstreamServiceMixin:
 
         item.downstream_task_id = new_task_id
         self._clear_replacement_in_progress(item)
+        deleted_archive_roots = self._cleanup_superseded_archive_roots(
+            db,
+            task,
+            item,
+            old_downstream_task_id=old_task_id,
+            new_downstream_task_id=new_task_id,
+            superseded_jobs=superseded_jobs,
+            reason=reason,
+        )
         task_manager_module.logger.info(
             "binary-security child binding replaced: task_id=%s stage=%s item_id=%s item_key=%s old_downstream_task_id=%s new_downstream_task_id=%s reason=%s",
             task.id,
@@ -1561,6 +1646,7 @@ class TaskDownstreamServiceMixin:
                 "old_downstream_task_id": old_task_id,
                 "new_downstream_task_id": new_task_id,
                 "reason": reason,
+                "deleted_archive_roots": deleted_archive_roots,
             },
         )
         self._record_event(

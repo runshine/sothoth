@@ -749,6 +749,71 @@ class ArchiveReclaimTests(unittest.TestCase):
         self.assertIn("superseded_archive_jobs_cancelled", event_types)
         self.assertIn("child_binding_replaced", event_types)
 
+    def test_replace_active_child_binding_supersedes_success_archive_jobs_and_deletes_archive_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = self._task()
+            task.output_root = str(Path(tmp) / "output")
+            task.workspace_root = str(Path(tmp) / "workspace")
+            archive_root = Path(task.output_root) / "firmware_unpacker" / "child-old" / "output"
+            archive_root.mkdir(parents=True, exist_ok=True)
+            (archive_root / "artifact.txt").write_text("old artifact\n", encoding="utf-8")
+
+            item = self._item(status="running")
+            item.stage_name = "firmware_unpack"
+            item.downstream_service = "firmware_unpacker"
+            item.downstream_task_id = "child-old"
+            archive_job = BinarySecurityArchiveJob(
+                id="aj-old-success",
+                task_id=task.id,
+                project_id=task.project_id,
+                stage_name=item.stage_name,
+                item_id=item.id,
+                item_key=item.item_key,
+                downstream_service=item.downstream_service,
+                downstream_task_id="child-old",
+                archive_status="success",
+                archive_root=str(archive_root),
+                payload={"bound_downstream_task_id": "child-old", "mapped_status": "success"},
+                created_at=_now(),
+                updated_at=_now(),
+            )
+            db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job], events=[])
+
+            async def _noop_cancel(*_args, **_kwargs):
+                return 1
+
+            async def _noop_delete(*_args, **_kwargs):
+                return 1
+
+            original_cancel = self.manager._downstream_cancel_refs
+            original_delete = self.manager._delete_downstream_refs
+            try:
+                self.manager._downstream_cancel_refs = _noop_cancel
+                self.manager._delete_downstream_refs = _noop_delete
+                old_downstream_task_id = asyncio.run(
+                    self.manager._replace_active_child_binding(
+                        db,
+                        task,
+                        item,
+                        new_downstream_task_id="child-new",
+                        token="token",
+                        reason="test_binding_replace_success_archive",
+                    )
+                )
+            finally:
+                self.manager._downstream_cancel_refs = original_cancel
+                self.manager._delete_downstream_refs = original_delete
+
+            self.assertEqual("child-old", old_downstream_task_id)
+            self.assertEqual("child-new", item.downstream_task_id)
+            self.assertEqual("superseded", archive_job.archive_status)
+            self.assertFalse(archive_root.exists())
+            event_types = [event.event_type for event in db.events]
+            self.assertIn("superseded_archive_jobs_cancelled", event_types)
+            self.assertIn("superseded_archive_roots_deleted", event_types)
+            replace_event = next(event for event in db.events if event.event_type == "child_binding_replaced")
+            self.assertEqual([str(archive_root)], list((replace_event.payload or {}).get("deleted_archive_roots") or []))
+
     def test_queue_downstream_archive_job_ignores_stale_child_payload(self):
         task = self._task()
         item = self._item(status="success")
@@ -12045,6 +12110,174 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(0, self.manager._cancel_state_from_operation(task, operation)["targets_blocking"])
         event_types = [getattr(event, "event_type", "") for event in db.added]
         self.assertIn("task_cancel_succeeded", event_types)
+
+    def test_run_cancel_operation_steps_retries_quiesce_timeout_without_crashing(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="entry_analysis",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "entry_analysis",
+                    "item_id": "si1",
+                    "item_key": "module-1",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": "eat_1",
+                    "project_id": "p1",
+                    "blocking": True,
+                    "cancel_request_status": "requested",
+                    "terminal_observation_status": "unknown",
+                }
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], operations=[operation])
+        db.expire_all = lambda: None
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_fetch_child_ref_payload(ref, token):
+            del ref, token
+            return {"task_id": "eat_1", "status": "running"}
+
+        controller = self.manager._downstream_tasks()
+        original_write = self.manager._write_task_metadata_async
+        original_timeout = self.manager._cancel_verify_timeout_seconds
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        self.manager._cancel_verify_timeout_seconds = lambda: 0
+        try:
+            with patch.object(controller, "fetch_child_ref_payload", side_effect=fake_fetch_child_ref_payload):
+                result = asyncio.run(
+                    self.manager._run_cancel_operation_steps(db, task, operation, "verify_downstream_quiesced")
+                )
+        finally:
+            self.manager._write_task_metadata_async = original_write
+            self.manager._cancel_verify_timeout_seconds = original_timeout
+
+        self.assertEqual({"operation_incomplete": True, "result": "retry"}, result)
+        self.assertEqual("cancelling", task.status)
+        self.assertEqual("running", operation.status)
+        self.assertEqual("verify_downstream_quiesced", dict(operation.resume_cursor or {}).get("current_step"))
+        cancel_state = self.manager._cancel_state_from_operation(task, operation)
+        self.assertEqual(1, cancel_state["targets_blocking"])
+        self.assertEqual(1, cancel_state["cancel_verify_attempt_count"])
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("task_cancel_quiesce_retry_scheduled", event_types)
+        self.assertNotIn("task_cancel_failed", event_types)
+
+    def test_run_cancel_operation_steps_force_finalizes_after_quiesce_retry_exhausted(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="entry_analysis",
+        )
+        operation.result_payload = {
+            "cancel_verify_attempt_count": 5,
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "entry_analysis",
+                    "item_id": "si1",
+                    "item_key": "module-1",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": "eat_1",
+                    "project_id": "p1",
+                    "blocking": True,
+                    "cancel_request_status": "requested",
+                    "terminal_observation_status": "unknown",
+                }
+            ],
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], operations=[operation])
+        db.expire_all = lambda: None
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_fetch_child_ref_payload(ref, token):
+            del ref, token
+            return {"task_id": "eat_1", "status": "running"}
+
+        controller = self.manager._downstream_tasks()
+        original_write = self.manager._write_task_metadata_async
+        original_timeout = self.manager._cancel_verify_timeout_seconds
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        self.manager._cancel_verify_timeout_seconds = lambda: 0
+        try:
+            with patch.object(controller, "fetch_child_ref_payload", side_effect=fake_fetch_child_ref_payload):
+                result = asyncio.run(
+                    self.manager._run_cancel_operation_steps(db, task, operation, "verify_downstream_quiesced")
+                )
+        finally:
+            self.manager._write_task_metadata_async = original_write
+            self.manager._cancel_verify_timeout_seconds = original_timeout
+
+        self.assertEqual({"operation_incomplete": False, "result": "force_finalize"}, result)
+        self.assertEqual("cancelled", task.status)
+        self.assertTrue(bool(dict(operation.result_payload or {}).get("force_cancelled_after_verify_retries")))
+        ignored_targets = list(dict(operation.result_payload or {}).get("ignored_blocking_targets") or [])
+        self.assertEqual(1, len(ignored_targets))
+        cancel_state = self.manager._cancel_state_from_operation(task, operation)
+        self.assertTrue(cancel_state["cancel_force_finalize"])
+        self.assertEqual(1, cancel_state["cancel_ignored_targets_count"])
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("task_cancel_quiesce_retry_exhausted", event_types)
+        self.assertIn("task_cancel_target_ignored_after_retry_exhausted", event_types)
+        self.assertIn("task_cancel_succeeded", event_types)
+        self.assertNotIn("task_cancel_failed", event_types)
 
     def test_retry_task_clears_archive_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -30133,13 +30366,68 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         cleanup_result = dict(operation.result_payload or {}).get("cleanup_result") or {}
         self.assertTrue(cleanup_result.get("cleanup_partial_failed"))
         self.assertEqual(1, len(cleanup_result.get("downstream_cleanup_deferred_refs") or []))
-        fallback = dict(operation.result_payload or {}).get("force_delete_fallback") or {}
-        self.assertTrue(fallback.get("applied"))
-        self.assertEqual("downstream_cleanup_incomplete", fallback.get("reason"))
         event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
-        self.assertIn("task_delete_auto_force_delete_fallback", event_types)
-        self.assertIn("task_delete_failed", event_types)
-        self.assertIn("task_force_delete_completed", event_types)
+        self.assertIn("task_delete_downstream_cleanup_incomplete_ignored", event_types)
+        self.assertIn("task_delete_completed", event_types)
+
+    def test_delete_downstream_refs_task_delete_scope_ignores_timeout_without_raising(self):
+        task = BinarySecurityTask(
+            id="t-delete-timeout",
+            project_id="p1",
+            name="delete-timeout",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        item = BinarySecurityStageItem(
+            id="si-delete-timeout",
+            task_id="t-delete-timeout",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="entry-1",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-delete-timeout",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        async def _run():
+            with patch.object(
+                self.manager,
+                "_run_with_limits",
+                AsyncMock(
+                    return_value=[
+                        (
+                            {"service": "entry_analyse", "task_id": "eat-delete-timeout", "stage_name": "entry_analysis", "project_id": "p1"},
+                            None,
+                            TimeoutError("delete timeout"),
+                        )
+                    ]
+                ),
+            ):
+                return await self.manager._delete_downstream_refs(
+                    db,
+                    task,
+                    [{"service": "entry_analyse", "task_id": "eat-delete-timeout", "stage_name": "entry_analysis"}],
+                    "token",
+                    cleanup_scope="task_delete",
+                )
+
+        deleted = asyncio.run(_run())
+
+        self.assertEqual(1, deleted)
+        cleanup_results = list(getattr(self.manager, "_last_downstream_cleanup_results", []) or [])
+        self.assertEqual(1, len(cleanup_results))
+        self.assertTrue(cleanup_results[0]["deferred"])
+        self.assertFalse(cleanup_results[0]["blocking"])
+        self.assertEqual("transport_error", cleanup_results[0]["deferred_reason"])
+        self.assertEqual("best_effort", cleanup_results[0]["cleanup_mode"])
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("child_task_delete_failed_but_ignored", event_types)
 
     def test_prepare_delete_task_fails_when_workspace_writers_do_not_quiesce(self):
         task = BinarySecurityTask(
@@ -30582,6 +30870,7 @@ def _test_delete_downstream_refs_treats_entry_delete_500_with_absent_task_as_suc
     self.assertIn("child_task_delete_requested", event_types)
     self.assertIn("child_task_delete_verified_absent", event_types)
     self.assertIn("child_task_delete_failed_but_ignored", event_types)
+    self.assertIn("child_task_delete_result_recorded", event_types)
 
 
 def _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists(self):
@@ -30722,6 +31011,107 @@ def _test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope(self):
     asyncio.run(_run())
 
 
+def _test_delete_downstream_refs_records_result_event_for_success(self):
+    task = BinarySecurityTask(
+        id="t-delete-success",
+        project_id="p1",
+        name="binary",
+        status="cancelled",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si-delete-success",
+        task_id="t-delete-success",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="entry-1",
+        status="cancelled",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-success",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    client = _AsyncEntryAnalyseClientStub(delete_result={"success": True})
+
+    with patch.object(downstream_tasks_module, "get_entry_analyse_client", return_value=client):
+        deleted = asyncio.run(
+            self.manager._delete_downstream_refs(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat-success", "stage_name": "entry_analysis"}],
+                "token",
+            )
+        )
+
+    self.assertEqual(1, deleted)
+    result_events = [event for event in db.added if getattr(event, "event_type", "") == "child_task_delete_result_recorded"]
+    self.assertGreaterEqual(len(result_events), 1)
+    self.assertIn("succeeded", [dict(event.payload or {}).get("result_outcome") for event in result_events])
+
+
+def _test_delete_downstream_refs_records_result_event_for_best_effort_cleanup(self):
+    task = BinarySecurityTask(
+        id="t-delete-best-effort",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    item = BinarySecurityStageItem(
+        id="si-delete-best-effort",
+        task_id="t-delete-best-effort",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="entry-1",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-best-effort",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    async def _run():
+        with patch.object(
+            self.manager,
+            "_run_with_limits",
+            AsyncMock(
+                return_value=[
+                    (
+                        {"service": "entry_analyse", "task_id": "eat-best-effort", "stage_name": "entry_analysis", "project_id": "p1"},
+                        None,
+                        TimeoutError("delete timeout"),
+                    )
+                ]
+            ),
+        ):
+            return await self.manager._delete_downstream_refs(
+                db,
+                task,
+                [{"service": "entry_analyse", "task_id": "eat-best-effort", "stage_name": "entry_analysis"}],
+                "token",
+                cleanup_scope="task_delete",
+            )
+
+    deleted = asyncio.run(_run())
+
+    self.assertEqual(1, deleted)
+    result_events = [event for event in db.added if getattr(event, "event_type", "") == "child_task_delete_result_recorded"]
+    self.assertGreaterEqual(len(result_events), 1)
+    payloads = [dict(event.payload or {}) for event in result_events]
+    matched = [payload for payload in payloads if payload.get("result_outcome") == "deferred_best_effort"]
+    self.assertTrue(matched)
+    self.assertTrue(matched[0].get("deferred"))
+    self.assertFalse(matched[0].get("blocking"))
+
+
 def _test_delete_operation_payload_root_externalizes_under_workspace(self):
     operation = BinarySecurityTaskOperation(
         id="op-delete-payload",
@@ -30746,6 +31136,8 @@ TaskManagerTests.test_delete_downstream_refs_treats_entry_delete_500_with_absent
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists = _test_delete_downstream_refs_blocks_when_entry_delete_500_and_task_still_exists
 TaskManagerTests.test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active = _test_delete_downstream_refs_blocks_when_entry_delete_conflict_and_task_active
 TaskManagerTests.test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope = _test_delete_downstream_refs_forwards_best_effort_and_cleanup_scope
+TaskManagerTests.test_delete_downstream_refs_records_result_event_for_success = _test_delete_downstream_refs_records_result_event_for_success
+TaskManagerTests.test_delete_downstream_refs_records_result_event_for_best_effort_cleanup = _test_delete_downstream_refs_records_result_event_for_best_effort_cleanup
 TaskManagerTests.test_delete_operation_payload_root_externalizes_under_workspace = _test_delete_operation_payload_root_externalizes_under_workspace
 
 
@@ -41299,6 +41691,63 @@ def _test_run_current_task_operation_cancel_success_repairs_reopened_running_tas
     self.assertIsNone(task.dispatcher_instance_id)
 
 
+def _test_run_current_task_operation_preserves_cancel_operation_when_quiesce_retry_pending(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-cancel-retry-pending",
+        project_id="p1",
+        name="source",
+        status="cancelling",
+        current_stage="entry_analysis",
+        current_operation_id="op-cancel-retry",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now()
+    task.lease_expires_at = _now() + timedelta(seconds=120)
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-retry",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        target_stage="entry_analysis",
+        status="running",
+        current_step=task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+    )
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
+    original_factory = task_manager_module.get_session_factory
+    original_runner = manager._run_task_operation_steps
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+
+        async def _fake_run_task_operation_steps(_db, current_task, current_operation):
+            current_task.status = "cancelling"
+            current_task.current_operation_id = current_operation.id
+            return {"operation_incomplete": True, "result": "retry"}
+
+        manager._run_task_operation_steps = _fake_run_task_operation_steps
+        changed = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._run_task_operation_steps = original_runner
+
+    self.assertFalse(changed)
+    self.assertEqual("cancelling", task.status)
+    self.assertEqual(operation.id, task.current_operation_id)
+    self.assertEqual("running", operation.status)
+    self.assertIsNone(operation.finished_at)
+
+
 def _test_sync_task_row_lease_view_from_owner_blocks_non_owner(self):
     manager = TaskManager()
     manager.instance_id = "worker-a"
@@ -41981,6 +42430,7 @@ TaskManagerTests.test_dispatch_task_by_id_skips_non_pending_task_when_active_run
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
 TaskManagerTests.test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption = _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption
 TaskManagerTests.test_run_current_task_operation_cancel_success_repairs_reopened_running_task = _test_run_current_task_operation_cancel_success_repairs_reopened_running_task
+TaskManagerTests.test_run_current_task_operation_preserves_cancel_operation_when_quiesce_retry_pending = _test_run_current_task_operation_preserves_cancel_operation_when_quiesce_retry_pending
 TaskManagerTests.test_run_current_task_operation_stops_on_stale_task_ownership = _test_run_current_task_operation_stops_on_stale_task_ownership
 TaskManagerTests.test_run_current_task_operation_finalizes_after_requeue_owner_handoff = _test_run_current_task_operation_finalizes_after_requeue_owner_handoff
 TaskManagerTests.test_run_current_task_operation_finalizes_after_requeue_owner_handoff_for_retry_family = _test_run_current_task_operation_finalizes_after_requeue_owner_handoff_for_retry_family

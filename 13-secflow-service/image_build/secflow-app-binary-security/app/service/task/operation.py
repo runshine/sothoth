@@ -276,6 +276,10 @@ class TaskOperationServiceMixin:
     def _cancel_verify_timeout_seconds() -> int:
         return 30
 
+    @staticmethod
+    def _cancel_verify_max_attempts() -> int:
+        return 5
+
     def _store_cancel_targets(
         self: TaskManager,
         operation: BinarySecurityTaskOperation,
@@ -288,6 +292,38 @@ class TaskOperationServiceMixin:
             operation,
             {"cancel_targets": [dict(target) for target in targets if isinstance(target, dict)]},
         )
+
+    def _update_cancel_verify_state(
+        self: TaskManager,
+        operation: BinarySecurityTaskOperation,
+        *,
+        attempt_count: int | None = None,
+        max_attempts: int | None = None,
+        last_started_at: str | None = None,
+        last_blocking_targets: list[dict[str, Any]] | None = None,
+        ignored_blocking_targets: list[dict[str, Any]] | None = None,
+        force_cancelled_after_verify_retries: bool | None = None,
+    ) -> dict[str, Any]:
+        updates: dict[str, Any] = {}
+        if attempt_count is not None:
+            updates["cancel_verify_attempt_count"] = max(0, int(attempt_count))
+        if max_attempts is not None:
+            updates["cancel_verify_max_attempts"] = max(1, int(max_attempts))
+        if last_started_at is not None:
+            updates["cancel_verify_last_started_at"] = last_started_at
+        if last_blocking_targets is not None:
+            updates["last_blocking_targets"] = [
+                dict(target) for target in list(last_blocking_targets) if isinstance(target, dict)
+            ]
+        if ignored_blocking_targets is not None:
+            updates["ignored_blocking_targets"] = [
+                dict(target) for target in list(ignored_blocking_targets) if isinstance(target, dict)
+            ]
+        if force_cancelled_after_verify_retries is not None:
+            updates["force_cancelled_after_verify_retries"] = bool(force_cancelled_after_verify_retries)
+        if not updates:
+            return self._operation_result_data(operation)
+        return self._update_operation_result_payload(operation, updates)
 
     @staticmethod
     def _cancel_target_display(target: dict[str, Any]) -> str:
@@ -2248,6 +2284,7 @@ class TaskOperationServiceMixin:
                 downstream_refs,
                 token,
                 force_delete=force_delete,
+                best_effort=True,
                 cleanup_scope="task_delete",
             )
             task_manager_module.logger.info(
@@ -2477,48 +2514,21 @@ class TaskOperationServiceMixin:
                 ),
                 None,
             ) or "下游删除未完成"
-            if _ensure_force_delete_fallback(
-                failure_reason="downstream_cleanup_incomplete",
-                failure_message=cleanup_error,
-                payload=cleanup_result,
-            ):
-                self._record_event(
-                    db,
-                    task,
-                    "task_delete_failed",
-                    "普通删除下游清理未完成，已自动降级为强制删除",
-                    stage_name=task.current_stage,
-                    level="warning",
-                    payload={
-                        **cleanup_result,
-                        "force_delete": False,
-                        "auto_force_delete_fallback": True,
-                    },
-                )
-                db.commit()
-            else:
-                self._clear_task_delete_in_progress(task)
-                self._set_task_status(
-                    db,
-                    task,
-                    task_manager_module.TASK_STATUS_DELETE_FAILED,
-                    reason="删除任务时下游子任务尚未完成删除确认",
-                    source="task_operation",
-                    stage_name=task.current_stage,
-                )
-                task.finished_at = task_manager_module._now()
-                task.last_error = cleanup_error
-                self._record_event(
-                    db,
-                    task,
-                    "task_delete_failed",
-                    "删除失败，下游子任务尚未完成删除确认",
-                    stage_name=task.current_stage,
-                    level="error",
-                    payload=cleanup_result,
-                )
-                db.commit()
-                raise ValidationError("删除失败，下游子任务尚未完成删除确认")
+            self._record_event(
+                db,
+                task,
+                f"{event_prefix}_downstream_cleanup_incomplete_ignored",
+                "下游删除未完全确认，已按尽力而为模式忽略残留并继续删除父任务",
+                stage_name=task.current_stage,
+                level="warning",
+                payload={
+                    **cleanup_result,
+                    "force_delete": force_delete,
+                    "best_effort": True,
+                    "ignored_cleanup_error": cleanup_error,
+                },
+            )
+            db.commit()
 
         db.delete(task)
         self._record_event(
@@ -2965,7 +2975,10 @@ class TaskOperationServiceMixin:
                 str(getattr(operation, "current_step", "") or "").strip() or None,
             )
 
-            await self._run_task_operation_steps(db, task, operation)
+            operation_run_result = await self._run_task_operation_steps(db, task, operation)
+            if isinstance(operation_run_result, dict) and bool(operation_run_result.get("operation_incomplete")):
+                db.commit()
+                return False
             if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
                 task_deleted = (
                     db.query(task_manager_module.BinarySecurityTask.id)
@@ -3536,19 +3549,18 @@ class TaskOperationServiceMixin:
         task_manager_module.observe_control_operation_auto_reconciled(operation_type, "failed", age_seconds=age_seconds)
         return True
 
-    async def _run_task_operation_steps(self: TaskManager, db: Session, task, operation) -> None:
+    async def _run_task_operation_steps(self: TaskManager, db: Session, task, operation) -> dict[str, Any] | None:
         from app.service import task_manager as task_manager_module
 
         resume_step = self._operation_resume_step(operation)
         if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL:
-            await self._run_cancel_operation_steps(db, task, operation, resume_step)
-            return
+            return await self._run_cancel_operation_steps(db, task, operation, resume_step)
         if operation.operation_type in {
             task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
             task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
         }:
             await self._run_retry_failed_items_operation_steps(db, task, operation, resume_step)
-            return
+            return None
         if operation.operation_type == task_manager_module.TASK_ACTION_RETRY_STAGE_FULL:
             resume_step = await self._run_retry_stage_full_operation_steps(db, task, operation, resume_step)
         else:
@@ -4189,7 +4201,7 @@ class TaskOperationServiceMixin:
             return
         self._apply_task_resume_decision(db, task, resume_decision, operation=operation)
 
-    async def _run_cancel_operation_steps(self: TaskManager, db: Session, task, operation, resume_step: str) -> None:
+    async def _run_cancel_operation_steps(self: TaskManager, db: Session, task, operation, resume_step: str) -> dict[str, Any] | None:
         from app.service import task_manager as task_manager_module
 
         cancel_steps = task_manager_module.TASK_CANCEL_SAGA_STEPS
@@ -4228,6 +4240,9 @@ class TaskOperationServiceMixin:
                 self._commit_or_rollback(db)
                 raise
             payload = result if isinstance(result, dict) else None
+            resolved_next_step = next_step
+            if isinstance(payload, dict) and str(payload.get("resume_current_step") or "").strip():
+                resolved_next_step = str(payload.get("resume_current_step") or "").strip()
             self._record_operation_step_finished(
                 db,
                 task,
@@ -4236,9 +4251,9 @@ class TaskOperationServiceMixin:
                 message=message,
                 stage_name=operation.target_stage,
                 payload=payload,
-                next_step=next_step,
+                next_step=resolved_next_step,
             )
-            current_step = next_step or step_name
+            current_step = resolved_next_step or step_name
             self._commit_or_rollback(db)
             return result
 
@@ -4313,6 +4328,16 @@ class TaskOperationServiceMixin:
 
         async def _verify_quiesced() -> dict[str, Any]:
             timeout_seconds = self._cancel_verify_timeout_seconds()
+            max_attempts = self._cancel_verify_max_attempts()
+            result_payload = dict(self._operation_result_data(operation) or {})
+            attempt_count = max(0, int(result_payload.get("cancel_verify_attempt_count") or 0))
+            verify_started_at = task_manager_module._isoformat_or_none(task_manager_module._now())
+            self._update_cancel_verify_state(
+                operation,
+                attempt_count=attempt_count,
+                max_attempts=max_attempts,
+                last_started_at=verify_started_at,
+            )
             deadline = task_manager_module._now() + timedelta(seconds=timeout_seconds)
             token = self._service_token()
             last_blocking_snapshot: list[str] = []
@@ -4382,7 +4407,19 @@ class TaskOperationServiceMixin:
                 self._store_cancel_targets(operation, refreshed_targets, workspace_root=task.workspace_root)
                 self._commit_or_rollback(db)
                 if not blocking_targets:
-                    return {"targets_total": len(refreshed_targets), "targets_blocking": 0}
+                    self._update_cancel_verify_state(
+                        operation,
+                        last_blocking_targets=[],
+                        ignored_blocking_targets=[],
+                        force_cancelled_after_verify_retries=False,
+                    )
+                    return {
+                        "result": "quiesced",
+                        "targets_total": len(refreshed_targets),
+                        "targets_blocking": 0,
+                        "attempt_count": attempt_count,
+                        "max_attempts": max_attempts,
+                    }
                 blocking_snapshot = sorted(self._cancel_target_display(target) for target in blocking_targets)
                 if blocking_snapshot != last_blocking_snapshot:
                     self._record_operation_event(
@@ -4398,10 +4435,78 @@ class TaskOperationServiceMixin:
                     self._commit_or_rollback(db)
                     last_blocking_snapshot = blocking_snapshot
                 if task_manager_module._now() >= deadline:
-                    raise ValidationError(
-                        "取消收敛超时，仍有目标未进入终态: "
-                        + ", ".join(self._cancel_target_display(target) for target in blocking_targets[:5])
+                    next_attempt_count = attempt_count + 1
+                    self._update_cancel_verify_state(
+                        operation,
+                        attempt_count=next_attempt_count,
+                        max_attempts=max_attempts,
+                        last_blocking_targets=blocking_targets,
+                        ignored_blocking_targets=blocking_targets if next_attempt_count > max_attempts else [],
+                        force_cancelled_after_verify_retries=next_attempt_count > max_attempts,
                     )
+                    if next_attempt_count <= max_attempts:
+                        self._record_operation_event(
+                            db,
+                            task,
+                            operation,
+                            "task_cancel_quiesce_retry_scheduled",
+                            f"取消仍在等待部分子任务收敛，已安排第 {next_attempt_count} 次重试",
+                            level="warning",
+                            stage_name=operation.target_stage,
+                            payload={
+                                "attempt_count": next_attempt_count,
+                                "max_attempts": max_attempts,
+                                "blocking_targets": blocking_targets,
+                            },
+                        )
+                        self._commit_or_rollback(db)
+                        return {
+                            "result": "retry",
+                            "targets_total": len(refreshed_targets),
+                            "targets_blocking": len(blocking_targets),
+                            "attempt_count": next_attempt_count,
+                            "max_attempts": max_attempts,
+                            "blocking_targets": blocking_targets,
+                            "resume_current_step": task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+                        }
+                    self._record_operation_event(
+                        db,
+                        task,
+                        operation,
+                        "task_cancel_quiesce_retry_exhausted",
+                        "取消收敛重试已达上限，将忽略残留子任务并强制完成父任务取消",
+                        level="warning",
+                        stage_name=operation.target_stage,
+                        payload={
+                            "attempt_count": next_attempt_count,
+                            "max_attempts": max_attempts,
+                            "ignored_blocking_targets": blocking_targets,
+                        },
+                    )
+                    for target in blocking_targets:
+                        self._record_operation_event(
+                            db,
+                            task,
+                            operation,
+                            "task_cancel_target_ignored_after_retry_exhausted",
+                            "该子任务未在取消收敛窗口内进入终态，已被忽略",
+                            level="warning",
+                            stage_name=str(target.get("stage_name") or operation.target_stage or "").strip() or None,
+                            payload={
+                                **dict(target),
+                                "ignored": True,
+                                "reason": "cancel_quiesce_retry_exhausted",
+                            },
+                        )
+                    self._commit_or_rollback(db)
+                    return {
+                        "result": "force_finalize",
+                        "targets_total": len(refreshed_targets),
+                        "targets_blocking": len(blocking_targets),
+                        "attempt_count": next_attempt_count,
+                        "max_attempts": max_attempts,
+                        "ignored_blocking_targets": blocking_targets,
+                    }
                 await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
                 db.expire_all()
                 task_refreshed = db.query(task_manager_module.BinarySecurityTask).filter(
@@ -4423,6 +4528,12 @@ class TaskOperationServiceMixin:
                     operation.current_step = operation_refreshed.current_step
 
         async def _finalize_cancelled() -> dict[str, Any]:
+            cancel_state = self._cancel_state_from_operation(task, operation)
+            ignored_blocking_targets = [
+                dict(target)
+                for target in list(self._operation_result_data(operation).get("ignored_blocking_targets") or [])
+                if isinstance(target, dict)
+            ]
             self._set_task_status(
                 db,
                 task,
@@ -4468,9 +4579,18 @@ class TaskOperationServiceMixin:
                 task,
                 operation,
                 "task_cancel_succeeded",
-                "任务取消已确认完成",
+                "任务取消已完成",
                 stage_name=operation.target_stage,
-                payload={"cancel_state": self._cancel_state_from_operation(task, operation)},
+                payload={
+                    "cancel_state": cancel_state,
+                    "force_cancelled_after_verify_retries": bool(
+                        self._operation_result_data(operation).get("force_cancelled_after_verify_retries")
+                    ),
+                    "ignored_blocking_target_count": len(ignored_blocking_targets),
+                    "ignored_blocking_targets_preview": ignored_blocking_targets[
+                        : task_manager_module.TASK_CANCEL_BLOCKING_TARGETS_PREVIEW_LIMIT
+                    ],
+                },
             )
             task_manager_module.observe_task_lifecycle("finished", status=task.status, task_type=self._task_type(task))
             await self._write_task_metadata_async(
@@ -4509,6 +4629,7 @@ class TaskOperationServiceMixin:
             )
             return {"task_status": task.status, "error": str(error)}
 
+        verify_outcome: dict[str, Any] | None = None
         try:
             await _run_step(
                 task_manager_module.TASK_OPERATION_STEP_MARK_TASK_CANCELLING,
@@ -4534,7 +4655,7 @@ class TaskOperationServiceMixin:
                 next_step=task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
                 fn=_cancel_downstream_targets,
             )
-            await _run_step(
+            verify_outcome = await _run_step(
                 task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
                 message="取消操作已完成下游收敛核验",
                 next_step=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
@@ -4549,12 +4670,17 @@ class TaskOperationServiceMixin:
             )
             raise
 
+        verify_result = str((verify_outcome or {}).get("result") or "").strip()
+        if verify_result == "retry":
+            return {"operation_incomplete": True, "result": "retry"}
+
         await _run_step(
             task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
             message="取消操作已收口为已取消",
             next_step=task_manager_module.TASK_OPERATION_STEP_SUCCEEDED,
             fn=_finalize_cancelled,
         )
+        return {"operation_incomplete": False, "result": verify_result or "quiesced"}
 
     async def _run_retry_failed_items_operation_steps(self: TaskManager, db: Session, task, operation, resume_step: str) -> None:
         from app.service import task_manager as task_manager_module

@@ -407,6 +407,31 @@ class DownstreamTaskController:
             payload=payload,
         )
 
+    def _record_child_delete_result(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem | dict[str, Any],
+        *,
+        ref: dict[str, Any],
+        cleanup_result: dict[str, Any],
+        outcome: str,
+        level: str = "info",
+    ) -> None:
+        self._record_downstream_item_disposition(
+            db,
+            task,
+            item,
+            event_type="child_task_delete_result_recorded",
+            message=f"下游删除结果已记录: {ref['service']}:{ref['task_id']} -> {outcome}",
+            level=level,
+            payload={
+                **dict(ref or {}),
+                **dict(cleanup_result or {}),
+                "result_outcome": outcome,
+            },
+        )
+
     def _record_control_outcome(
         self,
         db: Session,
@@ -959,6 +984,7 @@ class DownstreamTaskController:
         best_effort: bool = False,
         cleanup_scope: str = "retry_prepare",
     ) -> int:
+        best_effort_delete = bool(best_effort or str(cleanup_scope or "").strip().lower() == "task_delete")
         normalized_refs = [
             {
                 **dict(ref or {}),
@@ -984,7 +1010,7 @@ class DownstreamTaskController:
             result: dict[str, Any] = {
                 **ref,
                 "operation": "delete",
-                "cleanup_mode": "best_effort" if best_effort else "blocking",
+                "cleanup_mode": "best_effort" if best_effort_delete else "blocking",
                 "cleanup_scope": cleanup_scope,
                 "delete_status": "not_sent",
                 "verify_status": "not_checked",
@@ -1044,7 +1070,7 @@ class DownstreamTaskController:
                 cleanup_result = {
                     **ref,
                     "operation": "delete",
-                    "cleanup_mode": "best_effort" if best_effort else "blocking",
+                    "cleanup_mode": "best_effort" if best_effort_delete else "blocking",
                     "cleanup_scope": cleanup_scope,
                     "delete_status": "failed",
                     "verify_status": "not_checked",
@@ -1067,6 +1093,14 @@ class DownstreamTaskController:
                     event_type="child_task_delete_succeeded",
                     message=f"下游子任务已删除: {ref['service']}:{ref['task_id']}",
                     payload=cleanup_result,
+                )
+                self._record_child_delete_result(
+                    db,
+                    task,
+                    event_item,
+                    ref=ref,
+                    cleanup_result=cleanup_result,
+                    outcome="succeeded",
                 )
                 continue
             if exc is None and verify_status == "succeeded":
@@ -1092,10 +1126,20 @@ class DownstreamTaskController:
                     level="warning",
                     payload=cleanup_result,
                 )
+                self._record_child_delete_result(
+                    db,
+                    task,
+                    event_item,
+                    ref=ref,
+                    cleanup_result=cleanup_result,
+                    outcome="verified_absent_ignored",
+                    level="warning",
+                )
                 continue
             if force_delete:
                 success_count += 1
                 cleanup_result["ignored_reason"] = "force_delete"
+                cleanup_result["blocking"] = False
                 self._record_downstream_item_disposition(
                     db,
                     task,
@@ -1107,6 +1151,15 @@ class DownstreamTaskController:
                     ),
                     level="warning",
                     payload=cleanup_result,
+                )
+                self._record_child_delete_result(
+                    db,
+                    task,
+                    event_item,
+                    ref=ref,
+                    cleanup_result=cleanup_result,
+                    outcome="force_delete_ignored",
+                    level="warning",
                 )
                 continue
             if cleanup_result.get("ignored_reason") == "terminal_error_state":
@@ -1123,8 +1176,17 @@ class DownstreamTaskController:
                     level="warning",
                     payload=cleanup_result,
                 )
+                self._record_child_delete_result(
+                    db,
+                    task,
+                    event_item,
+                    ref=ref,
+                    cleanup_result=cleanup_result,
+                    outcome="terminal_error_ignored",
+                    level="warning",
+                )
                 continue
-            if best_effort:
+            if best_effort_delete:
                 success_count += 1
                 cleanup_result["blocking"] = False
                 cleanup_result["deferred"] = True
@@ -1150,6 +1212,15 @@ class DownstreamTaskController:
                     level="warning",
                     payload=cleanup_result,
                 )
+                self._record_child_delete_result(
+                    db,
+                    task,
+                    event_item,
+                    ref=ref,
+                    cleanup_result=cleanup_result,
+                    outcome="deferred_best_effort",
+                    level="warning",
+                )
                 continue
             blocking_message = (
                 f"旧下游任务仍在运行，不能安全删除: {ref['service']}:{ref['task_id']}"
@@ -1165,6 +1236,15 @@ class DownstreamTaskController:
                 item=event_item,
                 level="warning",
                 payload=cleanup_result,
+            )
+            self._record_child_delete_result(
+                db,
+                task,
+                event_item,
+                ref=ref,
+                cleanup_result=cleanup_result,
+                outcome="blocking_failed",
+                level="warning",
             )
             raise ValidationError(blocking_message)
         db.commit()
