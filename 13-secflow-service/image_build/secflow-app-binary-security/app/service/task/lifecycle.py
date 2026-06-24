@@ -560,10 +560,10 @@ class TaskLifecycleServiceMixin:
         interval_seconds = max(
             5,
             int(
-                getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30)
+                getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 60)
                 or self.cfg.scheduler.stage_poll_interval_seconds
                 or self.cfg.scheduler.poll_interval_seconds
-                or 30
+                or 60
             ),
         )
         while self._running:

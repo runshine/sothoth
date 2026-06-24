@@ -1165,8 +1165,19 @@ class TaskManager(
     def _stage_downstream_sync_max_consecutive_errors(self) -> int:
         return max(1, int(getattr(self.cfg.scheduler, "stage_downstream_sync_max_consecutive_errors", 10) or 10))
 
+    def _downstream_child_sync_interval_seconds(self) -> int:
+        return max(5, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 60) or 60))
+
     def _stage_downstream_sync_backoff_base_seconds(self) -> int:
-        return max(1, int(getattr(self.cfg.scheduler, "stage_downstream_sync_backoff_base_seconds", 2) or 2))
+        configured = int(
+            getattr(
+                self.cfg.scheduler,
+                "stage_downstream_sync_backoff_base_seconds",
+                self._downstream_child_sync_interval_seconds(),
+            )
+            or self._downstream_child_sync_interval_seconds()
+        )
+        return max(1, configured)
 
     def _stage_downstream_sync_backoff_max_seconds(self) -> int:
         base = self._stage_downstream_sync_backoff_base_seconds()
@@ -1182,7 +1193,14 @@ class TaskManager(
         )
 
     def _stage_item_sync_reconcile_interval_seconds(self) -> int:
-        configured = int(getattr(self.cfg.scheduler, "stage_item_sync_reconcile_interval_seconds", 30) or 30)
+        configured = int(
+            getattr(
+                self.cfg.scheduler,
+                "stage_item_sync_reconcile_interval_seconds",
+                self._downstream_child_sync_interval_seconds(),
+            )
+            or self._downstream_child_sync_interval_seconds()
+        )
         return max(5, configured)
 
     def _stage_item_sync_reconcile_batch_size(self) -> int:
@@ -10307,6 +10325,11 @@ class TaskManager(
         input_files: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         existing_summary = dict(task.summary or {})
+        runtime_task_keys = (
+            dict(existing_summary.get("runtime_task_keys") or {})
+            if isinstance(existing_summary.get("runtime_task_keys"), dict)
+            else {}
+        )
         normalized_inputs = [dict(item) for item in (input_files if input_files is not None else existing_summary.get("input_files") or [])]
         input_dir = Path(task.workspace_root) / "input"
         run_dir = Path(task.workspace_root) / "run"
@@ -10346,6 +10369,13 @@ class TaskManager(
             "input_file_path": existing_summary.get("input_file_path"),
             "input_dir_path": existing_summary.get("input_dir_path"),
             "input_file_paths": list(existing_summary.get("input_file_paths") or []),
+            "runtime_task_keys": {
+                "root_task_key_secret": str(runtime_task_keys.get("root_task_key_secret") or "").strip() or None,
+                "root_task_key_id": str(runtime_task_keys.get("root_task_key_id") or "").strip() or None,
+                "root_task_key_name": str(runtime_task_keys.get("root_task_key_name") or "").strip() or None,
+                "root_task_key_prefix": str(runtime_task_keys.get("root_task_key_prefix") or "").strip() or None,
+                "task_key_source": str(runtime_task_keys.get("task_key_source") or "").strip() or None,
+            },
         }
         if task_type == TASK_TYPE_BINARY_MODULE:
             summary = {
@@ -10867,7 +10897,7 @@ class TaskManager(
                     if item and item.downstream_task_id:
                         await self._cancel_downstream(item, self._service_token())
                     return "cancelled", payload
-                await asyncio.sleep(self.cfg.scheduler.stage_poll_interval_seconds)
+                await asyncio.sleep(self._downstream_child_sync_interval_seconds())
             except StaleTaskExecution:
                 raise
             except NotFoundError:
@@ -10887,12 +10917,7 @@ class TaskManager(
                         error_type=self._classify_downstream_sync_error(exc),
                         http_status=self._extract_http_status_from_exception(exc),
                     )
-                await asyncio.sleep(
-                    min(
-                        self._stage_downstream_sync_backoff_max_seconds(),
-                        self._stage_downstream_sync_backoff_base_seconds(),
-                    )
-                )
+                await asyncio.sleep(self._stage_downstream_sync_backoff_base_seconds())
 
     def _touch_task_heartbeat(self, task_id: str) -> None:
         now = _now()

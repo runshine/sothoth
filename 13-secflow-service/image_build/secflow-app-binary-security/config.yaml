@@ -44,7 +44,8 @@ scheduler:
   poll_interval_seconds: 5
   task_concurrency: 2
   stage_poll_interval_seconds: 5
-  downstream_reconcile_interval_seconds: 30
+  downstream_reconcile_interval_seconds: 60
+  stage_item_sync_reconcile_interval_seconds: 60
   readless_reconcile_interval_seconds: 300
   heartbeat_update_interval_seconds: 15
   downstream_reconcile_grace_seconds: 30
@@ -55,6 +56,8 @@ scheduler:
   downstream_sync_concurrency: 8
   downstream_action_concurrency: 8
   downstream_request_timeout_seconds: 120
+  stage_downstream_sync_backoff_base_seconds: 60
+  stage_downstream_sync_backoff_max_seconds: 60
 
 queue:
   enabled: true

@@ -41500,6 +41500,153 @@ def _test_get_task_detail_task_key_snapshot_reports_unused_without_keys(self):
     self.assertEqual([], detail.task_key_snapshot.work_keys)
 
 
+def _test_reset_task_for_hard_restart_preserves_runtime_task_keys(self):
+    task = BinarySecurityTask(
+        id="t-restart",
+        project_id="p1",
+        name="source-task",
+        status="cancelled",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        current_stage="dataflow_vuln_scan",
+        execution_epoch=3,
+        root_task_key_id="584",
+        root_task_key_name="dispatch-root-key",
+        root_task_key_prefix="rtk",
+        task_key_source="schedule_dispatch",
+    )
+    task.summary = {
+        "input_files": [{"filename": "a.c", "size": 1}],
+        "input_kind": "source_archives",
+        "input_mode": "input_dir",
+        "input_dir_path": "/src",
+        "runtime_task_keys": {
+            "root_task_key_secret": "root-secret-1",
+            "root_task_key_id": "584",
+            "root_task_key_name": "dispatch-root-key",
+            "root_task_key_prefix": "rtk",
+            "task_key_source": "schedule_dispatch",
+        },
+    }
+    task.metrics = {}
+    task.stage_summary = {"system_analysis": {"status": "success"}}
+    task.cleanup_snapshot = {"previous_epoch": 2}
+
+    self.manager._reset_task_for_hard_restart(task)
+
+    runtime_task_keys = dict(task.summary.get("runtime_task_keys") or {})
+    self.assertEqual("root-secret-1", runtime_task_keys.get("root_task_key_secret"))
+    self.assertEqual("584", runtime_task_keys.get("root_task_key_id"))
+    self.assertEqual("dispatch-root-key", runtime_task_keys.get("root_task_key_name"))
+    self.assertEqual("rtk", runtime_task_keys.get("root_task_key_prefix"))
+    self.assertEqual("schedule_dispatch", runtime_task_keys.get("task_key_source"))
+    self.assertEqual(4, task.execution_epoch)
+    self.assertEqual("system_analysis", task.current_stage)
+
+
+def _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key(self):
+    task = BinarySecurityTask(
+        id="task-restart-key",
+        project_id="p1",
+        name="source-task",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        current_stage="dataflow_vuln_scan",
+        execution_epoch=2,
+        root_task_key_id="584",
+        root_task_key_name="dispatch-root-key",
+        root_task_key_prefix="rtk",
+        task_key_source="schedule_dispatch",
+    )
+    task.summary = {
+        "input_files": [{"filename": "a.c", "size": 1}],
+        "input_kind": "source_archives",
+        "input_mode": "input_dir",
+        "input_dir_path": "/src",
+        "runtime_task_keys": {
+            "root_task_key_secret": "root-secret-1",
+            "root_task_key_id": "584",
+            "root_task_key_name": "dispatch-root-key",
+            "root_task_key_prefix": "rtk",
+            "task_key_source": "schedule_dispatch",
+        },
+    }
+    task.metrics = {}
+    task.stage_summary = {}
+    task.cleanup_snapshot = {}
+    self.manager._reset_task_for_hard_restart(task)
+
+    item = BinarySecurityStageItem(
+        id="si-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr1",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        downstream_service="system_analyse",
+        status="pending",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    create_calls: list[dict[str, Any]] = []
+
+    class _FakeDownstreamTasks:
+        async def create_child_task(self, _db, _task, _item, *, service, token, payload, event_payload):
+            create_calls.append(
+                {
+                    "service": service,
+                    "token": token,
+                    "payload": dict(payload),
+                    "event_payload": dict(event_payload or {}),
+                }
+            )
+            return {"task_id": "child-1", "status": "running"}
+
+    original_downstream_tasks = self.manager._downstream_tasks
+    original_active_delete_operation = self.manager._active_delete_operation
+    try:
+        self.manager._downstream_tasks = lambda: _FakeDownstreamTasks()
+        self.manager._active_delete_operation = lambda *_args, **_kwargs: None
+        created = asyncio.run(
+            self.manager._downstream_create_task(
+                db,
+                task,
+                item,
+                service="system_analyse",
+                token="tok",
+                payload={"input_path": "/src"},
+            )
+        )
+    finally:
+        self.manager._downstream_tasks = original_downstream_tasks
+        self.manager._active_delete_operation = original_active_delete_operation
+
+    self.assertEqual("child-1", created["task_id"])
+    self.assertEqual(1, len(create_calls))
+    create_payload = create_calls[0]["payload"]
+    self.assertEqual("tok", create_calls[0]["token"])
+    self.assertTrue(str(create_payload.get("agent_task_key_id") or "").strip())
+    self.assertEqual("system_analyse-si-1", create_payload.get("agent_task_key_name"))
+    self.assertEqual("rtk", create_payload.get("agent_task_key_prefix"))
+    self.assertEqual("schedule_dispatch", create_payload.get("agent_task_key_source"))
+    self.assertEqual("root-secret-1", create_payload.get("agent_task_key_secret"))
+    self.assertEqual(create_payload.get("agent_task_key_id"), item.payload.get("downstream_agent_task_key_id"))
+    self.assertEqual("system_analyse-si-1", item.payload.get("downstream_agent_task_key_name"))
+    self.assertEqual("rtk", item.payload.get("downstream_agent_task_key_prefix"))
+    self.assertEqual("schedule_dispatch", item.payload.get("downstream_key_source"))
+    event_types = [str(getattr(row, "event_type", "") or "") for row in db.events]
+    self.assertIn("downstream_work_key_requested", event_types)
+    self.assertIn("downstream_work_key_created", event_types)
+    self.assertIn("downstream_create_with_agent_task_key", event_types)
+
+
 def _test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks(self):
     task = BinarySecurityTask(
         id="t1",
@@ -42308,6 +42455,8 @@ TaskManagerTests.test_archive_apply_repaired_stage_refresh_delegates_to_binary_t
 TaskManagerTests.test_compact_stage_success_items_delegates_to_dataflow_handler = _test_compact_stage_success_items_delegates_to_dataflow_handler
 TaskManagerTests.test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets = _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets
 TaskManagerTests.test_get_task_detail_task_key_snapshot_reports_unused_without_keys = _test_get_task_detail_task_key_snapshot_reports_unused_without_keys
+TaskManagerTests.test_reset_task_for_hard_restart_preserves_runtime_task_keys = _test_reset_task_for_hard_restart_preserves_runtime_task_keys
+TaskManagerTests.test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key = _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key
 TaskManagerTests.test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks = _test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks
 TaskManagerTests.test_get_task_detail_does_not_fallback_schedule_user_task_id_for_non_schedule_tasks = _test_get_task_detail_does_not_fallback_schedule_user_task_id_for_non_schedule_tasks
 TaskManagerTests.test_task_row_owner_runtime_supported_rejects_recent_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_rejects_recent_remote_dispatch_without_runtime_lease

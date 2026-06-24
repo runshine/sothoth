@@ -101,8 +101,8 @@ class SchedulerConfig(BaseModel):
     poll_interval_seconds: int = 5
     task_concurrency: int = 2
     stage_poll_interval_seconds: int = 5
-    downstream_reconcile_interval_seconds: int = 30
-    stage_item_sync_reconcile_interval_seconds: int = 30
+    downstream_reconcile_interval_seconds: int = 60
+    stage_item_sync_reconcile_interval_seconds: int = 60
     readless_reconcile_interval_seconds: int = 300
     heartbeat_update_interval_seconds: int = 15
     task_lease_ttl_seconds: int = 120
@@ -125,7 +125,7 @@ class SchedulerConfig(BaseModel):
     downstream_action_concurrency: int = 8
     downstream_request_timeout_seconds: int = 120
     stage_downstream_sync_max_consecutive_errors: int = 10
-    stage_downstream_sync_backoff_base_seconds: int = 2
+    stage_downstream_sync_backoff_base_seconds: int = 60
     stage_downstream_sync_backoff_max_seconds: int = 60
     stage_item_sync_stale_seconds: int = 300
     stage_item_sync_reconcile_batch_size: int = 100
