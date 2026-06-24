@@ -913,18 +913,27 @@ class TaskItemSyncServiceMixin:
             if item is None or task is None:
                 session.rollback()
                 return
+            observed_at = task_manager_module._now()
             downstream_status = str(payload.get("status") or "").strip().lower() or None
             mapped_status = self._map_downstream_status(downstream_status or "")
             if not mapped_status:
-                self._refresh_stage_item_downstream_observation(
-                    item,
+                self._persist_child_sync_observation(
+                    session,
+                    task=task,
+                    item=item,
+                    change_source="poll_until_terminal",
                     sync_status="observed",
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                     status_raw=downstream_status,
                     mapped_status=None,
                     downstream_status=downstream_status,
                     state_applied=False,
-                    downstream_payload=payload,
+                    last_sync_result="success",
+                    clear_error_state=True,
+                    extra_payload={
+                        "operation": "poll_until_terminal",
+                        "downstream_payload_source": "owned_execution_poll",
+                    },
                 )
                 session.commit()
                 return
@@ -939,30 +948,44 @@ class TaskItemSyncServiceMixin:
                     mapped_status=mapped_status,
                     downstream_payload=payload,
                     error_message=None,
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                 )
-                self._mark_stage_item_sync_observation(
-                    item,
+                self._persist_child_sync_observation(
+                    session,
+                    task=task,
+                    item=item,
+                    change_source="poll_until_terminal",
                     sync_status="synced",
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                     status_raw=downstream_status,
                     mapped_status=mapped_status,
                     downstream_status=downstream_status,
                     state_applied=True,
-                    downstream_payload=payload,
+                    last_sync_result="success",
                     clear_error_state=True,
+                    extra_payload={
+                        "operation": "poll_until_terminal",
+                        "downstream_payload_source": "owned_execution_poll",
+                    },
                 )
             else:
-                self._refresh_stage_item_downstream_observation(
-                    item,
+                self._persist_child_sync_observation(
+                    session,
+                    task=task,
+                    item=item,
+                    change_source="poll_until_terminal",
                     sync_status="observed",
-                    synced_at=task_manager_module._now(),
+                    synced_at=observed_at,
                     status_raw=downstream_status,
                     mapped_status=mapped_status,
                     downstream_status=downstream_status,
                     state_applied=False,
-                    downstream_payload=payload,
+                    last_sync_result="success",
                     clear_error_state=True,
+                    extra_payload={
+                        "operation": "poll_until_terminal",
+                        "downstream_payload_source": "owned_execution_poll",
+                    },
                 )
             session.commit()
         except Exception:
