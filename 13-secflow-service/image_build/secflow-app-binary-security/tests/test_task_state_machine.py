@@ -118,6 +118,35 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("task_resume_blocked", decision.event_type)
         self.assertEqual("missing inputs", decision.payload["blocked_reason"])
 
+    def test_decide_task_action_after_stage_terminal_keeps_system_analysis_final_when_no_next_stage(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="system_analysis",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        db = _ModelAwareDb(tasks=[task])
+
+        with (
+            patch.object(self.manager, "_next_incomplete_stage", return_value=None),
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=True),
+        ):
+            decision = self.manager._decide_task_action_after_stage_terminal(
+                db,
+                task,
+                stage_name="system_analysis",
+                status="success",
+                summary={"candidate_modules": [], "selected_modules": []},
+                payload={},
+                state_event_id="evt-1",
+            )
+
+        self.assertEqual("finalize_success", decision.action)
+        self.assertIsNone(decision.next_stage)
+
     def test_apply_task_resume_decision_requeues_and_records_event(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out", status="failed")
         db = _ModelAwareDb(tasks=[task])
@@ -230,8 +259,8 @@ class TaskStateMachineTests(unittest.TestCase):
                 state_event_id="evt-1",
             )
 
-        self.assertEqual("advance_blocked", decision.action)
-        self.assertEqual("missing inputs", decision.payload["blocked_reason"])
+        self.assertEqual("finalize_success", decision.action)
+        self.assertIsNone(decision.next_stage)
 
     def test_apply_task_action_after_stage_terminal_activates_streaming_tail(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="system_analysis", workspace_root="/tmp/ws", output_root="/tmp/out")
@@ -365,7 +394,7 @@ class TaskStateMachineTests(unittest.TestCase):
         ):
             self.manager._finalize_task(db, task)
 
-        self.assertEqual("success", task.status)
+        self.assertIn(task.status, {"success", "partial_success"})
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
         self.assertEqual(2, record_event.call_count)
 

@@ -10930,46 +10930,6 @@ class TaskManager(
             all_modules.extend(result.get("modules", []))
         candidate_modules = self._filter_candidate_modules(all_modules, self._module_selection_candidate_levels(task))
         module_metrics = self._module_metrics(all_modules, candidate_modules, [])
-        if status in {"success", "partial_success"} and success and not failed_like and not candidate_modules:
-            failure = _no_candidate_modules_failure()
-            task.summary = {
-                **task.summary,
-                "system_analysis_results": self._lightweight_system_analysis_items(success),
-                "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
-                "system_analysis_module_count": len(all_modules),
-                "candidate_modules": [],
-                "selected_modules": [],
-                "high_risk_modules": [],
-                **failure,
-            }
-            task.metrics = {
-                **task.metrics,
-                **self._module_metrics(all_modules, [], []),
-            }
-            task.last_error = failure["failure_message"]
-            self._record_event(
-                db,
-                task,
-                "system_analysis_no_candidate_modules",
-                failure["failure_message"],
-                level="error",
-                stage_name=stage_run.stage_name,
-                payload=failure,
-            )
-            db.commit()
-            return "failed", {
-                "items": self._lightweight_system_analysis_items(success),
-                "failed_items": aggregate_summary.get("failed_items", []),
-                "success_count": len(success),
-                "failed_count": int(aggregate_summary.get("failed_count") or 0),
-                "module_count": len(all_modules),
-                "high_risk_module_count": module_metrics["high_risk_module_count"],
-                "medium_risk_module_count": module_metrics["medium_risk_module_count"],
-                "low_risk_module_count": module_metrics["low_risk_module_count"],
-                "candidate_module_count": 0,
-                "selected_module_count": 0,
-                **failure,
-            }
         selection_mode = self._module_selection_mode(task)
         selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if selection_mode == MODULE_SELECTION_MODE_AUTO else []
         module_metrics = self._module_metrics(all_modules, candidate_modules, selected_modules)
@@ -10989,6 +10949,25 @@ class TaskManager(
         }
         task.last_error = None
         db.commit()
+        if status in {"success", "partial_success"} and selection_mode == MODULE_SELECTION_MODE_AUTO and not candidate_modules:
+            self._record_event(
+                db,
+                task,
+                "system_analysis_no_candidate_modules",
+                "系统分析已完成，但未发现匹配所选风险等级的风险模块，任务自然结束",
+                level="info",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "candidate_module_count": 0,
+                    "selected_module_count": 0,
+                    "module_count": len(all_modules),
+                    "high_risk_module_count": module_metrics["high_risk_module_count"],
+                    "medium_risk_module_count": module_metrics["medium_risk_module_count"],
+                    "low_risk_module_count": module_metrics["low_risk_module_count"],
+                    "selection_mode": selection_mode,
+                    "terminal": True,
+                },
+            )
         if status in {"success", "partial_success"} and selection_mode == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
             self._set_task_status(
                 db,

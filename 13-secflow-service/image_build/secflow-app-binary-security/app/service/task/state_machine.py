@@ -1843,14 +1843,30 @@ class TaskStateMachineMixin:
             decision.message = f"阶段失败，停止后续推进: {stage_name}"
             decision.level = "error"
             return decision
-        next_stage = self._next_incomplete_stage(db, task)
         if (
-            next_stage is None
-            and normalize_stage_name(stage_name) == "system_analysis"
-            and status == "success"
-            and self._entry_analysis_inputs(db, task)
+            normalize_stage_name(stage_name) == "system_analysis"
+            and status in {"success", "partial_success"}
+            and str(self._module_selection_mode(task) or "").strip() == "auto"
         ):
-            next_stage = "entry_analysis"
+            candidate_modules = list(
+                (summary or {}).get("candidate_modules")
+                or (task.summary or {}).get("candidate_modules")
+                or []
+            )
+            if not candidate_modules:
+                decision.action = "finalize_success"
+                decision.event_type = "task_completed_without_candidate_modules"
+                decision.message = "系统分析已完成且未选出可推进模块，任务直接结束"
+                decision.level = "info"
+                decision.payload = {
+                    "state_event_id": state_event_id,
+                    "completed_stage": stage_name,
+                    "selection_mode": "auto",
+                    "candidate_module_count": 0,
+                    "selected_module_count": 0,
+                }
+                return decision
+        next_stage = self._next_incomplete_stage(db, task)
         if next_stage and not self._should_auto_advance_to_stage(db, task, next_stage):
             blocked_reason = self._continue_stage_input_error(db, task, next_stage)
             decision.action = "advance_blocked"

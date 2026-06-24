@@ -21403,7 +21403,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["h1", "m1"], [row["module_key"] for row in rows])
 
-    def test_stage_system_analysis_marks_no_candidate_modules_as_business_failed(self):
+    def test_stage_system_analysis_without_candidate_modules_succeeds_and_terminates(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             task = BinarySecurityTask(
@@ -21460,12 +21460,85 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._prepare_stage_items_for_execution = original_prepare
                 self.manager._run_stage_pool = original_run_stage_pool
 
-            self.assertEqual("failed", status)
-            self.assertEqual("no_candidate_modules", summary["failure_code"])
-            self.assertEqual("business", summary["failure_category"])
-            self.assertIn("未发现匹配所选风险等级的风险模块", summary["failure_message"])
-            self.assertEqual(summary["failure_message"], task.last_error)
-            self.assertEqual("no_candidate_modules", task.summary["failure_code"])
+            self.assertEqual("success", status)
+            self.assertNotIn("failure_code", summary)
+            self.assertIsNone(task.last_error)
+            self.assertEqual([], task.summary["candidate_modules"])
+            self.assertEqual([], task.summary["selected_modules"])
+            self.assertEqual([], task.summary["high_risk_modules"])
+            event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
+            self.assertIn("system_analysis_no_candidate_modules", event_types)
+            self.assertTrue(
+                any(
+                    getattr(event, "level", "") == "info"
+                    and getattr(event, "event_type", "") == "system_analysis_no_candidate_modules"
+                    for event in db.added
+                    if isinstance(event, BinarySecurityEvent)
+                )
+            )
+
+    def test_stage_system_analysis_without_candidate_modules_succeeds_for_auto_selection_across_risk_levels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="source-task",
+                status="running",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/src",
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.policy = {"module_selection_mode": "auto", "module_risk_levels": ["高", "中", "低"]}
+            stage_run = BinarySecurityStageRun(
+                id="sr1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="system_analysis",
+                sequence_no=1,
+                status="running",
+            )
+            (workspace / "input").mkdir(parents=True, exist_ok=True)
+            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+            original_prepare = self.manager._prepare_stage_items_for_execution
+            original_run_stage_pool = self.manager._run_stage_pool
+            self.manager._prepare_stage_items_for_execution = lambda *args, **kwargs: None
+
+            async def fake_run_stage_pool(current_task, items, concurrency, runner, retries=0, initial_retry=False):
+                del current_task, items, concurrency, runner, retries, initial_retry
+                return [
+                    {
+                        "status": "success",
+                        "item": {
+                            "firmware_key": "source_project",
+                            "firmware_name": "source-task",
+                            "filename": "source-project",
+                            "unpacked_root": str(workspace / "input"),
+                            "source_root": str(workspace / "input"),
+                            "task_type": TASK_TYPE_SOURCE,
+                        },
+                        "modules": [{"module_key": "m1", "module_name": "m1", "risk_level": "低", "risk_score": 10}],
+                    }
+                ]
+
+            self.manager._run_stage_pool = fake_run_stage_pool
+            try:
+                status, summary = asyncio.run(
+                    self.manager._stage_system_analysis(db, task, stage_run, token=None, retry_existing=False)
+                )
+            finally:
+                self.manager._prepare_stage_items_for_execution = original_prepare
+                self.manager._run_stage_pool = original_run_stage_pool
+
+            self.assertEqual("success", status)
+            self.assertEqual([], task.summary["candidate_modules"])
+            self.assertEqual([], task.summary["selected_modules"])
+            self.assertEqual([], task.summary["high_risk_modules"])
+            self.assertNotIn("failure_code", summary)
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertIn("system_analysis_no_candidate_modules", event_types)
 
@@ -21528,6 +21601,39 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotEqual(task_manager_module.NO_CANDIDATE_MODULES_FAILURE_MESSAGE, task.last_error)
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertNotIn("system_analysis_no_candidate_modules", event_types)
+
+    def test_stage_terminal_success_without_candidate_modules_does_not_force_next_stage(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[])
+
+        with (
+            patch.object(self.manager, "_next_incomplete_stage", return_value=None),
+            patch.object(self.manager, "_entry_analysis_inputs", return_value=[{"module_key": "m1"}]),
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=True),
+        ):
+            decision = self.manager._decide_task_action_after_stage_terminal(
+                db,
+                task,
+                stage_name="system_analysis",
+                status="success",
+                summary={"candidate_modules": [], "selected_modules": []},
+                payload={},
+                state_event_id="evt-1",
+            )
+
+        self.assertEqual("finalize_success", decision.action)
+        self.assertIsNone(decision.next_stage)
 
     def test_stage_system_analysis_pending_result_does_not_close_as_success(self):
         task = BinarySecurityTask(
@@ -36692,6 +36798,7 @@ def _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending(self):
     observation = dict((item.result or {}).get("sync_observation") or {})
     self.assertTrue(observation.get("state_applied"))
     self.assertEqual("pending", observation.get("mapped_status"))
+    self.assertFalse(db.sync_events)
 
 
 def _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied(self):
@@ -36722,6 +36829,56 @@ def _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied
     observation = dict((item.result or {}).get("sync_observation") or {})
     self.assertFalse(observation.get("state_applied"))
     self.assertEqual("pending", observation.get("mapped_status"))
+    sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
+    self.assertEqual(1, len(sync_rows))
+    self.assertEqual("observed", sync_rows[0].event_type)
+    self.assertEqual("poll_until_terminal", sync_rows[0].operation)
+    self.assertEqual("observed", sync_rows[0].sync_status)
+    self.assertFalse(bool(sync_rows[0].state_applied))
+
+
+def _test_record_polled_child_sync_failure_records_transport_sync_event(self):
+    task = BinarySecurityTask(
+        id="task-polled-sync-failure",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="item-polled-sync-failure",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sa-1",
+        result={},
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        self.manager._record_polled_child_sync_failure(
+            task_id=task.id,
+            item_id=item.id,
+            error_message="downstream timed out",
+            error_type="ReadTimeout",
+            http_status=504,
+        )
+
+    sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
+    self.assertEqual(1, len(sync_rows))
+    self.assertEqual("transport_error", sync_rows[0].event_type)
+    self.assertEqual("poll_transport_error", sync_rows[0].operation)
+    self.assertEqual("transport_error", sync_rows[0].sync_status)
+    self.assertFalse(bool(sync_rows[0].state_applied))
+    self.assertEqual("ReadTimeout", sync_rows[0].error_type)
 
 
 def _test_sync_downstream_status_rewinds_running_entry_item_to_pending(self):
