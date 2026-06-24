@@ -8084,6 +8084,8 @@ class TaskManager(
         if normalized_stage == "knowledge_graph_entry_fetch":
             return bool(str(summary.get("input_dir") or "").strip())
         if normalized_stage == "dataflow_vuln_scan":
+            if not self._entry_analysis_authoritative_items_ready(db, task):
+                return False
             return bool(self._effective_entry_inputs(task, db))
         return True
 
@@ -9683,6 +9685,8 @@ class TaskManager(
             normalized = [self._normalize_entry_analysis_module_input(task, module) for module in (summary.get("b2s_results") or []) if isinstance(module, dict)]
             if normalized != list(summary.get("b2s_results") or []):
                 task.summary = {**summary, "b2s_results": normalized}
+        if normalize_stage_name(stage_name) == "entry_analysis":
+            self._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task)
         if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and not summary.get("entry_results"):
             if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
                 self._refresh_knowledge_graph_entry_fetch_summary(task)
@@ -9764,6 +9768,54 @@ class TaskManager(
             "current_stage_item_count": current_stage_item_count,
             "stage_run_status": stage_run_status,
         }
+
+    def _entry_analysis_authoritative_items_ready(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+    ) -> bool:
+        rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
+        return not bool(rebuild_state.get("required"))
+
+    def _stage_has_authoritative_materialization(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        resolved_items = stage_items if stage_items is not None else self._stage_items(db, task.id, normalized_stage)
+        if resolved_items:
+            return True
+        if normalized_stage == "entry_analysis":
+            return self._entry_analysis_historical_child_count(db, task) > 0
+        if normalized_stage == "dataflow_vuln_scan":
+            upstream_stage = self._streaming_upstream_stage(task, normalized_stage)
+            if upstream_stage and self._stage_requires_archive_success_gate(task, upstream_stage):
+                if not self._stage_has_archived_success_progress(db, task, upstream_stage):
+                    return False
+            return bool(self._effective_entry_inputs(task, db) or self._entry_results(task))
+        return False
+
+    def _entry_analysis_pending_requires_materialization(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> bool:
+        rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
+        if bool(rebuild_state.get("required")):
+            return True
+        resolved_items = stage_items if stage_items is not None else self._stage_items(db, task.id, "entry_analysis")
+        resolved_status = str(getattr(stage_run, "status", "") or "").strip() if stage_run is not None else ""
+        return bool(resolved_status in {"pending", "queued"} and not resolved_items)
 
     def _mark_entry_analysis_authoritative_rebuild_summary(
         self,
@@ -10248,6 +10300,14 @@ class TaskManager(
     ) -> bool:
         if stage_items:
             return True
+        if normalize_stage_name(stage_name) in {"entry_analysis", "dataflow_vuln_scan"}:
+            return self._stage_has_authoritative_materialization(
+                db,
+                task,
+                stage_name,
+                stage_run=stage_run,
+                stage_items=stage_items,
+            )
         if self._archive_jobs_for_stages(db, task.id, [stage_name]):
             return True
         stage_summary = dict(task.stage_summary or {})
@@ -10430,6 +10490,22 @@ class TaskManager(
         next_stage = self._next_incomplete_stage(db, task)
         if not next_stage:
             return False
+        if normalize_stage_name(next_stage) == "entry_analysis":
+            rebuilt = self._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task)
+            if self._entry_analysis_pending_requires_materialization(db, task):
+                self._record_event(
+                    db,
+                    task,
+                    "task_resume_blocked_for_missing_authoritative_items",
+                    "入口分析 authoritative item 尚未就绪，暂不恢复到普通待调度状态",
+                    stage_name="entry_analysis",
+                    level="warning",
+                    payload={
+                        "resume_reason": "archive_input_repaired",
+                        "rebuild_state": dict(rebuilt or {}),
+                    },
+                )
+                return False
         decision = self._decide_task_resume_after_stage_reset(
             db,
             task,
@@ -11140,9 +11216,23 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        input_files = list(task.summary.get("input_files") or [])
+        input_files = [dict(item) for item in (task.summary.get("input_files") or [])]
         if not input_files:
             return "failed", {"error": "缺少输入文件"}
+        summary_changed = False
+        for input_file in input_files:
+            firmware_key = str(input_file.get("firmware_key") or "").strip()
+            if firmware_key:
+                continue
+            filename = str(input_file.get("filename") or input_file.get("relative_path") or "").strip()
+            input_file["firmware_key"] = _slug(Path(filename).stem or filename)
+            summary_changed = True
+        if summary_changed:
+            task.summary = {
+                **task.summary,
+                "input_files": input_files,
+            }
+            db.commit()
         executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,
@@ -11822,6 +11912,30 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
+        if not self._entry_analysis_authoritative_items_ready(db, task):
+            rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task)
+            self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
+            self._record_event(
+                db,
+                task,
+                "dataflow_activation_blocked_until_entry_analysis_materialized",
+                "入口分析 authoritative item 尚未 materialize，阻止提前进入数据流漏洞挖掘阶段",
+                stage_name=stage_run.stage_name,
+                level="warning",
+                payload=dict(rebuild_state),
+            )
+            blocked_summary = {
+                "status": "blocked_until_entry_analysis_materialized",
+                "items": [],
+                "success_count": 0,
+                "failed_count": 0,
+                "candidate_entry_count": 0,
+                "selected_entry_count": 0,
+                "entry_count": 0,
+                **dict(rebuild_state),
+            }
+            self._persist_stage_run_output_summary(task, stage_run, blocked_summary)
+            return "pending", blocked_summary
         flow_inputs = self._effective_entry_inputs(task, db)
         if not flow_inputs:
             self._rebuild_entry_results_from_stage_items(db, task)

@@ -87,10 +87,18 @@ class TaskStateMachineMixin:
         runtime_lease = self._runtime_lease_for_task(db, task.id)
         if self._runtime_lease_is_active(runtime_lease):
             return True
-        if str(getattr(task, "status", "") or "").strip() in active_statuses and (
+        if str(getattr(task, "status", "") or "").strip().lower() in active_statuses and (
             str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         ):
-            return True
+            current_stage = str(getattr(task, "current_stage", "") or "").strip()
+            if current_stage and self._stage_has_real_runnable_work(db, task, current_stage):
+                return True
+            if current_stage and self._stage_has_active_archive_jobs(db, task, current_stage):
+                return True
+            snapshot = snapshots_by_stage.get(current_stage) or {}
+            if bool(snapshot.get("has_unresolved_expected_outputs")):
+                return True
+            return False
         return False
 
     def _task_children_all_terminal(
@@ -986,6 +994,8 @@ class TaskStateMachineMixin:
                 ]
                 if recoverable_items:
                     continue
+            elif stage_run is not None and not self._should_terminalize_parent_for_failed_stage(task, stage_run):
+                continue
             snapshot = self._stage_failure_snapshot(task, stage_run)
             failure_message = next((str(item.error_message or "").strip() for item in items if str(item.error_message or "").strip()), None)
             if not self._stage_ready_to_escalate_failure(workflow_snapshots, stage_name):
@@ -2009,6 +2019,20 @@ class TaskStateMachineMixin:
                     or self._binary_entry_analysis_barrier_enabled(task)
                 )
                 and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+            )
+            and (
+                (
+                    normalize_stage_name(next_stage) == "entry_analysis"
+                    and self._stage_has_materialized_inputs(db, task, next_stage, allow_rebuild=False)
+                )
+                or (
+                    normalize_stage_name(next_stage) != "entry_analysis"
+                    and self._stage_has_authoritative_materialization(db, task, next_stage)
+                )
+            )
+            and (
+                not self._stage_requires_archive_success_gate(task, stage_name)
+                or self._stage_has_archived_success_progress(db, task, stage_name)
             )
         ):
             decision.action = "activate_streaming_tail"
@@ -3257,6 +3281,30 @@ class TaskStateMachineMixin:
             and current_stage_has_live_work
             and self._is_streaming_tail_stage(task, next_stage)
         ):
+            if next_stage == "entry_analysis":
+                rebuilt = self._rebuild_missing_entry_analysis_stage_items_from_inputs(
+                    db,
+                    task,
+                    stage_run=next_stage_run,
+                )
+                if self._entry_analysis_pending_requires_materialization(
+                    db,
+                    task,
+                    stage_run=next_stage_run,
+                    stage_items=self._stage_items(db, task.id, next_stage),
+                ):
+                    self._record_event(
+                        db,
+                        task,
+                        "task_resume_blocked_for_missing_authoritative_items",
+                        "入口分析 authoritative item 尚未就绪，暂不按普通 pending 恢复任务",
+                        level="warning",
+                        stage_name=next_stage,
+                        payload={
+                            "stage_status": next_stage_status,
+                            "rebuild_state": dict(rebuilt or {}),
+                        },
+                    )
             _apply_retry_reopen_patch(
                 status="running",
                 reason="当前上游阶段仍有活跃工作，流式 tail 预建不会抢占任务主阶段",
@@ -3917,6 +3965,43 @@ class TaskStateMachineMixin:
                 if next_stage_run is not None
                 else "pending"
             )).strip()
+            if (
+                str(next_stage or "").strip() == "entry_analysis"
+                and self._entry_analysis_pending_requires_materialization(
+                    db,
+                    task,
+                    stage_run=next_stage_run,
+                    stage_items=next_stage_items,
+                )
+            ):
+                rebuilt = self._rebuild_missing_entry_analysis_stage_items_from_inputs(
+                    db,
+                    task,
+                    stage_run=next_stage_run,
+                )
+                if self._entry_analysis_pending_requires_materialization(
+                    db,
+                    task,
+                    stage_run=next_stage_run,
+                    stage_items=self._stage_items(db, task.id, next_stage),
+                ):
+                    self._record_event(
+                        db,
+                        task,
+                        "task_resume_blocked_for_missing_authoritative_items",
+                        "入口分析 authoritative item 尚未就绪，暂不按普通 pending 恢复任务",
+                        level="warning",
+                        stage_name=next_stage,
+                        payload={
+                            "stage_status": next_stage_status,
+                            "rebuild_state": dict(rebuilt or {}),
+                        },
+                    )
+                    self._sync_task_abnormal_reason_snapshot(db, task, None)
+                    return True
+                next_stage_items = self._stage_items(db, task.id, next_stage)
+                next_snapshot = next((snapshot for snapshot in self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs) if str(snapshot.get("stage_name") or "").strip() == next_stage), next_snapshot)
+                next_stage_status = str((next_snapshot or {}).get("status") or next_stage_status).strip()
             self._apply_task_main_state_update(
                 db,
                 task,

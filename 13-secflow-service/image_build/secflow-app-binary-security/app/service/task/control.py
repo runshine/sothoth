@@ -101,6 +101,8 @@ class TaskControlServiceMixin:
         return self._task_summary_dir(task, "temp_upload_dir", fallback)
 
     def _normalize_input_files(self: TaskManager, files, *, task_type: str) -> list[dict[str, Any]]:
+        from app.service import task_manager as task_manager_module
+
         rows: list[dict[str, Any]] = []
         seen_relative_paths: set[str] = set()
         saw_archive = False
@@ -120,6 +122,11 @@ class TaskControlServiceMixin:
                 raise ValidationError("存在重复路径")
             seen_relative_paths.add(relative_path)
             normalized = {**row, "filename": filename, "relative_path": relative_path}
+            if task_type == "binary":
+                firmware_key = str(normalized.get("firmware_key") or "").strip()
+                if not firmware_key:
+                    firmware_key = task_manager_module._slug(Path(filename).stem or filename)
+                normalized["firmware_key"] = firmware_key
             if task_type == "source":
                 if raw_relative_path and not is_archive:
                     saw_tree = True

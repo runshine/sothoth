@@ -6746,6 +6746,19 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["src/main.c", "include/util.h"], [row["relative_path"] for row in rows])
         self.assertEqual("source_tree_files", self.manager._source_input_kind(rows))
 
+    def test_normalize_binary_input_files_populates_firmware_key(self):
+        rows = self.manager._normalize_input_files(
+            [
+                {"filename": "NE20E-V800R022C10SPC100.cc"},
+            ],
+            task_type=TASK_TYPE_BINARY,
+        )
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("NE20E-V800R022C10SPC100.cc", rows[0]["filename"])
+        self.assertEqual("NE20E-V800R022C10SPC100.cc", rows[0]["relative_path"])
+        self.assertEqual("NE20E-V800R022C10SPC100", rows[0]["firmware_key"])
+
     def test_normalize_source_input_files_rejects_mixed_archive_and_tree_modes(self):
         with self.assertRaisesRegex(ValidationError, "不能混合目录文件和压缩包"):
             self.manager._normalize_input_files(
@@ -6825,6 +6838,65 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2, len(task.summary["input_files"]))
             self.assertEqual(2, task.metrics["uploaded_file_count"])
             self.assertEqual("pending", detail.status)
+
+    async def test_complete_uploads_populates_firmware_key_for_binary_inputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            input_dir = workspace / "input"
+            input_dir.mkdir(parents=True)
+            fw_name = "NE20E-V800R022C10SPC100.cc"
+            fw_path = input_dir / fw_name
+            fw_path.write_bytes(b"firmware-demo")
+
+            task = BinarySecurityTask(
+                id="bin1",
+                project_id="p1",
+                name="binary-task",
+                task_type=TASK_TYPE_BINARY,
+                status="pending_upload",
+                firmware_source="project_filesystem",
+                firmware_path=str(input_dir),
+                output_root=str(workspace / "output"),
+                workspace_root=str(workspace),
+            )
+            task.summary = {
+                "input_dir": str(input_dir),
+                "input_kind": "firmware_files",
+                "input_files": [{"filename": fw_name, "relative_path": fw_name}],
+            }
+            task.metrics = {}
+            db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
+
+            def _fake_start_task(_db, *, project_id, task_id):
+                self.assertEqual("p1", project_id)
+                self.assertEqual("bin1", task_id)
+                return self.manager.get_task_detail(_db, project_id=project_id, task_id=task_id)
+
+            original_start_task = self.manager.start_task
+            original_build_queue_info = self.manager._build_queue_info
+            self.manager.start_task = _fake_start_task
+            self.manager._build_queue_info = lambda *_args, **_kwargs: {"pending_positions": {}, "running_count": 0, "queued_count": 0, "max_concurrent_tasks": 0}
+            try:
+                with patch.object(self.manager, "_check_storage_free_space", return_value=None):
+                    detail = await self.manager.complete_uploads(
+                        db,
+                        project_id="p1",
+                        task_id="bin1",
+                        payload=BinarySecurityUploadCompletePayload(
+                            files=[BinarySecurityInputFile(filename=fw_name, relative_path=fw_name)]
+                        ),
+                        updated_by="tester",
+                        authorization_token="token",
+                    )
+            finally:
+                self.manager.start_task = original_start_task
+                self.manager._build_queue_info = original_build_queue_info
+
+            self.assertEqual("pending", task.status)
+            self.assertEqual("pending", detail.status)
+            self.assertEqual(1, len(task.summary["input_files"]))
+            self.assertEqual("NE20E-V800R022C10SPC100", task.summary["input_files"][0]["firmware_key"])
+            self.assertEqual(str(fw_path), task.summary["input_files"][0]["path"])
 
     async def test_complete_uploads_accepts_source_tree_files_from_temp_upload_dir(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -19866,13 +19938,24 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             stage_items=[system_item],
             events=[],
         )
-
-        repaired = self.manager._repair_descendants_after_archive_apply_if_needed(
-            db,
-            task,
-            system_item,
-            state_event_id="sev-system-archive-success",
-        )
+        original_rebuild = self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs
+        original_enqueue = self.manager._enqueue_task
+        self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs = lambda *_args, **_kwargs: {
+            "required": True,
+            "rebuilt": False,
+            "reason": "historical_children_exist_but_authoritative_items_missing",
+        }
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            repaired = self.manager._repair_descendants_after_archive_apply_if_needed(
+                db,
+                task,
+                system_item,
+                state_event_id="sev-system-archive-success",
+            )
+        finally:
+            self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs = original_rebuild
+            self.manager._enqueue_task = original_enqueue
 
         self.assertFalse(repaired)
         self.assertNotEqual("archive_input_repaired", str((task.summary or {}).get("stale_reason") or "").strip())
@@ -28465,6 +28548,55 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("fu-live", item.downstream_task_id)
         self.assertEqual("success", item.status)
 
+    def test_stage_firmware_unpack_backfills_missing_firmware_key(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="fw-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        task.summary = {
+            "input_files": [
+                {"filename": "a.bin", "path": "/tmp/ws/input/a.bin"},
+            ]
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[], archive_jobs=[])
+
+        async def fake_run_stage_pool(task_arg, items, concurrency, runner, retries=0, initial_retry=False):
+            del task_arg, concurrency, runner, retries, initial_retry
+            self.assertEqual("a", items[0]["firmware_key"])
+            return [{"status": "success", "item": items[0]}]
+
+        with (
+            patch.object(self.manager, "_run_stage_pool", side_effect=fake_run_stage_pool),
+            patch.object(self.manager, "_aggregate_stage_items", return_value=("success", {"firmware_unpack_results": []})),
+        ):
+            status, summary = asyncio.run(
+                self.manager._stage_firmware_unpack(
+                    db,
+                    task,
+                    stage_run,
+                    token="tok",
+                    retry_existing=False,
+                )
+            )
+
+        self.assertEqual("success", status)
+        self.assertIn("firmware_unpack_results", summary)
+        self.assertEqual("a", task.summary["input_files"][0]["firmware_key"])
+        self.assertGreaterEqual(db.commits, 1)
+
     def test_run_vuln_item_reuses_duplicate_downstream_task_before_create(self):
         task = BinarySecurityTask(
             id="t1",
@@ -33081,6 +33213,79 @@ def _test_archive_input_repair_uses_resume_decision(self):
     self.assertEqual("binary_to_source", applied[0]["next_stage"])
 
 
+def _test_archive_input_repair_blocks_resume_for_unmaterialized_entry_analysis(self):
+    task = BinarySecurityTask(
+        id="t-entry-blocked",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    task.summary = {
+        "b2s_results": [
+            {
+                "module_key": "m1",
+                "module_name": "mod-a",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/mod-a",
+                "module_dir": "/src/project/mod-a",
+                "entry_descriptor_ready": True,
+                "entry_files_list": "/src/project/mod-a/files.list",
+            }
+        ]
+    }
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry-empty",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run], stage_items=[], events=[], ea_tasks=[])
+
+    original_next_stage = self.manager._next_incomplete_stage
+    original_apply = self.manager._apply_task_resume_decision
+    original_rebuild = self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs
+    original_pending_gate = self.manager._entry_analysis_pending_requires_materialization
+    applied = []
+
+    self.manager._next_incomplete_stage = lambda *_args, **_kwargs: "entry_analysis"
+    self.manager._apply_task_resume_decision = lambda *_args, **_kwargs: applied.append("applied") or True
+    self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs = lambda *_args, **_kwargs: {
+        "required": True,
+        "rebuilt": False,
+        "reason": "historical_children_exist_but_authoritative_items_missing",
+    }
+    self.manager._entry_analysis_pending_requires_materialization = lambda *_args, **_kwargs: True
+    try:
+        resumed = self.manager._requeue_after_archive_input_repair(
+            db,
+            task,
+            repaired_stage="binary_to_source",
+            affected_stages=["entry_analysis"],
+            state_event_id="sev-entry-blocked",
+            before_signature={"entry_input_count": 0},
+            after_signature={"entry_input_count": 1},
+        )
+    finally:
+        self.manager._next_incomplete_stage = original_next_stage
+        self.manager._apply_task_resume_decision = original_apply
+        self.manager._rebuild_missing_entry_analysis_stage_items_from_inputs = original_rebuild
+        self.manager._entry_analysis_pending_requires_materialization = original_pending_gate
+
+    self.assertFalse(resumed)
+    self.assertEqual([], applied)
+    self.assertNotEqual("pending", task.status)
+    self.assertFalse(any(event.event_type == "archive_apply_triggered_input_repair" for event in db.events))
+
+
 def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
     now_value = _now()
     task = BinarySecurityTask(
@@ -33447,6 +33652,7 @@ TaskManagerTests.test_retry_stage_full_cleanup_reconciles_affected_stages_in_ses
 TaskManagerTests.test_requeue_task_after_retry_operation_uses_resume_decision = _test_requeue_task_after_retry_operation_uses_resume_decision
 TaskManagerTests.test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry = _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry
 TaskManagerTests.test_archive_input_repair_uses_resume_decision = _test_archive_input_repair_uses_resume_decision
+TaskManagerTests.test_archive_input_repair_blocks_resume_for_unmaterialized_entry_analysis = _test_archive_input_repair_blocks_resume_for_unmaterialized_entry_analysis
 TaskManagerTests.test_run_task_operation_steps_requeue_uses_resume_decision = _test_run_task_operation_steps_requeue_uses_resume_decision
 TaskManagerTests.test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision = _test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision
 TaskManagerTests.test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision = _test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision
@@ -38573,6 +38779,76 @@ def _test_finalize_gate_blocked_active_path_does_not_restore_running_after_autho
     self.assertNotIn("task_finalize_deferred_for_active_stage", event_types)
 
 
+def _test_task_has_any_active_children_ignores_empty_running_stage_projection(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-empty-running-projection",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-live",
+    )
+    system_run = BinarySecurityStageRun(
+        id="sr-system-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-dataflow-running-empty",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="running",
+        started_at=_now(),
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-system-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=system_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, entry_run, dataflow_run],
+        stage_items=[system_item],
+        events=[],
+    )
+
+    self.assertFalse(
+        manager._task_has_any_active_children(
+            db,
+            task,
+            stage_runs=[system_run, entry_run, dataflow_run],
+            stage_items=[system_item],
+        )
+    )
+
+
 def _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -38904,6 +39180,88 @@ def _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_m
     self.assertIsNone(task.finished_at)
     self.assertEqual("running", task.status)
     self.assertEqual("system_analysis", task.current_stage)
+
+
+def _test_refresh_task_status_after_sync_blocks_plain_pending_resume_for_unmaterialized_entry_analysis(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-refresh-entry-shell",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="binary_to_source",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "b2s_results": [
+            {
+                "module_key": "m1",
+                "module_name": "mod-a",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/mod-a",
+                "module_dir": "/src/project/mod-a",
+                "entry_descriptor_ready": True,
+                "entry_files_list": "/src/project/mod-a/files.list",
+            }
+        ]
+    }
+    b2s_run = BinarySecurityStageRun(
+        id="sr-refresh-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="binary_to_source",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-refresh-entry-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    b2s_item = BinarySecurityStageItem(
+        id="si-refresh-b2s-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=b2s_run.id,
+        stage_name="binary_to_source",
+        item_key="m1",
+        item_name="mod-a",
+        status="success",
+        downstream_service="binary_to_source",
+        downstream_task_id="b2s-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[b2s_run, entry_run], stage_items=[b2s_item], events=[], ea_tasks=[])
+
+    original_rebuild = manager._rebuild_missing_entry_analysis_stage_items_from_inputs
+    original_pending_gate = manager._entry_analysis_pending_requires_materialization
+    original_enqueue = manager._enqueue_task
+    manager._rebuild_missing_entry_analysis_stage_items_from_inputs = lambda *_args, **_kwargs: {
+        "required": True,
+        "rebuilt": False,
+        "reason": "historical_children_exist_but_authoritative_items_missing",
+    }
+    manager._entry_analysis_pending_requires_materialization = lambda *_args, **_kwargs: True
+    manager._enqueue_task = lambda *_args, **_kwargs: None
+    try:
+        with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+            manager._refresh_task_status_after_sync(db, task)
+    finally:
+        manager._rebuild_missing_entry_analysis_stage_items_from_inputs = original_rebuild
+        manager._entry_analysis_pending_requires_materialization = original_pending_gate
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual("running", task.status)
+    self.assertEqual("binary_to_source", task.current_stage)
+    self.assertNotEqual("pending", task.status)
 
 
 def _test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode(self):
@@ -41467,6 +41825,64 @@ def _test_cleanup_task_workspace_retries_transient_residual_directory(self):
 
     self.assertEqual("deleted", cleanup_status)
     self.assertEqual([5, 5, 5], sleeps)
+
+
+def _test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized(self):
+    task = BinarySecurityTask(
+        id="task-dataflow-blocked",
+        project_id="p1",
+        name="binary-module",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "b2s_results": [
+            {
+                "module_key": "m1",
+                "module_name": "mod-a",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/mod-a",
+                "module_dir": "/src/project/mod-a",
+                "entry_descriptor_ready": True,
+                "entry_files_list": "/src/project/mod-a/files.list",
+            }
+        ]
+    }
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-dataflow",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="pending",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run, dataflow_run], stage_items=[], events=[], ea_tasks=[])
+
+    original_ready = self.manager._entry_analysis_authoritative_items_ready
+    try:
+        self.manager._entry_analysis_authoritative_items_ready = lambda *_args, **_kwargs: False
+        status, summary = asyncio.run(
+            self.manager._stage_dataflow_vuln_scan(db, task, dataflow_run, token=None, retry_existing=False)
+        )
+    finally:
+        self.manager._entry_analysis_authoritative_items_ready = original_ready
+
+    self.assertEqual("pending", status)
+    self.assertEqual("blocked_until_entry_analysis_materialized", summary.get("status"))
+    self.assertTrue(any(event.event_type == "dataflow_activation_blocked_until_entry_analysis_materialized" for event in db.events))
 
 
 def _test_get_project_config_normalizes_legacy_partial_success_stage_names(self):
@@ -44786,6 +45202,7 @@ TaskManagerTests.test_finalize_gate_blocks_when_active_children_exist = _test_fi
 TaskManagerTests.test_finalize_gate_allows_when_workflow_terminal_and_children_terminal = _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal
 TaskManagerTests.test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure = _test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure
 TaskManagerTests.test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized = _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized
+TaskManagerTests.test_refresh_task_status_after_sync_blocks_plain_pending_resume_for_unmaterialized_entry_analysis = _test_refresh_task_status_after_sync_blocks_plain_pending_resume_for_unmaterialized_entry_analysis
 TaskManagerTests.test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode = _test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode
 TaskManagerTests.test_stage_terminal_after_system_analysis_archive_does_not_activate_dataflow_before_entry_analysis_materializes = _test_stage_terminal_after_system_analysis_archive_does_not_activate_dataflow_before_entry_analysis_materializes
 TaskManagerTests.test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_streaming = _test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_streaming
@@ -44801,6 +45218,7 @@ TaskManagerTests.test_record_downstream_sync_event_trims_each_item_bucket_indepe
 TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_item_id = _test_record_downstream_sync_event_uses_fallback_bucket_without_item_id
 TaskManagerTests.test_record_downstream_item_disposition_maps_create_and_retry_audit_events = _test_record_downstream_item_disposition_maps_create_and_retry_audit_events
 TaskManagerTests.test_downstream_create_task_records_requested_and_applied_sync_events = _test_downstream_create_task_records_requested_and_applied_sync_events
+TaskManagerTests.test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized = _test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
 TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync
