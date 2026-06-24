@@ -22,6 +22,28 @@ if TYPE_CHECKING:
 
 
 class TaskStateMachineMixin:
+    def _stage_has_active_archive_jobs(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        normalized_stage = str(stage_name or "").strip()
+        if not normalized_stage:
+            return False
+        active_statuses = {"pending", "queued", "dispatching", "running", "applying", "reconciling"}
+        archive_jobs = (
+            db.query(task_manager_module.BinarySecurityArchiveJob)
+            .filter(
+                task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
+                task_manager_module.BinarySecurityArchiveJob.stage_name == normalized_stage,
+            )
+            .all()
+        )
+        return any((str(getattr(job, "archive_status", "") or "").strip().lower() in active_statuses) for job in archive_jobs)
+
     def _task_has_any_active_children(
         self: TaskManager,
         db: Session,
@@ -35,10 +57,26 @@ class TaskStateMachineMixin:
         active_statuses = {"pending", "queued", "dispatching", "running", "applying", "reconciling"}
         runs = list(stage_runs or db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all())
         items = list(stage_items or db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
-        if any(str(getattr(run, "status", "") or "").strip() in active_statuses for run in runs):
-            return True
         if any((self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()) in active_statuses for item in items):
             return True
+        snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=runs)
+        snapshots_by_stage = {
+            str(snapshot.get("stage_name") or "").strip(): snapshot
+            for snapshot in snapshots
+            if str(snapshot.get("stage_name") or "").strip()
+        }
+        for run in runs:
+            run_status = str(getattr(run, "status", "") or "").strip().lower()
+            if run_status not in active_statuses:
+                continue
+            stage_name = str(getattr(run, "stage_name", "") or "").strip()
+            snapshot = snapshots_by_stage.get(stage_name) or {}
+            if bool(snapshot.get("has_active_items")) or bool(snapshot.get("has_unresolved_expected_outputs")):
+                return True
+            if int(snapshot.get("item_count") or 0) > 0:
+                return True
+            if self._stage_has_active_archive_jobs(db, task, stage_name):
+                return True
         archive_jobs = (
             db.query(task_manager_module.BinarySecurityArchiveJob)
             .filter(task_manager_module.BinarySecurityArchiveJob.task_id == task.id)
@@ -762,7 +800,10 @@ class TaskStateMachineMixin:
         task: BinarySecurityTask,
         stage_run: BinarySecurityStageRun | None,
     ) -> bool:
-        if stage_run is None or str(stage_run.status or "").strip() != "failed":
+        if stage_run is None:
+            return False
+        normalized_status = str(stage_run.status or "").strip()
+        if normalized_status not in {"failed", "cancelled", "downstream_missing"}:
             return False
         snapshot = self._stage_failure_snapshot(task, stage_run)
         error_text = " ".join(
@@ -779,6 +820,8 @@ class TaskStateMachineMixin:
             failure_category=snapshot.get("failure_category"),
         ):
             return False
+        if normalized_status in {"cancelled", "downstream_missing"}:
+            return True
         failure_code = str(snapshot.get("failure_code") or "").strip().lower()
         failure_category = str(snapshot.get("failure_category") or "").strip().lower()
         if failure_code or failure_category:
@@ -1250,6 +1293,15 @@ class TaskStateMachineMixin:
         }:
             if failed_idx is None or current_idx is None:
                 return False
+            if gate.reason_code == "active_children_present":
+                stage_items = self._stage_items(db, task.id, failed_stage)
+                if not self._task_has_any_active_children(db, task, stage_runs=stage_runs, stage_items=stage_items):
+                    return True
+                if blocked_stage and blocked_stage != failed_stage:
+                    blocked_items = self._stage_items(db, task.id, blocked_stage)
+                    blocked_has_real_children = bool(blocked_items) or self._stage_has_active_archive_jobs(db, task, blocked_stage)
+                    if not blocked_has_real_children:
+                        return True
             if failed_idx > current_idx:
                 return True
             return failed_idx <= current_idx
@@ -3444,6 +3496,50 @@ class TaskStateMachineMixin:
             gate.blocked_by_stage or "-",
             gate.next_stage or "-",
         )
+        if str(getattr(task, "status", "") or "").strip() in {"failed", "cancelled"} and not self._task_has_any_active_children(
+            db,
+            task,
+            stage_runs=runs,
+        ):
+            self._last_task_heartbeat_at.pop(task.id, None)
+            return True
+        authoritative_failure_ctx = (
+            self._current_stage_authoritative_failure_context(db, task, stage_runs=runs)
+            or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=runs)
+            or self._later_stage_authoritative_failure_context(db, task, stage_runs=runs)
+        )
+        if (
+            authoritative_failure_ctx is not None
+            and self._should_terminalize_parent_for_failed_stage(
+                task,
+                authoritative_failure_ctx.get("stage_run"),
+            )
+            and self._should_finalize_after_authoritative_failure(
+                db,
+                task,
+                failure_ctx=authoritative_failure_ctx,
+                stage_runs=runs,
+            )
+        ):
+            failure_stage_run = authoritative_failure_ctx.get("stage_run")
+            failure_snapshot = self._stage_failure_snapshot(task, failure_stage_run) if failure_stage_run is not None else {}
+            self._finalize_task_after_authoritative_failure(
+                db,
+                task,
+                failure_ctx={
+                    **authoritative_failure_ctx,
+                    "failure_code": authoritative_failure_ctx.get("failure_code") or failure_snapshot.get("failure_code"),
+                    "failure_category": authoritative_failure_ctx.get("failure_category") or failure_snapshot.get("failure_category"),
+                    "failure_message": authoritative_failure_ctx.get("failure_message")
+                    or (getattr(failure_stage_run, "last_error", None) if failure_stage_run is not None else None)
+                    or failure_snapshot.get("failure_message")
+                    or failure_snapshot.get("error"),
+                    "reason": authoritative_failure_ctx.get("reason") or "finalize_gate_blocked_but_authoritative_failure_present",
+                },
+                previous_status=str(getattr(task, "status", "") or "").strip() or None,
+                event_type="dispatching_state_force_terminalized",
+            )
+            return True
         if self._finalize_task_handle_active_progress(db, task, stage_runs=runs):
             return True
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=runs)

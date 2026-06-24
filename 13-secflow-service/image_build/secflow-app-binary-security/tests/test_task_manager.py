@@ -38265,6 +38265,99 @@ def _test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_
     self.assertIn("task_finalized_after_child_failure", event_types)
 
 
+def _test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-cancelled-authoritative-failure-not-running",
+        project_id="p1",
+        name="source",
+        status="failed",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-live",
+        dispatch_started_at=_now() - timedelta(minutes=2),
+        lease_expires_at=_now() + timedelta(minutes=3),
+    )
+    system_run = BinarySecurityStageRun(
+        id="sr-system-cancelled-authoritative",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="cancelled",
+        last_error="下游系统分析任务已取消",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry-empty-terminal",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="failed",
+        last_error="empty streaming tail historical terminal event",
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-dataflow-projected-running",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="running",
+        started_at=_now() - timedelta(minutes=1),
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-system-cancelled-authoritative",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=system_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="cancelled",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-cancelled-authoritative",
+        error_message="阶段子任务异常结束",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, entry_run, dataflow_run],
+        stage_items=[system_item],
+        events=[],
+    )
+
+    decision = manager._evaluate_task_finalization_gate(
+        db,
+        task,
+        stage_runs=[system_run, entry_run, dataflow_run],
+        stage_items=[system_item],
+    )
+    self.assertFalse(decision.allowed)
+    self.assertEqual("active_children_present", decision.reason_code)
+
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+        handled = manager._handle_finalize_gate_blocked_active_path(
+            db,
+            task,
+            stage_runs=[system_run, entry_run, dataflow_run],
+            finalize_gate=decision,
+        )
+
+    self.assertTrue(handled)
+    self.assertEqual("failed", task.status)
+    self.assertEqual("dataflow_vuln_scan", task.current_stage)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+    self.assertEqual("worker-live", task.dispatcher_instance_id)
+    event_types = [event.event_type for event in db.events]
+    self.assertNotIn("task_finalize_deferred_for_incomplete_stage", event_types)
+    self.assertNotIn("task_finalize_deferred_for_active_stage", event_types)
+
+
 def _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -43510,6 +43603,7 @@ TaskManagerTests.test_should_preserve_task_dispatch_ownership_uses_runtime_lease
 TaskManagerTests.test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success = _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success
 TaskManagerTests.test_finalize_gate_blocks_when_active_children_exist = _test_finalize_gate_blocks_when_active_children_exist
 TaskManagerTests.test_finalize_gate_allows_when_workflow_terminal_and_children_terminal = _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal
+TaskManagerTests.test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure = _test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure
 TaskManagerTests.test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized = _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized
 TaskManagerTests.test_reducer_activate_tail_reconciliation_defers_to_owner_worker = _test_reducer_activate_tail_reconciliation_defers_to_owner_worker
 TaskManagerTests.test_record_downstream_sync_event_trims_per_item_bucket_to_20 = _test_record_downstream_sync_event_trims_per_item_bucket_to_20
