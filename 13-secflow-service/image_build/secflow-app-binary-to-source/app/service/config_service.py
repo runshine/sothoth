@@ -84,11 +84,17 @@ class ConfigService:
         data["concurrency"] = normalize_concurrency(data.get("concurrency"))
         data["default_mode"] = normalize_b2s_mode(data.get("default_mode"))
         data["llm_provider_key"] = _normalize_provider_key(data.get("llm_provider_key"))
+        data["project_id"] = _GLOBAL_CONFIG_PROJECT_ID
         data["updated_at"] = row.updated_at.isoformat() if (row and row.updated_at) else None
         return data
 
     def save_config(self, db: Session, config_data: dict, project_id: str | None = None) -> dict:
-        blob = {k: v for k, v in config_data.items() if k not in {"project_id", "updated_at", "effective_llm_provider"}}
+        # Backward-compatible with the old call style:
+        # save_config(db, project_id, config_data). Runtime API uses the new
+        # global config style: save_config(db, config_data).
+        if isinstance(config_data, str) and isinstance(project_id, dict):
+            config_data = project_id
+        blob = {k: v for k, v in (config_data or {}).items() if k not in {"project_id", "updated_at", "effective_llm_provider"}}
         blob["budget_exhausted_action"] = normalize_budget_exhausted_action(
             blob.get("budget_exhausted_action")
         )
@@ -111,6 +117,7 @@ class ConfigService:
         result["concurrency"] = normalize_concurrency(result.get("concurrency"))
         result["default_mode"] = normalize_b2s_mode(result.get("default_mode"))
         result["llm_provider_key"] = _normalize_provider_key(result.get("llm_provider_key"))
+        result["project_id"] = _GLOBAL_CONFIG_PROJECT_ID
         result["updated_at"] = row.updated_at.isoformat() if row.updated_at else None
         return result
 
