@@ -807,6 +807,20 @@ class TaskQueryServiceMixin:
             deleted_event_count=int(deleted_count or 0),
         )
 
+    def clear_sync_events(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityActionResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        deleted_count = (
+            db.query(BinarySecuritySyncEvent)
+            .filter(BinarySecuritySyncEvent.task_id == task.id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        return BinarySecurityActionResponse(
+            task_id=task.id,
+            message=f"同步记录已清空，共删除 {deleted_count} 条记录",
+            deleted_event_count=int(deleted_count or 0),
+        )
+
     def delete_timeline_event(
         self: TaskManager,
         db: Session,

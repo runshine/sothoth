@@ -467,6 +467,16 @@ def clear_timeline(
     return get_task_manager().clear_timeline(db, project_id=project_id, task_id=task_id)
 
 
+@router.delete("/projects/{project_id}/tasks/{task_id}/sync-events", response_model=BinarySecurityActionResponse)
+def clear_sync_events(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().clear_sync_events(db, project_id=project_id, task_id=task_id)
+
+
 @router.delete("/projects/{project_id}/tasks/{task_id}/timeline/{event_id}", response_model=BinarySecurityActionResponse)
 def delete_timeline_event(
     project_id: str,
