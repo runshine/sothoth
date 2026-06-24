@@ -7084,14 +7084,22 @@ class TaskManager(
         task: BinarySecurityTask,
         stage_name: str,
     ) -> list[dict[str, Any]]:
-        return [
-            {
-                **dict(item.input_ref or {}),
-                **dict(item.output_ref or {}),
-                **self._load_stage_item_result_payload(item),
-            }
-            for item in self._stage_archived_success_items(db, task, stage_name)
-        ]
+        rows: list[dict[str, Any]] = []
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, stage_name)
+        for item in self._stage_archived_success_items(db, task, stage_name):
+            resolved_archive_refs = self._resolved_stage_item_archive_refs(
+                item,
+                archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []),
+            )
+            rows.append(
+                {
+                    **dict(item.input_ref or {}),
+                    **dict(item.output_ref or {}),
+                    **self._load_stage_item_result_payload(item),
+                    **resolved_archive_refs,
+                }
+            )
+        return rows
 
     def _stage_archive_jobs_by_item(self, db: Session, task_id: str, stage_name: str) -> dict[str, list[BinarySecurityArchiveJob]]:
         jobs = (
@@ -8249,6 +8257,60 @@ class TaskManager(
         if handler is None:
             return
         handler.refresh_summary_from_items(self, db, task)
+        self._rebuild_system_analysis_module_selection_from_summary(task)
+
+    def _rebuild_system_analysis_module_selection_from_summary(self, task: BinarySecurityTask) -> None:
+        summary = dict(task.summary or {})
+        if "system_analysis_modules" not in summary:
+            return
+        modules = [dict(module) for module in list(summary.get("system_analysis_modules") or []) if isinstance(module, dict)]
+        risk_levels = list(self._module_selection_candidate_levels(task) or [])
+        candidate_modules = self._filter_candidate_modules(modules, risk_levels)
+        high_risk_modules = [
+            dict(module)
+            for module in modules
+            if self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")) == "高"
+        ]
+
+        if self._module_selection_mode(task) == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
+            existing_selected = [
+                dict(module)
+                for module in list(summary.get("selected_modules") or [])
+                if isinstance(module, dict)
+            ]
+            candidate_by_key = {
+                str(module.get("module_key") or "").strip(): dict(module)
+                for module in candidate_modules
+                if str(module.get("module_key") or "").strip()
+            }
+            selected_modules: list[dict[str, Any]] = []
+            for module in existing_selected:
+                module_key = str(module.get("module_key") or "").strip()
+                if not module_key:
+                    continue
+                authoritative = candidate_by_key.get(module_key)
+                if authoritative is None:
+                    continue
+                selected_modules.append(
+                    {
+                        **authoritative,
+                        "selected_by": module.get("selected_by") or MODULE_SELECTION_MODE_MANUAL_CONFIRM,
+                        "selected_at": module.get("selected_at"),
+                    }
+                )
+        else:
+            selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if candidate_modules else []
+
+        task.summary = {
+            **summary,
+            "candidate_modules": self._lightweight_modules_for_storage(candidate_modules),
+            "selected_modules": self._lightweight_modules_for_storage(selected_modules),
+            "high_risk_modules": self._lightweight_modules_for_storage(high_risk_modules),
+        }
+        task.metrics = {
+            **dict(task.metrics or {}),
+            **self._module_metrics(modules, candidate_modules, selected_modules),
+        }
 
     def _refresh_firmware_unpack_stage_from_synced_items(self, db: Session, task: BinarySecurityTask) -> None:
         handler = self._stage_handler("firmware_unpack")
@@ -10533,34 +10595,6 @@ class TaskManager(
             )
         return contaminated
 
-    def _should_reopen_failed_stage_after_archive_input_repair(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        stage_run: BinarySecurityStageRun | None,
-    ) -> bool:
-        if stage_run is None or str(stage_run.status or "").strip() != "failed":
-            return False
-        summary = dict(task.summary or {})
-        if str(summary.get("stale_reason") or "").strip() != "archive_input_repaired":
-            return False
-        stage_name = str(stage_run.stage_name or "").strip()
-        if not stage_name:
-            return False
-        failure_snapshot = self._stage_failure_snapshot(task, stage_run)
-        failure_message = (
-            self._string_or_none(failure_snapshot.get("failure_message"))
-            or self._string_or_none(failure_snapshot.get("error"))
-            or self._string_or_none(getattr(stage_run, "last_error", None))
-        )
-        if not self._is_archive_repair_sensitive_failure(
-            stage_name,
-            failure_code=self._string_or_none(failure_snapshot.get("failure_code")),
-            failure_message=failure_message,
-        ):
-            return False
-        return self._stage_has_materialized_inputs(db, task, stage_name)
-
     def _reset_descendant_stages_after_archive_repair(
         self,
         db: Session,
@@ -10591,11 +10625,6 @@ class TaskManager(
             ).first()
             if stage_run is not None:
                 self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
-        summary = dict(task.summary or {})
-        summary["stale_reason"] = "archive_input_repaired"
-        summary["stale_from_stage"] = repaired_stage
-        summary["stale_stages"] = affected_stages
-        task.summary = summary
         return {
             "affected_stages": affected_stages,
             "deleted_stage_item_count": deleted_stage_item_count,
@@ -10603,89 +10632,6 @@ class TaskManager(
             "deleted_state_event_count": deleted_state_event_count,
             "deleted_timeline_event_count": deleted_timeline_event_count,
         }
-
-    def _requeue_after_archive_input_repair(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        *,
-        repaired_stage: str,
-        affected_stages: list[str],
-        state_event_id: str | None,
-        before_signature: dict[str, Any],
-        after_signature: dict[str, Any],
-    ) -> bool:
-        next_stage = self._next_incomplete_stage(db, task)
-        if not next_stage:
-            return False
-        if normalize_stage_name(next_stage) == "entry_analysis":
-            rebuilt = self._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task)
-            if self._entry_analysis_pending_requires_materialization(db, task):
-                self._record_event(
-                    db,
-                    task,
-                    "task_resume_blocked_for_missing_authoritative_items",
-                    "入口分析 authoritative item 尚未就绪，暂不恢复到普通待调度状态",
-                    stage_name="entry_analysis",
-                    level="warning",
-                    payload={
-                        "resume_reason": "archive_input_repaired",
-                        "rebuild_state": dict(rebuilt or {}),
-                    },
-                )
-                return False
-        decision = self._decide_task_resume_after_stage_reset(
-            db,
-            task,
-            next_stage=next_stage,
-            resume_reason="archive_input_repaired",
-            source="archive_apply",
-            message=f"归档修复后任务重新进入下一阶段: {next_stage}",
-            payload={
-                "state_event_id": state_event_id,
-                "repaired_stage": repaired_stage,
-                "affected_stages": affected_stages,
-                "input_semantics_before": before_signature,
-                "input_semantics_after": after_signature,
-            },
-        )
-        if not decision.should_resume:
-            blocked_reason = self._continue_stage_input_error(db, task, next_stage)
-            self._record_event(
-                db,
-                task,
-                "archive_apply_input_repair_blocked",
-                "归档晚到修复后仍无法自动推进到下一阶段",
-                level="warning",
-                stage_name=next_stage,
-                payload={
-                    "state_event_id": state_event_id,
-                    "repaired_stage": repaired_stage,
-                    "blocked_reason": blocked_reason,
-                    "affected_stages": affected_stages,
-                    "input_semantics_before": before_signature,
-                    "input_semantics_after": after_signature,
-                },
-            )
-            return False
-        self._record_event(
-            db,
-            task,
-            "archive_apply_triggered_input_repair",
-            "上游阶段归档晚到修复了后续输入，已失效化污染阶段并重新排队",
-            stage_name=repaired_stage,
-            level="warning",
-            payload={
-                "state_event_id": state_event_id,
-                "repaired_stage": repaired_stage,
-                "next_stage": next_stage,
-                "affected_stages": affected_stages,
-                "input_semantics_before": before_signature,
-                "input_semantics_after": after_signature,
-            },
-        )
-        decision.event_type = "task_requeued_after_archive_input_repair"
-        return self._apply_task_resume_decision(db, task, decision)
 
     def _base_task_summary(
         self,
@@ -11443,21 +11389,14 @@ class TaskManager(
         all_modules: list[dict[str, Any]] = []
         for result in success:
             all_modules.extend(result.get("modules", []))
-        module_metrics = self._module_metrics(all_modules, [], [])
         task.summary = {
             **self._clear_failure_fields_from_summary(task.summary),
             "system_analysis_results": self._lightweight_system_analysis_items(success),
             "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
             "system_analysis_module_count": len(all_modules),
-            "candidate_modules": list(task.summary.get("candidate_modules") or []) if isinstance(task.summary, dict) else [],
-            "selected_modules": list(task.summary.get("selected_modules") or []) if isinstance(task.summary, dict) else [],
-            "high_risk_modules": list(task.summary.get("high_risk_modules") or []) if isinstance(task.summary, dict) else [],
         }
+        self._rebuild_system_analysis_module_selection_from_summary(task)
         self._clear_entry_result_state(task)
-        task.metrics = {
-            **task.metrics,
-            **module_metrics,
-        }
         task.last_error = None
         db.commit()
         return status, {
@@ -11471,9 +11410,9 @@ class TaskManager(
             "pending_count": int(aggregate_summary.get("pending_count") or 0),
             "downstream_missing_count": int(aggregate_summary.get("downstream_missing_count") or 0),
             "module_count": len(all_modules),
-            "high_risk_module_count": module_metrics["high_risk_module_count"],
-            "medium_risk_module_count": module_metrics["medium_risk_module_count"],
-            "low_risk_module_count": module_metrics["low_risk_module_count"],
+            "high_risk_module_count": int((task.metrics or {}).get("high_risk_module_count") or 0),
+            "medium_risk_module_count": int((task.metrics or {}).get("medium_risk_module_count") or 0),
+            "low_risk_module_count": int((task.metrics or {}).get("low_risk_module_count") or 0),
             "candidate_module_count": int((task.metrics or {}).get("candidate_module_count") or 0),
             "selected_module_count": int((task.metrics or {}).get("selected_module_count") or 0),
             "requires_confirmation": False,

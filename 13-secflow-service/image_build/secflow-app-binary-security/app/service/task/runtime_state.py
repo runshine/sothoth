@@ -444,6 +444,8 @@ class TaskRuntimeStateServiceMixin:
         source: str,
     ) -> bool:
         normalized_source = str(source or "").strip().lower()
+        if normalized_source == "state_machine":
+            return True
         guarded_sources = {
             "state_reducer",
             "runtime_state",

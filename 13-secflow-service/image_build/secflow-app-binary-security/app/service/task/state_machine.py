@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 
 
 class TaskStateMachineMixin:
+    _ACTIVE_STAGE_STATUSES = {"pending", "queued", "running", "dispatching", "applying", "reconciling"}
+
     def _stage_has_active_archive_jobs(
         self: TaskManager,
         db: Session,
@@ -30,6 +32,8 @@ class TaskStateMachineMixin:
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
+        if db is None:
+            return False
         normalized_stage = str(stage_name or "").strip()
         if not normalized_stage:
             return False
@@ -143,6 +147,24 @@ class TaskStateMachineMixin:
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
         next_stage = self._next_incomplete_stage(db, task)
+        authoritative_failure = (
+            self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+            or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+            or self._later_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+        )
+        if authoritative_failure is not None:
+            failure_stage = str(authoritative_failure.get("stage_name") or "").strip()
+            if workflow_blocked_stage and workflow_blocked_stage == failure_stage:
+                workflow_blocked_stage = None
+            if next_stage and str(next_stage or "").strip() == failure_stage:
+                next_stage = None
+        if next_stage:
+            next_snapshot = next(
+                (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == str(next_stage or "").strip()),
+                None,
+            )
+            if next_snapshot is not None and self._stage_snapshot_is_shell_active(db, task, next_snapshot):
+                next_stage = None
         if workflow_blocked_stage or next_stage:
             return True
         return False
@@ -162,8 +184,10 @@ class TaskStateMachineMixin:
             (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == str(blocked_stage or "").strip()),
             None,
         )
+        if blocked_snapshot is not None and self._stage_snapshot_is_shell_active(db, task, blocked_snapshot):
+            return False
         blocked_status = str((blocked_snapshot or {}).get("status") or "").strip()
-        if blocked_status not in {"pending", "queued", "dispatching", "running", "applying", "reconciling"}:
+        if blocked_status not in self._ACTIVE_STAGE_STATUSES:
             return False
         return self._should_requeue_for_owned_execution(
             db,
@@ -171,6 +195,57 @@ class TaskStateMachineMixin:
             next_stage=blocked_stage,
             next_stage_status=blocked_status,
         )
+
+    def _stage_snapshot_is_shell_active(
+        self: TaskManager,
+        db: Session | None,
+        task: BinarySecurityTask,
+        snapshot: dict[str, Any] | None,
+    ) -> bool:
+        if not isinstance(snapshot, dict):
+            return False
+        stage_name = str(snapshot.get("stage_name") or "").strip()
+        if not stage_name:
+            return False
+        status = str(snapshot.get("status") or "").strip()
+        if status not in self._ACTIVE_STAGE_STATUSES:
+            return False
+        if not bool(snapshot.get("has_stage_run")):
+            return False
+        if int(snapshot.get("item_count") or 0) > 0:
+            return False
+        if bool(snapshot.get("has_active_items")) or bool(snapshot.get("has_unresolved_expected_outputs")):
+            return False
+        if bool(snapshot.get("has_materialized_inputs")):
+            return False
+        if db is None:
+            return True
+        if self._stage_has_active_archive_jobs(db, task, stage_name):
+            return False
+        if self._stage_has_real_runnable_work(db, task, stage_name):
+            return False
+        return True
+
+    def _stage_status_for_task(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> str:
+        normalized_stage = str(stage_name or "").strip()
+        if not normalized_stage:
+            return "pending"
+        stage_run = (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == normalized_stage,
+            )
+            .order_by(BinarySecurityStageRun.sequence_no.desc(), BinarySecurityStageRun.created_at.desc(), BinarySecurityStageRun.id.desc())
+            .first()
+        )
+        stage_items = self._stage_items(db, task.id, normalized_stage)
+        return str(self._business_stage_status(task, normalized_stage, stage_run, stage_items, db=db) or "pending").strip() or "pending"
 
     def _evaluate_task_finalization_gate(
         self: TaskManager,
@@ -187,6 +262,12 @@ class TaskStateMachineMixin:
         next_stage = self._next_incomplete_stage(db, task)
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=runs)
         blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
+        next_snapshot = next(
+            (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == str(next_stage or "").strip()),
+            None,
+        )
+        if next_snapshot is not None and self._stage_snapshot_is_shell_active(db, task, next_snapshot):
+            next_stage = None
         has_authoritative_failure = (
             self._current_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
             or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
@@ -654,12 +735,11 @@ class TaskStateMachineMixin:
         for snapshot in snapshots:
             stage_name = str(snapshot.get("stage_name") or "").strip()
             if (
-                self._is_streaming_tail_stage(task, stage_name)
-                and not int(snapshot.get("item_count") or 0)
-                and not bool(snapshot.get("has_active_items"))
-                and not bool(snapshot.get("has_unresolved_expected_outputs"))
-                and str(snapshot.get("status") or "").strip() in {"pending", "queued", "running", "dispatching"}
+                str(snapshot.get("status") or "").strip() == "partial_success"
+                and not self._partial_success_advancement_enabled(task, stage_name)
             ):
+                return stage_name or None
+            if self._stage_snapshot_is_shell_active(None, task, snapshot):
                 continue
             if not bool(snapshot.get("has_stage_run")):
                 return stage_name or None
@@ -1187,6 +1267,34 @@ class TaskStateMachineMixin:
         failure_category = self._string_or_none(failure_ctx.get("failure_category"))
         failure_message = self._string_or_none(failure_ctx.get("failure_message")) or task.last_error
         stage_run = failure_ctx.get("stage_run")
+        self._record_event(
+            db,
+            task,
+            "authoritative_failure_finalize_started",
+            "检测到权威终态失败，开始收口父任务主状态",
+            level="warning",
+            stage_name=stage_name,
+            payload={
+                "failure_stage": stage_name,
+                "failure_code": failure_code,
+                "failure_category": failure_category,
+                "failure_message": failure_message,
+                "previous_status": previous_status,
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "authoritative_failure_finalize_bypassed_owner_guard",
+            "权威失败收口已绕过 owner guard，直接写入父任务主状态",
+            level="warning",
+            stage_name=stage_name,
+            payload={
+                "failure_stage": stage_name,
+                "failure_code": failure_code,
+                "failure_category": failure_category,
+            },
+        )
         if not self._apply_task_main_state_update(
             db,
             task,
@@ -1199,7 +1307,35 @@ class TaskStateMachineMixin:
             last_error=failure_message,
             clear_runtime_owner=True,
         ):
+            self._record_event(
+                db,
+                task,
+                "task_main_state_fact_drift_detected",
+                "权威失败事实已成立，但父任务主状态写入未成功",
+                level="error",
+                stage_name=stage_name,
+                payload={
+                    "failure_stage": stage_name,
+                    "failure_code": failure_code,
+                    "failure_category": failure_category,
+                    "failure_message": failure_message,
+                },
+            )
             return
+        self._record_event(
+            db,
+            task,
+            "authoritative_failure_finalize_applied",
+            "权威失败收口已写入父任务主状态",
+            level="warning",
+            stage_name=stage_name,
+            payload={
+                "failure_stage": stage_name,
+                "failure_code": failure_code,
+                "failure_category": failure_category,
+                "failure_message": failure_message,
+            },
+        )
         self._record_event(
             db,
             task,
@@ -1323,32 +1459,34 @@ class TaskStateMachineMixin:
         task: BinarySecurityTask,
     ) -> str | None:
         summary = dict(task.summary or {})
-        if str(summary.get("stale_reason") or "").strip() == "archive_input_repaired":
-            for stage_name in [
-                str(candidate_stage).strip()
-                for candidate_stage in list(summary.get("stale_stages") or [])
-                if str(candidate_stage).strip()
-            ]:
-                if not self._stage_enabled(task, stage_name):
-                    continue
-                if self._stage_has_materialized_inputs(db, task, stage_name):
-                    return stage_name
         if (
             self._source_entry_analysis_barrier_enabled(task)
             and self._stage_has_archived_success_progress(db, task, "system_analysis")
             and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+            and (
+                self._stage_status_for_task(db, task, "system_analysis") != "partial_success"
+                or self._partial_success_advancement_enabled(task, "system_analysis")
+            )
         ):
             return "entry_analysis"
         if (
             self._binary_system_analysis_binary_to_source_barrier_enabled(task)
             and self._stage_has_archived_success_progress(db, task, "system_analysis")
             and not self._stage_has_archived_success_progress(db, task, "binary_to_source")
+            and (
+                self._stage_status_for_task(db, task, "system_analysis") != "partial_success"
+                or self._partial_success_advancement_enabled(task, "system_analysis")
+            )
         ):
             return "binary_to_source"
         if (
             self._binary_entry_analysis_barrier_enabled(task)
             and self._stage_has_archived_success_progress(db, task, "binary_to_source")
             and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+            and (
+                self._stage_status_for_task(db, task, "binary_to_source") != "partial_success"
+                or self._partial_success_advancement_enabled(task, "binary_to_source")
+            )
         ):
             return "entry_analysis"
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
@@ -1485,12 +1623,21 @@ class TaskStateMachineMixin:
     ) -> BinarySecurityStageRun | None:
         excluded = str(exclude_stage or "").strip()
         stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
+        snapshots_by_stage = {
+            str(snapshot.get("stage_name") or "").strip(): snapshot
+            for snapshot in snapshots
+            if str(snapshot.get("stage_name") or "").strip()
+        }
         for run in stage_runs:
             current_stage_name = str(run.stage_name or "").strip()
             if excluded and current_stage_name == excluded:
                 continue
             current_status = str(run.status or "").strip()
             if current_status not in {"pending", "queued", "running", "dispatching"}:
+                continue
+            snapshot = snapshots_by_stage.get(current_stage_name)
+            if snapshot is not None and self._stage_snapshot_is_shell_active(db, task, snapshot):
                 continue
             return run
         return None
@@ -1509,6 +1656,30 @@ class TaskStateMachineMixin:
 
         decision = task_manager_module._TaskLayerDecision()
         if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return decision
+        authoritative_failure = (
+            self._current_stage_authoritative_failure_context(db, task)
+            or self._earlier_stage_authoritative_failure_context(db, task)
+            or self._later_stage_authoritative_failure_context(db, task)
+        )
+        if authoritative_failure is not None and self._should_finalize_after_authoritative_failure(
+            db,
+            task,
+            failure_ctx=authoritative_failure,
+        ):
+            self._record_event(
+                db,
+                task,
+                "takeover_requeue_suppressed_by_authoritative_failure",
+                "权威失败已成立，已禁止 takeover/requeue 并优先走 finalize",
+                level="warning",
+                stage_name=str(authoritative_failure.get("stage_name") or task.current_stage or "").strip() or None,
+                payload={
+                    "failure_stage": str(authoritative_failure.get("stage_name") or "").strip() or None,
+                    "failure_code": self._string_or_none(authoritative_failure.get("failure_code")),
+                    "failure_category": self._string_or_none(authoritative_failure.get("failure_category")),
+                },
+            )
             return decision
         if self._has_active_owned_execution_holder(db, task):
             return decision
@@ -2984,7 +3155,6 @@ class TaskStateMachineMixin:
             failed_stage_run is not None
             and not had_stage_retry_mode
             and not had_task_retry_mode
-            and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
             and not self._is_streaming_tail_stage(task, failed_stage_run.stage_name)
         ):
             failed_stage_name = str(failed_stage_run.stage_name or task.current_stage or "").strip() or None
@@ -3102,7 +3272,6 @@ class TaskStateMachineMixin:
             return True
         if (
             failed_stage_run is not None
-            and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
             and self._stage_ready_to_escalate_failure(workflow_snapshots, str(failed_stage_run.stage_name or "").strip())
             and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run)
             and self._should_finalize_after_authoritative_failure(
@@ -3134,7 +3303,6 @@ class TaskStateMachineMixin:
             failed_stage_run is not None
             and not had_stage_retry_mode
             and not had_task_retry_mode
-            and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
         ):
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             exhausted_owner_lost_items = [item for item in failed_items if self._owner_lost_retry_exhausted(task, item)]
@@ -3202,7 +3370,6 @@ class TaskStateMachineMixin:
             failed_stage_run is not None
             and not had_stage_retry_mode
             and not had_task_retry_mode
-            and not self._should_reopen_failed_stage_after_archive_input_repair(db, task, failed_stage_run)
         ):
             if not self._stage_ready_to_escalate_failure(workflow_snapshots, str(failed_stage_run.stage_name or "").strip()):
                 has_active_work = any(
@@ -3246,12 +3413,6 @@ class TaskStateMachineMixin:
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
         summary_after_retry_clear = dict(task.summary or {})
-        stale_reason_after_retry_clear = str(summary_after_retry_clear.get("stale_reason") or "").strip()
-        stale_stages_after_retry_clear = {
-            str(stage_name).strip()
-            for stage_name in list(summary_after_retry_clear.get("stale_stages") or [])
-            if str(stage_name).strip()
-        }
         current_stage_name = str(task.current_stage or "").strip()
         current_stage_items = self._stage_items(db, task.id, current_stage_name) if current_stage_name else []
         current_stage_has_live_work = bool(
@@ -3261,13 +3422,6 @@ class TaskStateMachineMixin:
                 or self._stage_has_live_downstream_children(current_stage_items)
                 or self._stage_has_real_runnable_work(db, task, current_stage_name)
             )
-        )
-        archive_input_repair_reopen = bool(
-            next_stage
-            and stale_reason_after_retry_clear == "archive_input_repaired"
-            and next_stage in stale_stages_after_retry_clear
-            and str(next_stage_status or "").strip() in {"pending", "queued", "running", "dispatching"}
-            and self._stage_has_materialized_inputs(db, task, next_stage)
         )
         if (
             next_stage
@@ -3336,7 +3490,6 @@ class TaskStateMachineMixin:
             and (
                 (had_stage_retry_mode and preferred_retry_next_stage == next_stage)
                 or had_task_retry_mode
-                or archive_input_repair_reopen
                 or self._stage_has_real_runnable_work(db, task, next_stage)
             )
         ):
@@ -3674,6 +3827,27 @@ class TaskStateMachineMixin:
             None,
         )
         blocked_status = str((blocked_snapshot or {}).get("status") or "").strip()
+        blocked_has_inputs = bool(
+            blocked_stage
+            and (
+                self._stage_has_materialized_inputs(db, task, blocked_stage, allow_rebuild=False)
+                if self._stage_requires_materialized_inputs(task, blocked_stage)
+                else True
+            )
+        )
+        if (
+            blocked_snapshot is not None
+            and not bool((blocked_snapshot or {}).get("has_stage_run"))
+            and not blocked_has_inputs
+            and not bool((blocked_snapshot or {}).get("has_active_items"))
+            and not bool((blocked_snapshot or {}).get("has_unresolved_expected_outputs"))
+        ):
+            blocked_stage = str(task.current_stage or "").strip() or blocked_stage
+            blocked_snapshot = next(
+                (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == blocked_stage),
+                None,
+            )
+            blocked_status = str((blocked_snapshot or {}).get("status") or "").strip()
         has_active_incomplete_stage, active_stage_name, active_stage_status = self._has_any_active_incomplete_stage(db, task, runs)
         if gate.reason_code == "active_children_present" and has_active_incomplete_stage and active_stage_name:
             blocked_stage = active_stage_name

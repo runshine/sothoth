@@ -154,6 +154,8 @@ class TaskContractServiceMixin:
                     "risk_level": self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")),
                     "risk_score": module.get("risk_score"),
                     "file_count": module.get("file_count"),
+                    "selected_by": module.get("selected_by"),
+                    "selected_at": module.get("selected_at"),
                 }
             )
         return rows
@@ -654,8 +656,40 @@ class TaskContractServiceMixin:
             str(module.get("module_name") or module.get("entry_module_name") or "module")
         )
 
+    def _existing_entry_module_descriptor(
+        self: TaskManager,
+        artifact_root: Path,
+        module: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        from app.service import task_manager as task_manager_module
+
+        entry_module_name = self._infer_entry_module_name(module, artifact_root, [])
+        files_list_path = artifact_root / "modules" / entry_module_name / "files.list"
+        if not self._is_entry_descriptor_usable(artifact_root, files_list_path):
+            return None
+        try:
+            rows = [line.strip() for line in files_list_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except Exception:
+            return None
+        module_dir = files_list_path.parent
+        return {
+            "entry_module_name": entry_module_name,
+            "entry_descriptor_root": str(artifact_root),
+            "entry_files_list": str(files_list_path),
+            "entry_source_file_count": len(rows),
+            "entry_source_files_preview": rows[:20],
+            "entry_descriptor_ready": True,
+            "module_dir": str(module_dir),
+            "files_list": str(files_list_path),
+            "source_root": str(artifact_root),
+        }
+
     def _prepare_entry_module_descriptor(self: TaskManager, artifact_root: Path, module: dict[str, Any]) -> dict[str, Any]:
         from app.service import task_manager as task_manager_module
+
+        existing = self._existing_entry_module_descriptor(artifact_root, module)
+        if existing is not None:
+            return existing
 
         source_files = self._collect_entry_source_files(artifact_root)
         entry_module_name = self._infer_entry_module_name(module, artifact_root, source_files)
@@ -718,6 +752,21 @@ class TaskContractServiceMixin:
             candidates.append(Path(raw))
         return task_manager_module._dedupe_paths(candidates)
 
+    def _binary_module_entry_descriptor_candidates(self: TaskManager, module: dict[str, Any]) -> list[Path]:
+        from app.service import task_manager as task_manager_module
+
+        candidates: list[Path] = []
+        for value in (
+            module.get("entry_descriptor_root"),
+            module.get("archive_root"),
+            module.get("artifact_root"),
+        ):
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            candidates.append(Path(raw))
+        return task_manager_module._dedupe_paths(candidates)
+
     def _normalize_entry_analysis_module_input(self: TaskManager, task: BinarySecurityTask, module: dict[str, Any]) -> dict[str, Any]:
         from app.service import task_manager as task_manager_module
 
@@ -738,7 +787,12 @@ class TaskContractServiceMixin:
                 normalized["files_list"] = str(files_list_path)
                 normalized["files_list_path"] = str(files_list_path)
                 return normalized
-        for artifact_root in self._entry_descriptor_candidates(normalized):
+        descriptor_candidates = (
+            self._binary_module_entry_descriptor_candidates(normalized)
+            if self._task_type(task) == task_manager_module.TASK_TYPE_BINARY_MODULE
+            else self._entry_descriptor_candidates(normalized)
+        )
+        for artifact_root in descriptor_candidates:
             if not artifact_root.exists():
                 continue
             prepared = self._prepare_entry_module_descriptor(artifact_root, normalized)
@@ -776,6 +830,16 @@ class TaskContractServiceMixin:
                 or ""
             )
             break
+        if self._task_type(task) == task_manager_module.TASK_TYPE_BINARY_MODULE and not normalized.get("entry_descriptor_ready"):
+            authoritative_root = str(
+                normalized.get("archive_root")
+                or normalized.get("artifact_root")
+                or normalized.get("entry_descriptor_root")
+                or ""
+            )
+            normalized["source_dir"] = authoritative_root
+            normalized["source_root"] = authoritative_root
+            normalized["source_root_path"] = authoritative_root
         return normalized
 
     def _build_entry_output_contract(

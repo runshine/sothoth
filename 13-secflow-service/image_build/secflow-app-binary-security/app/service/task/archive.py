@@ -223,6 +223,72 @@ class TaskArchiveServiceMixin:
         )
         return [target_stage]
 
+    async def _prepare_archive_retry_full_preserve_target_authority(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        target_stage: str,
+        *,
+        jobs: list[Any],
+        stage_items: list[Any],
+    ) -> list[str]:
+        from app.service import task_manager as task_manager_module
+
+        stage_sequence = self._stage_sequence_for_task(task)
+        if target_stage not in stage_sequence:
+            raise ValidationError(f"{target_stage} is not present in current stage sequence")
+
+        target_index = stage_sequence.index(target_stage)
+        descendant_stages = list(stage_sequence[target_index + 1 :])
+        downstream_refs = self._retry_downstream_refs_for_stages(db, task, descendant_stages)
+
+        if downstream_refs:
+            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
+
+        if descendant_stages:
+            self._clear_stage_outputs_from(task, descendant_stages[0], mark_stale=False)
+            self._delete_archive_children_for_stages(db, task, descendant_stages)
+            self._delete_stage_items_for_stages(db, task.id, descendant_stages)
+            self._delete_state_event_rows_for_stages(db, task.id, descendant_stages)
+            self._delete_timeline_rows_for_stages(db, task.id, descendant_stages)
+            for stage_name in descendant_stages:
+                stage_run = db.query(task_manager_module.BinarySecurityStageRun).filter(
+                    task_manager_module.BinarySecurityStageRun.task_id == task.id,
+                    task_manager_module.BinarySecurityStageRun.stage_name == stage_name,
+                ).first()
+                if stage_run is not None:
+                    self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
+
+        if jobs:
+            self._delete_archive_roots_for_jobs(task, jobs)
+        self._clear_archive_jobs_for_stages(db, task.id, [target_stage])
+        rebuilt = self._rebuild_authoritative_archive_jobs_for_stage(
+            db,
+            task,
+            target_stage,
+            stage_items,
+            archive_jobs=jobs,
+        )
+
+        self._mark_task_waiting_for_archive_retry(db, task, target_stage, preserve_active_state=True)
+        self._record_event(
+            db,
+            task,
+            "archive_stage_full_retry_requested",
+            "阶段归档任务已重建，并清空下游阶段等待重新物化",
+            stage_name=target_stage,
+            payload={
+                "stage_name": target_stage,
+                "rebuild_count": rebuilt,
+                "retry_semantics": "archive_full",
+                "archive_rebuild_mode": "target_stage_archive_only",
+                "preserve_target_authoritative_child": True,
+                "cleared_business_stages": list(descendant_stages),
+                "cleared_archive_stages": [target_stage, *descendant_stages],
+            },
+        )
+        return [target_stage]
+
     def _expand_stage_name_aliases(self: TaskManager, stage_names: list[str]) -> list[str]:
         normalized: list[str] = []
         seen: set[str] = set()
@@ -570,7 +636,7 @@ class TaskArchiveServiceMixin:
         )
         if not supported:
             raise ValidationError(reason or self._archive_stage_full_retry_failure_reason(normalized_target_stage))
-        return await self._prepare_authoritative_archive_retry_full(
+        return await self._prepare_archive_retry_full_preserve_target_authority(
             db,
             task,
             normalized_target_stage,
@@ -1382,12 +1448,6 @@ class TaskArchiveServiceMixin:
                     "archive_bound_downstream_task_id": job_bound_downstream_task_id or None,
                 },
             )
-            self._repair_descendants_after_archive_apply_if_needed(
-                db,
-                task,
-                item,
-                state_event_id=state_event_id,
-            )
             await self._write_task_metadata_async(
                 task,
                 Path(task.workspace_root) / "input" / "task-metadata.json",
@@ -1412,45 +1472,3 @@ class TaskArchiveServiceMixin:
                 duration_seconds=task_manager_module._elapsed_seconds_since(job.started_at) if job is not None else None,
             )
             raise
-
-    def _repair_descendants_after_archive_apply_if_needed(self: TaskManager, db: Session, task, item, *, state_event_id: str | None):
-        repaired_stage = str(item.stage_name or "").strip()
-        if not repaired_stage:
-            return False
-        descendant_stages = self._descendant_stages_for_stage(task, repaired_stage)
-        if not descendant_stages:
-            return False
-        if (
-            self._streaming_mode_enabled(task)
-            and repaired_stage == "entry_analysis"
-            and any(self._is_streaming_tail_stage(task, stage_name) for stage_name in descendant_stages)
-        ):
-            return False
-        before_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
-        self._archive_apply_repaired_stage_refresh(db, task, repaired_stage)
-        after_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
-        contaminated = self._archive_apply_descendant_contamination(db, task, repaired_stage)
-        used_forced_contamination = False
-        if not contaminated:
-            contaminated = self._archive_apply_forced_descendant_contamination(db, task, repaired_stage)
-            used_forced_contamination = bool(contaminated)
-        if not contaminated:
-            return False
-        if repaired_stage == "system_analysis" and used_forced_contamination and before_signature == after_signature:
-            return False
-        if (
-            before_signature == after_signature
-            and not self._archive_apply_signature_has_runnable_inputs(after_signature)
-            and not self._archive_apply_stage_has_authoritative_success_payload(db, task, repaired_stage)
-        ):
-            return False
-        repair_result = self._reset_descendant_stages_after_archive_repair(db, task, repaired_stage, contaminated)
-        return self._requeue_after_archive_input_repair(
-            db,
-            task,
-            repaired_stage=repaired_stage,
-            affected_stages=list(repair_result.get("affected_stages") or []),
-            state_event_id=state_event_id,
-            before_signature=before_signature,
-            after_signature=after_signature,
-        )
