@@ -6760,9 +6760,9 @@ class TaskManager(
 
     def _stage_requires_archive_success_gate(self, task: BinarySecurityTask, stage_name: str) -> bool:
         normalized_stage = normalize_stage_name(stage_name)
-        if normalized_stage == "system_analysis":
+        if normalized_stage in {"firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis"}:
             return True
-        return self._is_streaming_tail_stage(task, stage_name) and normalized_stage == "dataflow_vuln_scan"
+        return False
 
     def _streaming_edges_for_task(self, task: BinarySecurityTask) -> tuple[tuple[str, str], ...]:
         if not self._streaming_mode_enabled(task):
@@ -11079,64 +11079,23 @@ class TaskManager(
         all_modules: list[dict[str, Any]] = []
         for result in success:
             all_modules.extend(result.get("modules", []))
-        candidate_modules = self._filter_candidate_modules(all_modules, self._module_selection_candidate_levels(task))
-        module_metrics = self._module_metrics(all_modules, candidate_modules, [])
-        selection_mode = self._module_selection_mode(task)
-        selected_modules = self._mark_selected_modules(candidate_modules, selected_by=MODULE_SELECTION_MODE_AUTO) if selection_mode == MODULE_SELECTION_MODE_AUTO else []
-        module_metrics = self._module_metrics(all_modules, candidate_modules, selected_modules)
+        module_metrics = self._module_metrics(all_modules, [], [])
         task.summary = {
             **self._clear_failure_fields_from_summary(task.summary),
             "system_analysis_results": self._lightweight_system_analysis_items(success),
             "system_analysis_modules": self._lightweight_modules_for_storage(all_modules),
             "system_analysis_module_count": len(all_modules),
-            "candidate_modules": candidate_modules,
-            "selected_modules": selected_modules,
-            "high_risk_modules": selected_modules,
+            "candidate_modules": list(task.summary.get("candidate_modules") or []) if isinstance(task.summary, dict) else [],
+            "selected_modules": list(task.summary.get("selected_modules") or []) if isinstance(task.summary, dict) else [],
+            "high_risk_modules": list(task.summary.get("high_risk_modules") or []) if isinstance(task.summary, dict) else [],
         }
         self._clear_entry_result_state(task)
         task.metrics = {
             **task.metrics,
-            **self._module_metrics(all_modules, candidate_modules, selected_modules),
+            **module_metrics,
         }
         task.last_error = None
         db.commit()
-        if status in {"success", "partial_success"} and selection_mode == MODULE_SELECTION_MODE_AUTO and not candidate_modules:
-            self._record_event(
-                db,
-                task,
-                "system_analysis_no_candidate_modules",
-                "系统分析已完成，但未发现匹配所选风险等级的风险模块，任务自然结束",
-                level="info",
-                stage_name=stage_run.stage_name,
-                payload={
-                    "candidate_module_count": 0,
-                    "selected_module_count": 0,
-                    "module_count": len(all_modules),
-                    "high_risk_module_count": module_metrics["high_risk_module_count"],
-                    "medium_risk_module_count": module_metrics["medium_risk_module_count"],
-                    "low_risk_module_count": module_metrics["low_risk_module_count"],
-                    "selection_mode": selection_mode,
-                    "terminal": True,
-                },
-            )
-        if status in {"success", "partial_success"} and selection_mode == MODULE_SELECTION_MODE_MANUAL_CONFIRM:
-            self._set_task_status(
-                db,
-                task,
-                TASK_STATUS_PENDING_MODULE_CONFIRMATION,
-                reason="系统分析已完成，等待人工确认模块",
-                source="task_manager",
-                stage_name=stage_run.stage_name,
-            )
-            self._record_event(
-                db,
-                task,
-                "module_selection_required",
-                "系统分析已完成，等待人工确认模块",
-                stage_name=stage_run.stage_name,
-                payload={"candidate_module_count": len(candidate_modules)},
-            )
-            db.commit()
         return status, {
             "items": self._lightweight_system_analysis_items(success),
             "failed_items": aggregate_summary.get("failed_items", []),
@@ -11151,9 +11110,9 @@ class TaskManager(
             "high_risk_module_count": module_metrics["high_risk_module_count"],
             "medium_risk_module_count": module_metrics["medium_risk_module_count"],
             "low_risk_module_count": module_metrics["low_risk_module_count"],
-            "candidate_module_count": len(candidate_modules),
-            "selected_module_count": len(selected_modules),
-            "requires_confirmation": selection_mode == MODULE_SELECTION_MODE_MANUAL_CONFIRM,
+            "candidate_module_count": int((task.metrics or {}).get("candidate_module_count") or 0),
+            "selected_module_count": int((task.metrics or {}).get("selected_module_count") or 0),
+            "requires_confirmation": False,
             "items_truncated": bool(aggregate_summary.get("items_truncated")),
             "failed_items_truncated": bool(aggregate_summary.get("failed_items_truncated")),
             "cancelled_items_truncated": bool(aggregate_summary.get("cancelled_items_truncated")),
@@ -11240,96 +11199,14 @@ class TaskManager(
         )
         status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
         entry_results = self._rebuild_entry_result_modules_from_stage_items(db, task, stage_run)
-        entry_mode = self._entry_selection_mode(task)
-        candidate_entries = self._entry_candidates(task, db)
-        selected_entries = candidate_entries if entry_mode == ENTRY_SELECTION_MODE_AUTO else self._effective_entry_inputs(task, db)
         summary = {
             **summary,
             "entry_results": entry_results,
-            "candidate_entry_count": len(candidate_entries),
-            "selected_entry_count": len(selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
-            "entry_count": sum(1 for _entry in selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
+            "candidate_entry_count": int((task.metrics or {}).get("candidate_entry_count") or 0),
+            "selected_entry_count": int((task.metrics or {}).get("selected_entry_count") or 0),
+            "entry_count": int((task.metrics or {}).get("entry_count") or 0),
             **self._entry_selection_metrics(task, db),
         }
-        if entry_mode == ENTRY_SELECTION_MODE_MANUAL_CONFIRM and status in {"success", "partial_success"}:
-            task.summary = {
-                **(task.summary or {}),
-                "entry_selection": {
-                    "mode": entry_mode,
-                    "status": "waiting_confirmation",
-                    "candidate_entries": candidate_entries,
-                    "selected_entry_keys": [],
-                    "selected_entries": [],
-                    "confirmed_at": None,
-                },
-            }
-            task.metrics = {
-                **(task.metrics or {}),
-                "candidate_entry_count": len(candidate_entries),
-                "selected_entry_count": 0,
-                "entry_count": 0,
-                **self._entry_selection_metrics(task, db),
-            }
-            self._set_task_status(
-                db,
-                task,
-                TASK_STATUS_PENDING_ENTRY_CONFIRMATION,
-                reason="入口分析已完成，等待人工确认入口",
-                source="task_manager",
-                stage_name=stage_run.stage_name,
-            )
-            stage_run.status = "waiting_confirmation"
-            stage_run.finished_at = None
-            stage_run.counts = self._stage_counts(db, stage_run)
-            self._record_event(
-                db,
-                task,
-                "entry_selection_required",
-                "入口分析已完成，等待人工确认入口",
-                stage_name=stage_run.stage_name,
-                payload={"candidate_entry_count": len(candidate_entries)},
-            )
-            db.commit()
-            return "success", {
-                **summary,
-                "entry_results": entry_results,
-                "candidate_entry_count": len(candidate_entries),
-                "selected_entry_count": 0,
-                "requires_confirmation": True,
-                "entry_selection": {
-                    "mode": entry_mode,
-                    "status": "waiting_confirmation",
-                    "candidate_entries": candidate_entries,
-                    "selected_entry_keys": [],
-                    "selected_entries": [],
-                    "confirmed_at": None,
-                },
-            }
-        if entry_mode == ENTRY_SELECTION_MODE_AUTO:
-            task.summary = {
-                **(task.summary or {}),
-                "entry_selection": {
-                    "mode": entry_mode,
-                    "status": "auto_selected",
-                    "candidate_entries": candidate_entries,
-                    "selected_entry_keys": [str(entry.get("entry_key") or "").strip() for entry in selected_entries if str(entry.get("entry_key") or "").strip()],
-                    "selected_entries": self._mark_selected_entries(selected_entries, selected_by=ENTRY_SELECTION_MODE_AUTO),
-                    "confirmed_at": _now().isoformat(),
-                },
-            }
-            task.metrics = {
-                **(task.metrics or {}),
-                "candidate_entry_count": len(candidate_entries),
-                "selected_entry_count": len(selected_entries),
-                "entry_count": len(selected_entries),
-                **self._entry_selection_metrics(task),
-            }
-            summary = {
-                **summary,
-                "entry_selection": dict((task.summary or {}).get("entry_selection") or {}),
-                "selected_entry_count": len(selected_entries),
-                "entry_count": len(selected_entries),
-            }
         return status, summary
 
     async def _stage_knowledge_graph_entry_fetch(

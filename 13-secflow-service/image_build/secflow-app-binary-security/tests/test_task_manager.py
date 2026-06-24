@@ -3762,7 +3762,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNotNone(task.finished_at)
 
-    def test_refresh_task_status_after_sync_revives_failed_task_with_pending_items(self):
+    def test_refresh_task_status_after_sync_keeps_failed_task_terminal_with_pending_items(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -3846,13 +3846,12 @@ class TaskManagerTests(unittest.TestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("failed", task.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertIsNone(task.finished_at)
-        self.assertIsNone(task.last_error)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
+        self.assertIsNotNone(task.finished_at)
+        self.assertEqual("stale failure", task.last_error)
         self.assertEqual("pending", dataflow_run.status)
-        self.assertIsNone(dataflow_run.finished_at)
 
     def test_refresh_task_status_after_sync_finalizes_later_failed_stage_when_current_stage_is_stale(self):
         task = BinarySecurityTask(
@@ -4077,7 +4076,8 @@ class TaskManagerTests(unittest.TestCase):
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("failed", task.status)
+        self.assertEqual("pending", task.status)
+        self.assertEqual("system_analysis", task.current_stage)
         stage_summaries = self.manager._build_stage_summaries(
             db,
             task,
@@ -4087,7 +4087,7 @@ class TaskManagerTests(unittest.TestCase):
         )
         by_stage = {summary.stage_name: summary for summary in stage_summaries}
         self.assertEqual("cancelled", by_stage["system_analysis"].status)
-        self.assertEqual("pending", by_stage["binary_to_source"].status)
+        self.assertEqual("failed", by_stage["binary_to_source"].status)
         self.assertEqual("pending", by_stage["entry_analysis"].status)
 
     def test_finalize_task_defers_incomplete_stage_instead_of_failed_terminal(self):
@@ -19920,7 +19920,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(event.event_type == "archive_apply_triggered_input_repair" for event in db.events))
         self.assertFalse(any(event.event_type == "task_requeued_after_archive_input_repair" for event in db.events))
 
-    def test_archive_input_repair_reopens_failed_binary_to_source_stage_after_inputs_restored(self):
+    def test_archive_input_repair_does_not_reopen_failed_binary_to_source_stage_after_inputs_restored(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -19987,7 +19987,33 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             sequence_no=4,
             status="pending",
         )
-        db = _ModelAwareDb(tasks=[task], stage_runs=[firmware_run, system_run, binary_to_source_run, entry_run], stage_items=[])
+        system_item = BinarySecurityStageItem(
+            id="si-system",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="module-1",
+            status="success",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+        )
+        system_archive_job = BinarySecurityArchiveJob(
+            id="aj-system",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si-system",
+            downstream_service="system_analyse",
+            downstream_task_id="sat1",
+            archive_status="success",
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[firmware_run, system_run, binary_to_source_run, entry_run],
+            stage_items=[system_item],
+            archive_jobs=[system_archive_job],
+        )
 
         original_enqueue = self.manager._enqueue_task
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
@@ -19996,9 +20022,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual("pending", task.status)
-        self.assertEqual("binary_to_source", task.current_stage)
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
+        self.assertEqual("failed", task.status)
+        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
         self.assertIsNone(task.last_error)
 
     def test_upstream_stage_retried_ignores_archive_input_repair_stale_marker(self):
@@ -21962,15 +21988,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], task.summary["selected_modules"])
             self.assertEqual([], task.summary["high_risk_modules"])
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
-            self.assertIn("system_analysis_no_candidate_modules", event_types)
-            self.assertTrue(
-                any(
-                    getattr(event, "level", "") == "info"
-                    and getattr(event, "event_type", "") == "system_analysis_no_candidate_modules"
-                    for event in db.added
-                    if isinstance(event, BinarySecurityEvent)
-                )
-            )
+            self.assertNotIn("system_analysis_no_candidate_modules", event_types)
 
     def test_stage_system_analysis_without_candidate_modules_succeeds_for_auto_selection_across_risk_levels(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -22035,7 +22053,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([], task.summary["high_risk_modules"])
             self.assertNotIn("failure_code", summary)
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
-            self.assertIn("system_analysis_no_candidate_modules", event_types)
+            self.assertNotIn("system_analysis_no_candidate_modules", event_types)
 
     def test_stage_system_analysis_preserves_downstream_failure_when_no_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -40983,10 +41001,64 @@ def _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation(se
         self.manager._run_stage_pool = original_run_stage_pool
 
     self.assertEqual("success", status)
-    self.assertTrue(summary["requires_confirmation"])
-    self.assertEqual("pending_entry_confirmation", task.status)
-    self.assertEqual("waiting_confirmation", stage_run.status)
+    self.assertFalse(summary.get("requires_confirmation", False))
+    self.assertEqual("running", task.status)
+    self.assertEqual("running", stage_run.status)
     self.assertEqual(0, task.metrics["selected_entry_count"])
+    self.assertNotIn("entry_selection", task.summary)
+
+
+def _test_decide_task_action_after_stage_terminal_waits_for_archive_for_gated_stages(self):
+    for stage_name in ("firmware_unpack", "system_analysis", "binary_to_source", "entry_analysis"):
+        task = BinarySecurityTask(
+            id=f"t-{stage_name}",
+            project_id="p1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY if stage_name in {"firmware_unpack", "binary_to_source"} else TASK_TYPE_SOURCE,
+            current_stage=stage_name,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        if stage_name == "binary_to_source":
+            task.summary = {"selected_modules": [{"module_key": "m1", "module_name": "module1"}]}
+        elif stage_name == "entry_analysis":
+            task.summary = {"selected_modules": [{"module_key": "m1", "module_name": "module1", "source_dir": "/src"}]}
+        stage_run = BinarySecurityStageRun(
+            id=f"sr-{stage_name}",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name=stage_name,
+            sequence_no=1,
+            status="success",
+        )
+        item = BinarySecurityStageItem(
+            id=f"si-{stage_name}",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=stage_run.id,
+            stage_name=stage_name,
+            item_key="k1",
+            item_name="item1",
+            status="success",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], archive_jobs=[])
+
+        decision = self.manager._decide_task_action_after_stage_terminal(
+            db,
+            task,
+            stage_name=stage_name,
+            status="success",
+            summary={},
+            payload={},
+            state_event_id=f"evt-{stage_name}",
+        )
+
+        self.assertEqual("wait_for_archive", decision.action)
+        self.assertEqual("stage_terminal_waiting_for_archive", decision.event_type)
+        self.assertEqual(stage_name, decision.payload["archive_gate_stage"])
 
 
 def _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode(self):
@@ -41405,6 +41477,7 @@ TaskManagerTests.test_archive_downstream_output_skips_empty_sources_without_crea
 TaskManagerTests.test_archive_job_payload_uses_compact_downstream_payload = _test_archive_job_payload_uses_compact_downstream_payload
 TaskManagerTests.test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes = _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payload_changes
 TaskManagerTests.test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation = _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation
+TaskManagerTests.test_decide_task_action_after_stage_terminal_waits_for_archive_for_gated_stages = _test_decide_task_action_after_stage_terminal_waits_for_archive_for_gated_stages
 TaskManagerTests.test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode = _test_stage_dataflow_vuln_scan_uses_selected_entry_inputs_in_manual_mode
 TaskManagerTests.test_cleanup_task_workspace_retries_transient_residual_directory = _test_cleanup_task_workspace_retries_transient_residual_directory
 TaskManagerTests.test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists = _test_stage_item_response_does_not_show_pending_sync_when_downstream_status_exists
