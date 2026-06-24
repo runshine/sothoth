@@ -1864,30 +1864,12 @@ class TaskManager(
         task_id = str(getattr(task, "id", "") or "").strip()
         if not task_id:
             return False
-        if self._task_execution_owner_count(task_id) > 0:
-            return True
-        now_value = _now()
         runtime_lease = (
             db.query(BinarySecurityTaskRuntimeLease)
             .filter(BinarySecurityTaskRuntimeLease.task_id == task_id)
             .first()
         )
-        if runtime_lease is not None and getattr(runtime_lease, "lease_expires_at", None) and runtime_lease.lease_expires_at > now_value:
-            return True
-        active_operation = None
-        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
-        if current_operation_id:
-            active_operation = (
-                db.query(BinarySecurityTaskOperation)
-                .filter(BinarySecurityTaskOperation.id == current_operation_id)
-                .first()
-            )
-        if active_operation is not None:
-            operation_type = str(getattr(active_operation, "operation_type", "") or "").strip()
-            operation_status = str(getattr(active_operation, "status", "") or "").strip()
-            if operation_type != TASK_ACTION_DELETE and operation_status in {"pending", "queued", "running"}:
-                return True
-        return False
+        return bool(self._runtime_lease_is_active(runtime_lease))
 
     async def _wait_for_task_workspace_quiesce(
         self,
@@ -2358,15 +2340,26 @@ class TaskManager(
     def _should_keep_task_heartbeat(self, db: Session, task: BinarySecurityTask | None) -> bool:
         if task is None:
             return False
-        if not self._task_row_owner_is_supported_locally(task):
-            return False
         if task.finished_at is not None:
             return False
-        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
-        if not self._has_local_task_execution_owner(task.id) and not self._task_has_active_streaming_stage_workers(task.id):
-            return False
-        return True
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        if runtime_lease is not None and bool(
+            self._runtime_lease_is_active(runtime_lease)
+            and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+        ):
+            return True
+        # Heartbeat is also the bootstrap path that materializes the authoritative
+        # runtime lease for a newly claimed local execution before reclaim logic
+        # starts trusting it.
+        return bool(
+            self._has_local_task_execution_owner(task.id)
+            or self._task_has_active_streaming_stage_workers(task.id)
+        )
 
     def _local_operation_worker_alive(self, operation_id: str | None) -> bool:
         normalized_operation_id = str(operation_id or "").strip()
@@ -2492,33 +2485,18 @@ class TaskManager(
     ) -> bool:
         if task is None:
             return False
-        task_id = str(getattr(task, "id", "") or "").strip()
-        if not task_id:
+        del active_operation
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
-        handle = self._runtime_handle(task_id)
-        if handle is not None and not handle.done():
-            return True
-        if self._has_local_task_execution_owner(task_id):
-            return True
-        if self._task_has_active_streaming_stage_workers(task_id):
-            return True
-        operation = active_operation
-        if operation is None:
-            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
-            if current_operation_id:
-                session = get_session_factory()()
-                try:
-                    operation = session.query(BinarySecurityTaskOperation).filter(
-                        BinarySecurityTaskOperation.id == current_operation_id
-                    ).first()
-                finally:
-                    session.close()
-        if operation is None:
-            return False
-        operation_status = str(getattr(operation, "status", "") or "").strip().lower()
-        if operation_status not in TASK_OPERATION_ACTIVE_STATUSES:
-            return False
-        return self._local_operation_worker_alive(str(getattr(operation, "id", "") or "").strip())
+        session = get_session_factory()()
+        try:
+            runtime_lease = self._runtime_lease_for_task(session, getattr(task, "id", None))
+            if runtime_lease is not None and self._runtime_lease_is_active(runtime_lease):
+                return str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+            return self._task_runtime_transition_guard_owned_by_current_instance(task)
+        finally:
+            session.close()
 
     def _task_row_owner_is_supported_locally(
         self,
@@ -5074,11 +5052,28 @@ class TaskManager(
         self._mark_loop_heartbeat("readless_reconcile")
         return True
 
+    def _latest_stage_run(self, db: Session, task_id: str, stage_name: str) -> BinarySecurityStageRun | None:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_task_id or not normalized_stage_name:
+            return None
+        return (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == normalized_task_id,
+                BinarySecurityStageRun.stage_name == normalized_stage_name,
+            )
+            .order_by(
+                BinarySecurityStageRun.sequence_no.desc(),
+                BinarySecurityStageRun.updated_at.desc(),
+                BinarySecurityStageRun.created_at.desc(),
+                BinarySecurityStageRun.id.desc(),
+            )
+            .first()
+        )
+
     def _ensure_stage_run(self, db: Session, task: BinarySecurityTask, stage_name: str) -> BinarySecurityStageRun:
-        stage_run = db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == stage_name,
-        ).first()
+        stage_run = self._latest_stage_run(db, task.id, stage_name)
         if stage_run:
             return stage_run
         stage_run = BinarySecurityStageRun(
@@ -5097,10 +5092,7 @@ class TaskManager(
                     db.flush()
                 return stage_run
             except IntegrityError:
-                existing = db.query(BinarySecurityStageRun).filter(
-                    BinarySecurityStageRun.task_id == task.id,
-                    BinarySecurityStageRun.stage_name == stage_name,
-                ).first()
+                existing = self._latest_stage_run(db, task.id, stage_name)
                 if existing is None:
                     raise
                 return existing

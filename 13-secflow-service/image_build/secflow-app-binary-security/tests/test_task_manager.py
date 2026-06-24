@@ -2833,6 +2833,12 @@ class TaskManagerTests(unittest.TestCase):
                 downstream_task_id="dfa-1",
             )
             dataflow_item.input_ref = {"entry_key": "entry-a", "function_name": "func_a", "module_key": "mod-a"}
+            runtime_lease = BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                owner_instance_id=self.manager.instance_id,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(minutes=1),
+            )
             event = BinarySecurityStateEvent(
                 id="sev-streaming-tail",
                 task_id="t1",
@@ -2848,7 +2854,13 @@ class TaskManagerTests(unittest.TestCase):
                 "status": "success",
                 "summary": {"success_count": 1, "failed_count": 0, "entry_count": 1},
             }
-            db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run, dataflow_run], stage_items=[dataflow_item], events=[event])
+            db = _AppendingModelAwareDb(
+                tasks=[task],
+                stage_runs=[system_run, entry_run, dataflow_run],
+                stage_items=[dataflow_item],
+                events=[event],
+                runtime_leases=[runtime_lease],
+            )
 
             original_factory = task_manager_module.get_session_factory
             original_write = self.manager._write_task_metadata_async
@@ -8984,6 +8996,60 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
 
         self.assertTrue(supported)
+
+    def test_has_active_task_workspace_writers_uses_runtime_lease_only(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="local-worker",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_RETRY,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+
+        active = self.manager._has_active_task_workspace_writers(db, task)
+
+        self.assertFalse(active)
+
+    def test_has_active_task_workspace_writers_accepts_active_runtime_lease(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="local-worker",
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id="t1",
+            owner_instance_id="local-worker",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(seconds=120),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease])
+
+        active = self.manager._has_active_task_workspace_writers(db, task)
+
+        self.assertTrue(active)
 
     def test_release_unsupported_task_row_owner_noops_when_no_owner_metadata_exists(self):
         task = BinarySecurityTask(
@@ -35645,44 +35711,53 @@ def _test_reconcile_stale_retry_family_operation_requeues_for_resume_when_not_ap
         "retry_archive_failed_items",
         "retry_archive_full",
     ]
+    resumable_statuses = [
+        "running",
+        "dispatching",
+        task_manager_module.TASK_STATUS_CANCELLING,
+        TASK_STATUS_CANCEL_FAILED,
+        task_manager_module.TASK_STATUS_DELETE_FAILED,
+    ]
     for operation_type in operation_types:
-        with self.subTest(operation_type=operation_type):
-            task = BinarySecurityTask(
-                id=f"task-reconcile-resume-{operation_type}",
-                project_id="p1",
-                name="source",
-                status="running",
-                runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                current_stage="entry_analysis",
-                current_operation_id=f"op-{operation_type}",
-                task_type=TASK_TYPE_SOURCE,
-                firmware_source="project_filesystem",
-                firmware_path="/src",
-                output_root="/o",
-                workspace_root="/w",
-            )
-            operation = BinarySecurityTaskOperation(
-                id=f"op-{operation_type}",
-                task_id=task.id,
-                project_id=task.project_id,
-                operation_type=operation_type,
-                target_stage="entry_analysis",
-                status="running",
-                current_step="collect_cleanup_plan",
-                updated_at=_now() - timedelta(seconds=120),
-                result_payload={"requeue": {"requested": False, "applied": False}},
-            )
-            db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
-            queued: list[str] = []
-            self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        for task_status in resumable_statuses:
+            with self.subTest(operation_type=operation_type, task_status=task_status):
+                task = BinarySecurityTask(
+                    id=f"task-reconcile-resume-{operation_type}-{task_status}",
+                    project_id="p1",
+                    name="source",
+                    status=task_status,
+                    runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                    current_stage="entry_analysis",
+                    current_operation_id=f"op-{operation_type}-{task_status}",
+                    task_type=TASK_TYPE_SOURCE,
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root="/o",
+                    workspace_root="/w",
+                )
+                operation = BinarySecurityTaskOperation(
+                    id=f"op-{operation_type}-{task_status}",
+                    task_id=task.id,
+                    project_id=task.project_id,
+                    operation_type=operation_type,
+                    target_stage="entry_analysis",
+                    status="running",
+                    current_step="collect_cleanup_plan",
+                    updated_at=_now() - timedelta(seconds=120),
+                    result_payload={"requeue": {"requested": False, "applied": False}},
+                )
+                db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+                queued: list[str] = []
+                self.manager._enqueue_task = lambda task_id: queued.append(task_id)
 
-            changed = self.manager._reconcile_stale_task_operation(db, task, operation)
+                changed = self.manager._reconcile_stale_task_operation(db, task, operation)
 
-            self.assertTrue(changed)
-            self.assertEqual("running", operation.status)
-            self.assertEqual([task.id], queued)
-            event_types = [event.event_type for event in db.events]
-            self.assertIn("operation_requeued_for_resume", event_types)
+                self.assertTrue(changed)
+                self.assertEqual("running", operation.status)
+                self.assertEqual([task.id], queued)
+                requeue_events = [event for event in db.events if event.event_type == "operation_requeued_for_resume"]
+                self.assertEqual(1, len(requeue_events))
+                self.assertTrue(bool((requeue_events[0].payload or {}).get("current_operation_bound")))
 
 
 def _test_reconcile_stale_retry_family_operation_finalizes_during_owned_execution_takeover_window(self):
@@ -35769,7 +35844,7 @@ def _test_reconcile_stale_retry_family_operation_fails_when_not_applied_and_not_
                 status="failed",
                 runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
                 current_stage="entry_analysis",
-                current_operation_id=f"op-{operation_type}",
+                current_operation_id="op-other",
                 task_type=TASK_TYPE_SOURCE,
                 firmware_source="project_filesystem",
                 firmware_path="/src",
@@ -35791,11 +35866,11 @@ def _test_reconcile_stale_retry_family_operation_fails_when_not_applied_and_not_
 
             changed = self.manager._reconcile_stale_task_operation(db, task, operation)
 
-            self.assertTrue(changed)
-            self.assertEqual("failed", operation.status)
-            self.assertIsNone(task.current_operation_id)
+            self.assertFalse(changed)
+            self.assertEqual("running", operation.status)
+            self.assertEqual("op-other", task.current_operation_id)
             event_types = [event.event_type for event in db.events]
-            self.assertIn("operation_reconciled_to_failed", event_types)
+            self.assertNotIn("operation_reconciled_to_failed", event_types)
 
 
 def _test_task_sync_status_view_excludes_terminal_synced_items_from_stale_count(self):

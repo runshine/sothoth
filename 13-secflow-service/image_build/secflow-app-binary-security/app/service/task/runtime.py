@@ -913,8 +913,6 @@ class TaskRuntimeServiceMixin:
                 and (task_manager_module._elapsed_seconds_since(dispatch_started_at) or 0) <= max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
             ):
                 continue
-            if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
-                continue
             lease = self._runtime_lease_for_task(db, task.id)
             if self._runtime_lease_is_active(lease):
                 continue
@@ -953,14 +951,6 @@ class TaskRuntimeServiceMixin:
         for task in stale_rows:
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
                 continue
-            if (
-                str(task.dispatcher_instance_id or "").strip() == self.instance_id
-                and self._local_runtime_handle_protects_dispatching_reclaim(
-                    task.id,
-                    dispatch_started_at=getattr(task, "dispatch_started_at", None),
-                )
-            ):
-                continue
             if self._task_runtime_transition_guard_active(task):
                 continue
             lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
@@ -979,13 +969,7 @@ class TaskRuntimeServiceMixin:
             protected_dispatching_window = bool(
                 active_item_count > 0
                 and (
-                    self._local_runtime_handle_protects_dispatching_reclaim(
-                        task.id,
-                        dispatch_started_at=getattr(task, "dispatch_started_at", None),
-                    )
-                    or self._has_local_task_execution_owner(task.id)
-                    or self._task_has_active_streaming_stage_workers(task.id)
-                    or (
+                    (
                         row_owner_matches_runtime_lease
                         and runtime_lease_expires_at is not None
                         and (task_manager_module._seconds_until(runtime_lease_expires_at) or 0) > 0
@@ -1547,16 +1531,6 @@ class TaskRuntimeServiceMixin:
                 stage_name=task.current_stage,
                 reason="run_task_dispatch_row_lease_view",
             )
-            if self._task_runtime_transition_guard_active(task):
-                self._clear_task_runtime_transition_guard(task)
-                self._record_event(
-                    db,
-                    task,
-                    "runtime_transition_guard_cleared",
-                    "owner worker 已接管任务，阶段切换保护窗口已关闭",
-                    stage_name=task.current_stage,
-                    payload={"dispatcher_instance_id": self.instance_id},
-                )
             self._clear_task_abnormal_reason_snapshot(db, task)
             self._bind_execution_token(task)
             self._register_task_execution_owner(task.id, "primary_task_worker")
@@ -1692,14 +1666,26 @@ class TaskRuntimeServiceMixin:
                         continue
                     if not self._task_runtime_owner_matches_current_instance(runtime_db, task_after_execute):
                         break
+                    authoritative_context_active = self._task_has_authoritative_active_stage_context(
+                        runtime_db,
+                        task_after_execute,
+                        stage_name=str(getattr(task_after_execute, "current_stage", "") or "").strip() or None,
+                    )
                     if self._task_runtime_transition_guard_active(task_after_execute):
+                        if authoritative_context_active:
+                            self._clear_task_runtime_transition_guard(task_after_execute)
+                            self._record_event(
+                                runtime_db,
+                                task_after_execute,
+                                "runtime_transition_guard_cleared",
+                                "阶段切换保护窗口已在权威阶段上下文建立后关闭",
+                                stage_name=task_after_execute.current_stage,
+                                payload={"dispatcher_instance_id": self.instance_id},
+                            )
+                            runtime_db.commit()
                         should_remain_active = True
                     else:
-                        should_remain_active = self._task_has_authoritative_active_stage_context(
-                            runtime_db,
-                            task_after_execute,
-                            stage_name=str(getattr(task_after_execute, "current_stage", "") or "").strip() or None,
-                        )
+                        should_remain_active = authoritative_context_active
                     if not should_remain_active:
                         break
                 finally:
@@ -1722,13 +1708,25 @@ class TaskRuntimeServiceMixin:
                         continue
                     if not self._task_runtime_owner_matches_current_instance(runtime_db, task_after_signals):
                         break
-                    if self._task_runtime_transition_guard_active(task_after_signals):
-                        continue
-                    if self._task_has_authoritative_active_stage_context(
+                    authoritative_context_active = self._task_has_authoritative_active_stage_context(
                         runtime_db,
                         task_after_signals,
                         stage_name=str(getattr(task_after_signals, "current_stage", "") or "").strip() or None,
-                    ):
+                    )
+                    if self._task_runtime_transition_guard_active(task_after_signals):
+                        if authoritative_context_active:
+                            self._clear_task_runtime_transition_guard(task_after_signals)
+                            self._record_event(
+                                runtime_db,
+                                task_after_signals,
+                                "runtime_transition_guard_cleared",
+                                "阶段切换保护窗口已在权威阶段上下文建立后关闭",
+                                stage_name=task_after_signals.current_stage,
+                                payload={"dispatcher_instance_id": self.instance_id},
+                            )
+                            runtime_db.commit()
+                        continue
+                    if authoritative_context_active:
                         continue
                     break
                 finally:

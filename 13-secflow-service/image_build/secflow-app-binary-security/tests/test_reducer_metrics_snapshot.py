@@ -50,6 +50,28 @@ class ReducerMetricsSnapshotTests(unittest.TestCase):
         self.assertIn('"source_pod": "reducer-1"', args[1])
         self.assertIn('"generated_at": 123.0', args[1])
 
+    def test_client_is_reused_across_snapshot_operations(self):
+        fake_client = SimpleNamespace(
+            set=AsyncMock(),
+            get=AsyncMock(return_value='{"metrics_payload":"demo","source_pod":"reducer-1","generated_at":123.0}'),
+            aclose=AsyncMock(),
+        )
+        store = ReducerMetricsSnapshotStore()
+        with patch.object(store, "_new_client", return_value=fake_client) as new_client:
+            asyncio.run(
+                store.write_snapshot(
+                    metrics_payload="# TYPE demo gauge\ndemo 1\n",
+                    source_pod="reducer-1",
+                    generated_at=123.0,
+                )
+            )
+            snapshot = asyncio.run(store.read_snapshot())
+            self.assertEqual("reducer-1", snapshot["source_pod"])
+            self.assertEqual(1, new_client.call_count)
+            fake_client.aclose.assert_not_awaited()
+            asyncio.run(store.close())
+            fake_client.aclose.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

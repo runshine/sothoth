@@ -3414,7 +3414,7 @@ class TaskOperationServiceMixin:
                 task_manager_module.observe_control_operation_auto_reconciled(operation_type, "succeeded", age_seconds=age_seconds)
             return finalized
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
-        if current_operation_id in {"", operation.id} and str(getattr(task, "status", "") or "").strip() in {"pending", "dispatching", "running"}:
+        if current_operation_id in {"", operation.id}:
             self._enqueue_task(task.id)
             self._record_operation_event(
                 db,
@@ -3429,6 +3429,7 @@ class TaskOperationServiceMixin:
                     "current_step": operation.current_step,
                     "task_status": str(getattr(task, "status", "") or "").strip(),
                     "runtime_phase": self._task_runtime_phase(task),
+                    "current_operation_bound": bool(current_operation_id == operation.id),
                     "auto_reconciled": True,
                 },
             )

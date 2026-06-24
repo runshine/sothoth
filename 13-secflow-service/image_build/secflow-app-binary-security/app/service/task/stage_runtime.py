@@ -117,10 +117,7 @@ class TaskStageRuntimeMixin:
     ) -> None:
         self._refresh_stage_run_from_items(db, task, stage_name)
         if stage_name == "entry_analysis":
-            stage_run = db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == stage_name,
-            ).first()
+            stage_run = self._latest_stage_run(db, task.id, stage_name)
             try:
                 self._rebuild_entry_results_from_stage_items(db, task, stage_run)
             except TypeError:
@@ -143,10 +140,7 @@ class TaskStageRuntimeMixin:
             self._refresh_streaming_tail_stage_state(db, task, stage_name)
         else:
             self._refresh_stage_run_from_items(db, task, stage_name)
-        return db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == stage_name,
-        ).first()
+        return self._latest_stage_run(db, task.id, stage_name)
 
     def _refresh_stage_from_authoritative_items(
         self: TaskManager,
@@ -209,15 +203,9 @@ class TaskStageRuntimeMixin:
         handler = self._stage_handler(normalized_stage_name)
         if handler is not None and handler.manages_stage_refresh():
             handler.refresh_summary_from_items(self, db, task)
-            return db.query(BinarySecurityStageRun).filter(
-                BinarySecurityStageRun.task_id == task.id,
-                BinarySecurityStageRun.stage_name == normalized_stage_name,
-            ).first()
+            return self._latest_stage_run(db, task.id, normalized_stage_name)
         self._refresh_stage_run_from_items(db, task, normalized_stage_name)
-        return db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == normalized_stage_name,
-        ).first()
+        return self._latest_stage_run(db, task.id, normalized_stage_name)
 
     def _reconcile_retry_affected_stages_in_session(
         self: TaskManager,
@@ -245,10 +233,7 @@ class TaskStageRuntimeMixin:
     ) -> None:
         from app.service import task_manager as task_manager_module
 
-        stage_run = db.query(BinarySecurityStageRun).filter(
-            BinarySecurityStageRun.task_id == task.id,
-            BinarySecurityStageRun.stage_name == stage_name,
-        ).first()
+        stage_run = self._latest_stage_run(db, task.id, stage_name)
         if not stage_run:
             return
         items = self._stage_items(db, task.id, stage_name)
