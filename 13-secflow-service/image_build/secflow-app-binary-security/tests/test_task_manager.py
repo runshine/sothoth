@@ -9153,6 +9153,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], cleared_leases)
 
     def test_run_task_operation_steps_resumes_from_requeue_step(self):
+        now_value = _now()
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -9164,6 +9165,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/fw",
             output_root="/o",
             workspace_root="/w",
+            dispatcher_instance_id="worker-1",
+            lease_expires_at=now_value + timedelta(seconds=60),
         )
         operation = BinarySecurityTaskOperation(
             id="op1",
@@ -9182,7 +9185,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             },
         )
         operation.resume_cursor = {"current_step": "requeue_task"}
-        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-1",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(seconds=60),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease])
         prepare_calls: list[str] = []
         queued: list[str] = []
 
@@ -9192,6 +9201,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             return ["entry_analysis"]
 
         original_decide = self.manager._decide_task_resume_after_stage_reset
+        original_instance_id = self.manager.instance_id
+        self.manager.instance_id = "worker-1"
         self.manager._prepare_retry_stage_full = fake_prepare_retry_stage_full
         self.manager._enqueue_task = lambda task_id: queued.append(task_id)
         self.manager._decide_task_resume_after_stage_reset = lambda *args, **kwargs: task_manager_module._TaskResumeDecision(
@@ -9207,6 +9218,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         try:
             asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
         finally:
+            self.manager.instance_id = original_instance_id
             self.manager._decide_task_resume_after_stage_reset = original_decide
 
         self.assertEqual([], prepare_calls)
@@ -9253,6 +9265,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("pending", task.status)
 
     def test_run_task_operation_steps_retry_stage_full_requeue_fails_when_resume_blocked(self):
+        now_value = _now()
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -9265,6 +9278,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             current_operation_id="op1",
+            dispatcher_instance_id="worker-1",
+            lease_expires_at=now_value + timedelta(seconds=60),
         )
         operation = BinarySecurityTaskOperation(
             id="op1",
@@ -9277,12 +9292,20 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             result_payload={"requeue": {"requested": False}},
         )
         operation.resume_cursor = {"current_step": "requeue_task"}
-        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-1",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(seconds=60),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
         queued: list[str] = []
         self.manager._enqueue_task = lambda task_id: queued.append(task_id)
 
         original_decide = self.manager._decide_task_resume_after_stage_reset
+        original_instance_id = self.manager.instance_id
         try:
+            self.manager.instance_id = "worker-1"
             def fake_decide(*args, **kwargs):
                 del args, kwargs
                 return task_manager_module._TaskResumeDecision(
@@ -9294,14 +9317,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.manager._decide_task_resume_after_stage_reset = fake_decide
-            with self.assertRaises(ValidationError):
-                asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
         finally:
+            self.manager.instance_id = original_instance_id
             self.manager._decide_task_resume_after_stage_reset = original_decide
 
         self.assertEqual([], queued)
         event_types = [row.event_type for row in db.events]
-        self.assertIn("task_resume_blocked", event_types)
+        self.assertIn("retry_requeue_blocked_after_cleanup", event_types)
+        self.assertEqual("failed", operation.status)
 
     def test_mark_task_waiting_for_archive_retry_clears_latest_abnormal_reason(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16227,6 +16251,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(cleanup_result.get("downstream_cleanup_deferred_refs") or []))
 
     def test_run_task_operation_steps_retry_stage_full_executes_cleanup_before_requeue(self):
+        now_value = _now()
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -16239,6 +16264,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             current_operation_id="op1",
+            dispatcher_instance_id="worker-1",
+            lease_expires_at=now_value + timedelta(seconds=60),
         )
         operation = BinarySecurityTaskOperation(
             id="op1",
@@ -16250,7 +16277,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             current_step="collect_cleanup_plan",
         )
         operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
-        db = _AppendingModelAwareDb(tasks=[task], operations=[operation])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-1",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(seconds=60),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease])
         calls = []
 
         async def fake_collect(db_arg, task_arg, operation_arg):
@@ -16274,7 +16307,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_collect = self.manager._operation_collect_retry_stage_full_plan
         original_cleanup = self.manager._operation_execute_retry_stage_full_cleanup
         original_decide = self.manager._decide_task_resume_after_stage_reset
+        original_instance_id = self.manager.instance_id
         try:
+            self.manager.instance_id = "worker-1"
             self.manager._operation_collect_retry_stage_full_plan = fake_collect
             self.manager._operation_execute_retry_stage_full_cleanup = fake_cleanup
             self.manager._enqueue_task = lambda task_id: calls.append(("requeue", task_id))
@@ -16289,6 +16324,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             )
             asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
         finally:
+            self.manager.instance_id = original_instance_id
             self.manager._operation_collect_retry_stage_full_plan = original_collect
             self.manager._operation_execute_retry_stage_full_cleanup = original_cleanup
             self.manager._decide_task_resume_after_stage_reset = original_decide
@@ -16311,6 +16347,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("task_requeued", event_types)
 
     def test_run_task_operation_steps_retry_verifies_cleanup_before_requeue(self):
+        now_value = _now()
         task = BinarySecurityTask(
             id="task1",
             project_id="p1",
@@ -16323,6 +16360,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             current_operation_id="op1",
+            dispatcher_instance_id="worker-1",
+            lease_expires_at=now_value + timedelta(seconds=60),
         )
         operation = BinarySecurityTaskOperation(
             id="op1",
@@ -16333,7 +16372,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             current_step="collect_cleanup_plan",
         )
         operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
-        db = _AppendingModelAwareDb(tasks=[task], operations=[operation])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-1",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(seconds=60),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease])
         calls = []
 
         async def fake_prepare_retry(_db, task_arg):
@@ -16378,7 +16423,9 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         original_prepare = self.manager._prepare_retry_task
         original_verify = self.manager._operation_verify_retry_cleanup_state
         original_decide = self.manager._decide_task_resume_after_stage_reset
+        original_instance_id = self.manager.instance_id
         try:
+            self.manager.instance_id = "worker-1"
             self.manager._prepare_retry_task = fake_prepare_retry
             self.manager._operation_verify_retry_cleanup_state = fake_verify_retry_cleanup
             self.manager._enqueue_task = lambda task_id: calls.append(("requeue", task_id))
@@ -16393,6 +16440,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             )
             asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
         finally:
+            self.manager.instance_id = original_instance_id
             self.manager._prepare_retry_task = original_prepare
             self.manager._operation_verify_retry_cleanup_state = original_verify
             self.manager._decide_task_resume_after_stage_reset = original_decide
@@ -32395,6 +32443,7 @@ def _test_stage_worker_terminal_event_preserves_stage_fact_when_task_layer_fails
 
 
 def _test_retry_failed_items_requeue_helper_preserves_existing_behavior(self):
+    now_value = _now()
     task = BinarySecurityTask(
         id="task1",
         project_id="p1",
@@ -32406,6 +32455,8 @@ def _test_retry_failed_items_requeue_helper_preserves_existing_behavior(self):
         firmware_path="/src",
         output_root="/o",
         workspace_root="/w",
+        dispatcher_instance_id="worker-1",
+        lease_expires_at=now_value + timedelta(seconds=60),
     )
     operation = BinarySecurityTaskOperation(
         id="op1",
@@ -32415,11 +32466,18 @@ def _test_retry_failed_items_requeue_helper_preserves_existing_behavior(self):
         target_stage="entry_analysis",
         status="running",
     )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-1",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=60),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
     queued = []
 
     original_enqueue = self.manager._enqueue_task
     original_should_auto = self.manager._should_auto_advance_to_stage
+    self.manager.instance_id = "worker-1"
     self.manager._enqueue_task = lambda task_id: queued.append(task_id)
     self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
     try:
@@ -32433,10 +32491,11 @@ def _test_retry_failed_items_requeue_helper_preserves_existing_behavior(self):
         self.manager._enqueue_task = original_enqueue
         self.manager._should_auto_advance_to_stage = original_should_auto
 
-    self.assertIn(task.status, {"pending", "running"})
+    self.assertEqual(task.status, "pending")
     self.assertEqual("entry_analysis", task.current_stage)
     self.assertEqual(["task1"], queued)
-    self.assertEqual(True, bool((operation.result_payload or {}).get("requeue", {}).get("requested")))
+    self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
 
 
 def _test_downstream_status_event_applied_uses_explicit_task_layer_reconcile(self):
@@ -32843,6 +32902,7 @@ def _test_retry_stage_full_cleanup_reconciles_affected_stages_in_session(self):
 
 
 def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
+    now_value = _now()
     task = BinarySecurityTask(
         id="task1",
         project_id="p1",
@@ -32854,6 +32914,8 @@ def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
         firmware_path="/src",
         output_root="/o",
         workspace_root="/w",
+        dispatcher_instance_id="worker-1",
+        lease_expires_at=now_value + timedelta(seconds=60),
     )
     operation = BinarySecurityTaskOperation(
         id="op1",
@@ -32863,7 +32925,13 @@ def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
         target_stage="entry_analysis",
         status="running",
     )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-1",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=60),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
 
     original_apply = self.manager._apply_task_resume_decision
     original_enqueue = self.manager._enqueue_task
@@ -32875,6 +32943,7 @@ def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
         applied.append({"next_stage": decision.next_stage, "source": decision.source, "operation_id": getattr(operation, "id", None)})
         return original_apply(_db, _task, decision, operation=operation)
 
+    self.manager.instance_id = "worker-1"
     self.manager._apply_task_resume_decision = _capture_apply
     self.manager._enqueue_task = lambda task_id: queued.append(task_id)
     self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
@@ -32891,8 +32960,12 @@ def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
         self.manager._should_auto_advance_to_stage = original_should_auto
 
     self.assertEqual(["task1"], queued)
-    self.assertEqual("entry_analysis", applied[0]["next_stage"])
-    self.assertEqual("retry_failed_items", applied[0]["source"])
+    self.assertEqual([], applied)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
 
 
 def _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry(self):
@@ -32950,11 +33023,12 @@ def _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_r
         self.manager._enqueue_task = original_enqueue
         self.manager._should_auto_advance_to_stage = original_should_auto
 
-    self.assertEqual("running", task.status)
-    self.assertEqual("worker-1", task.dispatcher_instance_id)
-    self.assertEqual([], queued)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertEqual(["task1"], queued)
     self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("requested")))
-    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+    self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
 
 
 def _test_archive_input_repair_uses_resume_decision(self):
@@ -33008,6 +33082,7 @@ def _test_archive_input_repair_uses_resume_decision(self):
 
 
 def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
+    now_value = _now()
     task = BinarySecurityTask(
         id="task-op-requeue",
         project_id="p1",
@@ -33019,6 +33094,8 @@ def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
         firmware_path="/src",
         output_root="/o",
         workspace_root="/w",
+        dispatcher_instance_id="test-worker",
+        lease_expires_at=now_value + timedelta(minutes=5),
     )
     operation = BinarySecurityTaskOperation(
         id="op-requeue",
@@ -33029,7 +33106,13 @@ def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
         status="running",
         current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
     )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="test-worker",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(minutes=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
 
     original_apply = self.manager._apply_task_resume_decision
     original_enqueue = self.manager._enqueue_task
@@ -33048,6 +33131,7 @@ def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
         )
         return original_apply(_db, _task, decision, operation=operation)
 
+    self.manager.instance_id = "test-worker"
     self.manager._apply_task_resume_decision = _capture_apply
     self.manager._enqueue_task = lambda task_id: queued.append(task_id)
     self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
@@ -33059,12 +33143,19 @@ def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
         self.manager._should_auto_advance_to_stage = original_should_auto
 
     self.assertEqual(["task-op-requeue"], queued)
-    self.assertEqual("entry_analysis", applied[0]["next_stage"])
-    self.assertEqual(TASK_ACTION_CONTINUE, applied[0]["source"])
-    self.assertEqual("task_requeued", applied[0]["event_type"])
+    self.assertEqual([], applied)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.lease_expires_at)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("retry_owner_release_requeue_started", event_types)
+    self.assertIn("retry_owner_release_requeue_applied", event_types)
+    self.assertIn("task_requeued", event_types)
 
 
 def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_state_without_requeue_marker(self):
+    now_value = _now()
     task = BinarySecurityTask(
         id="task-op-hard-retry",
         project_id="p1",
@@ -33076,6 +33167,8 @@ def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_st
         firmware_path="/src",
         output_root="/o",
         workspace_root="/w",
+        dispatcher_instance_id="test-worker",
+        lease_expires_at=now_value + timedelta(minutes=5),
     )
     operation = BinarySecurityTaskOperation(
         id="op-hard-retry",
@@ -33087,7 +33180,13 @@ def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_st
         current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
         result_payload={},
     )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], events=[])
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="test-worker",
+        heartbeat_at=now_value,
+        lease_expires_at=now_value + timedelta(minutes=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
 
     original_apply = self.manager._apply_task_resume_decision
     original_enqueue = self.manager._enqueue_task
@@ -33106,6 +33205,7 @@ def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_st
         )
         return original_apply(_db, _task, decision, operation=operation)
 
+    self.manager.instance_id = "test-worker"
     self.manager._apply_task_resume_decision = _capture_apply
     self.manager._enqueue_task = lambda task_id: queued.append(task_id)
     self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
@@ -33117,9 +33217,71 @@ def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_st
         self.manager._should_auto_advance_to_stage = original_should_auto
 
     self.assertEqual(["task-op-hard-retry"], queued)
-    self.assertEqual("system_analysis", applied[0]["next_stage"])
-    self.assertEqual(TASK_ACTION_RETRY, applied[0]["source"])
-    self.assertEqual("task_requeued", applied[0]["event_type"])
+    self.assertEqual([], applied)
+    self.assertEqual("pending", task.status)
+    self.assertEqual("system_analysis", task.current_stage)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.lease_expires_at)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("retry_owner_release_requeue_started", event_types)
+    self.assertIn("retry_owner_release_requeue_applied", event_types)
+    self.assertIn("task_requeued", event_types)
+
+
+def _test_run_task_operation_steps_requeue_fails_without_owner_release_permission(self):
+    task = BinarySecurityTask(
+        id="task-op-requeue-blocked",
+        project_id="p1",
+        name="n",
+        status="failed",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="other-worker",
+        lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-requeue-blocked",
+        task_id=task.id,
+        project_id="p1",
+        operation_type=TASK_ACTION_RETRY,
+        target_stage="system_analysis",
+        status="running",
+        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+        result_payload={},
+    )
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="other-worker",
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
+
+    original_enqueue = self.manager._enqueue_task
+    original_should_auto = self.manager._should_auto_advance_to_stage
+    queued = []
+
+    self.manager.instance_id = "test-worker"
+    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
+    try:
+        asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+    finally:
+        self.manager._enqueue_task = original_enqueue
+        self.manager._should_auto_advance_to_stage = original_should_auto
+
+    self.assertEqual([], queued)
+    self.assertEqual("failed", operation.status)
+    self.assertEqual(TASK_OPERATION_STEP_FAILED, operation.current_step)
+    self.assertEqual("other-worker", task.dispatcher_instance_id)
+    self.assertTrue(any(lease.task_id == task.id for lease in db.runtime_leases))
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("retry_owner_release_requeue_suppressed", event_types)
+    self.assertIn("retry_requeue_blocked_after_cleanup", event_types)
 
 
 def _test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision(self):
@@ -34533,20 +34695,28 @@ def _test_service_base_urls_use_service_roots(self):
 
 def _test_task_heartbeat_controller_refreshes_owned_running_task(self):
     manager = TaskManager()
+    now_value = _now()
     task = BinarySecurityTask(
         id="task-1",
         project_id="p1",
         status="running",
         dispatcher_instance_id=manager.instance_id,
-        dispatch_started_at=_now(),
-        lease_expires_at=_now() + timedelta(seconds=5),
+        dispatch_started_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=5),
     )
     db = _AppendingModelAwareDb(tasks=[task])
     original_factory = task_manager_module.get_session_factory
     try:
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager._register_task_execution_owner(task.id, "primary_task_worker")
-        manager._workers[task.id] = type("Handle", (), {"done": lambda self: False})()
+        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+            task_id=task.id,
+            runner_task=AsyncMock(),
+            heartbeat_task=None,
+            claimed_at=now_value,
+            execution_token=None,
+            lease_owner_instance_id=manager.instance_id,
+        )
         original_lease = task.lease_expires_at
         manager._refresh_task_heartbeats_once()
         self.assertEqual(1, len(db.runtime_leases))
@@ -34559,18 +34729,30 @@ def _test_task_heartbeat_controller_refreshes_owned_running_task(self):
 
 def _test_task_heartbeat_controller_skips_task_without_owner(self):
     manager = TaskManager()
+    now_value = _now()
     task = BinarySecurityTask(
         id="task-2",
         project_id="p1",
         status="running",
         dispatcher_instance_id=manager.instance_id,
-        dispatch_started_at=_now(),
-        lease_expires_at=_now() + timedelta(seconds=5),
+        dispatch_started_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=5),
     )
     db = _AppendingModelAwareDb(tasks=[task])
     original_factory = task_manager_module.get_session_factory
     try:
         task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+            task_id=task.id,
+            runner_task=AsyncMock(),
+            heartbeat_task=None,
+            claimed_at=now_value,
+            execution_token=None,
+            lease_owner_instance_id=manager.instance_id,
+            owner_active=False,
+            release_requested=True,
+            release_reason="test_skip",
+        )
         original_updated_at = task.updated_at
         original_lease = task.lease_expires_at
         manager._refresh_task_heartbeats_once()
@@ -34582,20 +34764,28 @@ def _test_task_heartbeat_controller_skips_task_without_owner(self):
 
 def _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership(self):
     manager = TaskManager()
+    now_value = _now()
     task = BinarySecurityTask(
         id="task-3",
         project_id="p1",
         status="running",
         dispatcher_instance_id="other-worker",
-        dispatch_started_at=_now(),
-        lease_expires_at=_now() + timedelta(seconds=5),
+        dispatch_started_at=now_value,
+        lease_expires_at=now_value + timedelta(seconds=5),
     )
     db = _AppendingModelAwareDb(tasks=[task])
     original_factory = task_manager_module.get_session_factory
     try:
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager._register_task_execution_owner(task.id, "primary_task_worker")
-        manager._workers[task.id] = type("Handle", (), {"done": lambda self: False})()
+        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+            task_id=task.id,
+            runner_task=AsyncMock(),
+            heartbeat_task=None,
+            claimed_at=now_value,
+            execution_token=None,
+            lease_owner_instance_id=manager.instance_id,
+        )
         original_lease = task.lease_expires_at
         manager._refresh_task_heartbeats_once()
         self.assertEqual(0, len(db.runtime_leases))
@@ -40049,6 +40239,7 @@ def _test_requeue_released_running_locked_skips_locally_owned_tail_lease(self):
 
 def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
     manager = TaskManager()
+    now_value = _now()
     task = BinarySecurityTask(
         id="task-tail-heartbeat",
         project_id="p1",
@@ -40062,8 +40253,8 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         dispatcher_instance_id=manager.instance_id,
-        lease_expires_at=_now() + timedelta(seconds=30),
-        updated_at=_now() - timedelta(minutes=5),
+        lease_expires_at=now_value + timedelta(seconds=30),
+        updated_at=now_value - timedelta(minutes=5),
     )
     item = BinarySecurityStageItem(
         id="si-tail-heartbeat",
@@ -40079,12 +40270,19 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
         task_id=task.id,
         execution_epoch=0,
         owner_instance_id=manager.instance_id,
-        heartbeat_at=_now() - timedelta(minutes=1),
-        lease_expires_at=_now() + timedelta(seconds=30),
+        heartbeat_at=now_value - timedelta(minutes=1),
+        lease_expires_at=now_value + timedelta(seconds=30),
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
     manager._register_task_execution_owner(task.id, "primary_task_worker")
-    manager._workers[task.id] = type("Handle", (), {"done": lambda self: False})()
+    manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+        task_id=task.id,
+        runner_task=AsyncMock(),
+        heartbeat_task=None,
+        claimed_at=now_value,
+        execution_token=None,
+        lease_owner_instance_id=manager.instance_id,
+    )
     previous_heartbeat_at = lease.heartbeat_at
 
     with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
@@ -40096,8 +40294,9 @@ def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
 
 def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
     manager = TaskManager()
+    now_value = _now()
     started_at = _now() - timedelta(seconds=20)
-    original_expiry = _now() + timedelta(seconds=5)
+    original_expiry = now_value + timedelta(seconds=5)
     task = BinarySecurityTask(
         id="task-tail-touch-heartbeat",
         project_id="p1",
@@ -40138,6 +40337,14 @@ def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager.cfg.scheduler.heartbeat_update_interval_seconds = 0
         manager._register_task_execution_owner(task.id, "primary_task_worker")
+        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+            task_id=task.id,
+            runner_task=AsyncMock(),
+            heartbeat_task=None,
+            claimed_at=now_value,
+            execution_token=None,
+            lease_owner_instance_id=manager.instance_id,
+        )
         manager._touch_task_heartbeat(task.id)
     finally:
         task_manager_module.get_session_factory = original_factory
@@ -40145,6 +40352,54 @@ def _test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
 
     self.assertGreater(task.lease_expires_at, original_expiry)
     self.assertGreater(task.updated_at, started_at)
+
+
+def _test_task_heartbeat_controller_keeps_lease_after_runner_exit_when_owner_still_active(self):
+    manager = TaskManager()
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-runner-exited-heartbeat",
+        project_id="p1",
+        status="running",
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id=manager.instance_id,
+        dispatch_started_at=now_value - timedelta(minutes=1),
+        lease_expires_at=now_value + timedelta(seconds=5),
+        updated_at=now_value - timedelta(minutes=1),
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id=manager.instance_id,
+        heartbeat_at=now_value - timedelta(minutes=1),
+        lease_expires_at=now_value + timedelta(seconds=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+    done_runner = AsyncMock()
+    done_runner.done.return_value = True
+    manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+        task_id=task.id,
+        runner_task=done_runner,
+        heartbeat_task=None,
+        claimed_at=now_value - timedelta(minutes=1),
+        execution_token="exec-1",
+        lease_owner_instance_id=manager.instance_id,
+        owner_active=True,
+        last_runner_exit_at=now_value - timedelta(seconds=10),
+    )
+
+    with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+        previous_expiry = task.lease_expires_at
+        manager._refresh_task_heartbeats_once()
+
+    self.assertGreater(task.lease_expires_at, previous_expiry)
+    self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
 
 
 def _test_activate_tail_reconciliation_deduplicates_owner_conflict_events(self):

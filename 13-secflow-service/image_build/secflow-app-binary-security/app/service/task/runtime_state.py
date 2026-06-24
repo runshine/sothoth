@@ -159,6 +159,12 @@ class TaskRuntimeStateServiceMixin:
             and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
         )
 
+    def _is_retry_like_operation_type(self: TaskManager, operation_type: str | None) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        normalized = str(operation_type or "").strip()
+        return normalized in task_manager_module.TASK_OPERATION_REQUEUE_APPLIED_TYPES
+
     def _parent_runtime_lease_decision_payload(
         self: TaskManager,
         decision: LeaseClearDecision,
@@ -307,6 +313,106 @@ class TaskRuntimeStateServiceMixin:
         reason: str,
     ) -> LeaseClearDecision:
         return self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
+
+    def _can_owner_release_parent_runtime_for_retry_requeue(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        operation,
+        reason: str,
+    ) -> LeaseClearDecision:
+        lease = self._runtime_lease_for_task(db, task.id)
+        runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
+        runtime_lease_expires_at = task_shared._isoformat_or_none(getattr(lease, "lease_expires_at", None)) if lease is not None else None
+        row_lease_expires_at_value = getattr(task, "lease_expires_at", None)
+        row_lease_expires_at = task_shared._isoformat_or_none(row_lease_expires_at_value)
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        task_status = str(getattr(task, "status", "") or "").strip().lower() or None
+        runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
+        operation_type = str(getattr(operation, "operation_type", "") or "").strip() or None
+        operation_status = str(getattr(operation, "status", "") or "").strip().lower() or None
+        task_terminal = bool(task_status in TASK_TERMINAL_STATUSES)
+        current_instance_id = str(self.instance_id or "").strip()
+        runtime_owner_matches = bool(runtime_lease_owner and runtime_lease_owner == current_instance_id)
+        row_owner_matches = bool(dispatcher_instance_id and dispatcher_instance_id == current_instance_id)
+        owner_matches_current_instance = runtime_owner_matches or row_owner_matches
+        lease_active = bool(lease is not None and self._runtime_lease_is_active(lease))
+        row_lease_active = bool(
+            row_lease_expires_at_value is not None
+            and (task_shared._seconds_until(row_lease_expires_at_value) or 0) > 0
+        )
+        row_lease_expired = bool(row_lease_expires_at_value is not None and not row_lease_active)
+        lease_state = (
+            "active"
+            if (lease_active or row_lease_active)
+            else "expired"
+            if (lease is not None or row_lease_expired)
+            else "missing"
+        )
+        if not self._is_retry_like_operation_type(operation_type):
+            return LeaseClearDecision(
+                allowed=False,
+                reason_code="operation_not_retry_like",
+                lease_state=lease_state,
+                owner_matches_current_instance=owner_matches_current_instance,
+                task_terminal=task_terminal,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+                active_operation_type=operation_type,
+                active_operation_status=operation_status,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                row_lease_expires_at=row_lease_expires_at,
+                dispatcher_instance_id=dispatcher_instance_id,
+            )
+        if not owner_matches_current_instance:
+            return LeaseClearDecision(
+                allowed=False,
+                reason_code="retry_requeue_owner_mismatch",
+                lease_state=lease_state,
+                owner_matches_current_instance=False,
+                task_terminal=task_terminal,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+                active_operation_type=operation_type,
+                active_operation_status=operation_status,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                row_lease_expires_at=row_lease_expires_at,
+                dispatcher_instance_id=dispatcher_instance_id,
+            )
+        if lease_state != "active":
+            return LeaseClearDecision(
+                allowed=False,
+                reason_code="retry_requeue_active_lease_required",
+                lease_state=lease_state,
+                owner_matches_current_instance=owner_matches_current_instance,
+                task_terminal=task_terminal,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+                active_operation_type=operation_type,
+                active_operation_status=operation_status,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                row_lease_expires_at=row_lease_expires_at,
+                dispatcher_instance_id=dispatcher_instance_id,
+            )
+        return LeaseClearDecision(
+            allowed=True,
+            reason_code="retry_owner_release_requeue",
+            lease_state=lease_state,
+            owner_matches_current_instance=owner_matches_current_instance,
+            task_terminal=task_terminal,
+            task_status=task_status,
+            runtime_phase=runtime_phase,
+            active_operation_type=operation_type,
+            active_operation_status=operation_status,
+            runtime_lease_owner=runtime_lease_owner,
+            runtime_lease_expires_at=runtime_lease_expires_at,
+            row_lease_expires_at=row_lease_expires_at,
+            dispatcher_instance_id=dispatcher_instance_id,
+        )
 
     def _record_parent_runtime_lease_decision(
         self: TaskManager,

@@ -1972,24 +1972,26 @@ class TaskRuntimeServiceMixin:
                 )
                 db.commit()
         finally:
-            if owner_registered:
-                self._release_task_execution_owner(task_id, "primary_task_worker")
+            self._mark_runner_exited_keep_owner(
+                task_id,
+                reason="runner_task_exited",
+            )
             async with self._worker_lock:
                 handle = self._workers.get(task_id)
-            if handle is not None and handle.heartbeat_task is not None and not handle.heartbeat_task.done():
-                handle.heartbeat_task.cancel()
-                with suppress(asyncio.CancelledError, Exception):
-                    await handle.heartbeat_task
             cleanup_db = session_factory()
             try:
                 cleanup_completed = False
                 task = cleanup_db.query(task_manager_module.BinarySecurityTask).filter(
                     task_manager_module.BinarySecurityTask.id == task_id
                 ).first()
-                has_local_runtime_holder = bool(
-                    self._has_local_task_execution_owner(task_id)
-                    or self._task_has_active_streaming_stage_workers(task_id)
-                )
+                if handle is None:
+                    has_local_runtime_holder = False
+                else:
+                    has_local_runtime_holder = self._task_should_remain_owned_without_active_runner(
+                        cleanup_db,
+                        task,
+                        handle,
+                    )
                 if (
                     task is not None
                     and not has_local_runtime_holder
@@ -2034,9 +2036,18 @@ class TaskRuntimeServiceMixin:
                     and (
                         task is None
                         or str(task.status or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES
-                        or not has_local_runtime_holder
+                        or (handle is not None and self._can_stop_parent_lease_heartbeat(cleanup_db, task, handle))
                     )
                 ):
+                    if handle is not None:
+                        self._request_parent_runtime_release(
+                            task_id,
+                            reason=(
+                                "terminal_cleanup"
+                                if task is not None and str(task.status or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES
+                                else "runtime_handle_cleanup"
+                            ),
+                        )
                     clear_result = self._clear_runtime_lease(
                         cleanup_db,
                         task_id,
@@ -2059,7 +2070,15 @@ class TaskRuntimeServiceMixin:
             finally:
                 cleanup_db.close()
             async with self._worker_lock:
-                self._workers.pop(task_id, None)
+                current_handle = self._workers.get(task_id)
+                if current_handle is not None and not bool(current_handle.owner_active):
+                    if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
+                        current_handle.heartbeat_task.cancel()
+                        with suppress(asyncio.CancelledError, Exception):
+                            await current_handle.heartbeat_task
+                    self._workers.pop(task_id, None)
+            if owner_registered and not self._has_local_task_execution_owner(task_id):
+                self._release_task_execution_owner(task_id, "primary_task_worker")
             db.close()
 
     async def _execute_task(self: TaskManager, task_id: str) -> None:

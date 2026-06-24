@@ -3732,19 +3732,47 @@ class TaskOperationServiceMixin:
             message=f"后台操作完成，任务已重新排队: {operation.operation_type}",
             payload={"operation_type": operation.operation_type},
         )
-        if not decision.should_resume:
-            self._record_operation_event(
+        requeue_applied = False
+        if self._is_retry_like_operation_type(getattr(operation, "operation_type", None)):
+            requeue_applied = self._apply_owner_release_and_requeue_after_retry_operation(
                 db,
                 task,
-                operation,
-                decision.event_type or "task_resume_blocked",
-                "后台操作完成，但当前仍不满足重新排队条件",
-                level="warning",
-                stage_name=operation.target_stage or task.current_stage,
-                payload=dict(decision.payload or {}),
+                target_stage=operation.target_stage or task.current_stage,
+                operation=operation,
+                resume_decision=decision,
             )
-            raise ValidationError("后台操作完成，但当前仍不满足重新排队条件")
-        self._apply_task_resume_decision(db, task, decision, operation=operation)
+        else:
+            if not decision.should_resume:
+                self._record_operation_event(
+                    db,
+                    task,
+                    operation,
+                    decision.event_type or "task_resume_blocked",
+                    "后台操作完成，但当前仍不满足重新排队条件",
+                    level="warning",
+                    stage_name=operation.target_stage or task.current_stage,
+                    payload=dict(decision.payload or {}),
+                )
+                operation.status = "failed"
+                operation.current_step = task_manager_module.TASK_OPERATION_STEP_FAILED
+                operation.finished_at = task_manager_module._now()
+                operation.updated_at = operation.finished_at
+                operation.error_code = "retry_requeue_decision_blocked"
+                operation.error_message = "后台操作完成，但当前仍不满足重新排队条件"
+                self._record_operation_step_failed(
+                    db,
+                    task,
+                    operation,
+                    step_name=task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK,
+                    error=ValidationError("后台操作完成，但当前仍不满足重新排队条件"),
+                    stage_name=operation.target_stage or task.current_stage,
+                )
+            else:
+                self._apply_task_resume_decision(db, task, decision, operation=operation)
+                requeue_applied = True
+        if not requeue_applied:
+            db.commit()
+            return
         self._record_operation_step_finished(
             db,
             task,
@@ -3772,18 +3800,200 @@ class TaskOperationServiceMixin:
         *,
         db: Session,
     ) -> bool:
-        operation_type = str(getattr(operation, "operation_type", "") or "").strip()
-        if operation_type not in {
-            task_manager_module.TASK_ACTION_RETRY,
-            task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
-            task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
-            task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
-        }:
+        del task, operation, db
+        return False
+
+    def _apply_owner_release_and_requeue_after_retry_operation(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        target_stage: str | None,
+        operation: BinarySecurityTaskOperation,
+        resume_decision,
+    ) -> bool:
+        resolved_stage = str(
+            getattr(resume_decision, "next_stage", None)
+            or target_stage
+            or task.current_stage
+            or ""
+        ).strip() or None
+        if not bool(getattr(resume_decision, "should_resume", False)) or not resolved_stage:
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_requeue_blocked_after_cleanup",
+                f"失败项重试清空完成，但当前仍不满足重新排队条件: {operation.operation_type}",
+                level="error",
+                stage_name=target_stage or task.current_stage,
+                payload={
+                    "operation_id": operation.id,
+                    "target_stage": target_stage or task.current_stage,
+                    "reason": "retry_operation_requeue",
+                    "reason_code": "retry_requeue_decision_blocked",
+                    "owner_release_allowed": False,
+                    "owner_release_and_requeue": False,
+                    "in_place_runtime_resume": False,
+                    "resume_decision": {
+                        "should_resume": bool(getattr(resume_decision, "should_resume", False)),
+                        "next_stage": getattr(resume_decision, "next_stage", None),
+                        "event_type": getattr(resume_decision, "event_type", None),
+                        "payload": dict(getattr(resume_decision, "payload", {}) or {}),
+                    },
+                },
+            )
+            operation.status = "failed"
+            operation.current_step = task_manager_module.TASK_OPERATION_STEP_FAILED
+            operation.finished_at = task_manager_module._now()
+            operation.updated_at = operation.finished_at
+            operation.error_code = "retry_requeue_decision_blocked"
+            operation.error_message = "后台操作完成，但当前仍不满足 owner 主动释放并重排队条件"
             return False
-        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+        decision = self._can_owner_release_parent_runtime_for_retry_requeue(
+            db,
+            task,
+            operation=operation,
+            reason="retry_operation_requeue",
+        )
+        if not decision.allowed:
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_owner_release_requeue_suppressed",
+                f"失败项重试完成，但当前 owner 不允许释放租约并重排队: {operation.operation_type}",
+                level="warning",
+                stage_name=resolved_stage or operation.target_stage,
+                payload={
+                    **self._parent_runtime_lease_decision_payload(decision, reason="retry_operation_requeue"),
+                    "operation_id": operation.id,
+                    "target_stage": resolved_stage,
+                    "owner_release_allowed": False,
+                    "owner_release_and_requeue": False,
+                    "in_place_runtime_resume": False,
+                },
+            )
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "retry_requeue_blocked_after_cleanup",
+                f"失败项重试清空完成，但无法合法重排队: {operation.operation_type}",
+                level="error",
+                stage_name=resolved_stage or operation.target_stage,
+                payload={
+                    "operation_id": operation.id,
+                    "target_stage": resolved_stage,
+                    "reason": "retry_operation_requeue",
+                    "reason_code": decision.reason_code,
+                    "owner_release_allowed": False,
+                    "owner_release_and_requeue": False,
+                    "in_place_runtime_resume": False,
+                    "resume_decision": {
+                        "should_resume": bool(getattr(resume_decision, "should_resume", False)),
+                        "next_stage": getattr(resume_decision, "next_stage", None),
+                        "event_type": getattr(resume_decision, "event_type", None),
+                        "payload": dict(getattr(resume_decision, "payload", {}) or {}),
+                    },
+                },
+            )
+            operation.status = "failed"
+            operation.current_step = task_manager_module.TASK_OPERATION_STEP_FAILED
+            operation.finished_at = task_manager_module._now()
+            operation.updated_at = operation.finished_at
+            operation.error_code = decision.reason_code
+            operation.error_message = "后台操作完成，但当前仍不满足 owner 主动释放并重排队条件"
             return False
-        if not self._lease_is_active(task, db=db):
-            return False
+
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "retry_owner_release_requeue_started",
+            f"失败项重试完成，当前 owner 开始释放租约并重排队: {operation.operation_type}",
+            stage_name=resolved_stage or operation.target_stage,
+            payload={
+                **self._parent_runtime_lease_decision_payload(decision, reason="retry_operation_requeue"),
+                "operation_id": operation.id,
+                "target_stage": resolved_stage,
+                "owner_release_allowed": True,
+                "owner_release_and_requeue": True,
+                "in_place_runtime_resume": False,
+            },
+        )
+        self._apply_task_main_state_update(
+            db,
+            task,
+            source="task_operation",
+            reason="失败项重试完成，owner 主动释放租约并重新进入待调度",
+            status="pending",
+            stage_name=resolved_stage,
+            runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            finished_at=None,
+            last_error=None,
+            clear_runtime_owner=True,
+        )
+        task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
+        self._clear_task_abnormal_reason_snapshot(db, task)
+        self._clear_runtime_lease(
+            db,
+            task.id,
+            owner_instance_id=str(self.instance_id or "").strip() or None,
+        )
+        self._invalidate_task_execution(task, force=True)
+        self._update_operation_result_payload(
+            operation,
+            {},
+            workspace_root=task.workspace_root,
+        )
+        self._mark_operation_requeue_applied(
+            db,
+            task,
+            operation,
+            target_stage=resolved_stage,
+            in_place_runtime_resume=False,
+            extra_payload={
+                "task_status_before": "retry_operation_succeeded",
+                "resume_reason": getattr(resume_decision, "resume_reason", None),
+                "source": getattr(resume_decision, "source", None),
+                "owner_release_and_requeue": True,
+            },
+            record_event=True,
+        )
+        self._enqueue_task(task.id)
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "retry_owner_release_requeue_applied",
+            f"失败项重试完成，当前 owner 已释放租约并重新排队: {operation.operation_type}",
+            stage_name=resolved_stage or operation.target_stage,
+            payload={
+                "operation_id": operation.id,
+                "next_stage": resolved_stage,
+                "resume_reason": getattr(resume_decision, "resume_reason", None),
+                "source": getattr(resume_decision, "source", None),
+                "owner_release_allowed": True,
+                "owner_release_and_requeue": True,
+                "in_place_runtime_resume": False,
+            },
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "task_requeued",
+            f"失败项重试完成，任务已重新排队: {operation.operation_type}",
+            stage_name=resolved_stage or operation.target_stage,
+            payload={
+                "next_stage": resolved_stage,
+                "resume_reason": getattr(resume_decision, "resume_reason", None),
+                "source": getattr(resume_decision, "source", None),
+                "owner_release_and_requeue": True,
+                "in_place_runtime_resume": False,
+            },
+        )
         return True
 
     def _requeue_task_after_retry_operation(
@@ -3793,7 +4003,7 @@ class TaskOperationServiceMixin:
         *,
         target_stage: str | None,
         operation: BinarySecurityTaskOperation,
-    ) -> None:
+        ) -> None:
         resume_decision = self._decide_task_resume_after_stage_reset(
             db,
             task,
@@ -3804,85 +4014,42 @@ class TaskOperationServiceMixin:
             payload={"operation_id": operation.id},
         )
         resume_decision.event_type = "task_requeued"
-        if self._can_resume_retry_operation_in_place(task, operation, db=db):
-            self._set_task_status(
+        if self._is_retry_like_operation_type(getattr(operation, "operation_type", None)):
+            self._apply_owner_release_and_requeue_after_retry_operation(
                 db,
                 task,
-                "running",
-                reason="失败项重试完成，当前 runtime 原地继续推进任务",
-                source="task_operation",
-                stage_name=target_stage or task.current_stage,
-            )
-            task.current_stage = target_stage or task.current_stage
-            task.last_error = None
-            task.finished_at = None
-            task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
-            self._clear_task_abnormal_reason_snapshot(db, task)
-            self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
-            self._update_operation_result_payload(
-                operation,
-                {},
-                workspace_root=task.workspace_root,
-            )
-            self._mark_operation_requeue_applied(
-                db,
-                task,
-                operation,
-                target_stage=target_stage or task.current_stage,
-                in_place_runtime_resume=True,
-                extra_payload={
-                    "task_status_before": "retry_operation_succeeded",
-                    "resume_reason": resume_decision.resume_reason,
-                    "source": resume_decision.source,
-                },
-            )
-            self._record_operation_event(
-                db,
-                task,
-                operation,
-                "task_requeued",
-                f"失败项重试完成，当前 runtime 将继续推进任务: {operation.operation_type}",
-                stage_name=operation.target_stage,
-                payload={
-                    "next_stage": task.current_stage,
-                    "resume_reason": resume_decision.resume_reason,
-                    "source": resume_decision.source,
-                    "in_place_runtime_resume": True,
-                },
+                target_stage=target_stage,
+                operation=operation,
+                resume_decision=resume_decision,
             )
             return
         if not resume_decision.should_resume:
-            self._set_task_status(
-                db,
-                task,
-                "pending",
-                reason="失败项重试完成，任务重新进入待调度",
-                source="task_operation",
-                stage_name=target_stage or task.current_stage,
-            )
-            task.current_stage = target_stage or task.current_stage
-            task.last_error = None
-            task.finished_at = None
-            self._invalidate_task_execution(task)
-            self._enqueue_task(task.id)
-            self._mark_operation_requeue_applied(
-                db,
-                task,
-                operation,
-                target_stage=target_stage or task.current_stage,
-                in_place_runtime_resume=False,
-                extra_payload={
-                    "task_status_before": "retry_operation_succeeded",
-                },
-                record_event=True,
-            )
+            operation.status = "failed"
+            operation.current_step = task_manager_module.TASK_OPERATION_STEP_FAILED
+            operation.finished_at = task_manager_module._now()
+            operation.updated_at = operation.finished_at
+            operation.error_code = "retry_requeue_decision_blocked"
+            operation.error_message = "后台操作完成，但当前仍不满足重新排队条件"
             self._record_operation_event(
                 db,
                 task,
                 operation,
-                "task_requeued",
-                f"失败项重试完成，任务已重新排队: {operation.operation_type}",
-                stage_name=operation.target_stage,
+                "retry_requeue_blocked_after_cleanup",
+                f"失败项重试清空完成，但当前仍不满足重新排队条件: {operation.operation_type}",
+                level="error",
+                stage_name=target_stage or operation.target_stage,
+                payload={
+                    "operation_id": operation.id,
+                    "next_stage": target_stage or task.current_stage,
+                    "resume_decision": {
+                        "should_resume": bool(getattr(resume_decision, "should_resume", False)),
+                        "next_stage": getattr(resume_decision, "next_stage", None),
+                        "event_type": getattr(resume_decision, "event_type", None),
+                        "payload": dict(getattr(resume_decision, "payload", {}) or {}),
+                    },
+                    "owner_release_and_requeue": False,
+                    "in_place_runtime_resume": False,
+                },
             )
             return
         self._apply_task_resume_decision(db, task, resume_decision, operation=operation)

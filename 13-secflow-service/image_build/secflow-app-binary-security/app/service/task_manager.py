@@ -433,6 +433,7 @@ TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS = "cancel_downstream_targets"
 TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED = "verify_downstream_quiesced"
 TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED = "finalize_task_cancelled"
 TASK_OPERATION_STEP_FINALIZE_TASK_CANCEL_FAILED = "finalize_task_cancel_failed"
+TASK_OPERATION_STEP_FAILED = "operation_failed"
 TASK_OPERATION_STEP_SUCCEEDED = "operation_succeeded"
 TASK_CANCEL_BLOCKING_TARGETS_PREVIEW_LIMIT = 20
 RETRY_CHILD_STRATEGY_REUSE_SUCCESS = "reuse_success"
@@ -627,6 +628,12 @@ class TaskRuntimeHandle:
     active_commit_completed_at: datetime | None = None
     active_commit_succeeded: bool = False
     lease_established: bool = False
+    owner_active: bool = True
+    release_requested: bool = False
+    release_reason: str | None = None
+    last_runner_exit_at: datetime | None = None
+    last_lease_refresh_at: datetime | None = None
+    takeover_observed: bool = False
 
     def done(self) -> bool:
         return self.runner_task.done()
@@ -1682,6 +1689,114 @@ class TaskManager(
     def _runtime_handle(self, task_id: str) -> TaskRuntimeHandle | None:
         return self._workers.get(str(task_id or "").strip())
 
+    def _mark_runner_exited_keep_owner(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return
+        handle.last_runner_exit_at = _now()
+        handle.last_progress_at = handle.last_progress_at or handle.last_runner_exit_at
+        handle.release_requested = False
+        handle.release_reason = str(reason or "").strip() or None
+        handle.owner_active = True
+
+    def _request_parent_runtime_release(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+        takeover_observed: bool = False,
+    ) -> None:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return
+        handle.release_requested = True
+        handle.release_reason = str(reason or "").strip() or None
+        handle.owner_active = False
+        handle.takeover_observed = bool(takeover_observed)
+
+    def _task_should_remain_owned_without_active_runner(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        handle: TaskRuntimeHandle | None,
+    ) -> bool:
+        if task is None or handle is None:
+            return False
+        if str(getattr(task, "status", "") or "").strip().lower() in TASK_TERMINAL_STATUSES:
+            return False
+        if not bool(handle.owner_active) or bool(handle.release_requested) or bool(handle.takeover_observed):
+            return False
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        if self._task_runtime_owner_matches_current_instance(db, task):
+            return True
+        active_operation = self._task_active_operation(db, task)
+        operation_status = str(getattr(active_operation, "status", "") or "").strip().lower() if active_operation is not None else ""
+        if operation_status in TASK_OPERATION_ACTIVE_STATUSES:
+            return True
+        if self._task_has_supported_control_operation_runtime(db, task, active_operation=active_operation):
+            return True
+        if self._task_has_authoritative_active_stage_context(
+            db,
+            task,
+            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+        ):
+            return True
+        if self._should_preserve_task_dispatch_ownership(
+            task,
+            previous_status=str(getattr(task, "status", "") or "").strip().lower() or None,
+            db=db,
+        ):
+            return True
+        return bool(
+            self._task_has_active_streaming_stage_workers(task.id)
+            or self._has_local_task_execution_owner(task.id)
+        )
+
+    def _should_continue_parent_lease_heartbeat(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        handle: TaskRuntimeHandle | None,
+    ) -> bool:
+        if task is None or handle is None:
+            return False
+        if str(getattr(task, "status", "") or "").strip().lower() in TASK_TERMINAL_STATUSES:
+            return False
+        if bool(handle.release_requested) or not bool(handle.owner_active) or bool(handle.takeover_observed):
+            return False
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        if dispatcher_instance_id and dispatcher_instance_id != str(self.instance_id or "").strip():
+            return False
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        if self._task_runtime_owner_matches_current_instance(db, task):
+            return True
+        return self._task_should_remain_owned_without_active_runner(db, task, handle)
+
+    def _can_stop_parent_lease_heartbeat(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        handle: TaskRuntimeHandle | None,
+    ) -> bool:
+        if handle is None:
+            return True
+        if bool(handle.takeover_observed):
+            return True
+        if task is None:
+            return True
+        if str(getattr(task, "status", "") or "").strip().lower() in TASK_TERMINAL_STATUSES:
+            return True
+        if bool(handle.release_requested):
+            return True
+        return not self._should_continue_parent_lease_heartbeat(db, task, handle)
+
     async def _start_task_runtime(self, task_id: str) -> bool:
         from app.service import task_manager as task_manager_module
 
@@ -2375,28 +2490,8 @@ class TaskManager(
                 return False
 
     def _should_keep_task_heartbeat(self, db: Session, task: BinarySecurityTask | None) -> bool:
-        if task is None:
-            return False
-        if task.finished_at is not None:
-            return False
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-        if dispatcher_instance_id != str(self.instance_id or "").strip():
-            return False
-        if self._task_runtime_transition_guard_owned_by_current_instance(task):
-            return True
-        runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
-        if runtime_lease is not None and bool(
-            self._runtime_lease_is_active(runtime_lease)
-            and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
-        ):
-            return True
-        # Heartbeat is also the bootstrap path that materializes the authoritative
-        # runtime lease for a newly claimed local execution before reclaim logic
-        # starts trusting it.
-        return bool(
-            self._has_local_task_execution_owner(task.id)
-            or self._task_has_active_streaming_stage_workers(task.id)
-        )
+        handle = self._runtime_handle(getattr(task, "id", None) if task is not None else None)
+        return self._should_continue_parent_lease_heartbeat(db, task, handle)
 
     def _local_operation_worker_alive(self, operation_id: str | None) -> bool:
         normalized_operation_id = str(operation_id or "").strip()
@@ -2713,6 +2808,9 @@ class TaskManager(
             task.updated_at = now_value
             session.commit()
             self._last_task_heartbeat_at[task_id] = now_value
+            handle = self._runtime_handle(task_id)
+            if handle is not None:
+                handle.last_lease_refresh_at = now_value
             observe_heartbeat_update(f"{source}_written")
             return True
         session.rollback()
@@ -2725,7 +2823,7 @@ class TaskManager(
             candidate_ids = sorted(
                 task_id
                 for task_id, handle in self._workers.items()
-                if handle is not None and not handle.done()
+                if handle is not None and bool(handle.owner_active)
             )
             observe_task_heartbeat_candidates(len(candidate_ids))
             if not candidate_ids:
@@ -2734,11 +2832,17 @@ class TaskManager(
             tasks_by_id = {task.id: task for task in rows}
             for task_id in candidate_ids:
                 task = tasks_by_id.get(task_id)
-                if not self._should_keep_task_heartbeat(session, task):
-                    if not self._has_local_task_execution_owner(task_id):
+                handle = self._runtime_handle(task_id)
+                if not self._should_continue_parent_lease_heartbeat(session, task, handle):
+                    if self._can_stop_parent_lease_heartbeat(session, task, handle):
                         self._last_task_heartbeat_at.pop(task_id, None)
-                        self._clear_runtime_lease(session, task_id, owner_instance_id=self.instance_id)
-                        session.commit()
+                        clear_result = self._clear_runtime_lease(session, task_id, owner_instance_id=self.instance_id)
+                        if clear_result.status != "lease_locked_retry_later":
+                            session.commit()
+                        else:
+                            session.rollback()
+                        if handle is not None:
+                            handle.owner_active = False
                     observe_heartbeat_update("controller_skipped")
                     continue
                 try:
@@ -10987,7 +11091,8 @@ class TaskManager(
         if last_heartbeat_at and (now - last_heartbeat_at).total_seconds() < interval_seconds:
             observe_heartbeat_update("fallback_skipped")
             return
-        has_owner = self._has_local_task_execution_owner(task_id)
+        handle = self._runtime_handle(task_id)
+        has_owner = self._has_local_task_execution_owner(task_id) or bool(handle is not None and handle.owner_active)
         has_streaming_worker = self._task_has_active_streaming_stage_workers(task_id)
         if not has_owner and not has_streaming_worker:
             observe_heartbeat_update("fallback_skipped")
@@ -10995,7 +11100,18 @@ class TaskManager(
         session = get_session_factory()()
         try:
             task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
-            if not self._should_keep_task_heartbeat(session, task):
+            if not self._should_continue_parent_lease_heartbeat(session, task, handle):
+                if not has_streaming_worker:
+                    observe_heartbeat_update("fallback_skipped")
+                    return
+                if task is None or str(getattr(task, "status", "") or "").strip().lower() in TASK_TERMINAL_STATUSES:
+                    observe_heartbeat_update("fallback_skipped")
+                    return
+                dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+                if dispatcher_instance_id != str(self.instance_id or "").strip():
+                    observe_heartbeat_update("fallback_skipped")
+                    return
+            elif not self._should_keep_task_heartbeat(session, task):
                 observe_heartbeat_update("fallback_skipped")
                 return
             self._write_task_heartbeat(session, task_id, now_value=now, source="fallback")
