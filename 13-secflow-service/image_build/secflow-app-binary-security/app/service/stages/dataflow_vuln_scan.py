@@ -22,9 +22,8 @@ class DataflowVulnScanStageHandler(BinarySecurityStageHandler):
         return True
 
     def build_inputs(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
-        del db
         return _deduplicate_entry_rows(
-            [dict(entry) for entry in manager._effective_entry_inputs(task) if isinstance(entry, dict)]
+            [dict(entry) for entry in manager._effective_entry_inputs(task, db) if isinstance(entry, dict)]
         )
 
     def continue_stage_input_error(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> str | None:

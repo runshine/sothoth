@@ -41,7 +41,7 @@ class TaskStageRuntimeMixin:
         materialized_key_set = set(materialized_item_keys)
         expected_entry_keys = [
             str(entry.get("entry_key") or "").strip()
-            for entry in list(self._effective_entry_inputs(task) or [])
+            for entry in list(self._effective_entry_inputs(task, db) or [])
             if isinstance(entry, dict) and str(entry.get("entry_key") or "").strip()
         ]
         expected_key_set = set(expected_entry_keys)

@@ -1399,9 +1399,13 @@ class TaskArchiveServiceMixin:
         self._archive_apply_repaired_stage_refresh(db, task, repaired_stage)
         after_signature = self._archive_apply_downstream_input_signature(db, task, repaired_stage)
         contaminated = self._archive_apply_descendant_contamination(db, task, repaired_stage)
+        used_forced_contamination = False
         if not contaminated:
             contaminated = self._archive_apply_forced_descendant_contamination(db, task, repaired_stage)
+            used_forced_contamination = bool(contaminated)
         if not contaminated:
+            return False
+        if repaired_stage == "system_analysis" and used_forced_contamination and before_signature == after_signature:
             return False
         if (
             before_signature == after_signature

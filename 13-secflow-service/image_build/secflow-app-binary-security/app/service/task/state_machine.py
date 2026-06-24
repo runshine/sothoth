@@ -1303,7 +1303,7 @@ class TaskStateMachineMixin:
             module_state = self._entry_module_completion_state(task, db)
             if not bool(module_state.get("complete")):
                 return False
-            if self._task_type(task) == TASK_TYPE_SOURCE and not bool(self._effective_entry_inputs(task)):
+            if self._task_type(task) == TASK_TYPE_SOURCE and not bool(self._effective_entry_inputs(task, db)):
                 return True
             return not bool(self._entry_results(task))
         return False
@@ -1843,6 +1843,19 @@ class TaskStateMachineMixin:
             decision.message = f"阶段失败，停止后续推进: {stage_name}"
             decision.level = "error"
             return decision
+        if normalize_stage_name(stage_name) == "system_analysis":
+            stage_items = self._stage_items(db, task.id, stage_name)
+            if self._stage_archive_success_blocked(task, stage_name, stage_items, db=db):
+                decision.action = "wait_for_archive"
+                decision.event_type = "stage_terminal_waiting_for_archive"
+                decision.message = "系统分析业务执行已完成，但归档未完成，暂不允许进入后续阶段"
+                decision.level = "info"
+                decision.payload = {
+                    "state_event_id": state_event_id,
+                    "completed_stage": stage_name,
+                    "archive_gate_stage": stage_name,
+                }
+                return decision
         if (
             normalize_stage_name(stage_name) == "system_analysis"
             and status in {"success", "partial_success"}
@@ -2001,6 +2014,18 @@ class TaskStateMachineMixin:
                 },
             )
             self._finalize_task(db, task)
+            await self._write_task_metadata_async(task, metadata_path, status=task.status)
+            return True
+        if decision.action == "wait_for_archive":
+            self._record_event(
+                db,
+                task,
+                decision.event_type or "stage_terminal_waiting_for_archive",
+                decision.message or "",
+                level=decision.level,
+                stage_name=stage_name,
+                payload=dict(decision.payload or {}),
+            )
             await self._write_task_metadata_async(task, metadata_path, status=task.status)
             return True
         if decision.action == "advance_blocked":

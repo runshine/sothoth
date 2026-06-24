@@ -262,6 +262,88 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("finalize_success", decision.action)
         self.assertIsNone(decision.next_stage)
 
+    def test_decide_task_action_after_system_analysis_terminal_waits_for_archive(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="system_analysis",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[stage_item])
+
+        decision = self.manager._decide_task_action_after_stage_terminal(
+            db,
+            task,
+            stage_name="system_analysis",
+            status="success",
+            summary={},
+            payload={},
+            state_event_id="evt-1",
+        )
+
+        self.assertEqual("wait_for_archive", decision.action)
+        self.assertEqual("stage_terminal_waiting_for_archive", decision.event_type)
+
+    def test_apply_task_action_after_system_analysis_terminal_waits_for_archive(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="system_analysis",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        db = _ModelAwareDb(tasks=[task])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        with (
+            patch.object(
+                self.manager,
+                "_decide_task_action_after_stage_terminal",
+                return_value=task_manager_module._StageTerminalTaskDecision(
+                    action="wait_for_archive",
+                    event_type="stage_terminal_waiting_for_archive",
+                    level="info",
+                    payload={"state_event_id": "evt-1"},
+                ),
+            ),
+            patch.object(self.manager, "_record_event") as record_event,
+            patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
+        ):
+            applied = asyncio.run(
+                self.manager._apply_task_action_after_stage_terminal(
+                    db,
+                    task,
+                    stage_name="system_analysis",
+                    status="success",
+                    summary={},
+                    payload={},
+                    state_event_id="evt-1",
+                )
+            )
+
+        self.assertTrue(applied)
+        self.assertEqual("running", task.status)
+        self.assertEqual("system_analysis", task.current_stage)
+        event_types = [call.args[2] for call in record_event.call_args_list]
+        self.assertIn("stage_terminal_waiting_for_archive", event_types)
+
     def test_apply_task_action_after_stage_terminal_activates_streaming_tail(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="system_analysis", workspace_root="/tmp/ws", output_root="/tmp/out")
         db = _ModelAwareDb(tasks=[task])

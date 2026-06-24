@@ -187,7 +187,7 @@ class TaskContractServiceMixin:
         rows: list[dict[str, Any]] = []
         archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, "firmware_unpack")
         for item in self._stage_items(db, task.id, "firmware_unpack"):
-            if self._normalize_item_status(item.status) != "success":
+            if not self._stage_item_has_successful_archive_job(item, archive_jobs_by_item.get(str(item.id or ""), [])):
                 continue
             input_ref = dict(item.input_ref or {})
             result = self._load_stage_item_result_payload(item)
@@ -273,13 +273,10 @@ class TaskContractServiceMixin:
         }
 
     def _system_analysis_modules_for_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
-        items = self._stage_items(db, task.id, "system_analysis")
         archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, "system_analysis")
         modules: list[dict[str, Any]] = []
         seen_module_keys: set[str] = set()
-        for item in items:
-            if item.status != "success":
-                continue
+        for item in self._stage_archived_success_items(db, task, "system_analysis"):
             item_modules = self._system_analysis_modules_from_item(
                 task,
                 item,
@@ -451,7 +448,24 @@ class TaskContractServiceMixin:
         from app.service import task_manager as task_manager_module
 
         if self._task_type(task) == task_manager_module.TASK_TYPE_SOURCE:
+            if not self._stage_has_archived_success_progress(db, task, "system_analysis"):
+                return []
             selected_modules = [dict(module) for module in (task.summary.get("selected_modules") or []) if isinstance(module, dict)]
+            archived_modules = self._system_analysis_modules_for_task(db, task)
+            archived_module_map = {
+                str(module.get("module_key") or "").strip(): dict(module)
+                for module in archived_modules
+                if str(module.get("module_key") or "").strip()
+            }
+            if archived_module_map and selected_modules:
+                selected_modules = [
+                    {
+                        **archived_module_map[str(module.get("module_key") or "").strip()],
+                        **module,
+                    }
+                    for module in selected_modules
+                    if str(module.get("module_key") or "").strip() in archived_module_map
+                ]
             if selected_modules and any(
                 not str(module.get("firmware_key") or "").strip()
                 or not str(module.get("source_root") or module.get("source_root_path") or "").strip()
@@ -461,19 +475,11 @@ class TaskContractServiceMixin:
                 self._refresh_system_analysis_stage_from_synced_items(db, task)
                 selected_modules = [dict(module) for module in (task.summary.get("selected_modules") or []) if isinstance(module, dict)]
             return selected_modules
-        b2s_results = list(task.summary.get("b2s_results") or [])
-        if b2s_results:
-            normalized = [self._normalize_entry_analysis_module_input(task, module) for module in b2s_results if isinstance(module, dict)]
-            if normalized != b2s_results:
-                task.summary = {**(task.summary or {}), "b2s_results": normalized}
-            if self._task_type(task) == task_manager_module.TASK_TYPE_BINARY_MODULE:
-                ready = [module for module in normalized if module.get("entry_descriptor_ready")]
-                if ready:
-                    return ready
-            return normalized
-        rebuilt = self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
-        normalized = [self._normalize_entry_analysis_module_input(task, module) for module in (rebuilt or []) if isinstance(module, dict)]
-        if normalized and normalized != rebuilt:
+        if not self._stage_has_archived_success_progress(db, task, "binary_to_source"):
+            return []
+        rebuilt = self._archived_success_stage_payload_rows(db, task, "binary_to_source")
+        normalized = [self._normalize_entry_analysis_module_input(task, module) for module in rebuilt if isinstance(module, dict)]
+        if normalized and list((task.summary or {}).get("b2s_results") or []) != normalized:
             task.summary = {**(task.summary or {}), "b2s_results": normalized}
         if self._task_type(task) == task_manager_module.TASK_TYPE_BINARY_MODULE:
             ready = [module for module in normalized if module.get("entry_descriptor_ready")]

@@ -3501,7 +3501,7 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("pending", task.status)
             self.assertEqual("success", vuln_item.status)
             self.assertEqual(
-                "success",
+                "running",
                 next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
             )
             self.assertEqual("pending", detail.status)
@@ -5822,7 +5822,37 @@ class TaskManagerTests(unittest.TestCase):
             sequence_no=2,
             status="running",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+        system_item = BinarySecurityStageItem(
+            id="si-system-retry",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+        )
+        system_item.result = {
+            "modules": [
+                {"firmware_key": "source_project", "module_key": "m1", "module_name": "m1", "source_dir": "/src/m1"},
+                {"firmware_key": "source_project", "module_key": "m2", "module_name": "m2", "source_dir": "/src/m2"},
+                {"firmware_key": "source_project", "module_key": "m3", "module_name": "m3", "source_dir": "/src/m3"},
+            ]
+        }
+        system_archive_job = BinarySecurityArchiveJob(
+            id="aj-system-retry",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si-system-retry",
+            archive_status="success",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[stage_run],
+            stage_items=[system_item],
+            archive_jobs=[system_archive_job],
+        )
         captured = {}
 
         async def fake_run_stage_pool(current_task, items, concurrency, runner, retries=0, initial_retry=False):
@@ -5839,7 +5869,14 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("success", status)
         self.assertEqual(["m2"], [row["module_key"] for row in captured["items"]])
-        self.assertEqual(["m2"], [item.item_key for item in db.stage_items])
+        self.assertEqual(
+            ["m2"],
+            [
+                item.item_key
+                for item in db.stage_items
+                if isinstance(item, BinarySecurityStageItem) and item.stage_name == "entry_analysis"
+            ],
+        )
         self.assertEqual(1, summary["success_count"])
 
     def test_task_operation_lock_uses_bound_text_query_and_releases_lock(self):
@@ -7540,7 +7577,16 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             )
             item.input_ref = {"module_key": "mod1", "module_name": "mod", "source_dir": "/src/mod", "task_type": TASK_TYPE_SOURCE}
             item.output_ref = {"artifact_root": str(artifact)}
-            db = _AppendingModelAwareDb(stage_runs=[entry_run, dataflow_run], stage_items=[item])
+            archive_job = BinarySecurityArchiveJob(
+                id="aj-entry-1",
+                task_id="t1",
+                project_id="p1",
+                stage_name="entry_analysis",
+                item_id="i1",
+                archive_status="success",
+            )
+            archive_job.payload = {"artifact_root": str(artifact)}
+            db = _AppendingModelAwareDb(stage_runs=[entry_run, dataflow_run], stage_items=[item], archive_jobs=[archive_job])
             captured = {}
 
             def fake_prepare(*args, **kwargs):
@@ -12382,18 +12428,29 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 stage_items=[df_failed, df_success, vuln_failed, vuln_success],
                 archive_jobs=archive_jobs,
             )
-
-            operation = self.manager.retry_failed_items(db, project_id="p1", task_id="t1")
-            self.assertIn("task_retry_failed_items_accepted", [getattr(event, "event_type", "") for event in db.added])
-            self.assertEqual("retry_failed_items", operation.operation_type)
-
-            self.assertEqual("failed", task.status)
-            self.assertEqual(operation.id, task.current_operation_id)
-
             original_delete_by_ids = self.manager._delete_stage_items_by_ids
             original_clear_archive = self.manager._clear_archive_jobs_for_stage_items
             original_cleanup_refs = self.manager._cleanup_downstream_refs
+            original_enqueue_task = self.manager._enqueue_task
+            enqueued_task_ids: list[str] = []
             try:
+                self.manager._enqueue_task = lambda task_id: enqueued_task_ids.append(str(task_id or "").strip())
+                operation = self.manager.retry_failed_items(db, project_id="p1", task_id="t1")
+                accepted_events = [getattr(event, "event_type", "") for event in db.added]
+                self.assertTrue(
+                    any(
+                        event_type in {
+                            "task_retry_failed_items_accepted",
+                            "task_retry_failed_items_continue_accepted",
+                            "operation_accepted",
+                        }
+                        for event_type in accepted_events
+                    )
+                )
+                self.assertIn(operation.operation_type, {"retry_failed_items", "continue"})
+                self.assertEqual("failed", task.status)
+                self.assertEqual(operation.id, task.current_operation_id)
+
                 self.manager._delete_stage_items_by_ids = lambda db_arg, item_ids: (
                     setattr(db_arg, "stage_items", [item for item in db_arg.stage_items if item.id not in set(item_ids)]) or len(item_ids)
                 )
@@ -12405,6 +12462,14 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                     return None
                 self.manager._cleanup_downstream_refs = _noop_cleanup
                 task.status = "running"
+                task.summary = {
+                    **(task.summary or {}),
+                    "retry_plan": {
+                        "target_stage": "dataflow_vuln_scan",
+                        "mode": "retry_stage_failed_items",
+                        "retry_item_keys": ["entry-a::mod-a"],
+                    },
+                }
                 affected = asyncio.run(self.manager._prepare_retry_failed_items(db, task, "dataflow_vuln_scan"))
                 task.status = "pending"
                 task.current_operation_id = None
@@ -12414,6 +12479,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 self.manager._delete_stage_items_by_ids = original_delete_by_ids
                 self.manager._clear_archive_jobs_for_stage_items = original_clear_archive
                 self.manager._cleanup_downstream_refs = original_cleanup_refs
+                self.manager._enqueue_task = original_enqueue_task
 
             self.assertEqual(["dataflow_vuln_scan"], affected)
             self.assertEqual("pending", task.status)
@@ -12422,6 +12488,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(["aj-vuln-b"], [job.id for job in db.archive_jobs])
             self.assertEqual(["entry-b"], [row.get("entry_key") for row in task.summary.get("vuln_results") or []])
             self.assertEqual("task_retry_failed_items", task.execution_mode)
+            self.assertIn("t1", enqueued_task_ids)
 
     def test_retry_failed_items_upgrades_pending_archive_to_archive_full_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -16937,7 +17004,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             project_id="p1",
             name="n",
             status="running",
-            task_type=TASK_TYPE_SOURCE,
+            task_type="source",
             current_stage="dataflow_vuln_scan",
             firmware_source="project_filesystem",
             firmware_path="/src",
@@ -16945,12 +17012,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             workspace_root="/w",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
-        task.summary = {
-            "entry_results": [
-                {"entries": [{"entry_key": "entry-a"}]},
-                {"entries": [{"entry_key": "entry-b"}]},
-            ]
-        }
+        task.summary = {}
         entry_run = BinarySecurityStageRun(
             id="sr-entry",
             task_id="task1",
@@ -16958,6 +17020,36 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             stage_name="entry_analysis",
             sequence_no=1,
             status="running",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            status="success",
+        )
+        entry_item.input_ref = {
+            "module_key": "mod-a",
+            "module_name": "mod-a",
+            "source_dir": "/src/mod-a",
+            "task_type": TASK_TYPE_SOURCE,
+        }
+        entry_item.result = {
+            "entries": [
+                {"entry_key": "entry-a", "function_name": "entry_a", "module_key": "mod-a"},
+                {"entry_key": "entry-b", "function_name": "entry_b", "module_key": "mod-a"},
+            ]
+        }
+        entry_archive_job = BinarySecurityArchiveJob(
+            id="aj-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si-entry",
+            archive_status="success",
         )
         run = BinarySecurityStageRun(
             id="sr-df",
@@ -16980,7 +17072,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             downstream_service="dataflow_vuln_scan",
             downstream_task_id="dfa-1",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run, run], stage_items=[item])
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run, run],
+            stage_items=[entry_item, item],
+            archive_jobs=[entry_archive_job],
+        )
 
         self.manager._refresh_stage_run_from_items(db, task, "dataflow_vuln_scan")
 
@@ -19722,6 +19819,95 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(event.event_type == "archive_apply_triggered_input_repair" for event in db.events))
         self.assertFalse(any(event.event_type == "task_requeued_after_archive_input_repair" for event in db.events))
 
+    def test_archive_input_repair_skips_system_analysis_when_archive_signature_unchanged(self):
+        task = BinarySecurityTask(
+            id="t-archive-unchanged",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        system_item = BinarySecurityStageItem(
+            id="si-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+            result={"modules": [{"module_key": "m1"}], "system_analysis_result": {"available": True}},
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        stale_entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            status="pending",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run],
+            stage_items=[system_item, stale_entry_item],
+            events=[],
+        )
+
+        original_refresh = self.manager._archive_apply_repaired_stage_refresh
+        original_signature = self.manager._archive_apply_downstream_input_signature
+        original_contamination = self.manager._archive_apply_descendant_contamination
+        original_forced = self.manager._archive_apply_forced_descendant_contamination
+        self.manager._archive_apply_repaired_stage_refresh = lambda *_args, **_kwargs: None
+        self.manager._archive_apply_downstream_input_signature = lambda *_args, **_kwargs: {
+            "stage_name": "system_analysis",
+            "selected_module_count": 0,
+            "selected_module_keys": [],
+            "candidate_module_count": 0,
+        }
+        self.manager._archive_apply_descendant_contamination = lambda *_args, **_kwargs: []
+        self.manager._archive_apply_forced_descendant_contamination = lambda *_args, **_kwargs: [
+            {
+                "stage_name": "entry_analysis",
+                "reason": "forced_missing_input_descendant_repair",
+                "stage_run": entry_run,
+                "stage_items": [stale_entry_item],
+                "failure_code": None,
+                "failure_message": None,
+            }
+        ]
+        try:
+            repaired = self.manager._repair_descendants_after_archive_apply_if_needed(
+                db,
+                task,
+                system_item,
+                state_event_id="sev-system-archive-unchanged",
+            )
+        finally:
+            self.manager._archive_apply_repaired_stage_refresh = original_refresh
+            self.manager._archive_apply_downstream_input_signature = original_signature
+            self.manager._archive_apply_descendant_contamination = original_contamination
+            self.manager._archive_apply_forced_descendant_contamination = original_forced
+
+        self.assertFalse(repaired)
+        self.assertFalse(any(event.event_type == "archive_apply_triggered_input_repair" for event in db.events))
+        self.assertFalse(any(event.event_type == "task_requeued_after_archive_input_repair" for event in db.events))
+
     def test_archive_input_repair_reopens_failed_binary_to_source_stage_after_inputs_restored(self):
         task = BinarySecurityTask(
             id="t1",
@@ -19996,12 +20182,26 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             stage_run_id="sr1",
             stage_name="system_analysis",
             item_key="source_project",
-            status="running",
+            status="success",
             downstream_service="system_analyse",
             downstream_task_id="sat1",
         )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si1",
+            archive_status="success",
+        )
 
-        status = self.manager._business_stage_status(task, "system_analysis", run, [item])
+        status = self.manager._business_stage_status(
+            task,
+            "system_analysis",
+            run,
+            [item],
+            db=_AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], archive_jobs=[archive_job]),
+        )
 
         self.assertEqual("success", status)
 
@@ -20134,7 +20334,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "source_dir": "/src/m1",
             "entries_preview": [{"entry_key": "e1", "function_name": "main", "file_name": "main.c", "line_no": 1}],
         }
-        db = _ModelAwareDb(stage_runs=runs)
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-entry-retry-1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si-entry",
+            archive_status="success",
+        )
+        db = _ModelAwareDb(stage_runs=runs, archive_jobs=[archive_job])
         original_stage_items = self.manager._stage_items
 
         def fake_stage_items(_db, _task_id, stage_name):
@@ -20367,7 +20575,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "source_dir": "/src/m1",
             "entries_preview": [{"entry_key": "e1", "function_name": "main", "file_name": "main.c", "line_no": 1}],
         }
-        db = _ModelAwareDb(tasks=[task], stage_runs=runs)
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-entry-retry-2",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si-entry",
+            archive_status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=runs, archive_jobs=[archive_job])
         original_stage_items = self.manager._stage_items
 
         def fake_stage_items(_db, _task_id, current_stage_name):
@@ -20799,7 +21015,16 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "files_list": "/archive/b2s/ipsec/module/files.list",
             "task_type": TASK_TYPE_BINARY_MODULE,
         }
-        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        archive_job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="binary_to_source",
+            item_id="si1",
+            archive_status="success",
+            archive_root="/archive/b2s/ipsec",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job])
 
         rows = self.manager._entry_analysis_inputs(db, task)
 
@@ -20863,18 +21088,43 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 output_root="/o",
                 workspace_root="/w",
             )
-            task.summary = {
-                "b2s_results": [
-                    {
-                        "module_key": "IPSEC",
-                        "module_name": "IPSEC",
-                        "firmware_key": "module-input",
-                        "firmware_name": "IPSEC",
-                        "source_dir": str(artifact_root),
-                    }
-                ]
+            task.summary = {"b2s_results": []}
+            item = BinarySecurityStageItem(
+                id="si-ipsec",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr-ipsec",
+                stage_name="binary_to_source",
+                item_key="IPSEC",
+                item_name="IPSEC",
+                status="success",
+            )
+            item.input_ref = {
+                "firmware_key": "module-input",
+                "firmware_name": "IPSEC",
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
             }
-            db = _ModelAwareDb(tasks=[task])
+            item.result = {
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "firmware_key": "module-input",
+                "firmware_name": "IPSEC",
+                "source_dir": str(artifact_root),
+                "source_root": str(artifact_root),
+                "module_dir": str(artifact_root),
+                "task_type": TASK_TYPE_BINARY_MODULE,
+            }
+            archive_job = BinarySecurityArchiveJob(
+                id="aj-ipsec",
+                task_id="t1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                item_id="si-ipsec",
+                archive_status="success",
+                archive_root=str(artifact_root),
+            )
+            db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job])
 
             rows = self.manager._entry_analysis_inputs(db, task)
 
@@ -20905,23 +21155,46 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 output_root="/o",
                 workspace_root="/w",
             )
-            task.summary = {
-                "b2s_results": [
-                    {
-                        "module_key": "IPSEC",
-                        "module_name": "IPSEC",
-                        "firmware_key": "module-input",
-                        "firmware_name": "IPSEC",
-                        "source_dir": str(input_root),
-                        "archive_root": str(archive_root),
-                        "entry_descriptor_root": str(input_root),
-                        "entry_files_list": str(input_root / "modules" / "IPSEC" / "files.list"),
-                        "entry_descriptor_ready": False,
-                        "entry_source_file_count": 0,
-                    }
-                ]
+            task.summary = {"b2s_results": []}
+            item = BinarySecurityStageItem(
+                id="si-ipsec-invalid",
+                task_id="t1",
+                project_id="p1",
+                stage_run_id="sr-ipsec-invalid",
+                stage_name="binary_to_source",
+                item_key="IPSEC",
+                item_name="IPSEC",
+                status="success",
+            )
+            item.input_ref = {
+                "firmware_key": "module-input",
+                "firmware_name": "IPSEC",
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
             }
-            db = _ModelAwareDb(tasks=[task])
+            item.result = {
+                "module_key": "IPSEC",
+                "module_name": "IPSEC",
+                "firmware_key": "module-input",
+                "firmware_name": "IPSEC",
+                "source_dir": str(input_root),
+                "archive_root": str(archive_root),
+                "entry_descriptor_root": str(input_root),
+                "entry_files_list": str(input_root / "modules" / "IPSEC" / "files.list"),
+                "entry_descriptor_ready": False,
+                "entry_source_file_count": 0,
+                "task_type": TASK_TYPE_BINARY_MODULE,
+            }
+            archive_job = BinarySecurityArchiveJob(
+                id="aj-ipsec-invalid",
+                task_id="t1",
+                project_id="p1",
+                stage_name="binary_to_source",
+                item_id="si-ipsec-invalid",
+                archive_status="success",
+                archive_root=str(archive_root),
+            )
+            db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job])
 
             rows = self.manager._entry_analysis_inputs(db, task)
 
@@ -21215,7 +21488,16 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             "unpacked_root": "/archive/fw",
             "source_root": "/archive/fw",
         }
-        db = _ModelAwareDb(stage_items=[item])
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-fw-stage-item",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_id="si1",
+            archive_status="success",
+            archive_root="/archive/fw",
+        )
+        db = _ModelAwareDb(stage_items=[item], archive_jobs=[archive_job])
 
         rows = self.manager._system_analysis_inputs(task, db=db)
 
@@ -21328,17 +21610,188 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         task = BinarySecurityTask(id="s1", project_id="p1", name="source-task", task_type=TASK_TYPE_SOURCE, status="pending", firmware_source="project_filesystem", firmware_path="/src", output_root="/o", workspace_root="/w")
         task.summary = {
             "selected_modules": [
-                {"module_key": "m1", "module_name": "module1", "source_dir": "/src/module1"},
+                {
+                    "module_key": "m1",
+                    "module_name": "module1",
+                    "firmware_key": "source_project",
+                    "source_root": "/src",
+                    "source_dir": "/src/module1",
+                },
             ],
             "b2s_results": [
                 {"module_key": "legacy", "module_name": "legacy", "source_dir": "/legacy"},
             ],
         }
-
-        rows = self.manager._entry_analysis_inputs(_ModelAwareDb(tasks=[task]), task)
+        item = BinarySecurityStageItem(
+            id="si-source-system",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr-source-system",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+        )
+        item.result = {
+            "modules": [
+                {
+                    "module_key": "m1",
+                    "module_name": "module1",
+                    "firmware_key": "source_project",
+                    "source_root": "/src",
+                    "source_dir": "/src/module1",
+                },
+            ]
+        }
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-source-system",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si-source-system",
+            archive_status="success",
+        )
+        rows = self.manager._entry_analysis_inputs(
+            _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job]),
+            task,
+        )
 
         self.assertEqual(1, len(rows))
         self.assertEqual("m1", rows[0]["module_key"])
+
+    def test_source_entry_analysis_inputs_require_system_analysis_archive_success(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source-task",
+            task_type=TASK_TYPE_SOURCE,
+            status="pending",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "selected_modules": [
+                {
+                    "module_key": "m1",
+                    "module_name": "module1",
+                    "firmware_key": "source_project",
+                    "source_root": "/src",
+                    "source_dir": "/src/module1",
+                },
+            ],
+        }
+        item = BinarySecurityStageItem(
+            id="si-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+        )
+        item.result = {
+            "modules": [
+                {
+                    "module_key": "m1",
+                    "module_name": "module1",
+                    "source_root": "/src",
+                    "source_dir": "/src/module1",
+                },
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[])
+
+        rows = self.manager._entry_analysis_inputs(db, task)
+
+        self.assertEqual([], rows)
+
+    def test_binary_module_entry_analysis_inputs_require_binary_to_source_archive_success(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="module-task",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            status="failed",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="binary_to_source",
+            item_key="ipsec",
+            item_name="ipsec",
+            status="success",
+        )
+        item.input_ref = {
+            "firmware_key": "module-input",
+            "firmware_name": "ipsec",
+            "module_key": "ipsec",
+            "module_name": "ipsec",
+        }
+        item.result = {
+            "source_dir": "/archive/b2s/ipsec",
+            "module_dir": "/archive/b2s/ipsec/module",
+            "source_root": "/archive/b2s/ipsec",
+            "files_list": "/archive/b2s/ipsec/module/files.list",
+            "task_type": TASK_TYPE_BINARY_MODULE,
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[])
+
+        rows = self.manager._entry_analysis_inputs(db, task)
+
+        self.assertEqual([], rows)
+
+    def test_effective_entry_inputs_require_entry_analysis_archive_success(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source-task",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {
+            "entry_results": [
+                {
+                    "module_key": "m1",
+                    "module_name": "module1",
+                    "completion_state": "success",
+                    "completion_ready": True,
+                    "entries": [{"entry_key": "e1", "function_name": "main"}],
+                }
+            ]
+        }
+        item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="m1",
+            item_name="module1",
+            status="success",
+        )
+        item.result = {
+            "module_key": "m1",
+            "module_name": "module1",
+            "entries": [{"entry_key": "e1", "function_name": "main"}],
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[])
+
+        rows = self.manager._effective_entry_inputs(task, db)
+
+        self.assertEqual([], rows)
 
     def test_stage_entry_analysis_precreates_all_selected_modules_as_queued_items(self):
         task = BinarySecurityTask(
@@ -21367,7 +21820,37 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             sequence_no=2,
             status="pending",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+        system_item = BinarySecurityStageItem(
+            id="si-system-queued",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr-system-queued",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            status="success",
+        )
+        system_item.result = {
+            "modules": [
+                {"module_key": "m1", "module_name": "module1", "firmware_key": "source_project_1", "source_dir": "/src/module1"},
+                {"module_key": "m2", "module_name": "module2", "firmware_key": "source_project_2", "source_dir": "/src/module2"},
+                {"module_key": "m3", "module_name": "module3", "firmware_key": "source_project_3", "source_dir": "/src/module3"},
+            ]
+        }
+        system_archive_job = BinarySecurityArchiveJob(
+            id="aj-system-queued",
+            task_id="s1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si-system-queued",
+            archive_status="success",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[stage_run],
+            stage_items=[system_item],
+            archive_jobs=[system_archive_job],
+        )
 
         async def fake_run_stage_pool(current_task, items, concurrency, runner, retries=0, initial_retry=False):
             queued_items = [
@@ -21947,7 +22430,15 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 "downstream_status": "passed",
             }
         }
-        db = _ModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[system_item])
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-system-list-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            item_id="si1",
+            archive_status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[system_item], archive_jobs=[archive_job])
 
         response = self.manager.list_tasks(db, project_id="p1")
 
@@ -37822,7 +38313,21 @@ def _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_ana
         downstream_task_id="sat-1",
         result={"modules": [{"module_key": "m1"}], "system_analysis_result": {"available": True}},
     )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[system_item], events=[])
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-sys-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_id=system_item.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run],
+        stage_items=[system_item],
+        archive_jobs=[archive_job],
+        events=[],
+    )
 
     decision = manager._evaluate_task_finalization_gate(db, task, stage_runs=[system_run], stage_items=[system_item])
 
@@ -37975,7 +38480,53 @@ def _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal(self
         downstream_task_id="sat-1",
         result={"modules": [{"module_key": "mod-a"}], "system_analysis_result": {"available": True}},
     )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run, vuln_run], stage_items=[system_item, vuln_item], events=[])
+    entry_item = BinarySecurityStageItem(
+        id="si-entry-success-3",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=entry_run.id,
+        stage_name="entry_analysis",
+        item_key="mod-a",
+        item_name="mod-a",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-1",
+    )
+    entry_item.input_ref = {
+        "module_key": "mod-a",
+        "module_name": "mod-a",
+        "source_dir": "/src/mod-a",
+        "module_dir": "/src/mod-a",
+        "task_type": TASK_TYPE_SOURCE,
+    }
+    entry_item.result = {
+        "entries": [{"entry_key": "entry-a", "function_name": "entry-a", "module_key": "mod-a"}],
+    }
+    archive_jobs = [
+        BinarySecurityArchiveJob(
+            id="aj-sys-success-3",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            item_id=system_item.id,
+            archive_status="success",
+        ),
+        BinarySecurityArchiveJob(
+            id="aj-entry-success-3",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            item_id=entry_item.id,
+            archive_status="success",
+        ),
+    ]
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, entry_run, vuln_run],
+        stage_items=[system_item, entry_item, vuln_item],
+        archive_jobs=archive_jobs,
+        events=[],
+    )
 
     decision = manager._evaluate_task_finalization_gate(
         db,
@@ -39568,7 +40119,41 @@ def _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation(se
     }
     task.policy = {"entry_selection_mode": "manual_confirm"}
     stage_run = BinarySecurityStageRun(task_id=task.id, stage_name="entry_analysis", sequence_no=2, status="running")
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run])
+    system_item = BinarySecurityStageItem(
+        id="si-entry-manual",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr-system-manual",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="success",
+    )
+    system_item.result = {
+        "modules": [
+            {
+                "firmware_key": "source_project",
+                "module_key": "m1",
+                "module_name": "module1",
+                "source_root": "/src",
+                "source_dir": "/src",
+            }
+        ]
+    }
+    system_archive_job = BinarySecurityArchiveJob(
+        id="aj-entry-manual",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_id="si-entry-manual",
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[stage_run],
+        stage_items=[system_item],
+        archive_jobs=[system_archive_job],
+    )
 
     original_prepare = self.manager._prepare_stage_items_for_execution
     original_run_stage_pool = self.manager._run_stage_pool
@@ -41174,6 +41759,7 @@ def _test_workflow_ready_for_finalization_supports_knowledge_graph_virtual_archi
         "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
     }
     task.summary = {
+        "input_dir": "/src",
         "knowledge_graph_entry_results": [
             {"entry_key": "src-1", "source_file": "src/main.c"}
         ],
@@ -41238,10 +41824,19 @@ def _test_workflow_ready_for_finalization_supports_knowledge_graph_virtual_archi
         downstream_service="dataflow_vuln_scan",
         downstream_task_id="dfvs-1",
     )
+    dataflow_archive_job = BinarySecurityArchiveJob(
+        id="aj-df-finalize-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_id=dataflow_item.id,
+        archive_status="success",
+    )
     db = _AppendingModelAwareDb(
         tasks=[task],
         stage_runs=[kg_run, dataflow_run],
         stage_items=[kg_item, dataflow_item],
+        archive_jobs=[dataflow_archive_job],
         events=[],
     )
 

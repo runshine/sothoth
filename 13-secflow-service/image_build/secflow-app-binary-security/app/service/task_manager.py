@@ -4414,7 +4414,30 @@ class TaskManager(
             if int(module.get("execution_epoch") or 0) == current_epoch
         ]
 
-    def _entry_result_success_modules(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+    def _entry_result_success_modules(self, task: BinarySecurityTask, db: Session | None = None) -> list[dict[str, Any]]:
+        if db is not None:
+            if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+                if not self._stage_has_archived_success_progress(db, task, "knowledge_graph_entry_fetch"):
+                    return []
+            else:
+                modules: list[dict[str, Any]] = []
+                seen: set[tuple[str, int]] = set()
+                for item in self._stage_archived_success_items(db, task, "entry_analysis"):
+                    normalized = self._entry_module_result_from_stage_item(task, item)
+                    key = (
+                        str(normalized.get("module_key") or "").strip(),
+                        int(normalized.get("execution_epoch") or 0),
+                    )
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    modules.append(normalized)
+                return [
+                    module
+                    for module in modules
+                    if str(module.get("completion_state") or "").strip() == "success"
+                    and bool(module.get("completion_ready"))
+                ]
         return [
             module
             for module in self._entry_result_modules_for_current_epoch(task)
@@ -4509,9 +4532,9 @@ class TaskManager(
     def _entry_module_completion_gate(self, task: BinarySecurityTask, db: Session) -> bool:
         return bool(self._entry_module_completion_state(task, db).get("complete"))
 
-    def _entry_module_flow_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+    def _entry_module_flow_inputs(self, task: BinarySecurityTask, db: Session | None = None) -> list[dict[str, Any]]:
         entries: list[dict[str, Any]] = []
-        for module in self._entry_result_success_modules(task):
+        for module in self._entry_result_success_modules(task, db):
             module_key = str(module.get("module_key") or "").strip()
             module_name = str(module.get("module_name") or "").strip()
             module_kind = str(module.get("module_kind") or "").strip()
@@ -4584,15 +4607,15 @@ class TaskManager(
             if isinstance(entry, dict)
         ]
 
-    def _entry_candidates(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+    def _entry_candidates(self, task: BinarySecurityTask, db: Session | None = None) -> list[dict[str, Any]]:
         snapshot = self._entry_selection_snapshot(task)
         candidate_entries = snapshot.get("candidate_entries")
-        if isinstance(candidate_entries, list) and candidate_entries:
+        if db is None and isinstance(candidate_entries, list) and candidate_entries:
             return self._materialized_flow_entries(
                 task,
                 [dict(item) for item in candidate_entries if isinstance(item, dict)],
             )
-        return self._entry_module_flow_inputs(task)
+        return self._entry_module_flow_inputs(task, db)
 
     def _selected_entry_keys(self, task: BinarySecurityTask) -> list[str]:
         snapshot = self._entry_selection_snapshot(task)
@@ -4620,9 +4643,9 @@ class TaskManager(
             for entry in entries
         ]
 
-    def _effective_entry_inputs(self, task: BinarySecurityTask) -> list[dict[str, Any]]:
+    def _effective_entry_inputs(self, task: BinarySecurityTask, db: Session | None = None) -> list[dict[str, Any]]:
         if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_AUTO:
-            return self._entry_candidates(task)
+            return self._entry_candidates(task, db)
         selected_entries = self._selected_entries(task)
         if selected_entries:
             return selected_entries
@@ -4631,15 +4654,15 @@ class TaskManager(
             return []
         return [
             entry
-            for entry in self._entry_candidates(task)
+            for entry in self._entry_candidates(task, db)
             if str(entry.get("entry_key") or "").strip() in selected_keys
         ]
 
-    def _entry_selection_metrics(self, task: BinarySecurityTask) -> dict[str, int]:
+    def _entry_selection_metrics(self, task: BinarySecurityTask, db: Session | None = None) -> dict[str, int]:
         module_state = self._entry_module_completion_state(task, None)
         return {
-            "candidate_entry_count": len(self._entry_candidates(task)),
-            "selected_entry_count": len(self._effective_entry_inputs(task)) if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task)),
+            "candidate_entry_count": len(self._entry_candidates(task, db)),
+            "selected_entry_count": len(self._effective_entry_inputs(task, db)) if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task, db)),
             "expected_entry_module_count": int(module_state.get("expected_module_count") or 0),
             "materialized_entry_module_count": int(module_state.get("materialized_module_count") or 0),
             "successful_entry_module_count": int(module_state.get("successful_module_count") or 0),
@@ -4746,7 +4769,7 @@ class TaskManager(
             modules.append(self._entry_module_result_from_stage_item(task, item))
         task.summary = {**(task.summary or {}), "entry_results": modules}
         metrics = dict(task.metrics or {})
-        metrics.update(self._entry_selection_metrics(task))
+        metrics.update(self._entry_selection_metrics(task, db))
         metrics["entry_count"] = sum(int(module.get("entry_count") or 0) for module in modules)
         task.metrics = metrics
         if stage_run is not None:
@@ -6687,7 +6710,77 @@ class TaskManager(
         return "pending"
 
     def _stage_requires_archive_success_gate(self, task: BinarySecurityTask, stage_name: str) -> bool:
-        return self._is_streaming_tail_stage(task, stage_name) and normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage == "system_analysis":
+            return True
+        return self._is_streaming_tail_stage(task, stage_name) and normalized_stage == "dataflow_vuln_scan"
+
+    def _streaming_edges_for_task(self, task: BinarySecurityTask) -> tuple[tuple[str, str], ...]:
+        if not self._streaming_mode_enabled(task):
+            return ()
+        sequence = [stage for stage in self._stage_sequence_for_task(task) if self._stage_enabled(task, stage)]
+        if len(sequence) < 2:
+            return ()
+        return tuple((sequence[index], sequence[index + 1]) for index in range(len(sequence) - 1))
+
+    def _streaming_upstream_stage(self, task: BinarySecurityTask, downstream_stage: str | None) -> str | None:
+        normalized_downstream = normalize_stage_name(downstream_stage)
+        for upstream_stage, candidate_downstream in self._streaming_edges_for_task(task):
+            if normalize_stage_name(candidate_downstream) == normalized_downstream:
+                return upstream_stage
+        return None
+
+    def _stage_item_has_successful_archive_job(
+        self,
+        item: BinarySecurityStageItem,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> bool:
+        normalized_status = self._normalize_downstream_status(getattr(item, "status", None)) or str(getattr(item, "status", "") or "").strip().lower()
+        if normalized_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
+            return False
+        return any(str(getattr(job, "archive_status", "") or "").strip().lower() == "success" for job in list(archive_jobs or []))
+
+    def _stage_archived_success_items(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> list[BinarySecurityStageItem]:
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage == "knowledge_graph_entry_fetch":
+            return []
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalized_stage)
+        return [
+            item
+            for item in self._stage_items(db, task.id, normalized_stage)
+            if self._stage_item_has_successful_archive_job(item, archive_jobs_by_item.get(str(item.id or ""), []))
+        ]
+
+    def _stage_has_archived_success_progress(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage == "knowledge_graph_entry_fetch":
+            return str(self._virtual_archive_stage_status(db, task, normalized_stage) or "").strip().lower() == "success"
+        return bool(self._stage_archived_success_items(db, task, normalized_stage))
+
+    def _archived_success_stage_payload_rows(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> list[dict[str, Any]]:
+        return [
+            {
+                **dict(item.input_ref or {}),
+                **dict(item.output_ref or {}),
+                **self._load_stage_item_result_payload(item),
+            }
+            for item in self._stage_archived_success_items(db, task, stage_name)
+        ]
 
     def _stage_archive_jobs_by_item(self, db: Session, task_id: str, stage_name: str) -> dict[str, list[BinarySecurityArchiveJob]]:
         jobs = (
@@ -6802,6 +6895,8 @@ class TaskManager(
                 if normalized_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
                     continue
                 item_jobs = jobs_by_item.get(str(item.id or ""), [])
+                if not item_jobs:
+                    return True
                 if item_jobs and any(str(job.archive_status or "").strip() != "success" for job in item_jobs):
                     return True
             return False
@@ -7806,7 +7901,7 @@ class TaskManager(
         if normalized_stage == "knowledge_graph_entry_fetch":
             return bool(str(summary.get("input_dir") or "").strip())
         if normalized_stage == "dataflow_vuln_scan":
-            return bool(self._effective_entry_inputs(task))
+            return bool(self._effective_entry_inputs(task, db))
         return True
 
     def _should_hold_task_on_stage_after_requeue(
@@ -9809,7 +9904,7 @@ class TaskManager(
                 "entry_input_keys": [key for key in entry_keys if key],
             }
         if normalized_stage == "entry_analysis":
-            entry_results = self._effective_entry_inputs(task)
+            entry_results = self._effective_entry_inputs(task, db)
             entries: list[dict[str, Any]] = []
             for row in entry_results:
                 if isinstance(row, dict):
@@ -11090,15 +11185,15 @@ class TaskManager(
         status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
         entry_results = self._rebuild_entry_result_modules_from_stage_items(db, task, stage_run)
         entry_mode = self._entry_selection_mode(task)
-        candidate_entries = self._entry_candidates(task)
-        selected_entries = candidate_entries if entry_mode == ENTRY_SELECTION_MODE_AUTO else self._effective_entry_inputs(task)
+        candidate_entries = self._entry_candidates(task, db)
+        selected_entries = candidate_entries if entry_mode == ENTRY_SELECTION_MODE_AUTO else self._effective_entry_inputs(task, db)
         summary = {
             **summary,
             "entry_results": entry_results,
             "candidate_entry_count": len(candidate_entries),
             "selected_entry_count": len(selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
             "entry_count": sum(1 for _entry in selected_entries) if entry_mode == ENTRY_SELECTION_MODE_AUTO else 0,
-            **self._entry_selection_metrics(task),
+            **self._entry_selection_metrics(task, db),
         }
         if entry_mode == ENTRY_SELECTION_MODE_MANUAL_CONFIRM and status in {"success", "partial_success"}:
             task.summary = {
@@ -11117,7 +11212,7 @@ class TaskManager(
                 "candidate_entry_count": len(candidate_entries),
                 "selected_entry_count": 0,
                 "entry_count": 0,
-                **self._entry_selection_metrics(task),
+                **self._entry_selection_metrics(task, db),
             }
             self._set_task_status(
                 db,
@@ -11648,10 +11743,10 @@ class TaskManager(
         token: str | None,
         retry_existing: bool = False,
     ) -> tuple[str, dict[str, Any]]:
-        flow_inputs = self._effective_entry_inputs(task)
+        flow_inputs = self._effective_entry_inputs(task, db)
         if not flow_inputs:
             self._rebuild_entry_results_from_stage_items(db, task)
-            flow_inputs = self._effective_entry_inputs(task)
+            flow_inputs = self._effective_entry_inputs(task, db)
         entries = _deduplicate_entry_keys(flow_inputs)
         if not entries:
             module_state = self._entry_module_completion_state(task, db)
