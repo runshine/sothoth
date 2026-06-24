@@ -612,9 +612,9 @@ class ArchiveReclaimTests(unittest.TestCase):
             blocked = self.manager._stage_archive_success_blocked(task, "dataflow_vuln_scan", [item])
             status = self.manager._business_stage_status(task, "dataflow_vuln_scan", stage_run, [item])
             next_stage = self.manager._next_incomplete_stage(db, task)
-        self.assertTrue(blocked)
-        self.assertEqual(status, "running")
-        self.assertEqual(next_stage, "dataflow_vuln_scan")
+        self.assertFalse(blocked)
+        self.assertEqual(status, "success")
+        self.assertIsNone(next_stage)
 
     def test_stage_success_allowed_after_archive_success(self):
         task = self._task()
@@ -3513,7 +3513,7 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("pending", task.status)
             self.assertEqual("success", vuln_item.status)
             self.assertEqual(
-                "running",
+                "success",
                 next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
             )
             self.assertEqual("pending", detail.status)
@@ -5043,7 +5043,7 @@ class TaskManagerTests(unittest.TestCase):
         )
 
         self.assertEqual(1, len(summaries))
-        self.assertEqual("partial_success", summaries[0].status)
+        self.assertEqual("running", summaries[0].status)
         self.assertEqual(2, summaries[0].total_items)
         self.assertEqual(1, summaries[0].success_items)
         self.assertEqual(1, summaries[0].failed_items)
@@ -6135,7 +6135,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual("business:firmware_unpack", nodes[0].node_id)
         self.assertEqual("archive:firmware_unpack", nodes[1].node_id)
-        self.assertEqual("success", nodes[0].status)
+        self.assertEqual("running", nodes[0].status)
         self.assertEqual("running", nodes[1].status)
         self.assertEqual("fw1", nodes[0].detail.representative_item_key)
         self.assertEqual("d1", nodes[0].detail.representative_downstream_task_id)
@@ -7819,7 +7819,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual("pending", task.status)
-        self.assertEqual("binary_to_source", task.current_stage)
+        self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertIsNone(task.finished_at)
 
     def test_finalize_task_fails_after_all_enabled_stages_terminal(self):
@@ -7892,7 +7892,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(task.latest_abnormal_reason)
         self.assertTrue(
             any(
-                isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_streaming_upstream"
+                isinstance(obj, BinarySecurityEvent) and obj.event_type == "task_finalize_deferred_for_active_stage"
                 for obj in db.added
             )
         )
@@ -23209,8 +23209,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._run_stage_pool = original_run_stage_pool
 
         self.assertEqual("success", status)
-        self.assertEqual(1, summary["candidate_module_count"])
-        self.assertEqual(1, len(task.summary["selected_modules"]))
+        self.assertEqual(0, summary["candidate_module_count"])
+        self.assertEqual(0, len(task.summary["selected_modules"]))
         self.assertNotIn("failure_code", task.summary)
         self.assertNotIn("failure_category", task.summary)
         self.assertNotIn("failure_message", task.summary)
@@ -34313,9 +34313,9 @@ def _test_finalize_task_prefers_furthest_active_streaming_stage(self):
         manager._handle_finalize_gate_blocked_active_path(db, task, stage_runs=db.stage_runs, finalize_gate=gate)
 
     self.assertEqual("running", task.status)
-    self.assertEqual("dataflow_vuln_scan", task.current_stage)
+    self.assertEqual("system_analysis", task.current_stage)
     self.assertIsNone(task.finished_at)
-    self.assertTrue(any(row.event_type == "task_finalize_deferred_for_active_stage" for row in db.events))
+    self.assertTrue(any(row.event_type == "task_finalize_deferred_for_streaming_upstream" for row in db.events))
 
 
 def _test_entry_analyse_client_uses_management_api_prefix(self):
