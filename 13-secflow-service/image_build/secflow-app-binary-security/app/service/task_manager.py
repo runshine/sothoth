@@ -5516,6 +5516,18 @@ class TaskManager(
                 with self._savepoint(db):
                     db.add(stage_run)
                     db.flush()
+                self._record_event(
+                    db,
+                    task,
+                    "stage_run_created",
+                    f"阶段执行记录已创建: {stage_name}",
+                    stage_name=stage_name,
+                    payload={
+                        "stage_run_id": stage_run.id,
+                        "sequence_no": stage_run.sequence_no,
+                        "status": stage_run.status,
+                    },
+                )
                 return stage_run
             except IntegrityError:
                 existing = self._latest_stage_run(db, task.id, stage_name)
@@ -8285,6 +8297,26 @@ class TaskManager(
         if self._is_streaming_tail_stage(task, stage_name):
             return False
         return self._stage_has_materialized_inputs(db, task, stage_name)
+
+    def _stage_start_ready(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        allow_rebuild: bool = False,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        if not normalized_stage:
+            return False
+        if self._stage_has_real_runnable_work(db, task, normalized_stage):
+            return True
+        return self._stage_has_materialized_inputs(
+            db,
+            task,
+            normalized_stage,
+            allow_rebuild=allow_rebuild,
+        )
 
     def _stage_requires_materialized_inputs(self, task: BinarySecurityTask, stage_name: str) -> bool:
         normalized_stage = normalize_stage_name(stage_name)

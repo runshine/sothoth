@@ -57,6 +57,30 @@ class TaskReducerServiceMixin:
         current_stage = str(getattr(task, "current_stage", "") or "").strip()
         if current_stage and current_stage in sequence and stage_name in sequence and sequence.index(current_stage) > sequence.index(stage_name):
             return
+        if not self._stage_start_ready(db, task, stage_name, allow_rebuild=False):
+            self._record_main_state_write_blocked(
+                db,
+                task,
+                source="state_reducer",
+                attempted_stage_name=stage_name,
+                attempted_status="running",
+                reason="stage_worker_start_requested_not_materialized",
+            )
+            self._request_task_layer_reconcile(
+                db,
+                task,
+                stage_name=stage_name,
+                source_event_type=event.event_type,
+                state_event_id=event.id,
+                reconcile_reason="stage_worker_start_requested",
+                message="阶段启动请求已收到，但当前阶段尚无真实可执行输入，已等待 owner worker 后续接管",
+                event_payload={
+                    "stage_retry_mode": bool(payload.get("stage_retry_mode")),
+                    "task_retry_mode": bool(payload.get("task_retry_mode")),
+                    "target_stage_name": payload.get("target_stage_name"),
+                },
+            )
+            return
         stage_run = self._ensure_stage_run(db, task, stage_name)
         if str(getattr(stage_run, "status", "") or "").strip() in TASK_TERMINAL_STATUSES and getattr(stage_run, "finished_at", None):
             return

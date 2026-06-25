@@ -2327,7 +2327,7 @@ class TaskRuntimeServiceMixin:
                     and self._source_entry_analysis_barrier_enabled(task)
                     and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
                 ):
-                    continue
+                    break
                 if not self._stage_enabled(task, stage_name):
                     stage_run = self._ensure_stage_run(db, task, stage_name)
                     stage_run.status = "success"
@@ -2352,6 +2352,8 @@ class TaskRuntimeServiceMixin:
                     )
                     db.commit()
                     continue
+                if not self._stage_start_ready(db, task, stage_name, allow_rebuild=False):
+                    break
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 if stage_name == "entry_analysis":
                     self._rebuild_missing_entry_analysis_stage_items_from_inputs(

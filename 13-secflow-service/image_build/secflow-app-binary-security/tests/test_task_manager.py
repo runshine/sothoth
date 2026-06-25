@@ -42112,6 +42112,115 @@ def _test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized(self
     self.assertTrue(any(event.event_type == "dataflow_activation_blocked_until_entry_analysis_materialized" for event in db.events))
 
 
+def _test_should_not_auto_advance_to_entry_analysis_with_only_empty_stage_run(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-empty-entry-run",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "system_analysis_modules": [{"module_key": "m1", "module_name": "module1", "risk_level": "high"}],
+    }
+    system_run = BinarySecurityStageRun(
+        id="sr-empty-entry-system",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="success",
+        finished_at=_now(),
+    )
+    entry_run = BinarySecurityStageRun(
+        id="sr-empty-entry-pending",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=2,
+        status="pending",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[system_run, entry_run],
+        stage_items=[],
+        archive_jobs=[],
+        events=[],
+    )
+
+    self.assertFalse(manager._should_auto_advance_to_stage(db, task, "entry_analysis"))
+
+
+def _test_reducer_stage_worker_start_requested_does_not_materialize_future_stage_run_without_inputs(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-reducer-no-materialize",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {"system_analysis_modules": [{"module_key": "m1"}]}
+    event = BinarySecurityStateEvent(
+        id="se-no-materialize",
+        task_id=task.id,
+        project_id=task.project_id,
+        event_type="stage_worker_start_requested",
+        stage_name="entry_analysis",
+        payload={"stage_name": "entry_analysis"},
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[],
+        stage_items=[],
+        archive_jobs=[],
+        events=[],
+        state_events=[event],
+    )
+
+    with patch.object(manager, "_request_task_layer_reconcile") as request_reconcile:
+        manager._apply_stage_worker_start_requested_locked(db, event)
+
+    self.assertEqual([], [run for run in db.stage_runs if run.stage_name == "entry_analysis"])
+    self.assertTrue(request_reconcile.called)
+
+
+def _test_ensure_stage_run_records_timeline_event_when_created(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-stage-run-event",
+        project_id="p1",
+        name="source",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], events=[])
+
+    stage_run = manager._ensure_stage_run(db, task, "system_analysis")
+
+    self.assertIsNotNone(stage_run)
+    matching = [event for event in db.events if event.event_type == "stage_run_created"]
+    self.assertEqual(1, len(matching))
+    self.assertEqual("system_analysis", matching[0].stage_name)
+
+
 def _test_get_project_config_normalizes_legacy_partial_success_stage_names(self):
     row = BinarySecurityServiceConfig(config_key="global")
     row.config = {
@@ -45539,6 +45648,9 @@ TaskManagerTests.test_downstream_create_task_records_requested_and_applied_sync_
 TaskManagerTests.test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key = _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key
 TaskManagerTests.test_downstream_create_task_fails_when_gateway_rejects_work_key = _test_downstream_create_task_fails_when_gateway_rejects_work_key
 TaskManagerTests.test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized = _test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized
+TaskManagerTests.test_should_not_auto_advance_to_entry_analysis_with_only_empty_stage_run = _test_should_not_auto_advance_to_entry_analysis_with_only_empty_stage_run
+TaskManagerTests.test_reducer_stage_worker_start_requested_does_not_materialize_future_stage_run_without_inputs = _test_reducer_stage_worker_start_requested_does_not_materialize_future_stage_run_without_inputs
+TaskManagerTests.test_ensure_stage_run_records_timeline_event_when_created = _test_ensure_stage_run_records_timeline_event_when_created
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
 TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync

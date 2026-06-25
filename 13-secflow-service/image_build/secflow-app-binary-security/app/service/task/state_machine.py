@@ -2057,9 +2057,6 @@ class TaskStateMachineMixin:
                 self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
                 if rebuild_state.get("required"):
                     return False
-            normalized_status = self._normalize_downstream_status(existing_run.status) or str(existing_run.status or "").strip()
-            if normalized_status in {"pending", "queued", "running", "dispatching", "applying"}:
-                return True
         if self._should_skip_stage_without_runnable_work(db, task, normalized_stage):
             return False
         return self._stage_has_real_runnable_work(db, task, normalized_stage) or self._stage_has_materialized_inputs(db, task, normalized_stage)

@@ -235,7 +235,6 @@ class TaskDownstreamServiceMixin:
                 "triggered_by_stage": upstream_item.stage_name,
             },
         )
-        stage_run = self._ensure_stage_run(db, task, "entry_analysis")
         existing = self._find_stage_item(
             db,
             task_id=task.id,
@@ -243,6 +242,7 @@ class TaskDownstreamServiceMixin:
             item_key=module_key,
             parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
         )
+        stage_run = self._ensure_stage_run(db, task, "entry_analysis")
         item = self._upsert_stage_item(
             db,
             task=task,
@@ -376,7 +376,6 @@ class TaskDownstreamServiceMixin:
         entry_key = str(dataflow_result.get("entry_key") or "").strip()
         if not entry_key:
             return None
-        stage_run = self._ensure_stage_run(db, task, "dataflow_vuln_scan")
         normalized_result = {
             **dataflow_result,
             "upstream_item_id": upstream_item.id,
@@ -389,6 +388,7 @@ class TaskDownstreamServiceMixin:
             item_key=entry_key,
             parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
         )
+        stage_run = self._ensure_stage_run(db, task, "dataflow_vuln_scan")
         item = self._upsert_stage_item(
             db,
             task=task,
