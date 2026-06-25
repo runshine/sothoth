@@ -38,7 +38,7 @@ from app.model import (
     TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
 )
-from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
+from app.exception import ConflictError, ForbiddenError, NotFoundError, UpstreamError, ValidationError
 from app.schemas import BinarySecurityServiceConfigPayload
 from app.schemas import (
     BinarySecurityInputFile,
@@ -53,6 +53,7 @@ from app.schemas import (
     BinarySecurityUploadCompletePayload,
 )
 from app.service import downstream_tasks as downstream_tasks_module
+from app.service import llm_gateway as llm_gateway_module
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import (
     TASK_ACTION_CONTINUE,
@@ -43212,6 +43213,7 @@ def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
         "downstream_agent_task_key_id": "585",
         "downstream_agent_task_key_name": "system_analyse-si-1",
         "downstream_agent_task_key_prefix": "wsk",
+        "downstream_agent_task_key_secret": "wsk_secret_1",
         "downstream_key_source": "schedule_dispatch",
     }
     created = BinarySecurityEvent(
@@ -43225,7 +43227,9 @@ def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
             "stage_name": "system_analysis",
             "service": "system_analyse",
             "agent_task_key_id": "585",
+            "agent_task_key_name": "system_analyse-si-1",
             "agent_task_key_prefix": "wsk",
+            "agent_task_key_secret": "wsk_secret_1",
             "agent_task_key_source": "schedule_dispatch",
         },
     )
@@ -43240,7 +43244,9 @@ def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
             "stage_name": "system_analysis",
             "service": "system_analyse",
             "agent_task_key_id": "585",
+            "agent_task_key_name": "system_analyse-si-1",
             "agent_task_key_prefix": "wsk",
+            "agent_task_key_secret": "wsk_secret_1",
             "agent_task_key_source": "schedule_dispatch",
         },
     )
@@ -43264,6 +43270,7 @@ def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
     self.assertTrue(detail.task_key_snapshot.root_task_key.used)
     self.assertTrue(detail.task_key_snapshot.root_task_key.has_secret)
     self.assertEqual("schedule_dispatch", detail.task_key_snapshot.root_task_key.source)
+    self.assertEqual("root-secret-1", detail.task_key_snapshot.root_task_key.value)
     self.assertEqual(1, len(detail.task_key_snapshot.work_keys))
     work_key = detail.task_key_snapshot.work_keys[0]
     self.assertEqual("system_analysis", work_key.stage_name)
@@ -43274,8 +43281,11 @@ def _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets(self):
     self.assertEqual("585", work_key.agent_task_key_id)
     self.assertEqual("system_analyse-si-1", work_key.agent_task_key_name)
     self.assertEqual("wsk", work_key.agent_task_key_prefix)
+    self.assertEqual("wsk_secret_1", work_key.value)
     self.assertTrue(work_key.has_secret)
-    self.assertNotIn("root-secret-1", json.dumps(detail.model_dump(mode="json"), ensure_ascii=False))
+    detail_dump = json.dumps(detail.model_dump(mode="json"), ensure_ascii=False)
+    self.assertIn("root-secret-1", detail_dump)
+    self.assertIn("wsk_secret_1", detail_dump)
 
 
 def _test_get_task_detail_task_key_snapshot_reports_unused_without_keys(self):
@@ -43411,9 +43421,23 @@ def _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_
 
     original_downstream_tasks = self.manager._downstream_tasks
     original_active_delete_operation = self.manager._active_delete_operation
+    original_gateway_client = llm_gateway_module._client
     try:
         self.manager._downstream_tasks = lambda: _FakeDownstreamTasks()
         self.manager._active_delete_operation = lambda *_args, **_kwargs: None
+        class _FakeGatewayClient:
+            async def issue_work_key(self, **kwargs):
+                self.kwargs = dict(kwargs)
+                return {
+                    "key": {
+                        "id": 585,
+                        "key_name": "system_analyse-si-1",
+                        "key_prefix": "wsk_12345678",
+                        "sub_task_id": "si-1",
+                    },
+                    "secret": "wsk_secret_1",
+                }
+        llm_gateway_module._client = _FakeGatewayClient()
         created = asyncio.run(
             self.manager._downstream_create_task(
                 db,
@@ -43427,24 +43451,100 @@ def _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_
     finally:
         self.manager._downstream_tasks = original_downstream_tasks
         self.manager._active_delete_operation = original_active_delete_operation
+        llm_gateway_module._client = original_gateway_client
 
     self.assertEqual("child-1", created["task_id"])
     self.assertEqual(1, len(create_calls))
     create_payload = create_calls[0]["payload"]
     self.assertEqual("tok", create_calls[0]["token"])
-    self.assertTrue(str(create_payload.get("agent_task_key_id") or "").strip())
+    self.assertEqual("585", str(create_payload.get("agent_task_key_id") or "").strip())
     self.assertEqual("system_analyse-si-1", create_payload.get("agent_task_key_name"))
-    self.assertEqual("rtk", create_payload.get("agent_task_key_prefix"))
-    self.assertEqual("schedule_dispatch", create_payload.get("agent_task_key_source"))
-    self.assertEqual("root-secret-1", create_payload.get("agent_task_key_secret"))
+    self.assertEqual("wsk_12345678", create_payload.get("agent_task_key_prefix"))
+    self.assertEqual("llm_gateway_work_key_exchange", create_payload.get("agent_task_key_source"))
+    self.assertEqual("wsk_secret_1", create_payload.get("agent_task_key_secret"))
+    self.assertNotEqual("root-secret-1", create_payload.get("agent_task_key_secret"))
     self.assertEqual(create_payload.get("agent_task_key_id"), item.payload.get("downstream_agent_task_key_id"))
     self.assertEqual("system_analyse-si-1", item.payload.get("downstream_agent_task_key_name"))
-    self.assertEqual("rtk", item.payload.get("downstream_agent_task_key_prefix"))
-    self.assertEqual("schedule_dispatch", item.payload.get("downstream_key_source"))
+    self.assertEqual("wsk_12345678", item.payload.get("downstream_agent_task_key_prefix"))
+    self.assertEqual("llm_gateway_work_key_exchange", item.payload.get("downstream_key_source"))
     event_types = [str(getattr(row, "event_type", "") or "") for row in db.events]
     self.assertIn("downstream_work_key_requested", event_types)
     self.assertIn("downstream_work_key_created", event_types)
     self.assertIn("downstream_create_with_agent_task_key", event_types)
+    payload_dump = json.dumps([dict(getattr(row, "payload", {}) or {}) for row in db.events], ensure_ascii=False)
+    self.assertNotIn("wsk_secret_1", payload_dump)
+    self.assertNotIn("root-secret-1", payload_dump)
+
+
+def _test_downstream_create_task_fails_when_gateway_rejects_work_key(self):
+    task = BinarySecurityTask(
+        id="task-gateway-fail",
+        project_id="p1",
+        name="source-task",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        current_stage="system_analysis",
+        root_task_key_id="584",
+        root_task_key_name="dispatch-root-key",
+        root_task_key_prefix="rtk",
+        task_key_source="schedule_dispatch",
+    )
+    task.summary = {
+        "runtime_task_keys": {
+            "root_task_key_secret": "root-secret-1",
+            "root_task_key_id": "584",
+            "root_task_key_name": "dispatch-root-key",
+            "root_task_key_prefix": "rtk",
+            "task_key_source": "schedule_dispatch",
+        }
+    }
+    item = BinarySecurityStageItem(
+        id="si-forbidden",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr1",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        downstream_service="system_analyse",
+        status="pending",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    original_downstream_tasks = self.manager._downstream_tasks
+    original_active_delete_operation = self.manager._active_delete_operation
+    original_gateway_client = llm_gateway_module._client
+    try:
+        self.manager._downstream_tasks = lambda: SimpleNamespace(create_child_task=AsyncMock())
+        self.manager._active_delete_operation = lambda *_args, **_kwargs: None
+        class _ForbiddenGatewayClient:
+            async def issue_work_key(self, **kwargs):
+                del kwargs
+                raise ForbiddenError("LLM Gateway 拒绝签发 worker key：当前 key 无权创建 work key")
+        llm_gateway_module._client = _ForbiddenGatewayClient()
+        with self.assertRaises(ForbiddenError):
+            asyncio.run(
+                self.manager._downstream_create_task(
+                    db,
+                    task,
+                    item,
+                    service="system_analyse",
+                    token="tok",
+                    payload={"input_path": "/src"},
+                )
+            )
+    finally:
+        self.manager._downstream_tasks = original_downstream_tasks
+        self.manager._active_delete_operation = original_active_delete_operation
+        llm_gateway_module._client = original_gateway_client
+
+    event_types = [str(getattr(row, "event_type", "") or "") for row in db.events]
+    self.assertIn("downstream_work_key_requested", event_types)
+    self.assertIn("downstream_work_key_request_failed", event_types)
+    self.assertNotIn("downstream_work_key_created", event_types)
 
 
 def _test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks(self):
@@ -45434,6 +45534,8 @@ TaskManagerTests.test_record_downstream_sync_event_trims_each_item_bucket_indepe
 TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_item_id = _test_record_downstream_sync_event_uses_fallback_bucket_without_item_id
 TaskManagerTests.test_record_downstream_item_disposition_maps_create_and_retry_audit_events = _test_record_downstream_item_disposition_maps_create_and_retry_audit_events
 TaskManagerTests.test_downstream_create_task_records_requested_and_applied_sync_events = _test_downstream_create_task_records_requested_and_applied_sync_events
+TaskManagerTests.test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key = _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key
+TaskManagerTests.test_downstream_create_task_fails_when_gateway_rejects_work_key = _test_downstream_create_task_fails_when_gateway_rejects_work_key
 TaskManagerTests.test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized = _test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key

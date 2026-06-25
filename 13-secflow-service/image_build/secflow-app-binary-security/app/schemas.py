@@ -643,6 +643,7 @@ class BinarySecurityRootTaskKeySnapshot(BinarySecurityBaseModel):
     name: Optional[str] = None
     prefix: Optional[str] = None
     source: Optional[str] = None
+    value: Optional[str] = None
     has_secret: bool = False
     used: bool = False
 
@@ -657,6 +658,7 @@ class BinarySecurityWorkKeySnapshot(BinarySecurityBaseModel):
     agent_task_key_name: Optional[str] = None
     agent_task_key_prefix: Optional[str] = None
     agent_task_key_source: Optional[str] = None
+    value: Optional[str] = None
     has_secret: bool = False
     created_at: Optional[datetime] = None
 

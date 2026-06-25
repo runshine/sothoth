@@ -31,7 +31,7 @@ from sqlalchemy.orm import Session, load_only
 
 from app.copy_utils import safe_copy2
 from app.config import get_config
-from app.exception import ConflictError, NotFoundError, UpstreamError, ValidationError
+from app.exception import ConflictError, ForbiddenError, NotFoundError, UnauthorizedError, UpstreamError, ValidationError
 from app.model import (
     PIPELINE_PROFILE_DEFAULT,
     PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
@@ -235,6 +235,7 @@ from app.service.task_queue import get_task_queue
 from app.service.http_client import get_shared_async_client
 from app.service.stages.registry import get_binary_security_stage_registry
 from app.service.knowledge_graph_audit import get_knowledge_graph_audit_client
+from app.service.llm_gateway import LLMGatewayWorkKeyIssueError, get_llm_gateway_client
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
@@ -745,17 +746,50 @@ class TaskManager(
                 root_secret = self._root_task_key_secret(task)
                 if not root_secret:
                     return {}
-                runtime_keys = dict((task.summary or {}).get("runtime_task_keys") or {})
-                prefix = str(runtime_keys.get("root_task_key_prefix") or "wsk").strip() or "wsk"
-                source = str(runtime_keys.get("task_key_source") or "schedule_dispatch").strip() or "schedule_dispatch"
-                work_key_name = f"{str(service or 'child').strip() or 'child'}-{str(getattr(item, 'id', '') or 'item').strip() or 'item'}"
-                work_key_id = hashlib.sha1(f"{task.id}:{getattr(item, 'id', '')}:{service}:{root_secret}".encode("utf-8")).hexdigest()[:12]
+                if not bool(getattr(self.cfg.llm_gateway, "enabled", True)):
+                    return {}
+                stage_item_id = str(getattr(item, "id", "") or "").strip() or "item"
+                stage_name = str(getattr(item, "stage_name", "") or "").strip() or "unknown_stage"
+                normalized_service = str(service or "child").strip() or "child"
+                key_name = f"{normalized_service}-{stage_item_id}"
+                description = (
+                    f"binary-security worker key "
+                    f"task_id={str(getattr(task, 'id', '') or '').strip() or '-'} "
+                    f"stage_name={stage_name} "
+                    f"stage_item_id={stage_item_id} "
+                    f"service={normalized_service}"
+                )
+                issued = await get_llm_gateway_client().issue_work_key(
+                    task_key_secret=root_secret,
+                    sub_task_id=stage_item_id,
+                    key_name=key_name,
+                    description=description,
+                    max_concurrency=0,
+                    enabled=True,
+                )
+                key = issued.get("key") if isinstance(issued.get("key"), dict) else {}
+                secret = str(issued.get("secret") or "").strip()
+                key_id = str(key.get("id") or "").strip()
+                key_name_value = str(key.get("key_name") or key_name).strip() or key_name
+                key_prefix = str(key.get("key_prefix") or "").strip() or None
+                if not secret or not key_id or not key_prefix:
+                    raise LLMGatewayWorkKeyIssueError(
+                        "LLM Gateway work key 响应缺少关键字段",
+                        status_code=201,
+                        response_text=str(issued)[:500],
+                        request_payload_preview={
+                            "sub_task_id": stage_item_id,
+                            "key_name": key_name,
+                        },
+                        retryable=False,
+                    )
                 return {
-                    "agent_task_key_id": work_key_id,
-                    "agent_task_key_name": work_key_name,
-                    "agent_task_key_prefix": prefix,
-                    "agent_task_key_source": source,
-                    "agent_task_key_secret": root_secret,
+                    "sub_task_id": stage_item_id,
+                    "agent_task_key_id": key_id,
+                    "agent_task_key_name": key_name_value,
+                    "agent_task_key_prefix": key_prefix,
+                    "agent_task_key_source": "llm_gateway_work_key_exchange",
+                    "agent_task_key_secret": secret,
                 }
             return _derive_downstream_work_key
         if item == "_rebuild_archive_jobs_for_stage":
@@ -1376,10 +1410,36 @@ class TaskManager(
                     "stage_item_id": str(getattr(item, "id", "") or ""),
                     "stage_name": str(getattr(item, "stage_name", "") or ""),
                     "service": str(service or ""),
+                    "sub_task_id": str(getattr(item, "id", "") or ""),
                     "has_root_task_key": True,
                 },
             )
-        work_key_payload = await self._derive_downstream_work_key(task=task, item=item, service=service)
+        try:
+            work_key_payload = await self._derive_downstream_work_key(task=task, item=item, service=service)
+        except (UnauthorizedError, ForbiddenError, LLMGatewayWorkKeyIssueError) as exc:
+            status_code = getattr(exc, "gateway_status_code", None)
+            response_text = getattr(exc, "response_text", None)
+            retryable = bool(getattr(exc, "retryable", False))
+            self._record_event(
+                db,
+                task,
+                "downstream_work_key_request_failed",
+                f"向 LLM Gateway 申请 worker key 失败: {service}",
+                level="warning" if retryable else "error",
+                stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
+                item=item,
+                payload={
+                    "stage_item_id": str(getattr(item, "id", "") or ""),
+                    "stage_name": str(getattr(item, "stage_name", "") or ""),
+                    "service": str(service or ""),
+                    "sub_task_id": str(getattr(item, "id", "") or ""),
+                    "gateway_status_code": status_code,
+                    "gateway_error": str(exc),
+                    "gateway_response_text": response_text,
+                    "retryable": retryable,
+                },
+            )
+            raise
         effective_token = token
         effective_payload = dict(payload or {})
         if work_key_payload:
@@ -1403,7 +1463,9 @@ class TaskManager(
                     "stage_item_id": str(getattr(item, "id", "") or ""),
                     "stage_name": str(getattr(item, "stage_name", "") or ""),
                     "service": str(service or ""),
+                    "sub_task_id": work_key_payload.get("sub_task_id"),
                     "agent_task_key_id": work_key_payload.get("agent_task_key_id"),
+                    "agent_task_key_name": work_key_payload.get("agent_task_key_name"),
                     "agent_task_key_prefix": work_key_payload.get("agent_task_key_prefix"),
                     "agent_task_key_source": work_key_payload.get("agent_task_key_source"),
                 },
@@ -1417,7 +1479,9 @@ class TaskManager(
                     "stage_item_id": str(getattr(item, "id", "") or ""),
                     "stage_name": str(getattr(item, "stage_name", "") or ""),
                     "service": str(service or ""),
+                    "sub_task_id": work_key_payload.get("sub_task_id"),
                     "agent_task_key_id": work_key_payload.get("agent_task_key_id"),
+                    "agent_task_key_name": work_key_payload.get("agent_task_key_name"),
                     "agent_task_key_prefix": work_key_payload.get("agent_task_key_prefix"),
                     "agent_task_key_source": work_key_payload.get("agent_task_key_source"),
                 },

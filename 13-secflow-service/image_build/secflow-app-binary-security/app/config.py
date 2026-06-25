@@ -56,6 +56,13 @@ class HttpClientConfig(BaseModel):
     retry_count: int = 1
 
 
+class LLMGatewayConfig(BaseModel):
+    enabled: bool = True
+    base_url: str = "http://gaiasec-llm-gateway"
+    work_key_path: str = "/api/aigw/work-keys"
+    timeout_seconds: int = 30
+
+
 class RegistryMenuLevelConfig(BaseModel):
     name: Optional[str] = None
     name_en: Optional[str] = None
@@ -221,6 +228,7 @@ class Config(BaseModel):
     database: DatabaseConfig
     auth_service: AuthServiceConfig
     project_service: ProjectServiceConfig
+    llm_gateway: LLMGatewayConfig = Field(default_factory=LLMGatewayConfig)
     registry: RegistryConfig = Field(default_factory=RegistryConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     scheduler: SchedulerConfig = Field(default_factory=SchedulerConfig)

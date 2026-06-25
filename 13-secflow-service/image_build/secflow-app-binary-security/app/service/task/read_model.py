@@ -355,6 +355,11 @@ class TaskReadModelServiceMixin:
         root_task_key_source = str(
             getattr(task, "task_key_source", "") or runtime_task_keys.get("task_key_source") or ""
         ).strip() or None
+        root_task_key_value = str(
+            self._root_task_key_secret(task)
+            or runtime_task_keys.get("root_task_key_secret")
+            or ""
+        ).strip() or None
         root_task_key_has_secret = bool(self._root_task_key_secret(task))
         root_task_key_used = bool(
             root_task_key_has_secret
@@ -460,13 +465,19 @@ class TaskReadModelServiceMixin:
                 or stage_item_payload.get("downstream_key_source")
                 or ""
             ).strip() or None
+            work_key_value = str(
+                stage_item_payload.get("downstream_agent_task_key_secret")
+                or payload.get("agent_task_key_secret")
+                or ""
+            ).strip() or None
             downstream_task_id = None
             if stage_item is not None:
                 downstream_task_id = str(getattr(stage_item, "downstream_task_id", "") or "").strip() or None
             if not downstream_task_id:
                 downstream_task_id = downstream_task_ids_by_item.get(stage_item_id)
             work_key_has_secret = bool(
-                agent_task_key_id
+                work_key_value
+                or agent_task_key_id
                 or stage_item_payload.get("downstream_agent_task_key_id")
                 or stage_item_payload.get("downstream_agent_task_key_name")
             )
@@ -484,6 +495,7 @@ class TaskReadModelServiceMixin:
                     agent_task_key_name=work_key_name,
                     agent_task_key_prefix=work_key_prefix,
                     agent_task_key_source=work_key_source,
+                    value=work_key_value,
                     has_secret=work_key_has_secret,
                     created_at=event.created_at,
                 )
@@ -495,6 +507,7 @@ class TaskReadModelServiceMixin:
                 name=root_task_key_name,
                 prefix=root_task_key_prefix,
                 source=root_task_key_source,
+                value=root_task_key_value,
                 has_secret=root_task_key_has_secret,
                 used=root_task_key_used,
             ),

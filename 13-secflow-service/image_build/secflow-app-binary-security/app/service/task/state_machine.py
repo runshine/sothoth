@@ -2668,6 +2668,7 @@ class TaskStateMachineMixin:
                 # 就绪判据：system_analysis 已 success 且 summary 已刷新（selected_modules 键存在）。
                 if (
                     normalize_stage_name(resolved_stage_name) == "system_analysis"
+                    and self._task_type(task) == TASK_TYPE_SOURCE
                     and not self._system_analysis_authoritative_complete(db, task)
                 ):
                     decision.action = "refresh_only"
