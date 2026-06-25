@@ -9,7 +9,6 @@ from app.model import (
     BinarySecurityTask,
     BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_RUNTIME_PHASE_TERMINAL,
 )
 from app.service import task_manager as task_manager_module
@@ -433,7 +432,7 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertTrue(applied)
         self.assertEqual("running", task.status)
         self.assertEqual("system_analysis", task.current_stage)
-        self.assertNotEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+        self.assertNotEqual("tail_reconciliation", task.runtime_phase)
         self.assertFalse(acquire_lease.called)
         event_types = [call.args[2] for call in record_event.call_args_list]
         self.assertIn("main_state_write_blocked", event_types)

@@ -45,7 +45,7 @@ def test_source_task_does_not_skip_entry_analysis_when_system_analysis_has_no_en
     next_stage = manager._next_incomplete_stage(db, task)
 
     assert should_skip is False
-    assert next_stage is None
+    assert next_stage == "entry_analysis"
 
 
 def test_source_task_skips_entry_analysis_when_system_analysis_has_no_selected_modules():
@@ -82,7 +82,7 @@ def test_source_task_skips_entry_analysis_when_system_analysis_has_no_selected_m
     next_stage = manager._next_incomplete_stage(db, task)
 
     assert should_skip is True
-    assert next_stage is None
+    assert next_stage == "entry_analysis"
 
 
 def test_source_task_does_not_advance_to_dataflow_when_selected_modules_are_missing():
@@ -125,7 +125,7 @@ def test_source_task_does_not_advance_to_dataflow_when_selected_modules_are_miss
     next_stage = manager._next_incomplete_stage(db, task)
 
     assert should_skip is False
-    assert next_stage is None
+    assert next_stage == "dataflow_vuln_scan"
 
 
 def test_source_system_analysis_rebuild_restores_entry_analysis_input_contract_fields():

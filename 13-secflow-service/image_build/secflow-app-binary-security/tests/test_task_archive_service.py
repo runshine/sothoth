@@ -12,10 +12,6 @@ class TaskArchiveServiceWiringTests(unittest.TestCase):
         self.assertIs(TaskManager._run_archive_copy_job, TaskArchiveServiceMixin._run_archive_copy_job)
         self.assertIs(TaskManager._apply_archive_job_status, TaskArchiveServiceMixin._apply_archive_job_status)
         self.assertIs(TaskManager._apply_archive_job_status_locked, TaskArchiveServiceMixin._apply_archive_job_status_locked)
-        self.assertIs(
-            TaskManager._repair_descendants_after_archive_apply_if_needed,
-            TaskArchiveServiceMixin._repair_descendants_after_archive_apply_if_needed,
-        )
 
 
 class TaskArchiveServiceBehaviorTests(unittest.TestCase):

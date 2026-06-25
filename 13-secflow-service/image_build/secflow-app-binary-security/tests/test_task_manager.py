@@ -32,7 +32,6 @@ from app.model import (
     BinarySecurityTaskRuntimeLease,
     BinarySecurityTaskStateLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_RUNTIME_PHASE_TERMINAL,
     PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
     TASK_TYPE_BINARY,
@@ -2330,7 +2329,7 @@ class TaskManagerTests(unittest.TestCase):
             status="running",
             task_type=TASK_TYPE_BINARY,
             current_stage="dataflow_vuln_scan",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             firmware_source="project_filesystem",
             firmware_path="/fw",
             output_root="/o",
@@ -8319,7 +8318,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             status="running",
             task_type=TASK_TYPE_BINARY,
             current_stage="dataflow_vuln_scan",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             firmware_source="project_filesystem",
             firmware_path="/fw",
             output_root="/o",
@@ -10120,7 +10119,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/fw",
             output_root="/o",
             workspace_root="/w",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         task.policy = {
             "max_stage_parallelism": 4,
@@ -10561,7 +10560,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         task.summary = {}
         task.metrics = {}
@@ -10703,7 +10702,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             output_root="/o",
             workspace_root="/w",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         item = BinarySecurityStageItem(
             id="si-tail-health-1",
@@ -21418,7 +21417,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(str(archive_root), normalized["source_root_path"])
             self.assertNotEqual(str(input_root), normalized["source_dir"])
 
-    def test_task_main_state_write_allowed_allows_state_machine_without_current_owner(self):
+    def test_task_main_state_write_allowed_blocks_state_machine_without_current_owner(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -21434,7 +21433,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task])
 
-        self.assertTrue(self.manager._task_main_state_write_allowed(db, task, source="state_machine"))
+        self.assertFalse(self.manager._task_main_state_write_allowed(db, task, source="state_machine"))
 
     def test_decide_owned_execution_requeue_skips_when_authoritative_failure_should_finalize(self):
         task = BinarySecurityTask(
@@ -21573,9 +21572,10 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         event_types = [event.event_type for event in db.events]
         self.assertIn("authoritative_failure_finalize_started", event_types)
-        self.assertIn("authoritative_failure_finalize_bypassed_owner_guard", event_types)
-        self.assertIn("authoritative_failure_finalize_applied", event_types)
-        self.assertEqual("failed", task.status)
+        self.assertIn("authoritative_failure_finalize_requested", event_types)
+        self.assertIn("task_main_state_fact_drift_detected", event_types)
+        self.assertNotIn("authoritative_failure_finalize_applied", event_types)
+        self.assertEqual("running", task.status)
 
     def test_compact_b2s_summary_item_keeps_binary_module_archive_contract(self):
         row = self.manager._compact_b2s_summary_item(
@@ -25567,7 +25567,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/w",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             tail_reconcile_state="handoff_waiting",
         )
         stage_run = BinarySecurityStageRun(
@@ -25600,7 +25600,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         task.metrics = {
             "entry_count": 0,
@@ -25632,7 +25632,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         task.metrics = {
             "entry_count": 0,
@@ -25664,7 +25664,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
         task.metrics = {
             "entry_count": 0,
@@ -25699,7 +25699,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/w",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             tail_reconcile_state="idle",
         )
         system_run = BinarySecurityStageRun(
@@ -25750,7 +25750,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/w",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             tail_reconcile_state="active",
         )
         runs = [
@@ -27188,7 +27188,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/ws",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
         )
 
         class _ClaimPendingDb(_ModelAwareDb):
@@ -27221,7 +27221,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/ws",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             current_stage="dataflow_vuln_scan",
         )
         stage_item = BinarySecurityStageItem(
@@ -27267,7 +27267,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/ws",
             policy_json='{"pipeline_mode": "mixed_streaming"}',
-            runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+            runtime_phase="tail_reconciliation",
             current_stage="dataflow_vuln_scan",
         )
         stage_item = BinarySecurityStageItem(
@@ -34044,10 +34044,10 @@ def _test_run_task_layer_reconcile_signal_archive_apply_uses_owner_stage_termina
         self.manager._apply_task_action_after_stage_terminal = original_apply
         self.manager._write_task_metadata_async = original_write
 
-    self.assertTrue(changed)
+    self.assertFalse(changed)
     self.assertEqual("refresh", calls[0][0])
     self.assertEqual([("refresh", "system_analysis")], calls)
-    self.assertEqual("pending", task.status)
+    self.assertEqual("running", task.status)
     self.assertEqual("system_analysis", task.current_stage)
 
 
@@ -35240,7 +35240,7 @@ def _test_worker_does_not_take_tail_runtime_lease_on_refresh(self):
         output_root="/out",
         workspace_root="/ws",
         policy_json='{"pipeline_mode": "mixed_streaming"}',
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
     )
     stage_run = BinarySecurityStageRun(
         id="sr-tail-1",
@@ -35307,7 +35307,8 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
         manager._refresh_task_status_after_sync(db, task)
 
-    self.assertEqual("running", task.status)
+    # 非 owner（dispatcher=worker-z != 本实例）且租约已过期 → 走 release_for_takeover：置 pending + 清 owner + 重新排队
+    self.assertEqual("pending", task.status)
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertIsNone(task.dispatcher_instance_id)
     self.assertFalse(bool(task.dispatch_started_at))
@@ -35316,7 +35317,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     recovered_events = [event for event in db.events if event.event_type == "streaming_parent_state_recovered"]
     self.assertTrue(recovered_events)
     self.assertEqual("dispatching", recovered_events[-1].payload.get("from_status"))
-    self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
+    self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))
 
 
 def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task(self):
@@ -35332,7 +35333,7 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
         output_root="/out",
         workspace_root="/ws",
         policy_json='{"pipeline_mode": "mixed_streaming"}',
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
     )
     stage_run = BinarySecurityStageRun(
         id="sr-tail-reconcile-pending-1",
@@ -35384,7 +35385,7 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
         manager._fetch_downstream_task_payload = original_fetch
 
     self.assertEqual("pending", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertEqual("tail_reconciliation", task.runtime_phase)
     self.assertEqual([], db.runtime_leases)
     deferred_events = [event for event in db.events if event.event_type == "tail_reconcile_sync_deferred_to_owner_worker"]
     self.assertEqual([], deferred_events)
@@ -35405,7 +35406,7 @@ def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_ta
         output_root="/out",
         workspace_root="/ws",
         policy_json='{"pipeline_mode": "mixed_streaming"}',
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
     )
     stage_run = BinarySecurityStageRun(
         id="sr-tail-reconcile-running-1",
@@ -35475,7 +35476,7 @@ def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_ta
         manager._enqueue_task = original_enqueue
 
     self.assertEqual("running", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_TAIL_RECONCILIATION, task.runtime_phase)
+    self.assertEqual("tail_reconciliation", task.runtime_phase)
     self.assertEqual([], queued)
     self.assertEqual([], db.runtime_leases)
     requested_events = [event for event in db.events if event.event_type == "tail_execution_takeover_requested"]
@@ -37311,7 +37312,7 @@ def _test_record_polled_child_sync_failure_keeps_tail_owner_lost_for_tail_stale(
         firmware_path="/fw",
         output_root="/o",
         workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
     )
     item = BinarySecurityStageItem(
         id="item-tail-stale",
@@ -37351,7 +37352,7 @@ def _test_worker_skips_tail_tasks_in_downstream_reconcile_candidates(self):
         output_root="/out",
         workspace_root="/ws",
         policy_json='{"pipeline_mode": "mixed_streaming"}',
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
     )
     item = BinarySecurityStageItem(
         id="si-tail-candidate",
@@ -38662,9 +38663,8 @@ def _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent(s
 
     self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
+    # 新设计：recover 到 running+owned 时保留主 owner（不再清空，避免 owned 无 owner 脱钩）
+    self.assertEqual("worker-z", task.dispatcher_instance_id)
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertEqual("idle", task.tail_reconcile_state)
     self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
@@ -40777,6 +40777,79 @@ def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_it
     self.assertTrue(any(event.event_type == "running_execution_released_for_takeover" for event in db.events))
 
 
+def _test_release_for_takeover_main_state_clears_owner(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-release-for-takeover",
+        project_id="p1",
+        name="source",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now() - timedelta(seconds=10)
+    task.lease_expires_at = _now() - timedelta(seconds=1)
+    db = _ModelAwareDb(tasks=[task], events=[])
+
+    updated = manager._apply_release_for_takeover_main_state(
+        db,
+        task,
+        source="unit_test",
+        reason="unit_test_release_for_takeover",
+        status="pending",
+        stage_name="entry_analysis",
+        finished_at=None,
+        last_error=None,
+    )
+
+    self.assertTrue(updated)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+
+
+def _test_terminal_main_state_clears_owner(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-terminal-clear-owner",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now() - timedelta(seconds=10)
+    task.lease_expires_at = _now() + timedelta(minutes=5)
+    db = _ModelAwareDb(tasks=[task], events=[])
+
+    updated = manager._apply_terminal_main_state(
+        db,
+        task,
+        source="unit_test",
+        reason="unit_test_terminal",
+        status="failed",
+        stage_name="system_analysis",
+        finished_at=_now(),
+        last_error="terminal failure",
+    )
+
+    self.assertTrue(updated)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    self.assertEqual("failed", task.status)
+
+
 def _test_requeue_released_running_locked_skips_locally_owned_tail_lease(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -40791,7 +40864,7 @@ def _test_requeue_released_running_locked_skips_locally_owned_tail_lease(self):
         output_root="/o",
         workspace_root="/w",
         policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
     )
     item = BinarySecurityStageItem(
         id="si-tail-owned",
@@ -40813,13 +40886,11 @@ def _test_requeue_released_running_locked_skips_locally_owned_tail_lease(self):
         lease_expires_at=_now() + timedelta(minutes=2),
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[], runtime_leases=[lease])
-    manager._acquire_tail_reconcile_owner(task.id)
 
     changed = manager._requeue_released_running_locked(db)
 
     self.assertFalse(changed)
     self.assertEqual("running", task.status)
-    self.assertFalse(manager._has_tail_reconcile_owner(task.id))
 
 
 def _test_task_heartbeat_controller_refreshes_tail_reconcile_owner_task(self):
@@ -40987,138 +41058,7 @@ def _test_task_heartbeat_controller_keeps_lease_after_runner_exit_when_owner_sti
     self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
 
 
-def _test_activate_tail_reconciliation_deduplicates_owner_conflict_events(self):
-    manager = TaskManager()
-    task = BinarySecurityTask(
-        id="task-tail-conflict-dedupe",
-        project_id="p1",
-        name="source",
-        status="running",
-        current_stage="dataflow_vuln_scan",
-        task_type=TASK_TYPE_SOURCE,
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-    )
-    now_value = _now()
-    payload = {
-        "lease_owner": "reducer-b",
-        "lease_generation": 7,
-        "owner_pod_uid": "pod-b",
-        "owner_boot_id": "boot-b",
-    }
-    existing = BinarySecurityEvent(
-        id="evt-tail-conflict-existing",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name=task.current_stage,
-        event_type="tail_reconcile_owner_conflict",
-        level="warning",
-        message=f"tail 收口 owner 冲突: {task.id}",
-        payload=payload,
-        created_at=now_value - timedelta(seconds=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], events=[existing])
-    lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        execution_epoch=0,
-        owner_instance_id="reducer-b",
-        owner_pod_uid="pod-b",
-        owner_boot_id="boot-b",
-        generation=7,
-        heartbeat_at=now_value,
-        lease_expires_at=now_value + timedelta(minutes=2),
-    )
 
-    with patch.object(manager, "_should_enter_tail_reconciliation", return_value=True), patch.object(
-        manager, "_maybe_upsert_runtime_lease", return_value=lease
-    ):
-        manager._activate_tail_reconciliation(db, task, now_value=now_value, fallback_status="running")
-
-    self.assertEqual(1, len([event for event in db.events if event.event_type == "tail_reconcile_owner_conflict"]))
-
-
-def _test_activate_tail_reconciliation_deduplicates_handoff_started_events(self):
-    manager = TaskManager()
-    task = BinarySecurityTask(
-        id="task-tail-handoff-dedupe",
-        project_id="p1",
-        name="source",
-        status="running",
-        current_stage="dataflow_vuln_scan",
-        task_type=TASK_TYPE_SOURCE,
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-    )
-    now_value = _now()
-    payload = {
-        "lease_owner": "reducer-b",
-        "lease_generation": 7,
-        "owner_pod_uid": "pod-b",
-        "owner_boot_id": "boot-b",
-    }
-    existing = BinarySecurityEvent(
-        id="evt-tail-handoff-existing",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name=task.current_stage,
-        event_type="tail_reconcile_handoff_started",
-        level="info",
-        message=f"tail 收口 handoff 开始: {task.id}",
-        payload=payload,
-        created_at=now_value - timedelta(seconds=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], events=[existing])
-    lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        execution_epoch=0,
-        owner_instance_id="reducer-b",
-        owner_pod_uid="pod-b",
-        owner_boot_id="boot-b",
-        generation=7,
-        heartbeat_at=now_value,
-        lease_expires_at=now_value + timedelta(minutes=2),
-    )
-
-    with patch.object(manager, "_should_enter_tail_reconciliation", return_value=True), patch.object(
-        manager, "_maybe_upsert_runtime_lease", return_value=lease
-    ):
-        manager._activate_tail_reconciliation(db, task, now_value=now_value, fallback_status="running")
-
-    self.assertEqual(1, len([event for event in db.events if event.event_type == "tail_reconcile_handoff_started"]))
-
-
-def _test_reducer_activate_tail_reconciliation_defers_to_owner_worker(self):
-    manager = TaskManager()
-    task = BinarySecurityTask(
-        id="task-tail-reducer-deferred",
-        project_id="p1",
-        name="source",
-        status="running",
-        current_stage="dataflow_vuln_scan",
-        task_type=TASK_TYPE_SOURCE,
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
-    )
-    db = _AppendingModelAwareDb(tasks=[task], events=[])
-
-    with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False):
-        lease = manager._activate_tail_reconciliation(db, task, now_value=_now(), fallback_status="running")
-
-    self.assertIsNone(lease)
-    self.assertEqual("running", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-    deferred_events = [event for event in db.events if event.event_type == "tail_reconcile_handoff_deferred_to_owner_worker"]
-    self.assertEqual([], deferred_events)
 
 
 def _test_run_task_finally_requeues_tail_runtime_without_active_owner(self):
@@ -41179,7 +41119,8 @@ def _test_run_task_finally_requeues_tail_runtime_without_active_owner(self):
 
     async def _tail_execute(_task_id):
         task.status = "running"
-        manager._activate_tail_reconciliation(db, task, now_value=_now(), fallback_status="pending", takeover_result="test")
+        task.tail_reconcile_state = "idle"
+        manager._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
 
     original_factory = task_manager_module.get_session_factory
     original_execute = manager._execute_task
@@ -41195,7 +41136,6 @@ def _test_run_task_finally_requeues_tail_runtime_without_active_owner(self):
         manager._task_has_authoritative_active_stage_context = original_active_context
 
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-    self.assertFalse(manager._has_tail_reconcile_owner(task.id))
     self.assertEqual("running", task.status)
     self.assertEqual("worker-a", task.dispatcher_instance_id)
     self.assertIsNotNone(task.dispatch_started_at)
@@ -42397,6 +42337,8 @@ TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _
 TaskManagerTests.test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent = _test_refresh_task_status_after_sync_recovers_dispatching_streaming_parent
 TaskManagerTests.test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_cancelled_stage_to_failed = _test_refresh_task_status_after_sync_converts_dispatching_task_with_earlier_cancelled_stage_to_failed
 TaskManagerTests.test_requeue_released_running_locked_requeues_streaming_tail_with_active_items = _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items
+TaskManagerTests.test_release_for_takeover_main_state_clears_owner = _test_release_for_takeover_main_state_clears_owner
+TaskManagerTests.test_terminal_main_state_clears_owner = _test_terminal_main_state_clears_owner
 TaskManagerTests.test_requeue_released_running_locked_skips_locally_owned_tail_lease = _test_requeue_released_running_locked_skips_locally_owned_tail_lease
 TaskManagerTests.test_reclaim_stale_running_streaming_tail_requeues_for_takeover = _test_reclaim_stale_running_streaming_tail_requeues_for_takeover
 TaskManagerTests.test_run_task_records_takeover_resume_event_for_streaming_tail = _test_run_task_records_takeover_resume_event_for_streaming_tail
@@ -42405,8 +42347,6 @@ TaskManagerTests.test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_
 TaskManagerTests.test_run_task_finally_requeues_tail_runtime_without_active_owner = _test_run_task_finally_requeues_tail_runtime_without_active_owner
 TaskManagerTests.test_run_task_finally_requeues_nonstreaming_runtime_without_active_owner = _test_run_task_finally_requeues_nonstreaming_runtime_without_active_owner
 TaskManagerTests.test_sync_task_row_lease_view_from_owner_blocks_non_owner = _test_sync_task_row_lease_view_from_owner_blocks_non_owner
-TaskManagerTests.test_activate_tail_reconciliation_deduplicates_owner_conflict_events = _test_activate_tail_reconciliation_deduplicates_owner_conflict_events
-TaskManagerTests.test_activate_tail_reconciliation_deduplicates_handoff_started_events = _test_activate_tail_reconciliation_deduplicates_handoff_started_events
 TaskManagerTests.test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed = _test_refresh_task_status_after_sync_converts_failed_streaming_parent_to_failed
 TaskManagerTests.test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable = _test_refresh_task_status_after_sync_keeps_owner_lost_child_recoverable
 TaskManagerTests.test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted = _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted
@@ -42481,7 +42421,7 @@ def _test_tail_stage_work_summary_ignores_terminal_residual_entry_bindings(self)
         output_root="/o",
         workspace_root="/w",
         policy_json='{"pipeline_mode": "mixed_streaming"}',
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
         tail_reconcile_state="active",
     )
     runs = [
@@ -42717,7 +42657,7 @@ def _test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync(self)
         name="demo",
         status="running",
         current_stage="dataflow_vuln_scan",
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
         task_type=TASK_TYPE_SOURCE,
         firmware_source="project_filesystem",
         firmware_path="/fw",
@@ -44385,10 +44325,8 @@ def _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state(s
     db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease], events=[])
     queued: list[str] = []
     cancellations: list[tuple[str, bool]] = []
-    released_tail_owners: list[str] = []
     original_enqueue = self.manager._enqueue_task
     original_cancel = self.manager._request_local_worker_cancel
-    original_release_tail_owner = self.manager._release_tail_reconcile_owner
     original_clear_runtime_lease = self.manager._clear_runtime_lease
 
     async def _fake_cancel(task_id: str, *, wait_for_runner: bool):
@@ -44397,7 +44335,6 @@ def _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state(s
     try:
         self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
         self.manager._request_local_worker_cancel = _fake_cancel
-        self.manager._release_tail_reconcile_owner = lambda task_id: released_tail_owners.append(task_id)
         self.manager._clear_runtime_lease = lambda _db, _task_id, **_kwargs: db.runtime_leases.clear()
         response = asyncio.run(
             self.manager.force_reset_task_to_pending(
@@ -44410,7 +44347,6 @@ def _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state(s
     finally:
         self.manager._enqueue_task = original_enqueue
         self.manager._request_local_worker_cancel = original_cancel
-        self.manager._release_tail_reconcile_owner = original_release_tail_owner
         self.manager._clear_runtime_lease = original_clear_runtime_lease
 
     self.assertTrue(response.accepted)
@@ -44418,7 +44354,6 @@ def _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state(s
     self.assertEqual("running", response.task_status_after_accept)
     self.assertEqual([(task.id, False)], cancellations)
     self.assertEqual([task.id], queued)
-    self.assertEqual([], released_tail_owners)
     self.assertEqual("running", task.status)
     self.assertEqual(response.operation_id, task.current_operation_id)
     self.assertEqual("worker-a", task.dispatcher_instance_id)
@@ -44468,7 +44403,6 @@ def _test_force_reset_task_to_pending_externalizes_large_operation_result_payloa
     original_cancel = self.manager._request_local_worker_cancel
     original_clear_runtime_lease = self.manager._clear_runtime_lease
     original_enqueue = self.manager._enqueue_task
-    original_release_tail_owner = self.manager._release_tail_reconcile_owner
 
     async def _fake_cancel(task_id: str, *, wait_for_runner: bool):
         return None
@@ -44477,7 +44411,6 @@ def _test_force_reset_task_to_pending_externalizes_large_operation_result_payloa
         self.manager._request_local_worker_cancel = _fake_cancel
         self.manager._clear_runtime_lease = lambda *_args, **_kwargs: None
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
-        self.manager._release_tail_reconcile_owner = lambda *_args, **_kwargs: None
         response = asyncio.run(
             self.manager.force_reset_task_to_pending(
                 db,
@@ -44490,7 +44423,6 @@ def _test_force_reset_task_to_pending_externalizes_large_operation_result_payloa
         self.manager._request_local_worker_cancel = original_cancel
         self.manager._clear_runtime_lease = original_clear_runtime_lease
         self.manager._enqueue_task = original_enqueue
-        self.manager._release_tail_reconcile_owner = original_release_tail_owner
 
     self.assertTrue(response.accepted)
     result_payload = dict(operation.result_payload or {})
@@ -45006,7 +44938,7 @@ def _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync
         task_type=TASK_TYPE_SOURCE,
         status="running",
         current_stage="dataflow_vuln_scan",
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
         dispatcher_instance_id=manager.instance_id,
         lease_expires_at=_now() + timedelta(minutes=5),
         firmware_source="project_filesystem",
@@ -45284,7 +45216,7 @@ def _test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task(sel
         task_type=TASK_TYPE_SOURCE,
         status="running",
         current_stage="dataflow_vuln_scan",
-        runtime_phase=TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
+        runtime_phase="tail_reconciliation",
         firmware_source="project_filesystem",
         firmware_path="/src",
         output_root="/o",
@@ -45431,6 +45363,8 @@ def _test_apply_task_main_state_update_records_parent_task_state_transition_when
     db = _ModelAwareDb(
         tasks=[task],
         runtime_leases=[
+            # 活跃 runtime_lease：running+owned 时清空主 owner 会被守卫抑制，
+            # 以避免 owned 无 owner + 僵尸心跳的死锁（SSS 事故根因）。
             BinarySecurityTaskRuntimeLease(
                 task_id=task.id,
                 owner_instance_id="worker-a",
@@ -45450,18 +45384,16 @@ def _test_apply_task_main_state_update_records_parent_task_state_transition_when
     )
 
     self.assertTrue(updated)
-    transition_events = [event for event in db.events if event.event_type == "parent_task_state_transition"]
-    self.assertEqual(1, len(transition_events))
-    payload = transition_events[0].payload or {}
-    self.assertEqual(
-        ["dispatcher_instance_id", "dispatch_started_at", "lease_expires_at"],
-        payload.get("changed_fields"),
-    )
-    self.assertEqual("worker-a", payload.get("before", {}).get("dispatcher_instance_id"))
-    self.assertIsNone(payload.get("after", {}).get("dispatcher_instance_id"))
-    self.assertIsNone(task.dispatcher_instance_id)
-    self.assertIsNone(task.dispatch_started_at)
-    self.assertIsNone(task.lease_expires_at)
+    # 守卫抑制清空：主 owner 保留，并记录 runtime_owner_clear_suppressed_for_running_owned
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertIsNotNone(task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    suppress_events = [
+        event
+        for event in db.events
+        if event.event_type == "runtime_owner_clear_suppressed_for_running_owned"
+    ]
+    self.assertEqual(1, len(suppress_events))
 
 
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
@@ -45497,7 +45429,6 @@ TaskManagerTests.test_streaming_tail_stage_names_for_binary_module_task_cover_fu
 TaskManagerTests.test_stage_terminal_after_system_analysis_archive_keeps_binary_to_source_as_current_stage_for_binary_task = _test_stage_terminal_after_system_analysis_archive_keeps_binary_to_source_as_current_stage_for_binary_task
 TaskManagerTests.test_stage_terminal_after_binary_to_source_archive_can_activate_entry_analysis_streaming_for_binary_task = _test_stage_terminal_after_binary_to_source_archive_can_activate_entry_analysis_streaming_for_binary_task
 TaskManagerTests.test_binary_module_task_can_activate_entry_analysis_streaming_after_binary_to_source_archive = _test_binary_module_task_can_activate_entry_analysis_streaming_after_binary_to_source_archive
-TaskManagerTests.test_reducer_activate_tail_reconciliation_defers_to_owner_worker = _test_reducer_activate_tail_reconciliation_defers_to_owner_worker
 TaskManagerTests.test_record_downstream_sync_event_trims_per_item_bucket_to_20 = _test_record_downstream_sync_event_trims_per_item_bucket_to_20
 TaskManagerTests.test_record_downstream_sync_event_trims_each_item_bucket_independently = _test_record_downstream_sync_event_trims_each_item_bucket_independently
 TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_item_id = _test_record_downstream_sync_event_uses_fallback_bucket_without_item_id

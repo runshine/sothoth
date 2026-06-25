@@ -12,7 +12,6 @@ from app.model import (
     BinarySecurityTaskOperation,
     TASK_TERMINAL_STATUSES,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_TYPE_SOURCE,
     normalize_stage_name,
 )
@@ -1285,8 +1284,8 @@ class TaskStateMachineMixin:
         self._record_event(
             db,
             task,
-            "authoritative_failure_finalize_bypassed_owner_guard",
-            "权威失败收口已绕过 owner guard，直接写入父任务主状态",
+            "authoritative_failure_finalize_requested",
+            "权威失败已请求收口父任务主状态",
             level="warning",
             stage_name=stage_name,
             payload={
@@ -1295,17 +1294,15 @@ class TaskStateMachineMixin:
                 "failure_category": failure_category,
             },
         )
-        if not self._apply_task_main_state_update(
+        if not self._apply_terminal_state_update(
             db,
             task,
-            source="state_machine",
             reason="检测到权威失败，任务终止",
-            stage_name=stage_name,
             status="failed",
+            stage_name=stage_name,
             runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
             finished_at=task.finished_at or task_manager_module._now(),
             last_error=failure_message,
-            clear_runtime_owner=True,
         ):
             self._record_event(
                 db,
@@ -1453,6 +1450,152 @@ class TaskStateMachineMixin:
             return failed_idx <= current_idx
 
         return False
+
+    def _build_authoritative_failure_ctx_from_stage_run(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun,
+        reason: str,
+        failure_code: str | None = None,
+        failure_category: str | None = None,
+        failure_message: str | None = None,
+    ) -> dict[str, Any]:
+        snapshot = self._stage_failure_snapshot(task, stage_run)
+        return {
+            "stage_name": stage_run.stage_name or task.current_stage,
+            "stage_run": stage_run,
+            "failure_code": failure_code if failure_code is not None else snapshot.get("failure_code"),
+            "failure_category": failure_category if failure_category is not None else snapshot.get("failure_category"),
+            "failure_message": (
+                failure_message
+                if failure_message is not None
+                else stage_run.last_error or snapshot.get("failure_message") or snapshot.get("error")
+            ),
+            "reason": reason,
+        }
+
+    def _try_finalize_failed_stage(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_run: BinarySecurityStageRun | None,
+        previous_status: str | None,
+        reason: str,
+        event_type: str,
+        failure_code: str | None = None,
+        failure_category: str | None = None,
+        failure_message: str | None = None,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        require_parent_terminalize: bool = True,
+    ) -> bool:
+        if stage_run is None:
+            return False
+        if require_parent_terminalize and not self._should_terminalize_parent_for_failed_stage(task, stage_run):
+            return False
+        failure_ctx = self._build_authoritative_failure_ctx_from_stage_run(
+            task,
+            stage_run=stage_run,
+            reason=reason,
+            failure_code=failure_code,
+            failure_category=failure_category,
+            failure_message=failure_message,
+        )
+        if not self._should_finalize_after_authoritative_failure(
+            db,
+            task,
+            failure_ctx={"stage_name": failure_ctx.get("stage_name")},
+            stage_runs=stage_runs,
+        ):
+            return False
+        self._finalize_task_after_authoritative_failure(
+            db,
+            task,
+            failure_ctx=failure_ctx,
+            previous_status=previous_status,
+            event_type=event_type,
+        )
+        return True
+
+    def _apply_terminal_state_update(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        reason: str,
+        status: str,
+        stage_name: str | None,
+        runtime_phase: str,
+        finished_at: Any,
+        last_error: Any = None,
+        source: str = "state_machine",
+    ) -> bool:
+        return self._apply_task_main_state_update(
+            db,
+            task,
+            source=source,
+            reason=reason,
+            status=status,
+            stage_name=stage_name,
+            runtime_phase=runtime_phase,
+            finished_at=finished_at,
+            last_error=self._MAIN_STATE_UNSET if last_error is None else last_error,
+            clear_runtime_owner=True,
+        )
+
+    def _apply_active_owned_execution_state(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        reason: str,
+        status: str | None = None,
+        stage_name: str | None = None,
+        finished_at: Any = None,
+        last_error: Any = None,
+        source: str = "state_machine",
+        record_blocked_event: bool = True,
+    ) -> bool:
+        return self._apply_task_main_state_update(
+            db,
+            task,
+            source=source,
+            reason=reason,
+            status=status,
+            stage_name=stage_name,
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            finished_at=finished_at,
+            last_error=self._MAIN_STATE_UNSET if last_error is None else last_error,
+            clear_runtime_owner=False,
+            record_blocked_event=record_blocked_event,
+        )
+
+    def _apply_lease_loss_requeue_state(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        reason: str,
+        status: str,
+        stage_name: str | None,
+        finished_at: Any = None,
+        last_error: Any = None,
+        source: str = "state_machine",
+    ) -> bool:
+        return self._apply_task_main_state_update(
+            db,
+            task,
+            source=source,
+            reason=reason,
+            status=status,
+            stage_name=stage_name,
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            finished_at=finished_at,
+            last_error=self._MAIN_STATE_UNSET if last_error is None else last_error,
+            clear_runtime_owner=True,
+        )
+
     def _next_incomplete_stage(
         self: TaskManager,
         db: Session,
@@ -1463,6 +1606,7 @@ class TaskStateMachineMixin:
             self._source_entry_analysis_barrier_enabled(task)
             and self._stage_has_archived_success_progress(db, task, "system_analysis")
             and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+            and bool(self._entry_analysis_inputs(db, task))
             and (
                 self._stage_status_for_task(db, task, "system_analysis") != "partial_success"
                 or self._partial_success_advancement_enabled(task, "system_analysis")
@@ -1483,6 +1627,7 @@ class TaskStateMachineMixin:
             self._binary_entry_analysis_barrier_enabled(task)
             and self._stage_has_archived_success_progress(db, task, "binary_to_source")
             and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+            and bool(self._entry_analysis_inputs(db, task))
             and (
                 self._stage_status_for_task(db, task, "binary_to_source") != "partial_success"
                 or self._partial_success_advancement_enabled(task, "binary_to_source")
@@ -2243,15 +2388,13 @@ class TaskStateMachineMixin:
         metadata_path = Path(task.workspace_root) / "input" / "task-metadata.json"
         if decision.action == "archive_blocked":
             archive_error = summary.get("error") or "总任务产物归档失败"
-            if not self._apply_task_main_state_update(
+            if not self._apply_terminal_state_update(
                 db,
                 task,
-                source="state_machine",
                 reason="总任务产物归档失败，任务终止",
-                stage_name=stage_name,
                 status="failed",
+                stage_name=stage_name,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
-                clear_runtime_owner=True,
                 finished_at=task_manager_module._now(),
                 last_error=archive_error,
             ):
@@ -2344,17 +2487,15 @@ class TaskStateMachineMixin:
             await self._write_task_metadata_async(task, metadata_path, status=task.status)
             return True
         if decision.action == "activate_streaming_tail":
-            if not self._apply_task_main_state_update(
+            if not self._apply_active_owned_execution_state(
                 db,
                 task,
-                source="state_machine",
                 reason="进入 streaming tail 收口",
-                stage_name=decision.next_stage,
+                source="state_machine",
                 status="running",
-                runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                stage_name=decision.next_stage,
                 finished_at=None,
                 last_error=None,
-                clear_runtime_owner=True,
             ):
                 return True
             lease = self._runtime_lease_for_task(db, task.id)
@@ -2759,7 +2900,7 @@ class TaskStateMachineMixin:
                 stage_name=task.current_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 finished_at=None,
-                clear_runtime_owner=True,
+                clear_runtime_owner=False,
             )
             return True
         active_cancel_operation = self._active_cancel_operation(db, task.id)
@@ -2769,30 +2910,27 @@ class TaskStateMachineMixin:
             return True
         active_operation = self._active_operation(db, task.id)
         if task.status == "cancelled":
-            self._apply_task_main_state_update(
+            self._apply_terminal_state_update(
                 db,
                 task,
-                source="state_machine",
                 reason="取消任务进入 terminal 收口",
+                status=str(task.status or "").strip() or "cancelled",
                 stage_name=task.current_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
                 finished_at=task.finished_at or task_manager_module._now(),
-                clear_runtime_owner=True,
             )
             self._invalidate_task_execution(task)
             return True
         if task.status == task_manager_module.TASK_STATUS_CANCEL_FAILED:
-            self._apply_task_main_state_update(
+            self._apply_terminal_state_update(
                 db,
                 task,
-                source="state_machine",
                 reason="取消失败任务进入 terminal 收口",
-                stage_name=task.current_stage,
                 status=task_manager_module.TASK_STATUS_CANCEL_FAILED,
+                stage_name=task.current_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
                 finished_at=task.finished_at or task_manager_module._now(),
                 last_error=task.last_error,
-                clear_runtime_owner=True,
             )
             self._invalidate_task_execution(task)
             return True
@@ -2804,7 +2942,7 @@ class TaskStateMachineMixin:
                 reason="待模块确认任务保持 owned execution 运行期状态",
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 finished_at=None,
-                clear_runtime_owner=True,
+                clear_runtime_owner=False,
                 record_blocked_event=False,
             )
             return True
@@ -2844,17 +2982,15 @@ class TaskStateMachineMixin:
             and not stage_runs
             and not db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).first()
         ):
-            self._apply_task_main_state_update(
+            self._apply_terminal_state_update(
                 db,
                 task,
-                source="state_machine",
                 reason="失败任务缺少阶段事实时进入 terminal 收口",
                 status="failed",
                 stage_name=task.current_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
                 finished_at=task.finished_at or task_manager_module._now(),
                 last_error=task.last_error,
-                clear_runtime_owner=True,
             )
             self._invalidate_task_execution(task)
             return True
@@ -2930,7 +3066,6 @@ class TaskStateMachineMixin:
                 )
                 return True
             next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            clear_runtime_owner = bool(self._is_streaming_tail_stage(task, task.current_stage))
             task.tail_reconcile_state = "idle"
             self._apply_task_main_state_update(
                 db,
@@ -2942,7 +3077,7 @@ class TaskStateMachineMixin:
                 runtime_phase=next_runtime_phase,
                 finished_at=None,
                 last_error=None,
-                clear_runtime_owner=clear_runtime_owner,
+                clear_runtime_owner=False,
             )
             self._clear_task_failure_state(task)
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -2979,14 +3114,6 @@ class TaskStateMachineMixin:
             last_error=None,
         )
         if not preserve_dispatch:
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="state_machine",
-                reason="活跃阶段释放运行期 owner，等待 worker 重新接管",
-                clear_runtime_owner=True,
-                record_blocked_event=False,
-            )
             current_stage_items = self._stage_items(db, task.id, str(task.current_stage or "").strip())
             has_live_downstream_children = self._stage_has_live_downstream_children(current_stage_items)
             if (
@@ -3137,7 +3264,7 @@ class TaskStateMachineMixin:
                     runtime_phase=next_runtime_phase,
                     finished_at=None,
                     last_error=None,
-                    clear_runtime_owner=True,
+                    clear_runtime_owner=False,
                 )
             return True
         next_stage = self._next_incomplete_stage(db, task)
@@ -3158,35 +3285,15 @@ class TaskStateMachineMixin:
             and not self._is_streaming_tail_stage(task, failed_stage_run.stage_name)
         ):
             failed_stage_name = str(failed_stage_run.stage_name or task.current_stage or "").strip() or None
-            if (
-                self._stage_ready_to_escalate_failure(workflow_snapshots, failed_stage_name or "")
-                and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run)
-                and self._should_finalize_after_authoritative_failure(
-                    db,
-                    task,
-                    failure_ctx={"stage_name": failed_stage_name},
-                    stage_runs=stage_runs,
-                )
+            if self._stage_ready_to_escalate_failure(workflow_snapshots, failed_stage_name or "") and self._try_finalize_failed_stage(
+                db,
+                task,
+                stage_run=failed_stage_run,
+                previous_status=current_status,
+                reason="failed_stage_run_terminalized_after_sync",
+                event_type="dispatching_state_force_terminalized",
+                stage_runs=stage_runs,
             ):
-                failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
-                self._finalize_task_after_authoritative_failure(
-                    db,
-                    task,
-                    failure_ctx={
-                        "stage_name": failed_stage_name,
-                        "stage_run": failed_stage_run,
-                        "failure_code": failure_snapshot.get("failure_code"),
-                        "failure_category": failure_snapshot.get("failure_category"),
-                        "failure_message": (
-                            failed_stage_run.last_error
-                            or failure_snapshot.get("failure_message")
-                            or failure_snapshot.get("error")
-                        ),
-                        "reason": "failed_stage_run_terminalized_after_sync",
-                    },
-                    previous_status=current_status,
-                    event_type="dispatching_state_force_terminalized",
-                )
                 return True
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             recoverable_owner_lost = any(self._owner_lost_retry_exhausted(task, item) is False and self._is_owner_lost_recoverable_failure(
@@ -3229,17 +3336,18 @@ class TaskStateMachineMixin:
                         runtime_phase=next_runtime_phase,
                         finished_at=None,
                         last_error=None,
-                        clear_runtime_owner=True,
+                        clear_runtime_owner=False,
                     )
                 self._clear_task_abnormal_reason_snapshot(db, task)
                 return True
             if not failed_items and "owner pod lost" in str(getattr(failed_stage_run, "last_error", "") or "").lower():
-                _apply_retry_reopen_patch(
-                    status="failed",
+                self._apply_terminal_state_update(
+                    db,
+                    task,
                     reason="owner pod lost 且无可恢复子项，任务失败",
+                    status="failed",
                     stage_name=failed_stage_run.stage_name or task.current_stage,
                     runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
-                    clear_runtime_owner=True,
                     finished_at=task.finished_at or task_manager_module._now(),
                 )
                 self._record_event(
@@ -3259,45 +3367,30 @@ class TaskStateMachineMixin:
                     stage_name=task.current_stage,
                 )
                 return True
-            _apply_retry_reopen_patch(
-                status="pending",
+            self._apply_lease_loss_requeue_state(
+                db,
+                task,
                 reason="失败阶段等待重新接管，任务回到待执行",
+                status="pending",
                 stage_name=failed_stage_run.stage_name or task.current_stage,
-                runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 finished_at=None,
                 last_error=None,
-                clear_runtime_owner=True,
             )
             self._clear_task_abnormal_reason_snapshot(db, task)
             return True
         if (
             failed_stage_run is not None
             and self._stage_ready_to_escalate_failure(workflow_snapshots, str(failed_stage_run.stage_name or "").strip())
-            and self._should_terminalize_parent_for_failed_stage(task, failed_stage_run)
-            and self._should_finalize_after_authoritative_failure(
+            and self._try_finalize_failed_stage(
                 db,
                 task,
-                failure_ctx={
-                    "stage_name": failed_stage_run.stage_name or task.current_stage,
-                },
+                stage_run=failed_stage_run,
+                previous_status=current_status,
+                reason="failed_stage_run_terminalized_after_sync",
+                event_type="task_finalized_after_stage_failure",
                 stage_runs=stage_runs,
             )
         ):
-            failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
-            self._finalize_task_after_authoritative_failure(
-                db,
-                task,
-                failure_ctx={
-                    "stage_name": failed_stage_run.stage_name or task.current_stage,
-                    "stage_run": failed_stage_run,
-                    "failure_code": failure_snapshot.get("failure_code"),
-                    "failure_category": failure_snapshot.get("failure_category"),
-                    "failure_message": failed_stage_run.last_error or failure_snapshot.get("failure_message") or failure_snapshot.get("error"),
-                    "reason": "failed_stage_run_terminalized_after_sync",
-                },
-                previous_status=current_status,
-                event_type="task_finalized_after_stage_failure",
-            )
             return True
         if (
             failed_stage_run is not None
@@ -3306,30 +3399,22 @@ class TaskStateMachineMixin:
         ):
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             exhausted_owner_lost_items = [item for item in failed_items if self._owner_lost_retry_exhausted(task, item)]
-            if exhausted_owner_lost_items and self._should_finalize_after_authoritative_failure(
-                db,
-                task,
-                failure_ctx={
-                    "stage_name": failed_stage_run.stage_name or task.current_stage,
-                },
-                stage_runs=stage_runs,
-            ):
+            if exhausted_owner_lost_items:
                 exhausted_item = exhausted_owner_lost_items[0]
-                self._finalize_task_after_authoritative_failure(
+                if self._try_finalize_failed_stage(
                     db,
                     task,
-                    failure_ctx={
-                        "stage_name": failed_stage_run.stage_name or task.current_stage,
-                        "stage_run": failed_stage_run,
-                        "failure_code": "owner_lost_retry_exhausted",
-                        "failure_category": "infrastructure",
-                        "failure_message": str(exhausted_item.error_message or "").strip() or "owner_lost_retry_exhausted",
-                        "reason": "owner_lost_retry_exhausted_after_sync",
-                    },
+                    stage_run=failed_stage_run,
                     previous_status=current_status,
+                    reason="owner_lost_retry_exhausted_after_sync",
                     event_type="task_owner_lost_final_failed",
-                )
-                return True
+                    failure_code="owner_lost_retry_exhausted",
+                    failure_category="infrastructure",
+                    failure_message=str(exhausted_item.error_message or "").strip() or "owner_lost_retry_exhausted",
+                    stage_runs=stage_runs,
+                    require_parent_terminalize=False,
+                ):
+                    return True
             if not failed_items:
                 failed_stage_error = " ".join(
                     str(part or "").strip()
@@ -3341,30 +3426,16 @@ class TaskStateMachineMixin:
                     if str(part or "").strip()
                 )
                 if "task owner pod lost" in failed_stage_error.lower() or "owner pod lost" in failed_stage_error.lower():
-                    failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
-                    if not self._should_finalize_after_authoritative_failure(
+                    if self._try_finalize_failed_stage(
                         db,
                         task,
-                        failure_ctx={
-                            "stage_name": failed_stage_run.stage_name or task.current_stage,
-                        },
+                        stage_run=failed_stage_run,
+                        previous_status=current_status,
+                        reason="failed_stage_run_owner_lost_without_child_items",
+                        event_type="task_finalized_after_stage_failure",
                         stage_runs=stage_runs,
                     ):
-                        return False
-                    self._finalize_task_after_authoritative_failure(
-                        db,
-                        task,
-                        failure_ctx={
-                            "stage_name": failed_stage_run.stage_name or task.current_stage,
-                            "stage_run": failed_stage_run,
-                            "failure_code": failure_snapshot.get("failure_code"),
-                            "failure_category": failure_snapshot.get("failure_category"),
-                            "failure_message": failed_stage_run.last_error or failure_snapshot.get("failure_message") or failure_snapshot.get("error"),
-                            "reason": "failed_stage_run_owner_lost_without_child_items",
-                        },
-                        previous_status=current_status,
-                        event_type="task_finalized_after_stage_failure",
-                    )
+                        return True
                 return True
         if (
             failed_stage_run is not None
@@ -3401,13 +3472,13 @@ class TaskStateMachineMixin:
                 return True
             if self._task_has_resumable_execution_path(db, task, stage_runs=stage_runs):
                 next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                _apply_retry_reopen_patch(
-                    status="pending",
+                self._apply_lease_loss_requeue_state(
+                    db,
+                    task,
                     reason="失败阶段等待重新接管，任务保持待执行",
+                    status="pending",
                     stage_name=failed_stage_name,
-                    runtime_phase=next_runtime_phase,
                     finished_at=None,
-                    clear_runtime_owner=True,
                 )
                 return True
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
@@ -3461,7 +3532,9 @@ class TaskStateMachineMixin:
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 finished_at=None,
                 last_error=None,
-                clear_runtime_owner=True,
+                # 保持 running+owned+当前阶段，当前 owner 须继续驱动剩余活跃工作，
+                # 清空主 owner 会制造 owned_execution 无 owner 的不可变式破坏态。
+                clear_runtime_owner=False,
             )
             self._clear_task_abnormal_reason_snapshot(db, task)
             return True
@@ -3480,7 +3553,8 @@ class TaskStateMachineMixin:
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 finished_at=None,
                 last_error=None,
-                clear_runtime_owner=True,
+                # 同上：保持 running+owned+当前阶段，不应清空主 owner。
+                clear_runtime_owner=False,
             )
             self._clear_task_abnormal_reason_snapshot(db, task)
             return True
@@ -3527,7 +3601,7 @@ class TaskStateMachineMixin:
                     runtime_phase=next_runtime_phase,
                     finished_at=None,
                     last_error=None,
-                    clear_runtime_owner=True,
+                    clear_runtime_owner=False,
                 )
             summary = dict(task.summary or {})
             if summary.get("stale_from_stage") and next_stage in set(summary.get("stale_stages") or []):
@@ -3610,12 +3684,13 @@ class TaskStateMachineMixin:
             )
             return True
         if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode and not next_stage:
-            _apply_retry_reopen_patch(
-                status="failed",
+            self._apply_terminal_state_update(
+                db,
+                task,
                 reason="无后续阶段且存在失败阶段，任务终止失败",
+                status="failed",
                 stage_name=failed_stage_run.stage_name or task.current_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
-                clear_runtime_owner=True,
                 finished_at=task.finished_at or task_manager_module._now(),
             )
             return True
@@ -3631,12 +3706,13 @@ class TaskStateMachineMixin:
         ):
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             if failed_items and not self._stage_has_nonterminal_items(failed_items):
-                _apply_retry_reopen_patch(
-                    status="failed",
+                self._apply_terminal_state_update(
+                    db,
+                    task,
                     reason="失败阶段已无非终态子项，任务终止失败",
+                    status="failed",
                     stage_name=failed_stage_run.stage_name or task.current_stage,
                     runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
-                    clear_runtime_owner=True,
                     finished_at=task.finished_at or task_manager_module._now(),
                 )
                 return True
@@ -3683,15 +3759,13 @@ class TaskStateMachineMixin:
                 )
             blocked_snapshot = next((snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == str(blocked_stage or "").strip()), None)
             blocked_status = str((blocked_snapshot or {}).get("status") or "").strip()
-            self._apply_task_main_state_update(
+            self._apply_active_owned_execution_state(
                 db,
                 task,
-                source="state_machine",
                 reason="工作流未满足最终收口条件，任务保持活跃",
+                source="state_machine",
                 status="running" if blocked_status in {"running", "dispatching"} or bool((blocked_snapshot or {}).get("has_active_items")) else "pending",
                 stage_name=blocked_stage or task.current_stage,
-                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
                 finished_at=None,
                 last_error=None,
             )
@@ -3717,15 +3791,14 @@ class TaskStateMachineMixin:
             or has_materialized_stale_context
         ):
             final_status = "partial_success"
-        self._apply_task_main_state_update(
+        self._apply_terminal_state_update(
             db,
             task,
-            source="state_machine",
             reason="工作流全部阶段完成，聚合最终任务状态",
+            source="state_machine",
             status=final_status,
             stage_name=task.current_stage,
             runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
-            clear_runtime_owner=True,
             finished_at=task_manager_module._now(),
         )
         self._last_task_heartbeat_at.pop(task.id, None)
@@ -3873,12 +3946,11 @@ class TaskStateMachineMixin:
                 status=next_status,
                 stage_name=blocked_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
+                clear_runtime_owner=False,
                 finished_at=None,
                 last_error=None,
             )
             task.tail_reconcile_state = "idle"
-            self._release_tail_reconcile_owner(task.id)
             self._last_task_heartbeat_at.pop(task.id, None)
             self._record_event(
                 db,
@@ -3914,7 +3986,7 @@ class TaskStateMachineMixin:
                 source="state_machine",
                 reason="待模块确认任务保持 owned execution 运行期状态",
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
+                clear_runtime_owner=False,
                 record_blocked_event=False,
             )
             self._sync_task_abnormal_reason_snapshot(db, task, None)
@@ -3988,12 +4060,11 @@ class TaskStateMachineMixin:
                 status="running" if _stage_should_keep_task_running(active_streaming_stage, active_streaming_status) else "pending",
                 stage_name=active_streaming_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
+                clear_runtime_owner=False,
                 finished_at=None,
                 last_error=None,
             )
             task.tail_reconcile_state = "idle"
-            self._release_tail_reconcile_owner(task.id)
             self._last_task_heartbeat_at.pop(task.id, None)
             self._record_event(
                 db,
@@ -4042,12 +4113,11 @@ class TaskStateMachineMixin:
                 status="running",
                 stage_name=active_stage_name,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
+                clear_runtime_owner=False,
                 finished_at=None,
                 last_error=None,
             )
             task.tail_reconcile_state = "idle"
-            self._release_tail_reconcile_owner(task.id)
             self._last_task_heartbeat_at.pop(task.id, None)
             self._record_event(
                 db,
@@ -4071,12 +4141,11 @@ class TaskStateMachineMixin:
             else next_active_status,
             stage_name=active_stage_name or task.current_stage,
             runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            clear_runtime_owner=True,
+            clear_runtime_owner=False,
             finished_at=None,
             last_error=None,
         )
         task.tail_reconcile_state = "idle"
-        self._release_tail_reconcile_owner(task.id)
         self._last_task_heartbeat_at.pop(task.id, None)
         self._record_event(
             db,
@@ -4179,12 +4248,11 @@ class TaskStateMachineMixin:
                 status="running" if next_stage_status in {"running", "dispatching", "applying"} or bool((next_snapshot or {}).get("has_active_items")) else "pending",
                 stage_name=workflow_blocked_stage or next_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                clear_runtime_owner=True,
+                clear_runtime_owner=False,
                 finished_at=None,
                 last_error=None,
             )
             task.tail_reconcile_state = "idle"
-            self._release_tail_reconcile_owner(task.id)
             self._last_task_heartbeat_at.pop(task.id, None)
             if self._should_requeue_for_owned_execution(
                 db,
@@ -4238,7 +4306,7 @@ class TaskStateMachineMixin:
                     stage_name=missing_enabled_stage,
                     status="pending",
                     runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                    clear_runtime_owner=True,
+                    clear_runtime_owner=False,
                     finished_at=None,
                     last_error=None,
                 ):

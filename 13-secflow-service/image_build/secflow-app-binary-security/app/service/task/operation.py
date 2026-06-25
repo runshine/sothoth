@@ -3891,17 +3891,15 @@ class TaskOperationServiceMixin:
             operation.error_message = "后台操作完成，但当前仍不满足原地恢复条件"
             return False
 
-        self._apply_task_main_state_update(
+        self._apply_active_owned_execution_main_state(
             db,
             task,
-            source="task_operation",
             reason="重试类控制操作完成，当前 owner 原地恢复执行",
+            source="task_operation",
             status="running",
             stage_name=resolved_stage,
-            runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             finished_at=None,
             last_error=None,
-            clear_runtime_owner=False,
         )
         task.current_stage = resolved_stage
         task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
@@ -4069,17 +4067,15 @@ class TaskOperationServiceMixin:
                 "in_place_runtime_resume": False,
             },
         )
-        self._apply_task_main_state_update(
+        self._apply_lease_loss_requeue_state(
             db,
             task,
-            source="task_operation",
             reason="失败项重试完成，owner 主动释放租约并重新进入待调度",
             status="pending",
             stage_name=resolved_stage,
-            runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             finished_at=None,
             last_error=None,
-            clear_runtime_owner=True,
+            source="task_operation",
         )
         task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
         self._clear_task_abnormal_reason_snapshot(db, task)

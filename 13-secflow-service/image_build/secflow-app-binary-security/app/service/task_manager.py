@@ -39,7 +39,6 @@ from app.model import (
     STAGE_SEQUENCE,
     TASK_TERMINAL_STATUSES,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    TASK_RUNTIME_PHASE_TAIL_RECONCILIATION,
     TASK_RUNTIME_PHASE_TERMINAL,
     TASK_STAGE_SEQUENCES,
     TASK_TYPE_BINARY,
@@ -2047,23 +2046,6 @@ class TaskManager(
         with self._task_execution_owner_lock:
             return sorted(task_id for task_id, owners in self._task_execution_owners.items() if owners)
 
-    def _acquire_tail_reconcile_owner(self, task_id: str) -> None:
-        del task_id
-
-    def _release_tail_reconcile_owner(self, task_id: str) -> None:
-        del task_id
-
-    def _has_tail_reconcile_owner(self, task_id: str) -> bool:
-        del task_id
-        return False
-
-    def _tail_reconcile_owner_token(self) -> dict[str, Any]:
-        return {}
-
-    def _next_tail_reconcile_generation(self, current_generation: int | None = None) -> int:
-        del current_generation
-        return int(self._owner_generation or 0)
-
     def _task_delete_snapshot(self, task: BinarySecurityTask) -> dict[str, Any]:
         snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
         return snapshot if isinstance(snapshot, dict) else {}
@@ -2838,38 +2820,35 @@ class TaskManager(
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         if previous_status == "running":
-            self._apply_task_status_only_update(
+            self._apply_release_for_takeover_main_state(
                 db,
                 task,
-                status="running",
-                reason="检测到任务 owner 元数据漂移，释放 owner 但保持任务运行态等待重新接管",
                 source="task_manager",
+                reason="检测到任务 owner 元数据漂移，释放 owner 但保持任务运行态等待重新接管",
+                status="running",
                 stage_name=task.current_stage,
-                clear_runtime_owner=True,
                 finished_at=None,
                 last_error=None,
             )
         elif previous_status == "dispatching":
-            self._apply_task_status_only_update(
+            self._apply_release_for_takeover_main_state(
                 db,
                 task,
-                status="pending",
-                reason="检测到 dispatching 任务 owner 元数据漂移，释放 owner 并等待重新调度",
                 source="task_manager",
+                reason="检测到 dispatching 任务 owner 元数据漂移，释放 owner 并等待重新调度",
+                status="pending",
                 stage_name=task.current_stage,
-                clear_runtime_owner=True,
                 finished_at=None,
                 last_error=None,
             )
         elif previous_status == TASK_STATUS_CANCELLING:
-            self._apply_task_status_only_update(
+            self._apply_release_for_takeover_main_state(
                 db,
                 task,
-                status=TASK_STATUS_CANCELLING,
-                reason="任务取消中但 owner 元数据漂移，保留取消状态并释放 owner",
                 source="task_manager",
+                reason="任务取消中但 owner 元数据漂移，保留取消状态并释放 owner",
+                status=TASK_STATUS_CANCELLING,
                 stage_name=task.current_stage,
-                clear_runtime_owner=True,
                 finished_at=None,
                 last_error=None,
                 record_blocked_event=False,
@@ -3156,14 +3135,13 @@ class TaskManager(
                         "path": f"{task.summary.get('input_dir')}/{relative_path}",
                     }
                 )
-        self._apply_task_status_only_update(
+        self._apply_release_for_takeover_main_state(
             db,
             task,
-            status="pending",
-            reason="输入文件上传完成，任务已进入调度队列",
             source="task_manager",
+            reason="输入文件上传完成，任务已进入调度队列",
+            status="pending",
             stage_name=self._stage_sequence_for_task(task)[0],
-            clear_runtime_owner=True,
         )
         task.summary = {
             **task.summary,
@@ -3205,14 +3183,13 @@ class TaskManager(
         input_files = task.summary.get("input_files") or []
         if not input_files:
             raise ValidationError("没有可用的输入文件")
-        self._apply_task_status_only_update(
+        self._apply_release_for_takeover_main_state(
             db,
             task,
-            status="pending",
-            reason="任务启动请求已受理，进入待调度",
             source="task_manager",
+            reason="任务启动请求已受理，进入待调度",
+            status="pending",
             stage_name=self._stage_sequence_for_task(task)[0],
-            clear_runtime_owner=True,
             finished_at=None,
             last_error=None,
         )
@@ -4240,7 +4217,7 @@ class TaskManager(
             return False
         previous_status = str(task.status or "").strip()
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
-        self._apply_task_status_only_update(
+        self._apply_active_owned_execution_main_state(
             db,
             task,
             status="running",
@@ -4250,7 +4227,6 @@ class TaskManager(
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             finished_at=None,
             last_error=None,
-            clear_runtime_owner=not self._should_preserve_task_dispatch_ownership(task, previous_status=previous_status, db=db),
         )
         task.tail_reconcile_state = "idle"
         self._clear_task_abnormal_reason_snapshot(db, task)
@@ -4298,14 +4274,13 @@ class TaskManager(
             return False
         previous_status = str(task.status or "").strip() or "running"
         previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
-        self._apply_task_status_only_update(
+        self._apply_release_for_takeover_main_state(
             db,
             task,
-            status="pending",
-            reason="运行实例租约失效，父任务释放并重新排队等待接管",
             source="task_manager",
+            reason="运行实例租约失效，父任务释放并重新排队等待接管",
+            status="pending",
             stage_name=active_stage_name or task.current_stage,
-            clear_runtime_owner=True,
             finished_at=None,
             last_error=None,
         )

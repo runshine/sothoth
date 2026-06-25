@@ -1499,7 +1499,6 @@ class TaskControlServiceMixin:
         self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION)
         self._invalidate_task_execution(task)
         self._clear_runtime_lease(db, task.id)
-        self._release_tail_reconcile_owner(task.id)
         self._clear_task_abnormal_reason_snapshot(db, task)
         self._record_event(
             db,

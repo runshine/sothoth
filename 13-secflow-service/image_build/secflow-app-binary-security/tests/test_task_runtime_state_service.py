@@ -89,10 +89,6 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_runtime_phase(task))
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, self.manager._task_control_mode(task))
 
-        self.manager._set_task_runtime_phase(task, "tail_reconciliation")
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_control_mode(task))
-
         self.manager._set_task_runtime_phase(task, "")
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
 

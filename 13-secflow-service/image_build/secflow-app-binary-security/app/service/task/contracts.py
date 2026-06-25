@@ -148,12 +148,17 @@ class TaskContractServiceMixin:
         for module in modules[:limit]:
             rows.append(
                 {
+                    "firmware_key": module.get("firmware_key"),
                     "module_key": module.get("module_key"),
                     "module_name": module.get("module_name"),
                     "rank": module.get("rank"),
                     "risk_level": self._normalize_module_risk_level(module.get("risk_level"), module.get("risk_score")),
                     "risk_score": module.get("risk_score"),
                     "file_count": module.get("file_count"),
+                    "source_root": module.get("source_root"),
+                    "source_root_path": module.get("source_root_path") or module.get("source_root"),
+                    "source_dir": module.get("source_dir") or module.get("module_dir"),
+                    "module_dir": module.get("module_dir") or module.get("source_dir"),
                     "selected_by": module.get("selected_by"),
                     "selected_at": module.get("selected_at"),
                 }

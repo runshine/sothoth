@@ -1412,15 +1412,14 @@ class TaskRuntimeServiceMixin:
             dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip() or None
             dispatch_started_at = task.dispatch_started_at
             task_lease_expires_at = task.lease_expires_at
-            self._apply_task_main_state_update(
+            self._apply_lease_loss_requeue_state(
                 db,
                 task,
-                source="runtime_worker",
                 reason="调度超时，任务回收并重新进入队列",
                 status="pending",
                 stage_name=task.current_stage,
-                clear_runtime_owner=True,
                 last_error=None,
+                source="runtime_worker",
             )
             task_manager_module.observe_dispatch_reclaim("dispatch_timeout")
             self._record_event(
@@ -1705,17 +1704,16 @@ class TaskRuntimeServiceMixin:
                     item.status = "failed"
                     item.finished_at = item.finished_at or task_manager_module._now()
                     item.error_message = item.error_message or "任务运行心跳超时"
-            self._apply_task_main_state_update(
+            self._apply_terminal_state_update(
                 db,
                 task,
-                source="runtime_worker",
                 reason="任务运行心跳超时，任务失败",
                 status="failed",
                 stage_name=current_stage_name or None,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
                 finished_at=task.finished_at or task_manager_module._now(),
                 last_error=task.last_error or "任务运行心跳超时",
-                clear_runtime_owner=True,
+                source="runtime_worker",
             )
             self._record_event(
                 db,
@@ -2094,15 +2092,14 @@ class TaskRuntimeServiceMixin:
                         )
                         db.commit()
                         return
-                    self._apply_task_main_state_update(
+                    self._apply_lease_loss_requeue_state(
                         db,
                         task,
-                        source="runtime_worker",
                         reason="owner active commit 失败，释放假活 dispatching owner 等待重新接管",
                         status="pending",
                         stage_name=task.current_stage,
-                        clear_runtime_owner=True,
                         last_error=None,
+                        source="runtime_worker",
                     )
                     self._clear_runtime_lease(
                         db,

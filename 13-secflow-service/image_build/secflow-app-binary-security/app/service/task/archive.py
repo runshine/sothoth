@@ -543,24 +543,21 @@ class TaskArchiveServiceMixin:
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             finished_at=None,
             last_error=None,
-            clear_runtime_owner=not preserve_active_state,
+            clear_runtime_owner=False,
         )
         task.execution_mode = None
         task.target_stage_name = None
         self._clear_task_abnormal_reason_snapshot(db, task)
         task.tail_reconcile_state = "idle"
-        clear_owner_for_requeue = not preserve_active_state
+        should_release_owner = not preserve_active_state
         clear_decision = None
-        if not clear_owner_for_requeue:
+        if not should_release_owner:
             clear_decision = self._can_reopen_parent_task_after_lease_loss(
                 db,
                 task,
                 reason="archive_retry_requeue",
             )
             if clear_decision.allowed:
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
                 self._record_parent_runtime_lease_decision(
                     db,
                     task,
@@ -571,6 +568,7 @@ class TaskArchiveServiceMixin:
                     stage_name=stage_name,
                     level="warning",
                 )
+                should_release_owner = True
             else:
                 self._record_parent_runtime_lease_decision(
                     db,
@@ -582,9 +580,11 @@ class TaskArchiveServiceMixin:
                     stage_name=stage_name,
                 )
         task.finished_at = None
-        if clear_owner_for_requeue or bool(clear_decision and clear_decision.allowed):
+        if should_release_owner:
+            task.dispatcher_instance_id = None
+            task.dispatch_started_at = None
+            task.lease_expires_at = None
             self._clear_runtime_lease(db, task.id)
-            self._release_tail_reconcile_owner(task.id)
             self._enqueue_task(task.id)
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=next_status)
         self._record_event(

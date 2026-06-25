@@ -1274,7 +1274,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, summary["unbound_runnable_item_count"])
         self.assertEqual(0, summary["bound_active_item_count"])
         self.assertTrue(self.manager._tail_requires_execution_takeover(db, task))
-        self.assertFalse(self.manager._should_enter_tail_reconciliation(db, task))
 
     def test_refresh_task_status_keeps_owned_execution_when_tail_has_unbound_items(self):
         task = BinarySecurityTask(
@@ -1316,9 +1315,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_active_operation", return_value=None),
             patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_enqueue_task", side_effect=lambda *_args, **_kwargs: None),
-            patch.object(self.manager, "_release_tail_reconcile_owner", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
-            patch.object(self.manager, "_activate_tail_reconciliation", side_effect=AssertionError("should not enter tail reconciliation")),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
@@ -1409,7 +1406,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_active_operation", return_value=None),
             patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_enqueue_task", side_effect=lambda *_args, **_kwargs: None),
-            patch.object(self.manager, "_release_tail_reconcile_owner", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
