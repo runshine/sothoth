@@ -828,9 +828,13 @@ class TaskReducerServiceMixin:
                 if (
                     observed_terminal_status in terminal_failure_statuses
                     and self._is_streaming_tail_stage(task, stage_name)
+                    and normalize_stage_name(stage_name) != "entry_analysis"
                     and not bool(payload.get("stage_retry_mode"))
                     and not bool(payload.get("task_retry_mode"))
                 ):
+                    # entry_analysis 是上游产出阶段（其子项由自身物化，不会"稍后从上游到达"），
+                    # 0-item 的 failed 终态是权威失败，必须上卷，不能当"等收敛"忽略。
+                    # 仅 dataflow_vuln_scan 这类消费型尾段才适用"等上游 funnel 子项"的忽略语义。
                     stage_run.status = "pending"
                     stage_run.finished_at = None
                     stage_run.last_error = None

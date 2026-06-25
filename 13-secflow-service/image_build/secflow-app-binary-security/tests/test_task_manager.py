@@ -8631,7 +8631,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-        self.assertEqual("dataflow_vuln_scan", self.manager._next_incomplete_stage(db, task))
+        self.assertEqual("entry_analysis", self.manager._next_incomplete_stage(db, task))
 
     def test_task_continue_support_targets_current_stage_when_partial_success_advancement_disabled(self):
         task = BinarySecurityTask(
@@ -8749,7 +8749,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual("pending", task.status)
-        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual("entry_analysis", task.current_stage)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNone(task.dispatch_started_at)
 

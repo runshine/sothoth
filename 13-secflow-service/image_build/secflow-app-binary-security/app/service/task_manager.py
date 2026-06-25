@@ -9971,6 +9971,29 @@ class TaskManager(
             return bool(self._effective_entry_inputs(task, db) or self._entry_results(task))
         return False
 
+    def _system_analysis_authoritative_complete(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        """system_analysis 是否已产出权威结果且 summary 已刷新（selected_modules 键存在）。
+
+        用于区分入口分析“未就绪需阻塞”与“就绪但 0 模块应成功收口”。
+        """
+        stage_run = (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == "system_analysis",
+            )
+            .first()
+        )
+        if stage_run is None:
+            return False
+        if str(stage_run.status or "").strip() not in {"success", "partial_success"}:
+            return False
+        return "selected_modules" in dict(task.summary or {})
+
     def _entry_analysis_pending_requires_materialization(
         self,
         db: Session,
@@ -9979,6 +10002,12 @@ class TaskManager(
         stage_run: BinarySecurityStageRun | None = None,
         stage_items: list[BinarySecurityStageItem] | None = None,
     ) -> bool:
+        # 系统分析尚未就绪：阻塞等待，不跳过也不收口
+        if not self._system_analysis_authoritative_complete(db, task):
+            return True
+        # 就绪但 0 模块：不阻塞，交给 _should_finalize_without_entries 成功收口
+        if not list((task.summary or {}).get("selected_modules") or []):
+            return False
         rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
         if bool(rebuild_state.get("required")):
             return True

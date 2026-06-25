@@ -2318,6 +2318,16 @@ class TaskRuntimeServiceMixin:
                     )
                     db.commit()
                     return
+                # 流式推进到 dataflow_vuln_scan 要求 entry_analysis 至少有 1 个成功归档子任务。
+                # 若 entry_analysis 仍未终态且 0 归档成功，不在本顺序 pass 启动 DFS（避免空跑+永久等待），
+                # 交给 streaming reconcile 在满足条件后通过 activate_streaming_tail 启动。
+                # entry_analysis 已终态且 0 归档成功的情况已由上方 _missing_entry_results_failure_context 失败收口。
+                if (
+                    task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+                    and self._source_entry_analysis_barrier_enabled(task)
+                    and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+                ):
+                    continue
                 if not self._stage_enabled(task, stage_name):
                     stage_run = self._ensure_stage_run(db, task, stage_name)
                     stage_run.status = "success"

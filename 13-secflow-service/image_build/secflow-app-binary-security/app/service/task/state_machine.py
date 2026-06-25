@@ -472,8 +472,24 @@ class TaskStateMachineMixin:
             return None
         if self._task_type(task) != TASK_TYPE_SOURCE:
             return None
+        if self._entry_results(task):
+            return None
         module_state = self._entry_module_completion_state(task, db)
-        if self._entry_results(task) or not bool(module_state.get("complete")):
+        # entry_analysis 已终态（不再会物化新模块）时，若仍无 entry_results 应判失败上卷，
+        # 而不是因 module_state.complete=False 放行让 DFS 进入永久等待。
+        # 仅当 entry_analysis 尚未终态且模块未收敛时才放行等待。
+        entry_stage_run = (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == "entry_analysis",
+            )
+            .first()
+        )
+        entry_terminal = str(getattr(entry_stage_run, "status", "") or "").strip() in {
+            "success", "failed", "partial_success", "cancelled", "downstream_missing",
+        }
+        if not entry_terminal and not bool(module_state.get("complete")):
             return None
         stage_run = self._ensure_stage_run(db, task, stage_name)
         failure_message = "entry_analysis 未产出 entry_results，无法继续进入 dataflow_vuln_scan"
@@ -1672,6 +1688,8 @@ class TaskStateMachineMixin:
     ) -> bool:
         normalized_stage = normalize_stage_name(stage_name)
         if normalized_stage == "entry_analysis":
+            if not self._system_analysis_authoritative_complete(db, task):
+                return False
             return not bool(self._entry_analysis_inputs(db, task))
         if normalized_stage == "dataflow_vuln_scan":
             module_state = self._entry_module_completion_state(task, db)
@@ -2645,6 +2663,15 @@ class TaskStateMachineMixin:
                 return decision
             stage_status = str(getattr(stage_run, "status", "") or "").strip()
             if stage_status in TASK_TERMINAL_STATUSES:
+                # 本阶段终态后若下一阶段是 entry_analysis 且其输入（selected_modules）尚未就绪，
+                # 延迟 stage_terminal_apply，避免在 summary 未刷新时空跑/跳过/提前收口。
+                # 就绪判据：system_analysis 已 success 且 summary 已刷新（selected_modules 键存在）。
+                if (
+                    normalize_stage_name(resolved_stage_name) == "system_analysis"
+                    and not self._system_analysis_authoritative_complete(db, task)
+                ):
+                    decision.action = "refresh_only"
+                    return decision
                 decision.action = "stage_terminal_apply"
                 decision.stage_name = resolved_stage_name
                 decision.stage_status = stage_status

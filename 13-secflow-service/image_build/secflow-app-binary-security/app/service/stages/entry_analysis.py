@@ -36,9 +36,8 @@ class EntryAnalysisStageHandler(BinarySecurityStageHandler):
             if not any(str(item.get("entry_files_list") or "").strip() for item in ready_inputs):
                 return "入口分析模块描述文件已生成但文件列表为空"
             return None
-        inputs = list(summary.get("selected_modules") or [])
-        if not inputs:
-            return "系统分析尚未产出可用模块，不能继续入口分析阶段"
+        # source：不再因 selected_modules 为空而报错跳过。未就绪由阻塞路径等待，
+        # 就绪但 0 模块由 _should_finalize_without_entries 成功收口，不进入后续阶段。
         return None
 
     def refresh_summary_from_items(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> None:
