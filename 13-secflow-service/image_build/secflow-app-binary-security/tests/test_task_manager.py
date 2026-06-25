@@ -43432,7 +43432,7 @@ def _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_
                     "key": {
                         "id": 585,
                         "key_name": "system_analyse-si-1",
-                        "key_prefix": "wsk_12345678",
+                        "key_value": "wsk_kv_1",
                         "sub_task_id": "si-1",
                     },
                     "secret": "wsk_secret_1",
@@ -43459,13 +43459,13 @@ def _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_
     self.assertEqual("tok", create_calls[0]["token"])
     self.assertEqual("585", str(create_payload.get("agent_task_key_id") or "").strip())
     self.assertEqual("system_analyse-si-1", create_payload.get("agent_task_key_name"))
-    self.assertEqual("wsk_12345678", create_payload.get("agent_task_key_prefix"))
+    self.assertEqual("wsk_kv_1", create_payload.get("agent_task_key_prefix"))
     self.assertEqual("llm_gateway_work_key_exchange", create_payload.get("agent_task_key_source"))
     self.assertEqual("wsk_secret_1", create_payload.get("agent_task_key_secret"))
     self.assertNotEqual("root-secret-1", create_payload.get("agent_task_key_secret"))
     self.assertEqual(create_payload.get("agent_task_key_id"), item.payload.get("downstream_agent_task_key_id"))
     self.assertEqual("system_analyse-si-1", item.payload.get("downstream_agent_task_key_name"))
-    self.assertEqual("wsk_12345678", item.payload.get("downstream_agent_task_key_prefix"))
+    self.assertEqual("wsk_kv_1", item.payload.get("downstream_agent_task_key_prefix"))
     self.assertEqual("llm_gateway_work_key_exchange", item.payload.get("downstream_key_source"))
     event_types = [str(getattr(row, "event_type", "") or "") for row in db.events]
     self.assertIn("downstream_work_key_requested", event_types)

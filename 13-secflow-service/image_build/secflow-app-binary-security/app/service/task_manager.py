@@ -771,8 +771,14 @@ class TaskManager(
                 secret = str(issued.get("secret") or "").strip()
                 key_id = str(key.get("id") or "").strip()
                 key_name_value = str(key.get("key_name") or key_name).strip() or key_name
-                key_prefix = str(key.get("key_prefix") or "").strip() or None
-                if not secret or not key_id or not key_prefix:
+                # 网关 work key 响应不含 key_prefix（其 key_prefix 列为空），回退到 key_value 作为前缀，
+                # 避免误报“响应缺少关键字段”导致下游创建永久 defer。
+                key_prefix = (
+                    str(key.get("key_prefix") or "").strip()
+                    or str(key.get("key_value") or "").strip()
+                    or None
+                )
+                if not secret or not key_id:
                     raise LLMGatewayWorkKeyIssueError(
                         "LLM Gateway work key 响应缺少关键字段",
                         status_code=201,
@@ -10058,6 +10064,43 @@ class TaskManager(
             return False
         return "selected_modules" in dict(task.summary or {})
 
+    def _binary_to_source_authoritative_complete(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        """binary_to_source 是否已收敛（无活跃子项）。
+
+        BINARY / BINARY_MODULE 任务的入口分析输入来自 binary_to_source 的 b2s_results。
+        仍在运行（有活跃子项/未终态）时入口分析应阻塞等待，而非提前 fail；
+        已收敛（success/failed/cancelled 等终态）后才交由 _missing_entry_analysis_input_reason
+        给出具体原因（例如 b2s 失败时传播其错误）。
+        """
+        items = self._stage_items(db, task.id, "binary_to_source")
+        if items:
+            active_statuses = {"pending", "queued", "running", "dispatching"}
+            return not any(
+                (self._normalize_downstream_status(item.status) or str(item.status or "").strip()) in active_statuses
+                for item in items
+            )
+        stage_run = (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == "binary_to_source",
+            )
+            .first()
+        )
+        if stage_run is None:
+            return False
+        return str(stage_run.status or "").strip() in {
+            "success",
+            "partial_success",
+            "failed",
+            "cancelled",
+            "downstream_missing",
+        }
+
     def _entry_analysis_pending_requires_materialization(
         self,
         db: Session,
@@ -10292,21 +10335,6 @@ class TaskManager(
             inputs = list(summary.get("selected_modules") or [])
             if not inputs:
                 return "系统分析尚未产出可用模块，不能继续二进制逆向阶段"
-            return None
-        if stage_name == "entry_analysis":
-            if self._task_type(task) == TASK_TYPE_BINARY_MODULE:
-                inputs = [dict(item) for item in (summary.get("b2s_results") or []) if isinstance(item, dict)]
-                if not inputs:
-                    return "binary-to-source 尚未产出可用结果，不能继续入口分析阶段"
-                ready_inputs = [item for item in inputs if item.get("entry_descriptor_ready")]
-                if not ready_inputs:
-                    return "binary-to-source 已成功，但未生成入口分析所需模块描述文件"
-                if not any(str(item.get("entry_files_list") or "").strip() for item in ready_inputs):
-                    return "入口分析模块描述文件已生成但文件列表为空"
-                return None
-            inputs = list(summary.get("selected_modules") or [])
-            if not inputs:
-                return "系统分析尚未产出可用模块，不能继续入口分析阶段"
             return None
         if normalize_stage_name(stage_name) == "knowledge_graph_entry_fetch":
             source_dir = str(summary.get("input_dir") or "").strip()
@@ -11545,6 +11573,15 @@ class TaskManager(
         self._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task, stage_run=stage_run)
         b2s_success = self._entry_analysis_inputs(db, task)
         if not b2s_success:
+            # SOURCE 任务就绪门控：system_analysis 未就绪→阻塞等待（不 fail）；就绪但 0 模块→成功收口
+            if self._task_type(task) == TASK_TYPE_SOURCE:
+                if not self._system_analysis_authoritative_complete(db, task):
+                    return "pending", {"reason": "system_analysis 尚未就绪，入口分析暂不执行，等待上游归档"}
+                return "success", {"reason": "system_analysis 已就绪但无入口模块，入口分析直接成功收口"}
+            # BINARY / BINARY_MODULE 任务就绪门控：binary_to_source 未就绪→阻塞等待（不 fail）
+            if self._task_type(task) in {TASK_TYPE_BINARY, TASK_TYPE_BINARY_MODULE}:
+                if not self._binary_to_source_authoritative_complete(db, task):
+                    return "pending", {"reason": "binary_to_source 尚未就绪，入口分析暂不执行，等待上游归档"}
             return "failed", {"error": self._missing_entry_analysis_input_reason(db, task)}
         executable_inputs = self._prepare_stage_items_for_execution(
             db,
@@ -12108,7 +12145,7 @@ class TaskManager(
                 }
                 self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
                 return "running", waiting_summary
-            return "failed", {"error": "没有可用于数据流漏洞挖掘的入口"}
+            return "success", {"reason": "入口模块已收敛但无可用于数据流漏洞挖掘的入口，直接成功收口"}
         executable_inputs = self._prepare_stage_items_for_execution(
             db,
             task=task,

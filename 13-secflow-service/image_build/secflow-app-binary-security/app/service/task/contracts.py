@@ -495,6 +495,11 @@ class TaskContractServiceMixin:
     def _missing_entry_analysis_input_reason(self: TaskManager, db: Session, task: BinarySecurityTask) -> str:
         from app.service import task_manager as task_manager_module
 
+        if self._task_type(task) == task_manager_module.TASK_TYPE_SOURCE:
+            # SOURCE 任务的入口输入来自 system_analysis 的 selected_modules，而非 binary_to_source
+            if not self._system_analysis_authoritative_complete(db, task):
+                return "系统分析尚未完成，入口分析等待系统分析归档"
+            return "系统分析已完成但未产出可用模块，入口分析无待执行项"
         items = self._stage_items(db, task.id, "binary_to_source")
         if not items:
             return "binary-to-source 阶段尚未产出任何可用于入口分析的源码模块"
