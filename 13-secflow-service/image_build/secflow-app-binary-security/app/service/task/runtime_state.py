@@ -219,9 +219,12 @@ class TaskRuntimeStateServiceMixin:
             row_lease_expires_at_value is not None
             and not row_lease_active
         )
+        # 仅当 runtime_lease 活跃时才判 "active"；无 runtime_lease 时 task 行 lease
+        # 只是陈旧残留（owner 已死/无主），不应阻塞回收——否则孤儿 owner 要等
+        # task 行 lease TTL 过期才被回收（rollout/崩溃后卡 ~300s）。
         lease_state = (
             "active"
-            if (lease_active or row_lease_active)
+            if lease_active
             else "expired"
             if (lease is not None or row_lease_expired)
             else "missing"
@@ -342,9 +345,10 @@ class TaskRuntimeStateServiceMixin:
             and (task_shared._seconds_until(row_lease_expires_at_value) or 0) > 0
         )
         row_lease_expired = bool(row_lease_expires_at_value is not None and not row_lease_active)
+        # 同 _can_clear_parent_runtime_ownership：无 runtime_lease 时不因 task 行 lease 误判 active。
         lease_state = (
             "active"
-            if (lease_active or row_lease_active)
+            if lease_active
             else "expired"
             if (lease is not None or row_lease_expired)
             else "missing"

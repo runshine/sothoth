@@ -219,9 +219,28 @@ class BinarySecurityTask(Base, JsonMixin):
                         tmp.unlink()
                 except Exception:
                     pass
-            self.summary_json = None
+            self.summary_json = self._dump_json(self._db_summary_payload(payload))
             return
         self.summary_json = self._dump_json(payload)
+
+    def _db_summary_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """提取必须落 DB 的最小 summary 子集（避免 summary_json TEXT 字段超长）。
+
+        完整 summary 仍以文件 task-summary.json 为权威副本；DB 仅保留文件丢失时
+        兜底所需的关键字段（work-key 交换用的 runtime_task_keys 等），其余大体量
+        字段（selected_modules/entry_results/...）不落 DB，需要时从文件或阶段产物重建。
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        runtime_task_keys = payload.get("runtime_task_keys")
+        db_payload: dict[str, Any] = {
+            "runtime_task_keys": dict(runtime_task_keys) if isinstance(runtime_task_keys, dict) else {},
+        }
+        # 其他小体量且非任务行列持有的必要字段
+        for key in ("pipeline_profile", "input_kind", "input_mode"):
+            value = payload.get(key)
+            if value is not None:
+                db_payload[key] = value
+        return db_payload
 
     def _summary_file_path(self) -> Path | None:
         if not self.workspace_root:

@@ -1610,7 +1610,9 @@ class TaskManagerTests(unittest.TestCase):
 
             summary_path = Path(tmp) / BinarySecurityTask.SUMMARY_FILENAME
             self.assertTrue(summary_path.is_file())
-            self.assertIsNone(task.summary_json)
+            # 文件为权威副本；DB 列只保留必要最小子集（runtime_task_keys 等），不再为 None
+            self.assertIsNotNone(task.summary_json)
+            self.assertEqual({"runtime_task_keys": {}}, json.loads(task.summary_json))
             self.assertEqual({"selected_modules": [{"module_key": "m1"}]}, task.summary)
 
     def test_task_summary_is_not_written_when_delete_in_progress(self):

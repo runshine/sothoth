@@ -1720,6 +1720,11 @@ class TaskManager(
                 active_tasks.append(handle.heartbeat_task)
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
+        # 优雅退出：主动释放本实例持有的 runtime_lease + 清 task 行 owner，
+        # 避免 rollout 后任务因孤儿租约卡 lease TTL（~300s）才被新 worker 接管。
+        owned_task_ids = [str(tid or "").strip() for tid in self._workers.keys() if str(tid or "").strip()]
+        if owned_task_ids:
+            await asyncio.to_thread(self._release_owned_runtime_leases_on_shutdown, owned_task_ids)
         self._workers.clear()
         self._operation_workers.clear()
         stage_item_active = list(self._stage_item_workers.values())
@@ -1732,6 +1737,44 @@ class TaskManager(
         self._last_task_heartbeat_at.clear()
         observe_task_heartbeat_candidates(0)
         observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
+
+    def _release_owned_runtime_leases_on_shutdown(self, task_ids: list[str]) -> None:
+        """优雅退出时释放本实例持有的 runtime_lease 并清 task 行 owner。
+
+        runner/heartbeat 已在 stop() 中先取消，此处仅做 DB 侧租约释放，使新 worker
+        可立即接管，无需等待 lease TTL（~300s）过期。仅在 owner_instance_id 匹配本实例时释放。
+        """
+        instance_id = str(self.instance_id or "").strip()
+        if not instance_id or not task_ids:
+            return
+        grace_seconds = max(1, int(getattr(self.cfg.scheduler, "shutdown_grace_seconds", 10) or 10))
+        deadline = time.monotonic() + grace_seconds
+        session_factory = get_session_factory()
+        released = 0
+        for task_id in task_ids:
+            if time.monotonic() > deadline:
+                logger.warning(
+                    "binary-security shutdown lease release timed out after %ss: released=%s pending=%s",
+                    grace_seconds, released, len(task_ids) - released,
+                )
+                break
+            db = session_factory()
+            try:
+                self._clear_runtime_lease(db, task_id, owner_instance_id=instance_id, swallow_lock_error=True)
+                task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+                if task is not None and str(getattr(task, "dispatcher_instance_id", "") or "").strip() == instance_id:
+                    task.dispatcher_instance_id = None
+                    task.dispatch_started_at = None
+                    task.lease_expires_at = None
+                db.commit()
+                released += 1
+            except Exception:
+                db.rollback()
+                logger.warning("binary-security shutdown lease release failed: task_id=%s", task_id, exc_info=True)
+            finally:
+                db.close()
+        if released:
+            logger.info("binary-security shutdown released %s owned runtime lease(s)", released)
 
     def _register_task_execution_owner(self, task_id: str, owner_kind: str) -> None:
         normalized_task_id = str(task_id or "").strip()
@@ -5313,7 +5356,7 @@ class TaskManager(
                         details.append(dict(item))
         if details:
             return details
-        return self._normalize_entry_taint_details({"taint_details": [], "taint_params": taint_params}, [str(v).strip() for v in taint_params if str(v).strip()])
+        return _normalize_entry_taint_details({"taint_details": [], "taint_params": taint_params}, [str(v).strip() for v in taint_params if str(v).strip()])
 
     def _knowledge_graph_analysis_metrics(self, meta: dict[str, Any]) -> dict[str, int]:
         analysis = dict(meta.get("analysis") or {})
