@@ -461,6 +461,73 @@ class TaskRuntimeStateServiceMixin:
             return True
         return self._task_runtime_owner_matches_current_instance(db, task) or self._task_runtime_transition_guard_owned_by_current_instance(task)
 
+    def _infer_running_to_pending_reason_category(
+        self: TaskManager,
+        *,
+        source: str,
+        reason: str,
+        clear_runtime_owner: bool,
+    ) -> str | None:
+        normalized_source = str(source or "").strip().lower()
+        normalized_reason = str(reason or "").strip().lower()
+        if normalized_source == "runtime_reclaim":
+            return "lease_loss_requeue"
+        if normalized_source == "task_manager":
+            return "stale_reclaim"
+        if normalized_source == "archive_worker":
+            return "retry_requeue"
+        if normalized_source == "task_operation":
+            return "control_operation_requeue"
+        if normalized_source == "runtime_worker" and clear_runtime_owner:
+            return "stale_reclaim"
+        return None
+
+    def _running_state_preservation_context(
+        self: TaskManager,
+        db: Session,
+        task,
+    ) -> dict[str, Any]:
+        transition_guard = self._task_runtime_transition_guard(task)
+        return {
+            "runtime_owner_valid": bool(self._running_task_has_valid_runtime_ownership(db, task)),
+            "transition_guard_active": bool(self._task_runtime_transition_guard_active(task)),
+            "transition_guard": transition_guard if transition_guard else None,
+            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+            "runtime_phase": str(self._task_runtime_phase(task) or "").strip() or None,
+            "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
+        }
+
+    def _task_should_preserve_running_during_owned_execution(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        attempted_status: str,
+        runtime_phase: str | None = None,
+        downgrade_reason_category: str | None = None,
+        clear_runtime_owner: bool = False,
+    ) -> tuple[bool, str | None]:
+        attempted = str(attempted_status or "").strip().lower()
+        if attempted != "pending":
+            return False, None
+        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if current_status != "running":
+            return False, None
+        effective_runtime_phase = str(runtime_phase or self._task_runtime_phase(task) or "").strip().lower()
+        if effective_runtime_phase != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return False, None
+        if downgrade_reason_category:
+            return False, None
+        if clear_runtime_owner:
+            return False, None
+        if self._task_runtime_transition_guard_active(task):
+            return True, "transition_guard_active"
+        if self._running_task_has_valid_runtime_ownership(db, task):
+            return True, "runtime_owner_still_valid"
+        if self._task_runtime_owner_matches_current_instance(db, task):
+            return True, "current_instance_still_owner"
+        return False, None
+
     def _apply_task_main_state_update(
         self: TaskManager,
         db: Session,
@@ -479,6 +546,9 @@ class TaskRuntimeStateServiceMixin:
         status_level: str = "info",
         status_payload: dict[str, Any] | None = None,
         record_blocked_event: bool = True,
+        downgrade_reason_category: str | None = None,
+        preserve_running_event_type: str | None = None,
+        preserve_running_message: str | None = None,
     ) -> bool:
         if not self._task_main_state_write_allowed(db, task, source=source):
             if record_blocked_event:
@@ -492,6 +562,77 @@ class TaskRuntimeStateServiceMixin:
                 )
             return False
         before_state = self._parent_task_state_snapshot(task)
+        attempted_status = str(status or "").strip() or None
+        effective_runtime_phase = runtime_phase if runtime_phase is not None else self._task_runtime_phase(task)
+        normalized_downgrade_reason_category = (
+            str(downgrade_reason_category or "").strip()
+            or self._infer_running_to_pending_reason_category(
+                source=source,
+                reason=reason,
+                clear_runtime_owner=clear_runtime_owner,
+            )
+        )
+        preserve_running, preserve_reason = self._task_should_preserve_running_during_owned_execution(
+            db,
+            task,
+            attempted_status=attempted_status or "",
+            runtime_phase=effective_runtime_phase,
+            downgrade_reason_category=normalized_downgrade_reason_category or None,
+            clear_runtime_owner=clear_runtime_owner,
+        )
+        state_context = self._running_state_preservation_context(db, task)
+        merged_status_payload = dict(status_payload or {})
+        if attempted_status:
+            merged_status_payload.setdefault("attempted_status", attempted_status)
+        merged_status_payload.setdefault("final_status", "running" if preserve_running else attempted_status)
+        merged_status_payload.setdefault("runtime_owner_valid", state_context.get("runtime_owner_valid"))
+        merged_status_payload.setdefault("transition_guard_active", state_context.get("transition_guard_active"))
+        merged_status_payload.setdefault("runtime_phase", state_context.get("runtime_phase"))
+        if normalized_downgrade_reason_category:
+            merged_status_payload.setdefault("downgrade_reason_category", normalized_downgrade_reason_category)
+        if preserve_running:
+            merged_status_payload.setdefault("preserve_running_rejected_reason", preserve_reason)
+            self._record_event(
+                db,
+                task,
+                preserve_running_event_type or "task_running_downgrade_to_pending_blocked",
+                preserve_running_message or "任务仍处于 owned execution 连续执行窗口，已阻止 running -> pending 降级",
+                level="warning",
+                stage_name=stage_name or str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                    "previous_status": str(before_state.get("status") or "").strip() or None,
+                    "attempted_status": attempted_status,
+                    "final_status": "running",
+                    "next_stage": str(stage_name or "").strip() or None,
+                    "source": str(source or "").strip() or None,
+                    "preserve_running_rejected_reason": preserve_reason,
+                    **state_context,
+                    **merged_status_payload,
+                },
+            )
+            status = "running"
+            clear_runtime_owner = False
+        elif attempted_status == "pending" and str(before_state.get("status") or "").strip() == "running":
+            self._record_event(
+                db,
+                task,
+                "task_running_downgrade_to_pending_allowed",
+                "任务已满足回收到待调度队列的条件，允许 running -> pending",
+                level="warning",
+                stage_name=stage_name or str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                    "previous_status": str(before_state.get("status") or "").strip() or None,
+                    "attempted_status": attempted_status,
+                    "final_status": "pending",
+                    "next_stage": str(stage_name or "").strip() or None,
+                    "source": str(source or "").strip() or None,
+                    "downgrade_reason_category": normalized_downgrade_reason_category or "unspecified",
+                    **state_context,
+                    **merged_status_payload,
+                },
+            )
         if status is not None:
             self._set_task_status(
                 db,
@@ -503,7 +644,7 @@ class TaskRuntimeStateServiceMixin:
                 message=status_message,
                 level=status_level,
                 stage_name=stage_name,
-                payload=status_payload,
+                payload=merged_status_payload,
             )
         if stage_name is not None:
             task.current_stage = stage_name

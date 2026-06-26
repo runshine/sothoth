@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 from contextlib import suppress
 from typing import TYPE_CHECKING
@@ -396,6 +395,8 @@ class TaskRuntimeServiceMixin:
                         stage_name="dataflow_vuln_scan",
                         finished_at=None,
                         last_error=None,
+                        preserve_running_event_type="task_running_state_preserved_for_tail_gate_block",
+                        preserve_running_message="tail 阶段仍有非终态运行事实，保持 running 等待权威收敛",
                     )
                 elif nonterminal_tail_run is not None:
                     self._apply_task_main_state_update(
@@ -407,6 +408,8 @@ class TaskRuntimeServiceMixin:
                         stage_name="dataflow_vuln_scan",
                         finished_at=None,
                         last_error=None,
+                        preserve_running_event_type="task_running_state_preserved_for_tail_gate_block",
+                        preserve_running_message="tail 阶段仍在推进，保持 running 等待后续收敛",
                     )
                 else:
                     self._apply_task_main_state_update(
@@ -459,6 +462,8 @@ class TaskRuntimeServiceMixin:
                         stage_name=str(task.current_stage or "").strip() or "entry_analysis",
                         finished_at=None,
                         last_error=None,
+                        preserve_running_event_type="task_running_state_preserved_for_tail_gate_block",
+                        preserve_running_message="tail 推进被 gate 阻断，但父任务仍保持 running",
                     )
             elif str(task.current_stage or "").strip() == "dataflow_vuln_scan":
                 self._apply_task_main_state_update(
@@ -479,6 +484,8 @@ class TaskRuntimeServiceMixin:
                     status="pending",
                     stage_name=str(task.current_stage or "").strip() or None,
                     finished_at=None,
+                    preserve_running_event_type="task_running_state_preserved_for_tail_gate_block",
+                    preserve_running_message="tail 权威进度暂未就绪，但 owner 仍有效，保持 running",
                 )
             if str(task.current_stage or "").strip() == "dataflow_vuln_scan":
                 self._sync_task_row_lease_view_from_owner(
@@ -675,7 +682,22 @@ class TaskRuntimeServiceMixin:
                     {"pending_positions": pending_positions},
                     db=db,
                 )
+                if queue_state == "dispatching" and recoverable_reason == "pending_task_owned_by_active_runtime":
+                    continue
                 if queue_state == "db_pending_not_enqueued":
+                    released = False
+                    if (
+                        str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+                        or getattr(task, "lease_expires_at", None) is not None
+                        or str(getattr(task, "current_operation_id", "") or "").strip()
+                    ):
+                        released = self._release_unsupported_task_row_owner(
+                            db,
+                            task,
+                            reason="pending_task_not_enqueued_reconcile",
+                        )
+                        if released:
+                            current_status = str(getattr(task, "status", "") or "").strip().lower()
                     task_manager_module.logger.warning(
                         "binary-security pending task not enqueued detected: task_id=%s task_status=%s queue_state=%s "
                         "recoverable_reason=%s dispatcher_instance_id=%s lease_expires_at=%s current_operation_id=%s",
@@ -701,6 +723,7 @@ class TaskRuntimeServiceMixin:
                             "lease_expires_at": task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
                             "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
                             "enqueue_context": "queue_reconcile",
+                            "owner_released_before_reenqueue": bool(released),
                         },
                     )
                     try:
@@ -2149,23 +2172,15 @@ class TaskRuntimeServiceMixin:
                 )
                 if not same_execution:
                     return
-                failure_event = self._build_inline_state_event(
+                await self._apply_task_execution_failed_payload_locked(
                     db,
-                    task_id=task.id,
-                    project_id=task.project_id,
-                    stage_name=task.current_stage,
-                    event_type="task_execution_failed",
-                    idempotency_key=(
-                        f"task_execution_failed:{task.id}:"
-                        f"{execution_token or current_token or ''}:{hashlib.sha1(str(exc).encode('utf-8')).hexdigest()}"
-                    ),
-                    payload={
-                        "error": str(exc),
-                        "dispatcher_instance_id": self.instance_id,
-                        "execution_token": execution_token or current_token,
-                    },
+                    task,
+                    error_message=str(exc),
+                    dispatcher_instance_id=self.instance_id,
+                    execution_token=execution_token or current_token,
+                    state_event_id=None,
+                    source_event_type="runtime_worker_exception",
                 )
-                await self._apply_task_execution_failed_locked(db, failure_event)
                 db.commit()
         finally:
             self._mark_runner_exited_keep_owner(
@@ -2377,25 +2392,16 @@ class TaskRuntimeServiceMixin:
                     to_stage=stage_name,
                     reason="stage_worker_start_requested",
                 )
-                start_event = self._build_inline_state_event(
+                self._apply_stage_worker_start_requested_payload_locked(
                     db,
-                    task=task,
-                    task_id=task.id,
-                    project_id=task.project_id,
+                    task,
                     stage_name=stage_name,
-                    event_type="stage_worker_start_requested",
-                    idempotency_key=(
-                        f"stage_worker_start_requested:{task.id}:{stage_name}:"
-                        f"{task.dispatch_started_at.isoformat() if task.dispatch_started_at else ''}"
-                    ),
-                    payload={
-                        "stage_name": stage_name,
-                        "stage_retry_mode": bool(stage_retry_mode),
-                        "task_retry_mode": bool(task_retry_mode),
-                        "target_stage_name": target_stage_name,
-                    },
+                    stage_retry_mode=bool(stage_retry_mode),
+                    task_retry_mode=bool(task_retry_mode),
+                    target_stage_name=target_stage_name,
+                    state_event_id=None,
+                    source_event_type="runtime_stage_worker_start",
                 )
-                self._apply_stage_worker_start_requested_locked(db, start_event)
                 handler = self._run_stage_executor
                 existing_stage_items = self._stage_items(db, task.id, stage_name) if task_retry_mode else []
                 db.commit()
@@ -2406,29 +2412,20 @@ class TaskRuntimeServiceMixin:
                     retry_existing = True
                 status, summary = await handler(db, task, stage_run, token, retry_existing=retry_existing)
                 execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
-                terminal_event = self._build_inline_state_event(
+                await self._apply_stage_worker_terminal_direct_locked(
                     db,
-                    task=task,
-                    task_id=task.id,
-                    project_id=task.project_id,
+                    task,
                     stage_name=stage_name,
-                    event_type="stage_worker_terminal_observed",
-                    idempotency_key=(
-                        f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
-                        f"{self._stage_terminal_generation_key(task, stage_name, db=db)}:{status}"
-                    ),
-                    payload={
-                        "stage_name": stage_name,
-                        "status": status,
-                        "summary": summary,
-                        "stage_retry_mode": bool(stage_retry_mode),
-                        "task_retry_mode": bool(task_retry_mode),
-                        "target_stage_name": target_stage_name,
-                        "execution_token": execution_token,
-                        "stage_generation": self._stage_terminal_generation_key(task, stage_name, db=db),
-                    },
+                    status=status,
+                    summary=summary,
+                    stage_retry_mode=bool(stage_retry_mode),
+                    task_retry_mode=bool(task_retry_mode),
+                    target_stage_name=target_stage_name,
+                    execution_token=execution_token,
+                    stage_generation=self._stage_terminal_generation_key(task, stage_name, db=db),
+                    state_event_id=None,
+                    source_event_type="stage_worker_terminal_observed",
                 )
-                await self._apply_stage_worker_terminal_event_locked(db, terminal_event)
                 self._record_event(
                     db,
                     task,
@@ -2445,29 +2442,20 @@ class TaskRuntimeServiceMixin:
                         task_manager_module.BinarySecurityTask.id == task_id
                     ).first()
                     if task is not None:
-                        terminal_event = self._build_inline_state_event(
+                        await self._apply_stage_worker_terminal_direct_locked(
                             db,
-                            task=task,
-                            task_id=task.id,
-                            project_id=task.project_id,
+                            task,
                             stage_name=stage_name,
-                            event_type="stage_worker_terminal_observed",
-                            idempotency_key=(
-                                f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
-                                f"{self._stage_terminal_generation_key(task, stage_name, db=db)}:{status}"
-                            ),
-                            payload={
-                                "stage_name": stage_name,
-                                "status": status,
-                                "summary": summary,
-                                "stage_retry_mode": bool(stage_retry_mode),
-                                "task_retry_mode": bool(task_retry_mode),
-                                "target_stage_name": target_stage_name,
-                                "execution_token": execution_token,
-                                "stage_generation": self._stage_terminal_generation_key(task, stage_name, db=db),
-                            },
+                            status=status,
+                            summary=summary,
+                            stage_retry_mode=bool(stage_retry_mode),
+                            task_retry_mode=bool(task_retry_mode),
+                            target_stage_name=target_stage_name,
+                            execution_token=execution_token,
+                            stage_generation=self._stage_terminal_generation_key(task, stage_name, db=db),
+                            state_event_id=None,
+                            source_event_type="stage_worker_terminal_observed",
                         )
-                        await self._apply_stage_worker_terminal_event_locked(db, terminal_event)
                         self._record_missing_stage_terminal_event(
                             db,
                             task,
@@ -4430,69 +4418,99 @@ class TaskRuntimeServiceMixin:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
-                    created = await self._downstream_create_task(
-                        session,
-                        task,
-                        item,
-                        service="dataflow_vuln_scan",
-                        token=self._resolve_downstream_token(token),
-                        payload={
-                            "task_name": f"{task.name}-{entry['function_name']}-scan",
-                            "module_input_path": module_input_path,
-                            "source_root_path": source_root_path,
-                            "prompt_content": prompt,
-                            "origin": _downstream_origin_payload(task, item),
-                            "source_file": normalized_source_file,
-                            "function_name": entry["function_name"],
-                            "line_hint": line_hint,
-                            "definition_kind": definition_kind,
-                            "taint_params": taint_params,
-                            "function_description": str(entry.get("function_description") or ""),
-                            "function_description_source": str(entry.get("function_description_source") or ""),
-                            "entry_reason": str(entry.get("entry_reason") or ""),
-                            "entry_reason_source": str(entry.get("entry_reason_source") or ""),
-                            "taint_mode": "explicit" if taint_params else "no_explicit_taint",
-                            "taint_params_missing": not bool(taint_params),
-                            "taint_details": [
-                                dict(detail)
-                                for detail in (entry.get("taint_details") or [])
-                                if isinstance(detail, dict)
-                            ],
-                        },
-                    )
-                    old_downstream_task_id = await self._replace_active_child_binding(
-                        session,
-                        task,
-                        item,
-                        new_downstream_task_id=created.get("task_id") or created.get("id"),
-                        token=self._resolve_downstream_token(token),
-                        reason="dataflow_vuln_scan_child_create",
-                        transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
-                    )
-                    self._record_downstream_item_disposition(
-                        session,
-                        task,
-                        item,
-                        event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                        message="已创建新的下游子任务",
-                        payload={
-                            "stage_name": item.stage_name,
-                            "item_id": item.id,
-                            "item_key": item.item_key,
-                            "old_downstream_task_id": old_downstream_task_id,
-                            "new_downstream_task_id": item.downstream_task_id,
-                            "strategy": retry_strategy if retrying else None,
-                            "old_downstream_status": retry_strategy_status if retrying else None,
-                        },
-                    )
-                    session.commit()
-                    status, payload = await self._poll_until_terminal(
-                        lambda: self._downstream_fetch_item_payload(task, item, None),
-                        success_statuses={"passed", "success"},
-                        failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
-                        task=task,
-                        item=item,
-                    )
+                    current_child_payload = await self._active_downstream_payload(task, item, token)
+                    if current_child_payload is not None and str(item.downstream_task_id or "").strip():
+                        current_child_status = self._map_downstream_status(str(current_child_payload.get("status") or "")) or "running"
+                        item.status = current_child_status
+                        item.started_at = item.started_at or _now()
+                        self._commit_stage_item_active_state(session, task, stage_run)
+                        self._record_downstream_item_disposition(
+                            session,
+                            task,
+                            item,
+                            event_type="downstream_child_adopted",
+                            message="已接管当前仍在运行中的 authoritative 下游子任务",
+                            payload={
+                                "stage_name": item.stage_name,
+                                "item_id": item.id,
+                                "item_key": item.item_key,
+                                "downstream_task_id": item.downstream_task_id,
+                                "adopted_status": current_child_status,
+                                "reason": "authoritative_child_already_active",
+                            },
+                        )
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            task=task,
+                            item=item,
+                        )
+                    else:
+                        created = await self._downstream_create_task(
+                            session,
+                            task,
+                            item,
+                            service="dataflow_vuln_scan",
+                            token=self._resolve_downstream_token(token),
+                            payload={
+                                "task_name": f"{task.name}-{entry['function_name']}-scan",
+                                "module_input_path": module_input_path,
+                                "source_root_path": source_root_path,
+                                "prompt_content": prompt,
+                                "origin": _downstream_origin_payload(task, item),
+                                "source_file": normalized_source_file,
+                                "function_name": entry["function_name"],
+                                "line_hint": line_hint,
+                                "definition_kind": definition_kind,
+                                "taint_params": taint_params,
+                                "function_description": str(entry.get("function_description") or ""),
+                                "function_description_source": str(entry.get("function_description_source") or ""),
+                                "entry_reason": str(entry.get("entry_reason") or ""),
+                                "entry_reason_source": str(entry.get("entry_reason_source") or ""),
+                                "taint_mode": "explicit" if taint_params else "no_explicit_taint",
+                                "taint_params_missing": not bool(taint_params),
+                                "taint_details": [
+                                    dict(detail)
+                                    for detail in (entry.get("taint_details") or [])
+                                    if isinstance(detail, dict)
+                                ],
+                            },
+                        )
+                        old_downstream_task_id = await self._replace_active_child_binding(
+                            session,
+                            task,
+                            item,
+                            new_downstream_task_id=created.get("task_id") or created.get("id"),
+                            token=self._resolve_downstream_token(token),
+                            reason="dataflow_vuln_scan_child_create",
+                            transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
+                        )
+                        self._record_downstream_item_disposition(
+                            session,
+                            task,
+                            item,
+                            event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
+                            message="已创建新的下游子任务",
+                            payload={
+                                "stage_name": item.stage_name,
+                                "item_id": item.id,
+                                "item_key": item.item_key,
+                                "old_downstream_task_id": old_downstream_task_id,
+                                "new_downstream_task_id": item.downstream_task_id,
+                                "strategy": retry_strategy if retrying else None,
+                                "old_downstream_status": retry_strategy_status if retrying else None,
+                            },
+                        )
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            task=task,
+                            item=item,
+                        )
             artifact_root = self._service_output_dir(
                 task,
                 item.downstream_service or stage_run.stage_name,

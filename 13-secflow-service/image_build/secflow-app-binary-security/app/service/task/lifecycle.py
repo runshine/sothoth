@@ -230,15 +230,13 @@ class TaskLifecycleServiceMixin:
             "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
             "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
             "compat_heartbeat_fallback": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
-            "legacy_state_event_inbox": self._loop_runtime_detail("state_event_inbox", self._state_event_inbox_loop_task),
-            "legacy_state_event_inbox_metrics": self._loop_runtime_detail("state_event_inbox_metrics", self._state_event_inbox_metrics_loop_task),
         }
         return {
             "running": self._running,
             "loops": {
                 loop_name: bool(detail.get("alive"))
                 for loop_name, detail in loop_details.items()
-                if loop_name not in {"compat_heartbeat_fallback", "legacy_state_event_inbox", "legacy_state_event_inbox_metrics"}
+                if loop_name not in {"compat_heartbeat_fallback"}
             },
             "loop_details": loop_details,
             "workers": {

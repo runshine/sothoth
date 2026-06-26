@@ -233,7 +233,9 @@ class _RouteManagerStub:
                 "recent": [{"id": "se-2", "status": "retryable"}],
             },
             "task_state_lock": {
-                "active": True,
+                "active": False,
+                "compatibility_only": True,
+                "legacy_row_present": True,
                 "owner_id": "reducer-1",
                 "operation": "reduce",
                 "lease_expires_at": None,
@@ -797,7 +799,8 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual(1, payload["state_events"]["status_counts"]["processing"])
-        self.assertTrue(payload["task_state_lock"]["active"])
+        self.assertFalse(payload["task_state_lock"]["active"])
+        self.assertTrue(payload["task_state_lock"]["compatibility_only"])
         self.assertEqual("downstream_status_synced", payload["reconcile"]["latest_event_type"])
         self.assertEqual(
             ("get_orchestration_observability", fake_db, "p1", "t1"),

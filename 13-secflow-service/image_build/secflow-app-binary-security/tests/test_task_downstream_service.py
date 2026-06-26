@@ -4,10 +4,18 @@ from unittest.mock import AsyncMock
 from pathlib import Path
 
 from app.exception import ValidationError
-from app.model import BinarySecurityArchiveJob, BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask
+from datetime import timedelta
+
+from app.model import (
+    BinarySecurityArchiveJob,
+    BinarySecurityStageItem,
+    BinarySecurityStageRun,
+    BinarySecurityTask,
+    BinarySecurityTaskRuntimeLease,
+)
 from app.service.task.downstream import TaskDownstreamServiceMixin
 from app.service.task_manager import TaskManager
-from test_task_manager import _ModelAwareDb
+from test_task_manager import _ModelAwareDb, _now
 
 
 class TaskDownstreamServiceStructureTests(unittest.TestCase):
@@ -51,7 +59,13 @@ class TaskDownstreamServiceBehaviorTests(unittest.TestCase):
             status="success",
             downstream_service="binary_to_source",
         )
-        db = _ModelAwareDb(tasks=[task], stage_items=[upstream])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[upstream], runtime_leases=[lease])
 
         seeded = self.manager._trigger_entry_items_from_b2s_result(
             db,

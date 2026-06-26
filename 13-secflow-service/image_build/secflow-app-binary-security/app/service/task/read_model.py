@@ -13,7 +13,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, load_only
 
 from app.exception import NotFoundError, ValidationError
-from app.model import normalize_stage_name
+from app.model import BinarySecurityTaskStateLease, normalize_stage_name
 
 from . import shared as task_shared
 
@@ -163,7 +163,6 @@ class TaskReadModelServiceMixin:
         *,
         db: Session | None = None,
     ) -> tuple[str, str | None]:
-        del db
         from app.service import task_manager as task_manager_module
 
         queue_info = queue_info or {}
@@ -176,6 +175,8 @@ class TaskReadModelServiceMixin:
         if status == "pending":
             if task.id in pending_positions:
                 return "queued", None
+            if db is not None and self._task_row_owner_is_runtime_supported(db, task):
+                return "dispatching", "pending_task_owned_by_active_runtime"
             return "db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"
         return "idle", None
 
@@ -250,11 +251,7 @@ class TaskReadModelServiceMixin:
         for stage_name, status, count in archive_rows:
             stage_bucket = archive_by_stage.setdefault(str(stage_name or "unknown"), {})
             stage_bucket[str(status or "unknown")] = int(count or 0)
-        lease = (
-            db.query(task_manager_module.BinarySecurityTaskStateLease)
-            .filter(task_manager_module.BinarySecurityTaskStateLease.task_id == task.id)
-            .first()
-        )
+        legacy_state_lease = db.query(BinarySecurityTaskStateLease).filter(BinarySecurityTaskStateLease.task_id == task.id).first()
         latest_reconcile = (
             db.query(task_manager_module.BinarySecurityEvent)
             .filter(
@@ -296,11 +293,13 @@ class TaskReadModelServiceMixin:
                 "last_reconcile_at": self._last_queue_reconcile_at,
             },
             "task_state_lock": {
-                "active": bool(lease and lease.lease_expires_at and lease.lease_expires_at > now_value),
-                "owner_id": lease.owner_id if lease else None,
-                "operation": lease.operation if lease else None,
-                "lease_expires_at": lease.lease_expires_at if lease else None,
-                "heartbeat_at": lease.heartbeat_at if lease else None,
+                "active": False,
+                "compatibility_only": True,
+                "legacy_row_present": legacy_state_lease is not None,
+                "owner_id": legacy_state_lease.owner_id if legacy_state_lease else None,
+                "operation": legacy_state_lease.operation if legacy_state_lease else None,
+                "lease_expires_at": legacy_state_lease.lease_expires_at if legacy_state_lease else None,
+                "heartbeat_at": legacy_state_lease.heartbeat_at if legacy_state_lease else None,
             },
             "archive": {
                 "by_stage": archive_by_stage,
@@ -1435,7 +1434,7 @@ class TaskReadModelServiceMixin:
         if status == "dead_letter":
             return "dead_letter"
         if self._is_lock_busy_state_event(event):
-            return "lock_busy"
+            return "none"
         if status == "retryable" or result == "retryable":
             return "retryable"
         if result in {"failed", "error"}:
@@ -1444,7 +1443,7 @@ class TaskReadModelServiceMixin:
 
     def _event_failure_reason(self: TaskManager, event) -> str | None:
         if self._is_lock_busy_state_event(event):
-            return "task state lease busy"
+            return None
         return str(getattr(event, "last_error_message", None) or getattr(event, "error_message", None) or "").strip() or None
 
     def _normalize_module_report_ref(
@@ -1917,6 +1916,9 @@ class TaskReadModelServiceMixin:
         workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_terminalization_ready = self._workflow_ready_for_finalization(workflow_snapshots)
         workflow_blocked_by_stage = self._workflow_blocked_on_stage(task, workflow_snapshots)
+        if self._task_status_is_terminal(task.status):
+            workflow_terminalization_ready = True
+            workflow_blocked_by_stage = None
         kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
         active_operation = self._active_operation(db, task.id)
         delete_state = self._task_delete_queue_state(task)
@@ -1930,6 +1932,7 @@ class TaskReadModelServiceMixin:
         return task_manager_module.BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
+            project_name=str(getattr(task, "project_id", "") or "").strip() or None,
             task_type=self._task_type(task),
             pipeline_profile=self._pipeline_profile(task),
             name=task.name,
@@ -2353,8 +2356,6 @@ class TaskReadModelServiceMixin:
             "archive_dispatch": "归档分发 loop",
             "archive_runtime_reconcile": "归档 reconcile loop",
             "state_repair_reconcile": "状态修复 loop",
-            "legacy_state_event_inbox": "历史兼容 state event inbox loop",
-            "legacy_state_event_inbox_metrics": "历史兼容 state event inbox metrics loop",
             "readless_reconcile": "readless reconcile loop",
         }.get(str(loop_key or "").strip(), loop_key)
 
@@ -2377,8 +2378,6 @@ class TaskReadModelServiceMixin:
             "archive_runtime_reconcile": getattr(self, "_archive_runtime_reconcile_task", None),
             "stage_item_sync_reconcile": getattr(self, "_stage_item_sync_reconcile_task", None),
             "state_repair_reconcile": getattr(self, "_state_repair_reconcile_task", None),
-            "legacy_state_event_inbox": getattr(self, "_state_event_inbox_loop_task", None),
-            "legacy_state_event_inbox_metrics": getattr(self, "_state_event_inbox_metrics_loop_task", None),
             "readless_reconcile": getattr(self, "_readless_reconcile_task", None),
         }
         loops: list[dict[str, Any]] = []

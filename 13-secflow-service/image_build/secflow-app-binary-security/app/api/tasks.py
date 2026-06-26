@@ -125,7 +125,39 @@ def list_tasks(
     )
 
 
-@router.get("/state-events", response_model=BinarySecurityStateEventInboxPageResponse)
+@router.get("/tasks", response_model=BinarySecurityTaskListResponse)
+def list_tasks_global(
+    project_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    task_type: Optional[str] = Query(None),
+    pipeline_profile: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=10, le=1000),
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().list_tasks(
+        db,
+        project_id=project_id,
+        status=status,
+        task_type=task_type,
+        pipeline_profile=pipeline_profile,
+        search=search,
+        sort_by=sort_by,
+        sort_order=sort_order,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get(
+    "/state-events",
+    response_model=BinarySecurityStateEventInboxPageResponse,
+    summary="List Historical Compatibility State Events",
+)
 def list_state_events(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=1000),
