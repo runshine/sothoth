@@ -197,7 +197,7 @@ class TaskArchiveServiceMixin:
             self._delete_archive_children_for_stages(db, task, descendant_stages)
             self._delete_stage_items_for_stages(db, task.id, descendant_stages)
             self._delete_state_event_rows_for_stages(db, task.id, descendant_stages)
-            self._delete_timeline_rows_for_stages(db, task.id, descendant_stages)
+            # Preserve task timeline history when descendant stages are rebuilt.
             for stage_name in descendant_stages:
                 stage_run = db.query(task_manager_module.BinarySecurityStageRun).filter(
                     task_manager_module.BinarySecurityStageRun.task_id == task.id,
@@ -251,7 +251,7 @@ class TaskArchiveServiceMixin:
             self._delete_archive_children_for_stages(db, task, descendant_stages)
             self._delete_stage_items_for_stages(db, task.id, descendant_stages)
             self._delete_state_event_rows_for_stages(db, task.id, descendant_stages)
-            self._delete_timeline_rows_for_stages(db, task.id, descendant_stages)
+            # Preserve task timeline history when descendant stages are rebuilt.
             for stage_name in descendant_stages:
                 stage_run = db.query(task_manager_module.BinarySecurityStageRun).filter(
                     task_manager_module.BinarySecurityStageRun.task_id == task.id,

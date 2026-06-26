@@ -1917,6 +1917,9 @@ class TaskReadModelServiceMixin:
         workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_terminalization_ready = self._workflow_ready_for_finalization(workflow_snapshots)
         workflow_blocked_by_stage = self._workflow_blocked_on_stage(task, workflow_snapshots)
+        if self._task_status_is_terminal(task.status):
+            workflow_terminalization_ready = True
+            workflow_blocked_by_stage = None
         kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
         active_operation = self._active_operation(db, task.id)
         delete_state = self._task_delete_queue_state(task)

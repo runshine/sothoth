@@ -4867,6 +4867,55 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("dispatching", task.status)
         self.assertEqual("running", next(summary.status for summary in detail.stage_summaries if summary.stage_name == "system_analysis"))
 
+    def test_get_task_detail_clears_workflow_blocked_stage_for_terminal_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            finished_at=_now(),
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="failed",
+            started_at=_now(),
+            finished_at=_now(),
+            last_error="boom",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            parent_key="source_project",
+            item_identity_key="source_project::source_project",
+            status="failed",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-1",
+        )
+        item.error_message = "boom"
+        db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
+
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+
+        self.assertEqual("failed", detail.status)
+        self.assertTrue(detail.workflow_terminalization_ready)
+        self.assertIsNone(detail.workflow_blocked_by_stage)
+
     def test_get_task_detail_streaming_tail_snapshot_stays_consistent(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -15977,6 +16026,98 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("succeeded", action_rows[0].get("verification_status"))
         self.assertEqual("b2s-new", action_rows[0].get("new_downstream_task_id"))
 
+    def test_operation_verify_retry_bindings_skips_duplicate_control_for_adopt_active_pending_verification(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+            current_operation_id="op1",
+        )
+        task.summary = {
+            "retry_plan": {
+                "target_stage": "system_analysis",
+                "mode": "retry",
+                "item_actions": [
+                    {
+                        "stage_name": "system_analysis",
+                        "item_id": "si-system",
+                        "item_key": "source_project",
+                        "parent_key": "source_project",
+                        "downstream_service": "system_analyse",
+                        "old_downstream_task_id": "sat-old",
+                        "current_downstream_task_id": "sat-old",
+                        "new_downstream_task_id": "sat-old",
+                        "strategy": "adopt_active",
+                        "observed_status": "running",
+                        "cleanup_performed": False,
+                        "binding_cleared": False,
+                        "verification_status": "pending",
+                        "error": None,
+                    }
+                ],
+                "affected_stages": ["system_analysis"],
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id="task1",
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        item = BinarySecurityStageItem(
+            id="si-system",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-system",
+            stage_name="system_analysis",
+            item_key="source_project",
+            item_name="source-project",
+            parent_key="source_project",
+            item_identity_key="source_project::source_project",
+            downstream_service="system_analyse",
+            downstream_task_id="sat-old",
+            status="pending",
+        )
+        self.manager._mark_replacement_in_progress(
+            item,
+            old_downstream_task_id="sat-old",
+            binding_cleared=False,
+            verification_status="pending",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="task1",
+            project_id="p1",
+            operation_type="retry",
+            target_stage="system_analysis",
+            status="running",
+            current_step="verify_retry_bindings",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], operations=[operation], events=[])
+
+        original_control = self.manager._downstream_control_existing_task
+        try:
+            async def should_not_run(*args, **kwargs):
+                raise AssertionError("duplicate downstream control should be skipped while adopt_active verification is pending")
+
+            self.manager._downstream_control_existing_task = should_not_run
+            result = asyncio.run(self.manager._operation_verify_retry_bindings(db, task, operation))
+        finally:
+            self.manager._downstream_control_existing_task = original_control
+
+        self.assertTrue(result["validation"]["validated"])
+        action_rows = list((operation.result_payload or {}).get("item_actions") or [])
+        self.assertEqual("pending", action_rows[0].get("verification_status"))
+
     def test_operation_verify_retry_bindings_accepts_fast_completed_recreated_child(self):
         task = BinarySecurityTask(
             id="task1",
@@ -16612,7 +16753,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(3, cleanup_summary["deleted_stage_item_count"])
             self.assertEqual(3, cleanup_summary["deleted_archive_job_count"])
             self.assertEqual(3, cleanup_summary["deleted_state_event_count"])
-            self.assertEqual(3, cleanup_summary["deleted_timeline_event_count"])
+            self.assertEqual(0, cleanup_summary["deleted_timeline_event_count"])
             self.assertFalse(entry_root.exists())
             self.assertFalse(dataflow_root.exists())
             self.assertFalse(vuln_root.exists())
@@ -16622,7 +16763,16 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
                 if row.stage_name in {"entry_analysis", "dataflow_vuln_scan"}
             ]
             self.assertTrue(
-                all(event_type in {"streaming_tail_stage_start_suppressed", "stage_retry_full_cleanup_finished"} for event_type in retained_events)
+                all(
+                    event_type in {
+                        "stage_finished",
+                        "stage_failed",
+                        "archive_finished",
+                        "streaming_tail_stage_start_suppressed",
+                        "stage_retry_full_cleanup_finished",
+                    }
+                    for event_type in retained_events
+                )
             )
             self.assertIn("stage_retry_full_cleanup_started", [row.event_type for row in db.events])
             self.assertIn("stage_retry_full_cleanup_finished", [row.event_type for row in db.events])
@@ -45704,6 +45854,99 @@ def _test_apply_task_main_state_update_records_parent_task_state_transition_when
     self.assertEqual(1, len(suppress_events))
 
 
+def _test_operation_verify_retry_bindings_skips_duplicate_control_for_adopt_active_pending_verification(self):
+    task = BinarySecurityTask(
+        id="task1",
+        project_id="p1",
+        name="n",
+        status="failed",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+        current_operation_id="op1",
+    )
+    task.summary = {
+        "retry_plan": {
+            "target_stage": "system_analysis",
+            "mode": "retry",
+            "item_actions": [
+                {
+                    "stage_name": "system_analysis",
+                    "item_id": "si-system",
+                    "item_key": "source_project",
+                    "parent_key": "source_project",
+                    "downstream_service": "system_analyse",
+                    "old_downstream_task_id": "sat-old",
+                    "current_downstream_task_id": "sat-old",
+                    "new_downstream_task_id": "sat-old",
+                    "strategy": "adopt_active",
+                    "observed_status": "running",
+                    "cleanup_performed": False,
+                    "binding_cleared": False,
+                    "verification_status": "pending",
+                    "error": None,
+                }
+            ],
+            "affected_stages": ["system_analysis"],
+        }
+    }
+    stage_run = BinarySecurityStageRun(
+        id="sr-system",
+        task_id="task1",
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="pending",
+    )
+    item = BinarySecurityStageItem(
+        id="si-system",
+        task_id="task1",
+        project_id="p1",
+        stage_run_id="sr-system",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        parent_key="source_project",
+        item_identity_key="source_project::source_project",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-old",
+        status="pending",
+    )
+    self.manager._mark_replacement_in_progress(
+        item,
+        old_downstream_task_id="sat-old",
+        binding_cleared=False,
+        verification_status="pending",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op1",
+        task_id="task1",
+        project_id="p1",
+        operation_type="retry",
+        target_stage="system_analysis",
+        status="running",
+        current_step="verify_retry_bindings",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], operations=[operation], events=[])
+
+    original_control = self.manager._downstream_control_existing_task
+    try:
+        async def should_not_run(*args, **kwargs):
+            raise AssertionError("duplicate downstream control should be skipped while adopt_active verification is pending")
+
+        self.manager._downstream_control_existing_task = should_not_run
+        result = asyncio.run(self.manager._operation_verify_retry_bindings(db, task, operation))
+    finally:
+        self.manager._downstream_control_existing_task = original_control
+
+    self.assertTrue(result["validation"]["validated"])
+    action_rows = list((operation.result_payload or {}).get("item_actions") or [])
+    self.assertEqual("pending", action_rows[0].get("verification_status"))
+
+
 TaskManagerTests.test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state = _test_force_reset_task_to_pending_clears_stuck_operation_and_runtime_state
 TaskManagerTests.test_force_reset_task_to_pending_rejects_terminal_success = _test_force_reset_task_to_pending_rejects_terminal_success
 TaskManagerTests.test_force_reset_task_to_pending_externalizes_large_operation_result_payload = _test_force_reset_task_to_pending_externalizes_large_operation_result_payload
@@ -45760,6 +46003,7 @@ TaskManagerTests.test_apply_task_main_state_update_records_parent_task_state_tra
 TaskManagerTests.test_apply_task_main_state_update_records_parent_task_state_transition_when_runtime_owner_is_cleared = _test_apply_task_main_state_update_records_parent_task_state_transition_when_runtime_owner_is_cleared
 TaskManagerTests.test_control_operation_runtime_lease_coverage_matches_supported_operation_set = _test_control_operation_runtime_lease_coverage_matches_supported_operation_set
 TaskManagerTests.test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease = _test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease
+TaskManagerTests.test_operation_verify_retry_bindings_skips_duplicate_control_for_adopt_active_pending_verification = _test_operation_verify_retry_bindings_skips_duplicate_control_for_adopt_active_pending_verification
 
 
 if __name__ == "__main__":

@@ -10699,7 +10699,7 @@ class TaskManager(
         deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
         deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
         deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
-        deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
+        deleted_timeline_event_count = 0
         for stage_name in affected_stages:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,

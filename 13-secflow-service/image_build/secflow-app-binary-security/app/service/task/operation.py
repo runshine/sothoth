@@ -818,7 +818,7 @@ class TaskOperationServiceMixin:
         self._delete_task_event_payload_dirs(task)
         self._delete_workspace_runtime_children(task)
         self._delete_task_summary_file(task)
-        cleanup_snapshot["cleanup_counts"]["timeline_events_deleted"] = self._delete_task_timeline_rows(db, task.id)
+        cleanup_snapshot["cleanup_counts"]["timeline_events_deleted"] = 0
         cleanup_snapshot["cleanup_counts"]["state_events_deleted"] = self._delete_task_state_event_rows(db, task.id)
         task.cleanup_snapshot = cleanup_snapshot
         self._validate_hard_restart_cleanup(db, task)
@@ -1175,7 +1175,7 @@ class TaskOperationServiceMixin:
         deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
         deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
         deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
-        deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
+        deleted_timeline_event_count = 0
         for stage_name in affected_stages:
             if (
                 phase == "prepare"
@@ -1903,6 +1903,17 @@ class TaskOperationServiceMixin:
                 continue
             strategy = str(action.get("strategy") or "").strip()
             if strategy != "recreate_from_abnormal":
+                replacement_state = self._replacement_in_progress_state(item)
+                if (
+                    strategy == "adopt_active"
+                    and replacement_state.get("verification_status") == "pending"
+                ):
+                    self._update_retry_item_action(
+                        task,
+                        item_id=item_id,
+                        updates={"verification_status": "pending"},
+                    )
+                    continue
                 if (
                     strategy == "adopt_active"
                     and str(item.downstream_task_id or "").strip()
@@ -2314,7 +2325,7 @@ class TaskOperationServiceMixin:
             "archive_jobs_deleted": self._delete_archive_children_for_stages(db, task, stage_names),
             "stage_items_deleted": self._delete_stage_items_for_stages(db, task.id, stage_names),
             "stage_runs_deleted": self._delete_stage_run_rows(db, task.id),
-            "timeline_events_deleted": self._delete_task_timeline_rows(db, task.id),
+            "timeline_events_deleted": 0,
             "state_events_deleted": self._delete_task_state_event_rows(db, task.id),
         }
         self._record_event(
