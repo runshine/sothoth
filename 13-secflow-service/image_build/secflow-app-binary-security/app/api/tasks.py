@@ -17,6 +17,7 @@ from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityArchiveJobPageResponse,
     BinarySecurityArtifactsResponse,
+    BinarySecurityDeleteQueueResponse,
     BinarySecurityDownstreamStatusSyncPayload,
     BinarySecurityEntrySelectionConfirmPayload,
     BinarySecurityEntrySelectionResponse,
@@ -148,6 +149,32 @@ def list_tasks_global(
         search=search,
         sort_by=sort_by,
         sort_order=sort_order,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.get("/delete-queue", response_model=BinarySecurityDeleteQueueResponse)
+def list_delete_queue(
+    project_id: Optional[str] = Query(None),
+    task_type: Optional[str] = Query(None),
+    delete_status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    sort_by: str = Query("delete_requested_at"),
+    sort_direction: str = Query("desc"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=1000),
+    _: TokenUser = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().list_delete_queue(
+        db,
+        project_id=project_id,
+        task_type=task_type,
+        delete_status=delete_status,
+        search=search,
+        sort_by=sort_by,
+        sort_direction=sort_direction,
         page=page,
         page_size=page_size,
     )

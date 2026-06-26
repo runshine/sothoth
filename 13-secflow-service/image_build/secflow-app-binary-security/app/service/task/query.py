@@ -26,6 +26,8 @@ from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityArchiveJobPageResponse,
     BinarySecurityArtifactsResponse,
+    BinarySecurityDeleteQueueItem,
+    BinarySecurityDeleteQueueResponse,
     BinarySecurityOverviewResponse,
     BinarySecurityProjectStats,
     BinarySecurityStageItemPageResponse,
@@ -49,6 +51,157 @@ logger = logging.getLogger(__name__)
 
 
 class TaskQueryServiceMixin:
+    def list_delete_queue(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str | None = None,
+        task_type: str | None = None,
+        delete_status: str | None = None,
+        search: str | None = None,
+        sort_by: str = "delete_requested_at",
+        sort_direction: str = "desc",
+        page: int = 1,
+        page_size: int = 20,
+    ) -> BinarySecurityDeleteQueueResponse:
+        normalized_project_id = str(project_id or "").strip() or None
+        normalized_task_type = str(task_type or "").strip()
+        normalized_delete_status = str(delete_status or "").strip().lower()
+        normalized_search = str(search or "").strip()
+        base_query = db.query(BinarySecurityTask).filter(
+            or_(
+                BinarySecurityTask.cleanup_snapshot_json.like('%"delete_queued": true%'),
+                BinarySecurityTask.cleanup_snapshot_json.like('%"delete_in_progress": true%'),
+                BinarySecurityTask.status.in_(["delete_failed", "force_delete_failed"]),
+            )
+        )
+        if normalized_project_id:
+            base_query = base_query.filter(BinarySecurityTask.project_id == normalized_project_id)
+        if normalized_task_type:
+            if normalized_task_type == "binary_firmware_e2e":
+                base_query = base_query.filter(
+                    or_(BinarySecurityTask.task_type == "binary", BinarySecurityTask.task_type.is_(None))
+                )
+            elif normalized_task_type == "source_scan_e2e":
+                base_query = base_query.filter(BinarySecurityTask.task_type == "source").filter(
+                    or_(
+                        BinarySecurityTask.policy_json.is_(None),
+                        ~BinarySecurityTask.policy_json.like('%"pipeline_profile": "kg_source_vuln_scan"%'),
+                    )
+                )
+            elif normalized_task_type == "kg_source_vuln_scan_e2e":
+                base_query = base_query.filter(BinarySecurityTask.task_type == "source").filter(
+                    BinarySecurityTask.policy_json.like('%"pipeline_profile": "kg_source_vuln_scan"%')
+                )
+            elif normalized_task_type == "binary_module_e2e":
+                base_query = base_query.filter(BinarySecurityTask.task_type == "binary_module")
+        if normalized_search:
+            base_query = base_query.filter(
+                or_(
+                    BinarySecurityTask.id.like(f"%{normalized_search}%"),
+                    BinarySecurityTask.name.like(f"%{normalized_search}%"),
+                    BinarySecurityTask.project_id.like(f"%{normalized_search}%"),
+                )
+            )
+
+        tasks = base_query.options(
+            load_only(
+                BinarySecurityTask.id,
+                BinarySecurityTask.project_id,
+                BinarySecurityTask.task_type,
+                BinarySecurityTask.name,
+                BinarySecurityTask.status,
+                BinarySecurityTask.policy_json,
+                BinarySecurityTask.cleanup_snapshot_json,
+                BinarySecurityTask.current_operation_id,
+                BinarySecurityTask.last_error,
+                BinarySecurityTask.updated_at,
+                BinarySecurityTask.started_at,
+                BinarySecurityTask.finished_at,
+            )
+        ).all()
+        project_names = self._task_list_project_names(db, tasks)
+
+        def parse_datetime(value: Any):
+            text = str(value or "").strip()
+            if not text:
+                return None
+            try:
+                return task_shared.parse_datetime(text)
+            except Exception:
+                return None
+
+        def map_queue_task_type(task: BinarySecurityTask) -> str:
+            task_kind = str(task.task_type or "binary").strip().lower() or "binary"
+            if task_kind == "source":
+                policy = task_shared.json_dict(task.policy_json)
+                if str(policy.get("pipeline_profile") or "").strip() == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+                    return "kg_source_vuln_scan_e2e"
+                return "source_scan_e2e"
+            if task_kind == "binary_module":
+                return "binary_module_e2e"
+            return "binary_firmware_e2e"
+
+        rows: list[BinarySecurityDeleteQueueItem] = []
+        stats = {"queued_total": 0, "running_total": 0, "blocked_total": 0, "failed_total": 0}
+        for task in tasks:
+            delete_state = self._task_delete_queue_state(task)
+            task_status = str(task.status or "").strip().lower()
+            delete_error = str(delete_state.get("delete_last_error") or task.last_error or "").strip() or None
+            if delete_state.get("delete_in_progress"):
+                mapped_delete_status = "running"
+            elif task_status in {"delete_failed", "force_delete_failed"} or delete_error:
+                mapped_delete_status = "failed"
+            elif delete_state.get("delete_queued"):
+                mapped_delete_status = "queued"
+            else:
+                continue
+            if normalized_delete_status and normalized_delete_status != mapped_delete_status:
+                continue
+            if mapped_delete_status in stats:
+                stats[mapped_delete_status] += 1
+            rows.append(
+                BinarySecurityDeleteQueueItem(
+                    id=str(task.id),
+                    project_id=str(task.project_id),
+                    project_name=project_names.get(str(task.project_id)),
+                    name=str(task.name or task.id),
+                    task_type=map_queue_task_type(task),
+                    task_status=str(task.status or ""),
+                    display_status=str(task.status or ""),
+                    delete_status=mapped_delete_status,
+                    delete_mode=str(delete_state.get("delete_mode") or "").strip() or None,
+                    delete_error=delete_error,
+                    last_error=str(task.last_error or "").strip() or None,
+                    delete_operation_id=str(delete_state.get("delete_operation_id") or task.current_operation_id or "").strip() or None,
+                    delete_requested_at=parse_datetime(delete_state.get("delete_requested_at")),
+                    delete_started_at=parse_datetime(delete_state.get("delete_started_at")),
+                    delete_finished_at=parse_datetime(delete_state.get("delete_finished_at")),
+                    updated_at=task.updated_at,
+                )
+            )
+
+        sort_key = str(sort_by or "").strip().lower()
+        reverse = str(sort_direction or "").strip().lower() != "asc"
+        sort_getters = {
+            "delete_requested_at": lambda item: item.delete_requested_at or item.updated_at,
+            "updated_at": lambda item: item.updated_at,
+            "name": lambda item: item.name.lower(),
+        }
+        rows.sort(
+            key=lambda item: (sort_getters.get(sort_key, sort_getters["delete_requested_at"])(item) or ""),
+            reverse=reverse,
+        )
+        total = len(rows)
+        offset = max(0, (page - 1) * page_size)
+        return BinarySecurityDeleteQueueResponse(
+            total=total,
+            page=page,
+            page_size=page_size,
+            items=rows[offset: offset + page_size],
+            stats=stats,
+        )
+
     def list_tasks(
         self: TaskManager,
         db: Session,

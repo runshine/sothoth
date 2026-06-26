@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from datetime import timedelta
 from contextlib import suppress
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from redis.exceptions import TimeoutError as RedisTimeoutError
@@ -149,6 +150,31 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         kwargs = from_url.call_args.kwargs
         self.assertEqual(REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, kwargs["socket_connect_timeout"])
         self.assertEqual(REDIS_SOCKET_TIMEOUT_SECONDS, kwargs["socket_timeout"])
+
+    def test_get_service_config_exposes_worker_task_concurrency(self):
+        manager = TaskManager()
+        manager.cfg.scheduler.task_concurrency = 40
+        response = manager.get_service_config(
+            SimpleNamespace(
+                query=lambda *_args, **_kwargs: SimpleNamespace(
+                    order_by=lambda *_a, **_k: SimpleNamespace(
+                        first=lambda: SimpleNamespace(
+                            config={
+                                "worker_task_concurrency": 9,
+                                "max_concurrent_tasks": 11,
+                                "dispatch_timeout_seconds": 70,
+                                "lease_timeout_seconds": 95,
+                            }
+                        )
+                    )
+                )
+            )
+        )
+
+        self.assertEqual(9, response.config.worker_task_concurrency)
+        self.assertEqual(11, response.config.max_concurrent_tasks)
+        self.assertEqual(70, response.config.dispatch_timeout_seconds)
+        self.assertEqual(95, response.config.lease_timeout_seconds)
 
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):

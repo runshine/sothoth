@@ -42,7 +42,7 @@ storage:
 scheduler:
   enabled: true
   poll_interval_seconds: 5
-  task_concurrency: 2
+  task_concurrency: 40
   stage_poll_interval_seconds: 5
   downstream_reconcile_interval_seconds: 60
   stage_item_sync_reconcile_interval_seconds: 60

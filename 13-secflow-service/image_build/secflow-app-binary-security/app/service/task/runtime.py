@@ -648,6 +648,16 @@ class TaskRuntimeServiceMixin:
             or 0
         )
 
+    def _local_active_runtime_count(self: TaskManager) -> int:
+        active = 0
+        for handle in list(self._workers.values()):
+            if handle is None:
+                continue
+            if handle.done() or bool(getattr(handle, "cancel_requested", False)):
+                continue
+            active += 1
+        return active
+
     async def _reconcile_work_queues(self: TaskManager, db: Session) -> None:
         from app.service import task_manager as task_manager_module
 
@@ -857,6 +867,9 @@ class TaskRuntimeServiceMixin:
         self._run_parent_reclaim_pass(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
+        local_active_count = self._local_active_runtime_count()
+        if local_active_count >= int(getattr(service_config, "worker_task_concurrency", 40) or 40):
+            return None
         if active_count >= service_config.max_concurrent_tasks:
             return None
         task = db.query(task_manager_module.BinarySecurityTask).filter(

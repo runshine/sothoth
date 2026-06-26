@@ -17,6 +17,8 @@ from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityAbnormalReasonHistoryResponse,
     BinarySecurityArchiveJobPageResponse,
+    BinarySecurityDeleteQueueItem,
+    BinarySecurityDeleteQueueResponse,
     BinarySecurityEntrySelectionResponse,
     BinarySecurityGlobalConfigPayload,
     BinarySecurityGlobalConfigResponse,
@@ -211,6 +213,7 @@ class _RouteManagerStub:
         self.calls.append(("get_config", db))
         return BinarySecurityGlobalConfigResponse(
             config=BinarySecurityGlobalConfigPayload(
+                worker_task_concurrency=7,
                 max_concurrent_tasks=12,
                 dispatch_timeout_seconds=60,
                 lease_timeout_seconds=90,
@@ -382,6 +385,7 @@ class _RouteManagerStub:
         self.calls.append(("get_service_config", db))
         return BinarySecurityServiceConfigResponse(
             config=BinarySecurityServiceConfigPayload(
+                worker_task_concurrency=7,
                 max_concurrent_tasks=12,
                 dispatch_timeout_seconds=60,
                 lease_timeout_seconds=90,
@@ -436,6 +440,41 @@ class _RouteManagerStub:
                         "blocking_code": "task_running",
                         "can_delete": False,
                     },
+                )
+            ],
+        )
+
+    def list_delete_queue(
+        self,
+        db,
+        project_id=None,
+        task_type=None,
+        delete_status=None,
+        search=None,
+        sort_by="delete_requested_at",
+        sort_direction="desc",
+        page=1,
+        page_size=20,
+    ):
+        self.calls.append(
+            ("list_delete_queue", db, project_id, task_type, delete_status, search, sort_by, sort_direction, page, page_size)
+        )
+        return BinarySecurityDeleteQueueResponse(
+            total=1,
+            page=page,
+            page_size=page_size,
+            stats={"queued_total": 1, "running_total": 0, "blocked_total": 0, "failed_total": 0},
+            items=[
+                BinarySecurityDeleteQueueItem(
+                    id="t-delete-1",
+                    project_id=project_id or "p-delete",
+                    project_name="Delete Project",
+                    name="queued-delete-task",
+                    task_type=task_type or "source_scan_e2e",
+                    task_status="delete_requested",
+                    display_status="delete_requested",
+                    delete_status=delete_status or "queued",
+                    delete_mode="delete",
                 )
             ],
         )
@@ -688,6 +727,28 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(50, payload["page_size"])
         self.assertEqual(
             ("list_tasks", fake_db, None, None, "source", None, None, "created_at", "desc", 1, 50),
+            manager.calls[0],
+        )
+
+    def test_list_delete_queue_route_allows_missing_project_id(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/delete-queue",
+                    params={"task_type": "source_scan_e2e", "page": 1, "page_size": 20},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual(1, payload["total"])
+        self.assertEqual(20, payload["page_size"])
+        self.assertEqual("queued", payload["items"][0]["delete_status"])
+        self.assertEqual(
+            ("list_delete_queue", fake_db, None, "source_scan_e2e", None, None, "delete_requested_at", "desc", 1, 20),
             manager.calls[0],
         )
 

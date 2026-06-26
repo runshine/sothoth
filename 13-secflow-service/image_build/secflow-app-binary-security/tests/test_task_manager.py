@@ -27865,6 +27865,48 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
+    def test_dispatch_task_by_id_respects_local_worker_task_concurrency_limit(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="t-local-cap",
+            project_id="p1",
+            name="local-cap",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/ws",
+            current_stage="system_analysis",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[])
+
+        class _Handle:
+            def __init__(self, done=False, cancel_requested=False):
+                self._done = done
+                self.cancel_requested = cancel_requested
+
+            def done(self):
+                return self._done
+
+        manager._workers = {
+            "task-a": _Handle(),
+            "task-b": _Handle(),
+        }
+        manager._load_service_config = lambda _db: SimpleNamespace(
+            worker_task_concurrency=2,
+            max_concurrent_tasks=40,
+            dispatch_timeout_seconds=60,
+            lease_timeout_seconds=90,
+        )
+
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
+            claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+
     def test_find_reusable_dataflow_payload_prefers_active_duplicate_task(self):
         task = BinarySecurityTask(id="t1", project_id="p1")
         item = BinarySecurityStageItem(

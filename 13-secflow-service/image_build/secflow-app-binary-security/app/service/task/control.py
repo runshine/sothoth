@@ -181,7 +181,8 @@ class TaskControlServiceMixin:
     def _global_config_defaults(self: TaskManager) -> dict[str, Any]:
         project_defaults = self._project_config_defaults(task_type="binary")
         return {
-            "max_concurrent_tasks": 20,
+            "worker_task_concurrency": 40,
+            "max_concurrent_tasks": 40,
             "dispatch_timeout_seconds": 60,
             "lease_timeout_seconds": 90,
             **project_defaults,

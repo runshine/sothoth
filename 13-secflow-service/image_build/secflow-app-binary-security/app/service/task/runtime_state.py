@@ -920,6 +920,13 @@ class TaskRuntimeStateServiceMixin:
                 or 60
             ),
         )
+        default_worker_task_concurrency = max(
+            1,
+            int(
+                getattr(scheduler_cfg, "task_concurrency", None)
+                or 40
+            ),
+        )
         default_lease_timeout = max(
             15,
             int(
@@ -939,6 +946,7 @@ class TaskRuntimeStateServiceMixin:
         except Exception:
             payload = {}
         return SimpleNamespace(
+            worker_task_concurrency=max(1, int(payload.get("worker_task_concurrency") or default_worker_task_concurrency)),
             max_concurrent_tasks=max(1, int(payload.get("max_concurrent_tasks") or default_max_concurrent)),
             dispatch_timeout_seconds=max(10, int(payload.get("dispatch_timeout_seconds") or default_dispatch_timeout)),
             lease_timeout_seconds=max(15, int(payload.get("lease_timeout_seconds") or default_lease_timeout)),
@@ -947,6 +955,7 @@ class TaskRuntimeStateServiceMixin:
     def get_service_config(self: TaskManager, db: Session) -> BinarySecurityServiceConfigResponse:
         config = self._load_service_config(db)
         payload = BinarySecurityServiceConfigPayload(
+            worker_task_concurrency=int(getattr(config, "worker_task_concurrency", 40)),
             max_concurrent_tasks=int(config.max_concurrent_tasks),
             dispatch_timeout_seconds=int(config.dispatch_timeout_seconds),
             lease_timeout_seconds=int(getattr(config, "lease_timeout_seconds", 90)),

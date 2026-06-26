@@ -43,7 +43,7 @@ data:
     scheduler:
       enabled: true
       poll_interval_seconds: 5
-      task_concurrency: 2
+      task_concurrency: 40
       stage_poll_interval_seconds: 5
       heartbeat_update_interval_seconds: 15
       downstream_reconcile_grace_seconds: 30

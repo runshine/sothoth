@@ -430,6 +430,40 @@ class BinarySecurityTaskListResponse(BinarySecurityBaseModel):
     items: list[BinarySecurityTaskResponse] = Field(default_factory=list)
 
 
+class BinarySecurityDeleteQueueItem(BinarySecurityBaseModel):
+    id: str
+    project_id: str
+    project_name: Optional[str] = None
+    name: str
+    task_type: str = TASK_TYPE_BINARY
+    task_status: str
+    display_status: str
+    delete_status: str
+    delete_mode: Optional[str] = None
+    delete_error: Optional[str] = None
+    last_error: Optional[str] = None
+    delete_operation_id: Optional[str] = None
+    delete_requested_at: Optional[datetime] = None
+    delete_started_at: Optional[datetime] = None
+    delete_finished_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class BinarySecurityDeleteQueueResponse(BinarySecurityBaseModel):
+    total: int = 0
+    page: int = 1
+    page_size: int = 20
+    items: list[BinarySecurityDeleteQueueItem] = Field(default_factory=list)
+    stats: dict[str, int] = Field(
+        default_factory=lambda: {
+            "queued_total": 0,
+            "running_total": 0,
+            "blocked_total": 0,
+            "failed_total": 0,
+        }
+    )
+
+
 class BinarySecurityStageItemResponse(BinarySecurityBaseModel):
     id: str
     stage_name: str
@@ -950,7 +984,8 @@ class BinarySecurityProjectConfigResponse(BinarySecurityTaskPolicyConfigResponse
 
 
 class BinarySecurityServiceConfigPayload(BinarySecurityBaseModel):
-    max_concurrent_tasks: int = Field(default=20, ge=1, le=200)
+    worker_task_concurrency: int = Field(default=40, ge=1, le=200)
+    max_concurrent_tasks: int = Field(default=40, ge=1, le=200)
     dispatch_timeout_seconds: int = Field(default=60, ge=10, le=600)
     lease_timeout_seconds: int = Field(default=90, ge=15, le=1800)
 
@@ -960,7 +995,8 @@ class BinarySecurityServiceConfigResponse(BinarySecurityBaseModel):
 
 
 class BinarySecurityGlobalConfigPayload(BinarySecurityBaseModel):
-    max_concurrent_tasks: int = Field(default=20, ge=1, le=200)
+    worker_task_concurrency: int = Field(default=40, ge=1, le=200)
+    max_concurrent_tasks: int = Field(default=40, ge=1, le=200)
     dispatch_timeout_seconds: int = Field(default=60, ge=10, le=600)
     lease_timeout_seconds: int = Field(default=90, ge=15, le=1800)
     pipeline_mode: str = Field(default="mixed_streaming")

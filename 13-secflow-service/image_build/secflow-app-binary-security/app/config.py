@@ -106,7 +106,7 @@ class StorageConfig(BaseModel):
 class SchedulerConfig(BaseModel):
     enabled: bool = True
     poll_interval_seconds: int = 5
-    task_concurrency: int = 2
+    task_concurrency: int = 40
     stage_poll_interval_seconds: int = 5
     downstream_reconcile_interval_seconds: int = 60
     stage_item_sync_reconcile_interval_seconds: int = 60
