@@ -179,6 +179,7 @@ from app.service.task.item_sync import TaskItemSyncServiceMixin
 from app.service.task.lifecycle import TaskLifecycleServiceMixin
 from app.service.task.operation import TaskOperationServiceMixin
 from app.service.task.operation_events import TaskOperationEventServiceMixin
+from app.service.task.owner_fact_apply import TaskOwnerFactApplyServiceMixin
 from app.service.task.query import TaskQueryServiceMixin
 from app.service.task.read_model import TaskReadModelServiceMixin
 from app.service.task.state_event_inbox import TaskStateEventInboxServiceMixin
@@ -671,6 +672,7 @@ class TaskManager(
     TaskOperationServiceMixin,
     TaskOperationEventServiceMixin,
     TaskEventServiceMixin,
+    TaskOwnerFactApplyServiceMixin,
     TaskRuntimeServiceMixin,
     TaskContractServiceMixin,
     TaskStateEventInboxServiceMixin,
@@ -1022,7 +1024,7 @@ class TaskManager(
         return self._service_role() in {"all", "worker"}
 
     def _can_consume_state_events(self) -> bool:
-        return self._service_role() in {"all", "worker"}
+        return False
 
     def _can_own_runtime_phase(self, phase: str | None) -> bool:
         normalized = str(phase or "").strip().lower()
@@ -1632,16 +1634,15 @@ class TaskManager(
         role = self._service_role()
         run_worker_loops = role in {"", "all", "worker"}
         logger.info(
-            "binary-security task manager starting: role=%s run_worker_loops=%s state_event_consumer=%s "
+            "binary-security task manager starting: role=%s run_worker_loops=%s "
             "queue_redis=%s task_queue_key=%s",
             role or "all",
             run_worker_loops,
-            self._can_consume_state_events(),
             str(getattr(self.cfg.queue, "redis_url", "") or "").strip() or None,
             str(getattr(self.cfg.queue, "task_queue_key", "") or "").strip() or None,
         )
         try:
-            if run_worker_loops or self._can_consume_state_events():
+            if run_worker_loops:
                 logger.info(
                     "binary-security task manager redis_warmup starting: timeout_seconds=%s retry_interval_seconds=%s",
                     int(getattr(self.cfg.queue, "startup_ready_timeout_seconds", 60) or 60),
@@ -1665,20 +1666,10 @@ class TaskManager(
                     self._stage_item_dispatch_loop(),
                     name="binary-security-stage-item-dispatcher",
                 )
-            if self._can_consume_state_events():
+            if self._is_worker_role():
                 self._task_heartbeat_loop_task = asyncio.create_task(
                     self._task_heartbeat_loop(),
                     name="binary-security-task-heartbeat",
-                )
-            if self._can_consume_state_events():
-                # owner/worker 主链接管 state_event inbox。
-                self._state_event_inbox_loop_task = asyncio.create_task(
-                    self._state_event_inbox_loop(),
-                    name="binary-security-state-event-inbox",
-                )
-                self._state_event_inbox_metrics_loop_task = asyncio.create_task(
-                    self._state_event_inbox_metrics_loop(),
-                    name="binary-security-state-event-inbox-metrics",
                 )
             logger.info("binary-security task manager started")
         except Exception:
@@ -6339,6 +6330,65 @@ class TaskManager(
                 db.rollback()
                 self._sleep_after_retryable_lock_error(attempt + 1)
 
+    def _build_inline_state_event(
+        self,
+        db: Session,
+        *,
+        task_id: str,
+        project_id: str,
+        event_type: str,
+        idempotency_key: str,
+        stage_name: str | None = None,
+        item_id: str | None = None,
+        archive_job_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+        task: BinarySecurityTask | None = None,
+    ) -> BinarySecurityStateEvent:
+        normalized_payload = dict(payload or {})
+        emitted_by = dict(normalized_payload.get("emitted_by") or {})
+        emitted_by.update(
+            {
+                "service": "binary-security",
+                "role": "owner",
+                "instance_id": str(self.instance_id or "").strip() or None,
+                "hostname": self._event_hostname(),
+                "pod_name": self._event_pod_name(),
+                "node_name": self._event_node_name(),
+            }
+        )
+        normalized_payload["emitted_by"] = emitted_by
+        normalized_payload.setdefault("runtime_role", "owner")
+        event = BinarySecurityStateEvent(
+            id=f"owner_sev_{uuid.uuid4().hex[:24]}",
+            task_id=task_id,
+            project_id=project_id,
+            stage_name=stage_name,
+            item_id=item_id,
+            archive_job_id=archive_job_id,
+            event_type=event_type,
+            idempotency_key=idempotency_key,
+            status="processed",
+            available_at=_now(),
+            updated_at=_now(),
+            processed_at=_now(),
+            processing_started_at=_now(),
+            processing_finished_at=_now(),
+            processing_result="owner_inline",
+            processed_by=str(self.instance_id or "").strip() or "owner",
+        )
+        event.payload = self._prepare_event_payload_for_db(
+            db,
+            task=task,
+            event_id=event.id,
+            event_type=event_type,
+            stage_name=stage_name,
+            payload=normalized_payload,
+            state_event=True,
+            task_id=task_id,
+            project_id=project_id,
+        )
+        return event
+
     def _record_missing_stage_terminal_event(
         self,
         db: Session,
@@ -6354,7 +6404,7 @@ class TaskManager(
             db,
             task,
             "stage_worker_terminal_event_missing",
-            f"检测到阶段终态事件漏信，已补投 state event inbox 事件: {stage_name}",
+            f"检测到阶段终态收口漏执行，已通知 owner 直接补做收口: {stage_name}",
             level="warning",
             stage_name=stage_name,
             payload={
@@ -6362,43 +6412,6 @@ class TaskManager(
                 "status": status,
                 "execution_token": execution_token,
                 "summary": self._fit_event_payload_for_db(dict(summary or {})),
-            },
-        )
-
-    def _emit_stage_terminal_event_safely(
-        self,
-        db: Session,
-        *,
-        task: BinarySecurityTask,
-        stage_name: str,
-        status: str,
-        summary: dict[str, Any],
-        stage_retry_mode: bool,
-        task_retry_mode: bool,
-        target_stage_name: str | None,
-        execution_token: str | None,
-    ) -> BinarySecurityStateEvent | None:
-        stage_generation = self._stage_terminal_generation_key(task, stage_name, db=db)
-        return self._enqueue_state_event(
-            db,
-            task=task,
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_name=stage_name,
-            event_type="stage_worker_terminal_observed",
-            idempotency_key=(
-                f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
-                f"{stage_generation}:{status}"
-            ),
-            payload={
-                "stage_name": stage_name,
-                "status": status,
-                "summary": summary,
-                "stage_retry_mode": bool(stage_retry_mode),
-                "task_retry_mode": bool(task_retry_mode),
-                "target_stage_name": target_stage_name,
-                "execution_token": execution_token,
-                "stage_generation": stage_generation,
             },
         )
 
@@ -6521,86 +6534,6 @@ class TaskManager(
             return True, "duplicate_consumed"
         return False, None
 
-    def _enqueue_downstream_status_event(
-        self,
-        db: Session,
-        *,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        mapped_status: str,
-        before_status: str | None,
-        downstream_status: str,
-        payload: dict[str, Any],
-        error_message: str | None = None,
-        http_status: int | None = None,
-        error_type: str | None = None,
-        status_raw: str | None = None,
-        force: bool = False,
-        event_type: str = "downstream_status_observed",
-    ) -> BinarySecurityStateEvent | None:
-        downstream_payload = self._lightweight_downstream_payload(payload or {})
-        fingerprint_payload = {
-            "item_id": item.id,
-            "downstream_task_id": item.downstream_task_id,
-            "mapped_status": mapped_status,
-            "downstream_status": downstream_status,
-            "error_message": error_message,
-            "downstream_payload": downstream_payload,
-        }
-        fingerprint = hashlib.sha1(json.dumps(fingerprint_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-        return self._enqueue_state_event(
-            db,
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_name=item.stage_name,
-            item_id=item.id,
-            event_type=event_type,
-            idempotency_key=f"{event_type}:{item.id}:{fingerprint}",
-            payload={
-                "mapped_status": mapped_status,
-                "before_status": before_status,
-                "downstream_status": downstream_status,
-                "downstream_payload": downstream_payload,
-                "error_message": error_message,
-                "http_status": http_status,
-                "error_type": error_type,
-                "status_raw": status_raw or downstream_status,
-                "force": bool(force),
-            },
-        )
-
-    def _enqueue_downstream_terminal_event(
-        self,
-        db: Session,
-        *,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        mapped_status: str,
-        before_status: str | None,
-        downstream_status: str,
-        payload: dict[str, Any],
-        error_message: str | None = None,
-        http_status: int | None = None,
-        error_type: str | None = None,
-        status_raw: str | None = None,
-        force: bool = False,
-    ) -> BinarySecurityStateEvent | None:
-        return self._enqueue_downstream_status_event(
-            db,
-            task=task,
-            item=item,
-            mapped_status=mapped_status,
-            before_status=before_status,
-            downstream_status=downstream_status,
-            payload=payload,
-            error_message=error_message,
-            http_status=http_status,
-            error_type=error_type,
-            status_raw=status_raw,
-            force=force,
-            event_type="downstream_terminal_observed",
-        )
-
     def _recover_missing_stage_terminal_events_locked(self, db: Session) -> bool:
         recovered = False
         running_tasks = db.query(BinarySecurityTask).filter(BinarySecurityTask.status == "running").all()
@@ -6618,25 +6551,22 @@ class TaskManager(
                     db=db,
                     stage_run=stage_run,
                 )
-                existing = db.query(BinarySecurityStateEvent).filter(
-                    BinarySecurityStateEvent.idempotency_key == expected_key
-                ).first()
-                if existing is not None:
-                    continue
                 summary = dict(stage_run.output_summary or {})
-                emitted = self._emit_stage_terminal_event_safely(
+                self._request_task_layer_reconcile(
                     db,
                     task=task,
                     stage_name=stage_name,
-                    status=stage_status,
-                    summary=summary,
-                    stage_retry_mode=False,
-                    task_retry_mode=False,
-                    target_stage_name=None,
-                    execution_token=task.dispatch_started_at.isoformat() if task.dispatch_started_at else "",
+                    source_event_type="stage_worker_terminal_observed",
+                    state_event_id=None,
+                    reconcile_reason="missing_stage_terminal_recovery",
+                    message="检测到阶段终态事实已存在但 owner 收口漏执行，已直接补做任务层收口",
+                    event_payload={
+                        "stage_status": stage_status,
+                        "summary": self._fit_event_payload_for_db(summary),
+                        "stage_terminal_event_idempotency_key": expected_key,
+                        "recovery_mode": "owner_direct_reconcile",
+                    },
                 )
-                if emitted is None:
-                    continue
                 self._record_missing_stage_terminal_event(
                     db,
                     task,
@@ -6650,35 +6580,6 @@ class TaskManager(
         if recovered:
             db.flush()
         return recovered
-
-    def _enqueue_archive_state_event_by_job_id(self, job_id: str, *, event_type: str, payload: dict[str, Any] | None = None) -> None:
-        db = get_session_factory()()
-        try:
-            job = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.id == job_id).first()
-            if job is None:
-                observe_state_event(event_type, "missing_archive_job")
-                return
-            merged_payload = {**(payload or {})}
-            if job.archive_root and "archive_root" not in merged_payload:
-                merged_payload["archive_root"] = job.archive_root
-            self._enqueue_state_event(
-                db,
-                task_id=job.task_id,
-                project_id=job.project_id,
-                stage_name=job.stage_name,
-                item_id=job.item_id,
-                archive_job_id=job.id,
-                event_type=event_type,
-                idempotency_key=f"{event_type}:{job.id}:{job.archive_status}:{job.updated_at.isoformat() if job.updated_at else ''}",
-                payload=merged_payload,
-            )
-            db.commit()
-        except Exception:
-            db.rollback()
-            observe_state_event(event_type, "error")
-            logger.exception("binary-security failed to enqueue archive state event: job=%s type=%s", job_id, event_type)
-        finally:
-            db.close()
 
     def _stage_counts(self, db: Session, stage_run: BinarySecurityStageRun) -> dict[str, int]:
         raw_items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.stage_run_id == stage_run.id).all()
@@ -10137,7 +10038,13 @@ class TaskManager(
             return False
         if str(stage_run.status or "").strip() not in {"success", "partial_success"}:
             return False
-        return "selected_modules" in dict(task.summary or {})
+        # 就绪判据（双路 OR）：
+        # ① task.summary 的 _summary_cache 有 selected_modules 键（同 session 内 setter 设过时有效）；
+        # ② stage_run.output_summary 有 module_count（DB 直读、由 refresh_summary_from_items 写入，
+        #    跨 session 也可靠——archive_dispatch_loop 的 session 写的 output_summary 在 DB 里）。
+        # 两条路覆盖：测试场景（cache fresh）和生产场景（cache stale 但 output_summary 在 DB）。
+        output_summary = dict(getattr(stage_run, "output_summary", None) or {})
+        return "selected_modules" in dict(task.summary or {}) or output_summary.get("module_count") is not None
 
     def _binary_to_source_authoritative_complete(
         self,
@@ -10188,7 +10095,7 @@ class TaskManager(
         if not self._system_analysis_authoritative_complete(db, task):
             return True
         # 就绪但 0 模块：不阻塞，交给 _should_finalize_without_entries 成功收口
-        if not list((task.summary or {}).get("selected_modules") or []):
+        if int(dict(task.metrics or {}).get("selected_module_count") or 0) == 0:
             return False
         rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
         if bool(rebuild_state.get("required")):

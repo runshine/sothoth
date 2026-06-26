@@ -25,31 +25,31 @@ DEFAULT_QUEUE_CONTEXT = "unspecified"
 class TaskQueue:
     def __init__(self) -> None:
         self.config = get_config().queue
-        self._clients_by_loop_id: dict[int, Redis] = {}
+        self._clients_by_loop_id: dict[asyncio.AbstractEventLoop, Redis] = {}
 
-    def _current_loop_id(self) -> int:
-        return id(asyncio.get_running_loop())
+    def _current_loop(self) -> asyncio.AbstractEventLoop:
+        return asyncio.get_running_loop()
 
-    def _forget_client(self, client: Redis, *, loop_id: int | None = None) -> None:
-        if loop_id is not None:
-            current = self._clients_by_loop_id.get(loop_id)
+    def _forget_client(self, client: Redis, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
+        if loop is not None:
+            current = self._clients_by_loop_id.get(loop)
             if current is client:
-                self._clients_by_loop_id.pop(loop_id, None)
+                self._clients_by_loop_id.pop(loop, None)
             return
-        stale_loop_ids = [cached_loop_id for cached_loop_id, cached in self._clients_by_loop_id.items() if cached is client]
-        for cached_loop_id in stale_loop_ids:
-            self._clients_by_loop_id.pop(cached_loop_id, None)
+        stale_loops = [cached_loop for cached_loop, cached in self._clients_by_loop_id.items() if cached is client]
+        for cached_loop in stale_loops:
+            self._clients_by_loop_id.pop(cached_loop, None)
 
     def _new_client(self, *, context: str = DEFAULT_QUEUE_CONTEXT) -> Redis:
-        loop_id = self._current_loop_id()
-        existing = self._clients_by_loop_id.get(loop_id)
+        loop = self._current_loop()
+        existing = self._clients_by_loop_id.get(loop)
         if existing is not None:
             return existing
         logger.info(
             "binary-security task queue creating redis client: context=%s loop_id=%s redis_url=%s task_queue_key=%s "
             "socket_connect_timeout=%s socket_timeout=%s active_loop_client_count=%s",
             str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
-            loop_id,
+            id(loop),
             str(self.config.redis_url or "").strip() or None,
             str(self.config.task_queue_key or "").strip() or None,
             REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
@@ -64,7 +64,7 @@ class TaskQueue:
             health_check_interval=30,
             socket_keepalive=True,
         )
-        self._clients_by_loop_id[loop_id] = client
+        self._clients_by_loop_id[loop] = client
         return client
 
     async def ping(self, *, context: str = "startup_warmup") -> None:
@@ -254,17 +254,17 @@ class TaskQueue:
         return await self._consume_result(client, queue_key, result)
 
     async def _close_client(self, client: Redis) -> None:
-        loop_id = None
+        loop = None
         try:
-            loop_id = self._current_loop_id()
+            loop = self._current_loop()
         except RuntimeError:
-            loop_id = None
+            loop = None
         try:
             await client.aclose()
         except Exception:
             logger.debug("failed closing redis client", exc_info=True)
         finally:
-            self._forget_client(client, loop_id=loop_id)
+            self._forget_client(client, loop=loop)
 
     async def _push_unique(self, client: Redis, queue_key: str, task_id: str) -> None:
         value = str(task_id or "").strip()

@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.model import BinarySecurityArchiveJob, BinarySecurityStateEvent, BinarySecurityTask
+from app.service.task.owner_fact_apply import TaskOwnerFactApplyServiceMixin
 from app.service.task.state_event_inbox import TaskStateEventInboxServiceMixin
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb
@@ -9,7 +10,7 @@ from test_task_manager import _ModelAwareDb
 
 class TaskStateEventInboxServiceStructureTests(unittest.TestCase):
     def test_task_manager_state_event_inbox_methods_are_bound_to_mixin(self):
-        self.assertIs(TaskManager._apply_stage_worker_start_requested_locked, TaskStateEventInboxServiceMixin._apply_stage_worker_start_requested_locked)
+        self.assertIs(TaskManager._apply_stage_worker_start_requested_locked, TaskOwnerFactApplyServiceMixin._apply_stage_worker_start_requested_locked)
         self.assertIs(TaskManager._state_event_inbox_loop, TaskStateEventInboxServiceMixin._state_event_inbox_loop)
         self.assertIs(TaskManager._state_event_inbox_metrics_loop, TaskStateEventInboxServiceMixin._state_event_inbox_metrics_loop)
         self.assertIs(TaskManager._publish_state_event_inbox_metrics_snapshot, TaskStateEventInboxServiceMixin._publish_state_event_inbox_metrics_snapshot)

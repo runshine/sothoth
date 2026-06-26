@@ -74,6 +74,40 @@ class TaskDownstreamServiceMixin:
             == str(target.get("definition_line") or target.get("line_no") or "").strip()
         )
 
+    def _ensure_streaming_stage_run_for_materialization(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        reason: str,
+    ) -> BinarySecurityStageRun:
+        normalized_stage = normalize_stage_name(stage_name)
+        if not normalized_stage:
+            raise ValidationError("流式阶段物化失败: stage_name 为空")
+        if not self._streaming_mode_enabled(task):
+            raise ValidationError(f"流式阶段物化失败: 任务 {task.id} 当前未启用 streaming 模式")
+        if normalized_stage not in self._streaming_tail_stage_names(task):
+            raise ValidationError(f"流式阶段物化失败: 阶段 {normalized_stage} 不是该任务的 streaming tail stage")
+        if not self._task_runtime_owner_matches_current_instance(db, task) and not self._task_runtime_transition_guard_owned_by_current_instance(task):
+            self._record_main_state_write_blocked(
+                db,
+                task,
+                source="runtime_worker",
+                attempted_stage_name=normalized_stage,
+                attempted_status="pending",
+                reason=f"{reason}_requires_current_owner",
+            )
+            raise ValidationError(f"流式阶段物化失败: 当前实例不是任务 {task.id} 的活跃 owner")
+        stage_run = self._ensure_stage_run(db, task, normalized_stage)
+        normalized_status = str(getattr(stage_run, "status", "") or "").strip().lower()
+        if normalized_status in {"failed", "cancelled", "downstream_missing", "success", "partial_success"}:
+            stage_run.status = "pending"
+            stage_run.finished_at = None
+            stage_run.last_error = None
+            stage_run.updated_at = task_manager_module._now()
+        return stage_run
+
     def _recover_entry_output_contract(
         self,
         db: Session,
@@ -242,7 +276,12 @@ class TaskDownstreamServiceMixin:
             item_key=module_key,
             parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
         )
-        stage_run = self._ensure_stage_run(db, task, "entry_analysis")
+        stage_run = self._ensure_streaming_stage_run_for_materialization(
+            db,
+            task,
+            "entry_analysis",
+            reason="streaming_entry_item_materialization",
+        )
         item = self._upsert_stage_item(
             db,
             task=task,
@@ -295,7 +334,12 @@ class TaskDownstreamServiceMixin:
         )
         if not entries:
             return []
-        stage_run = self._ensure_stage_run(db, task, "dataflow_vuln_scan")
+        stage_run = self._ensure_streaming_stage_run_for_materialization(
+            db,
+            task,
+            "dataflow_vuln_scan",
+            reason="streaming_dataflow_item_materialization",
+        )
         created_items: list[BinarySecurityStageItem] = []
         created_count = 0
         refreshed_count = 0
@@ -388,7 +432,12 @@ class TaskDownstreamServiceMixin:
             item_key=entry_key,
             parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
         )
-        stage_run = self._ensure_stage_run(db, task, "dataflow_vuln_scan")
+        stage_run = self._ensure_streaming_stage_run_for_materialization(
+            db,
+            task,
+            "dataflow_vuln_scan",
+            reason="streaming_vuln_item_materialization",
+        )
         item = self._upsert_stage_item(
             db,
             task=task,

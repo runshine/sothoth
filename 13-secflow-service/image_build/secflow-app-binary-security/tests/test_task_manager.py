@@ -1794,7 +1794,13 @@ class TaskManagerTests(unittest.TestCase):
             status="success",
             downstream_service="binary_to_source",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[lease])
 
         seeded = self.manager._trigger_entry_items_from_b2s_result(
             db,
@@ -1850,7 +1856,13 @@ class TaskManagerTests(unittest.TestCase):
                 status="success",
                 downstream_service="binary_to_source",
             )
-            db = _AppendingModelAwareDb(tasks=[task], stage_items=[])
+            lease = BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                owner_instance_id=self.manager.instance_id,
+                heartbeat_at=_now(),
+                lease_expires_at=_now() + timedelta(minutes=5),
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[lease])
 
             seeded = self.manager._trigger_entry_items_from_b2s_result(
                 db,
@@ -1903,7 +1915,13 @@ class TaskManagerTests(unittest.TestCase):
             status="success",
             downstream_service="entry_analyse",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[lease])
 
         seeded = self.manager._trigger_dataflow_items_from_entry_result(
             db,
@@ -1935,6 +1953,63 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(any(run.stage_name == "dataflow_vuln_scan" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_dataflow_vuln_scan_items_seeded" for event in db.events))
 
+    def test_trigger_dataflow_items_from_entry_result_requires_current_owner_for_stage_run_materialization(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            dispatcher_instance_id="other-worker",
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="entry_analyse",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="other-worker",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[lease], events=[])
+
+        with self.assertRaises(ValidationError):
+            self.manager._trigger_dataflow_items_from_entry_result(
+                db,
+                task,
+                {
+                    "entries": [
+                        {
+                            "entry_key": "entry-1",
+                            "module_key": "module-1",
+                            "function_name": "handle_req",
+                            "file_name": "main.c",
+                        }
+                    ]
+                },
+                upstream_item=upstream_item,
+            )
+
+        self.assertEqual([], db.stage_runs)
+        blocked = [event for event in db.events if event.event_type == "main_state_write_blocked"]
+        self.assertTrue(blocked)
+
     def test_trigger_vuln_items_from_dataflow_result_creates_pending_vuln_item_in_streaming_mode(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -1962,7 +2037,13 @@ class TaskManagerTests(unittest.TestCase):
             status="success",
             downstream_service="dataflow_vuln_scan",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[lease])
 
         seeded = self.manager._trigger_vuln_items_from_dataflow_result(
             db,
@@ -2023,7 +2104,13 @@ class TaskManagerTests(unittest.TestCase):
             status="success",
             downstream_service="dataflow_vuln_scan",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stale_run], stage_items=[])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stale_run], stage_items=[], runtime_leases=[lease])
 
         seeded = self.manager._trigger_vuln_items_from_dataflow_result(
             db,
@@ -2087,7 +2174,13 @@ class TaskManagerTests(unittest.TestCase):
             status="dispatching",
             downstream_service="dataflow_vuln_scan",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing], runtime_leases=[lease])
 
         seeded = self.manager._trigger_vuln_items_from_dataflow_result(
             db,
@@ -2148,7 +2241,13 @@ class TaskManagerTests(unittest.TestCase):
             downstream_service="dataflow_vuln_scan",
             downstream_task_id="dvs_existing",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing], runtime_leases=[lease])
 
         seeded = self.manager._trigger_vuln_items_from_dataflow_result(
             db,
@@ -10053,10 +10152,12 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("manual_policy_update_requested", [getattr(event, "event_type", "") for event in db.added])
-        self.manager._apply_manual_policy_update_requested_locked(db, db.added[-1])
+        self.assertIn("task_runtime_policy_updated", [getattr(event, "event_type", "") for event in db.added])
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
+        self.assertEqual(4, detail.base_policy["stage_parallelism"]["firmware_unpack"])
+        self.assertEqual(2, detail.runtime_override["stage_parallelism"]["firmware_unpack"])
+        self.assertEqual(8, detail.runtime_override["stage_parallelism"]["dataflow_vuln_scan"])
         self.assertEqual(8, detail.policy["max_stage_parallelism"])
         self.assertEqual(2, detail.policy["stage_parallelism"]["firmware_unpack"])
         self.assertEqual(8, detail.policy["stage_parallelism"]["dataflow_vuln_scan"])
@@ -10149,7 +10250,6 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.manager._apply_manual_policy_update_requested_locked(db, db.added[-1])
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
         self.assertEqual(4, detail.base_policy["stage_parallelism"]["entry_analysis"])
@@ -10281,8 +10381,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
-        self.assertIn("manual_policy_update_requested", [getattr(event, "event_type", "") for event in db.added])
-        self.manager._apply_manual_policy_update_requested_locked(db, db.added[-1])
+        self.assertIn("task_policy_updated", [getattr(event, "event_type", "") for event in db.added])
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
         self.assertEqual(8, detail.policy["max_stage_parallelism"])
@@ -10329,10 +10428,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         event = db.added[-1]
-        self.assertEqual("manual_policy_update_requested", getattr(event, "event_type", ""))
-        self.assertEqual("mixed_streaming", event.payload["after"]["pipeline_mode"])
-
-        self.manager._apply_manual_policy_update_requested_locked(db, event)
+        self.assertEqual("task_policy_updated", getattr(event, "event_type", ""))
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
         self.assertEqual("mixed_streaming", detail.policy["pipeline_mode"])
 
@@ -10368,8 +10464,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         event = db.added[-1]
-        self.assertEqual("barrier", event.payload["after"]["pipeline_mode"])
-        self.manager._apply_manual_policy_update_requested_locked(db, event)
+        self.assertEqual("task_policy_updated", getattr(event, "event_type", ""))
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
         self.assertEqual("barrier", detail.policy["pipeline_mode"])
 
@@ -25055,7 +25150,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertIsNone(task.dispatch_started_at)
         self.assertIsNone(task.lease_expires_at)
 
-    def test_recover_missing_stage_terminal_events_requeues_missing_terminal_signal(self):
+    def test_recover_missing_stage_terminal_events_requests_owner_reconcile(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = BinarySecurityTask(
                 id="task1",
@@ -25085,10 +25180,11 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             recovered = self.manager._recover_missing_stage_terminal_events_locked(db)
 
             self.assertTrue(recovered)
-            terminal_events = [row for row in db.added if row.__class__.__name__ == "BinarySecurityStateEvent"]
-            self.assertEqual(1, len(terminal_events))
-            self.assertEqual("stage_worker_terminal_observed", terminal_events[0].event_type)
-            self.assertEqual("failed", terminal_events[0].payload["status"])
+            runtime_workset = dict(task.runtime_workset or {})
+            pending_reconcile = dict(runtime_workset.get("pending_task_layer_reconcile") or {})
+            self.assertEqual("entry_analysis", pending_reconcile.get("stage_name"))
+            self.assertEqual("stage_worker_terminal_observed", pending_reconcile.get("source_event_type"))
+            self.assertEqual("missing_stage_terminal_recovery", pending_reconcile.get("reconcile_reason"))
             self.assertTrue(any(row.event_type == "stage_worker_terminal_event_missing" for row in db.added if row.__class__.__name__ == "BinarySecurityEvent"))
 
     def test_recover_missing_stage_terminal_events_skips_when_event_already_exists(self):
@@ -25128,8 +25224,11 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
             recovered = self.manager._recover_missing_stage_terminal_events_locked(db)
 
-            self.assertFalse(recovered)
-            self.assertFalse(any(row.__class__.__name__ == "BinarySecurityEvent" and row.event_type == "stage_worker_terminal_event_missing" for row in db.added))
+            self.assertTrue(recovered)
+            runtime_workset = dict(task.runtime_workset or {})
+            pending_reconcile = dict(runtime_workset.get("pending_task_layer_reconcile") or {})
+            self.assertEqual("entry_analysis", pending_reconcile.get("stage_name"))
+            self.assertTrue(any(row.__class__.__name__ == "BinarySecurityEvent" and row.event_type == "stage_worker_terminal_event_missing" for row in db.added))
 
     def test_recover_missing_stage_terminal_events_without_dispatch_token(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -25159,11 +25258,12 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             recovered = self.manager._recover_missing_stage_terminal_events_locked(db)
 
             self.assertTrue(recovered)
-            terminal_events = [row for row in db.added if row.__class__.__name__ == "BinarySecurityStateEvent"]
-            self.assertEqual(1, len(terminal_events))
+            runtime_workset = dict(task.runtime_workset or {})
+            pending_reconcile = dict(runtime_workset.get("pending_task_layer_reconcile") or {})
+            self.assertEqual("entry_analysis", pending_reconcile.get("stage_name"))
             self.assertEqual(
                 "stage_worker_terminal_observed:task1:entry_analysis:seq:2:failed",
-                terminal_events[0].idempotency_key,
+                pending_reconcile.get("event_payload", {}).get("stage_terminal_event_idempotency_key"),
             )
             warnings = [row for row in db.added if row.__class__.__name__ == "BinarySecurityEvent"]
             self.assertTrue(any(row.event_type == "stage_worker_terminal_event_missing" for row in warnings))
@@ -25206,7 +25306,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             recovered = self.manager._recover_missing_stage_terminal_events_locked(db)
 
             self.assertFalse(recovered)
-            self.assertFalse(any(row.__class__.__name__ == "BinarySecurityStateEvent" for row in db.added))
             self.assertFalse(any(row.__class__.__name__ == "BinarySecurityEvent" and row.event_type == "stage_worker_terminal_event_missing" for row in db.added))
 
     def test_normalize_entry_analysis_module_input_prepares_binary_module_descriptor(self):
@@ -32302,7 +32401,6 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
     original_write = self.manager._write_task_metadata_async
     original_reconcile = self.manager._run_task_layer_reconcile_signal
     original_archive_job = self.manager._ensure_downstream_archive_job
-    original_enqueue_archive_event = self.manager._enqueue_archive_state_event_by_job_id
     original_apply_archive_job_status = self.manager._apply_archive_job_status
     signals = []
 
@@ -32326,7 +32424,6 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
     self.manager._write_task_metadata_async = _noop_write
     self.manager._run_task_layer_reconcile_signal = _capture_reconcile
     self.manager._ensure_downstream_archive_job = _archive_success
-    self.manager._enqueue_archive_state_event_by_job_id = lambda *_args, **_kwargs: None
     self.manager._apply_archive_job_status = _noop_apply_archive_job_status
     try:
         resp = asyncio.run(
@@ -32343,7 +32440,6 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
         self.manager._write_task_metadata_async = original_write
         self.manager._run_task_layer_reconcile_signal = original_reconcile
         self.manager._ensure_downstream_archive_job = original_archive_job
-        self.manager._enqueue_archive_state_event_by_job_id = original_enqueue_archive_event
         self.manager._apply_archive_job_status = original_apply_archive_job_status
 
     self.assertEqual(1, resp.synced_downstream_count)
@@ -32407,7 +32503,6 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
     original_fetch = self.manager._fetch_downstream_task_payload
     original_write = self.manager._write_task_metadata_async
     original_archive_job = self.manager._ensure_downstream_archive_job
-    original_enqueue_archive_event = self.manager._enqueue_archive_state_event_by_job_id
     original_apply_archive_job_status = self.manager._apply_archive_job_status
 
     async def _fetch(*_args, **_kwargs):
@@ -32425,7 +32520,6 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
     self.manager._fetch_downstream_task_payload = _fetch
     self.manager._write_task_metadata_async = _noop_write
     self.manager._ensure_downstream_archive_job = _archive_success
-    self.manager._enqueue_archive_state_event_by_job_id = lambda *_args, **_kwargs: None
     self.manager._apply_archive_job_status = _noop_apply_archive_job_status
     try:
         resp = asyncio.run(
@@ -32441,7 +32535,6 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
         self.manager._fetch_downstream_task_payload = original_fetch
         self.manager._write_task_metadata_async = original_write
         self.manager._ensure_downstream_archive_job = original_archive_job
-        self.manager._enqueue_archive_state_event_by_job_id = original_enqueue_archive_event
         self.manager._apply_archive_job_status = original_apply_archive_job_status
 
     self.assertEqual(0, resp.failed_downstream_count)
@@ -35486,7 +35579,7 @@ def _test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail
     self.assertEqual([], requested_events)
 
 
-def _test_start_worker_role_runs_state_event_loops(self):
+def _test_start_worker_role_does_not_spawn_state_event_inbox_loops(self):
     manager = TaskManager()
 
     async def _noop():
@@ -35508,8 +35601,8 @@ def _test_start_worker_role_runs_state_event_loops(self):
         task_manager_module.get_task_queue().wait_until_ready = AsyncMock()
         with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
             asyncio.run(manager.start())
-            self.assertIsNotNone(manager._state_event_inbox_loop_task)
-            self.assertIsNotNone(manager._state_event_inbox_metrics_loop_task)
+            self.assertIsNone(manager._state_event_inbox_loop_task)
+            self.assertIsNone(manager._state_event_inbox_metrics_loop_task)
             self.assertIsNotNone(manager._task_heartbeat_loop_task)
             self.assertIsNotNone(manager._loop_task)
         asyncio.run(manager.stop())
@@ -42419,7 +42512,7 @@ TaskManagerTests.test_worker_does_not_take_tail_runtime_lease_on_refresh = _test
 TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
 TaskManagerTests.test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task
 TaskManagerTests.test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task = _test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task
-TaskManagerTests.test_start_worker_role_runs_state_event_loops = _test_start_worker_role_runs_state_event_loops
+TaskManagerTests.test_start_worker_role_does_not_spawn_state_event_inbox_loops = _test_start_worker_role_does_not_spawn_state_event_inbox_loops
 TaskManagerTests.test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running = _test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running
 TaskManagerTests.test_effective_stage_item_downstream_status_allows_recoverable_running_display = _test_effective_stage_item_downstream_status_allows_recoverable_running_display
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error

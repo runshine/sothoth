@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from app.exception import ValidationError
+from app.model import BinarySecurityStateEvent
 from app.model import TASK_RUNTIME_PHASE_OWNED_EXECUTION
 
 if TYPE_CHECKING:
@@ -1215,12 +1216,28 @@ class TaskArchiveServiceMixin:
             db.close()
 
     async def _apply_archive_job_status(self: TaskManager, job_id: str, archived_root: str | None) -> None:
-        await asyncio.to_thread(
-            self._enqueue_archive_state_event_by_job_id,
-            job_id,
-            event_type="archive_job_copied",
-            payload={"archive_root": archived_root, "source": "compat_apply_request"},
-        )
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            synthetic_event = BinarySecurityStateEvent(
+                id=f"owner_sev_{uuid.uuid4().hex[:24]}",
+                event_type="archive_job_copied",
+                archive_job_id=job_id,
+            )
+            synthetic_event.payload = {"archive_root": archived_root, "source": "owner_direct_apply_request"}
+            await self._apply_archive_job_status_locked(
+                db,
+                job_id,
+                archived_root,
+                state_event_id=synthetic_event.id,
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
     async def _apply_archive_job_status_locked(
         self: TaskManager,

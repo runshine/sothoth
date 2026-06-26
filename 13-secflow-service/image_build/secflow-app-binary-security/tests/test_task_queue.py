@@ -137,7 +137,7 @@ class _FakeRedisPingFlaky(_FakeRedis):
 
 
 async def _bind_client_for_current_loop(queue: TaskQueue, client) -> None:
-    queue._clients_by_loop_id[id(asyncio.get_running_loop())] = client
+    queue._clients_by_loop_id[asyncio.get_running_loop()] = client
 
 
 class TaskQueueTests(unittest.TestCase):

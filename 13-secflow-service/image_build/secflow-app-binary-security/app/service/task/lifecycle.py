@@ -182,8 +182,6 @@ class TaskLifecycleServiceMixin:
             "archive_runtime_reconcile": self._archive_runtime_reconcile_interval_seconds(),
             "state_repair_reconcile": self._state_repair_reconcile_interval_seconds(),
             "readless_reconcile": max(1, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300)),
-            "state_event_inbox": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
-            "state_event_inbox_metrics": max(5, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
             "task_heartbeat": max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15)),
         }.get(loop_name, configured)
         return max(configured, interval_seconds * 2 + 15)
@@ -231,13 +229,17 @@ class TaskLifecycleServiceMixin:
             "task_dispatch": self._loop_runtime_detail("task_dispatch", self._loop_task),
             "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
             "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
-            "state_event_inbox": self._loop_runtime_detail("state_event_inbox", self._state_event_inbox_loop_task),
-            "state_event_inbox_metrics": self._loop_runtime_detail("state_event_inbox_metrics", self._state_event_inbox_metrics_loop_task),
             "compat_heartbeat_fallback": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
+            "legacy_state_event_inbox": self._loop_runtime_detail("state_event_inbox", self._state_event_inbox_loop_task),
+            "legacy_state_event_inbox_metrics": self._loop_runtime_detail("state_event_inbox_metrics", self._state_event_inbox_metrics_loop_task),
         }
         return {
             "running": self._running,
-            "loops": {loop_name: bool(detail.get("alive")) for loop_name, detail in loop_details.items() if loop_name != "compat_heartbeat_fallback"},
+            "loops": {
+                loop_name: bool(detail.get("alive"))
+                for loop_name, detail in loop_details.items()
+                if loop_name not in {"compat_heartbeat_fallback", "legacy_state_event_inbox", "legacy_state_event_inbox_metrics"}
+            },
             "loop_details": loop_details,
             "workers": {
                 "task_workers": len([handle for handle in self._workers.values() if not handle.done()]),
@@ -249,7 +251,7 @@ class TaskLifecycleServiceMixin:
                 "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
-            "lease_auditor_active": bool(self._can_consume_state_events() and self._runtime_lease_capable()),
+            "lease_auditor_active": bool(self._runtime_lease_capable()),
         }
 
     def _collect_runtime_metrics_snapshot_sync(self: TaskManager) -> dict[str, int]:
@@ -846,12 +848,7 @@ class TaskLifecycleServiceMixin:
     async def _archive_worker(self: TaskManager, work_type: str, job_id: str) -> None:
         try:
             if work_type == "apply":
-                await asyncio.to_thread(
-                    self._enqueue_archive_state_event_by_job_id,
-                    job_id,
-                    event_type="archive_job_copied",
-                    payload={"source": "archive_apply_claim"},
-                )
+                await self._apply_archive_job_status(job_id, None)
             else:
                 await self._process_archive_job(job_id)
         except asyncio.CancelledError:

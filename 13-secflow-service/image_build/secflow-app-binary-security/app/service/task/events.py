@@ -170,7 +170,7 @@ class TaskEventServiceMixin:
             "processed_by_hostname": self._event_hostname(),
             "processed_by_pod_name": self._event_pod_name(),
             "processed_by_node_name": self._event_node_name(),
-            "processed_by_role": "owner" if self._can_consume_state_events() else self._event_runtime_role(),
+            "processed_by_role": "owner",
         }
         meaningful = {key: value for key, value in origin.items() if key != "kind" and value}
         return origin if meaningful else None

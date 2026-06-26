@@ -5,13 +5,14 @@ import json
 import shutil
 import zipfile
 import os
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session
 
 from app.exception import NotFoundError, ValidationError
-from app.model import BinarySecurityProjectConfig, BinarySecurityServiceConfig, BinarySecurityTaskOperation
+from app.model import BinarySecurityProjectConfig, BinarySecurityServiceConfig, BinarySecurityStateEvent, BinarySecurityTaskOperation
 from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityGlobalConfigPayload,
@@ -33,6 +34,29 @@ if TYPE_CHECKING:
 
 
 class TaskControlServiceMixin:
+    def _apply_manual_policy_update_direct(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        payload: dict[str, Any],
+    ) -> None:
+        synthetic_event = BinarySecurityStateEvent(
+            id=f"owner_sev_{uuid.uuid4().hex[:24]}",
+            task_id=task.id,
+            project_id=task.project_id,
+            event_type="manual_policy_update_requested",
+        )
+        synthetic_event.payload = dict(payload or {})
+        self._apply_manual_policy_update_payload_locked(
+            db,
+            task,
+            payload=dict(synthetic_event.payload or {}),
+            state_event_id=synthetic_event.id,
+            applied_by="owner_direct",
+        )
+        self._enqueue_task(task.id)
+
     def _task_delete_snapshot_state(self: TaskManager, task) -> dict[str, Any]:
         snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
         return snapshot if isinstance(snapshot, dict) else {}
@@ -788,13 +812,9 @@ class TaskControlServiceMixin:
             raise ValidationError(reason or "不允许修改任务策略")
         before = json.loads(json.dumps(dict(task.policy or {})))
         after = self._normalize_policy_update_payload(task, payload)
-        event = self._enqueue_state_event(
+        self._apply_manual_policy_update_direct(
             db,
-            task=task,
-            task_id=task.id,
-            project_id=task.project_id,
-            event_type="manual_policy_update_requested",
-            idempotency_key=f"manual_policy_update_requested:{task.id}:{hash(json.dumps(after, sort_keys=True, ensure_ascii=False))}",
+            task,
             payload={
                 "mode": "policy",
                 "before": before,
@@ -802,8 +822,6 @@ class TaskControlServiceMixin:
                 "effective_scope": "future_stages_only",
             },
         )
-        if event is not None:
-            task.updated_at = getattr(task, "updated_at", None)
         return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def update_task_runtime_policy(
@@ -843,13 +861,9 @@ class TaskControlServiceMixin:
             after["continue_on_item_failure"] = bool(payload.continue_on_item_failure)
         if payload.tail_reconcile_poll_interval_seconds is not None:
             after["tail_reconcile_poll_interval_seconds"] = int(payload.tail_reconcile_poll_interval_seconds)
-        self._enqueue_state_event(
+        self._apply_manual_policy_update_direct(
             db,
-            task=task,
-            task_id=task.id,
-            project_id=task.project_id,
-            event_type="manual_policy_update_requested",
-            idempotency_key=f"manual_runtime_policy_update_requested:{task.id}:{current_version + 1}",
+            task,
             payload={
                 "mode": "runtime_override",
                 "before": before,

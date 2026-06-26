@@ -687,12 +687,12 @@ class TaskRuntimeServiceMixin:
                         task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
                         str(getattr(task, "current_operation_id", "") or "").strip() or None,
                     )
-                    self._enqueue_state_event(
+                    self._record_event(
                         db,
-                        task_id=task.id,
-                        project_id=task.project_id,
-                        event_type="pending_task_not_enqueued_detected",
-                        idempotency_key=f"pending_task_not_enqueued_detected:{task.id}:{int(now_value.timestamp()) // interval_seconds}",
+                        task,
+                        "pending_task_not_enqueued_detected",
+                        "检测到 pending 任务未进入 Redis task queue，已开始同步自愈",
+                        level="warning",
                         payload={
                             "task_status": current_status,
                             "queue_state": queue_state,
@@ -702,23 +702,20 @@ class TaskRuntimeServiceMixin:
                             "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
                             "enqueue_context": "queue_reconcile",
                         },
-                        task=task,
                     )
                     try:
                         await queue.force_requeue_task(normalized_task_id, context="queue_reconcile_pending_reenqueue")
-                        self._enqueue_state_event(
+                        self._record_event(
                             db,
-                            task_id=task.id,
-                            project_id=task.project_id,
-                            event_type="pending_task_reenqueued_by_reconcile",
-                            idempotency_key=f"pending_task_reenqueued_by_reconcile:{task.id}:{int(now_value.timestamp()) // interval_seconds}",
+                            task,
+                            "pending_task_reenqueued_by_reconcile",
+                            "pending 任务已由 queue reconcile 同步重新放回 Redis task queue",
                             payload={
                                 "task_status": current_status,
                                 "queue_state": queue_state,
                                 "recoverable_reason": recoverable_reason,
                                 "enqueue_context": "queue_reconcile",
                             },
-                            task=task,
                         )
                     except Exception as exc:
                         task_manager_module.logger.exception(
@@ -730,12 +727,12 @@ class TaskRuntimeServiceMixin:
                             exc.__class__.__name__,
                             exc,
                         )
-                        self._enqueue_state_event(
+                        self._record_event(
                             db,
-                            task_id=task.id,
-                            project_id=task.project_id,
-                            event_type="pending_task_reenqueue_failed",
-                            idempotency_key=f"pending_task_reenqueue_failed:{task.id}:{int(now_value.timestamp()) // interval_seconds}",
+                            task,
+                            "pending_task_reenqueue_failed",
+                            "pending 任务重新放回 Redis task queue 失败，等待下一轮自愈重试",
+                            level="warning",
                             payload={
                                 "task_status": current_status,
                                 "queue_state": queue_state,
@@ -744,7 +741,6 @@ class TaskRuntimeServiceMixin:
                                 "error": str(exc),
                                 "enqueue_context": "queue_reconcile",
                             },
-                            task=task,
                         )
                     continue
                 await queue.push_task(normalized_task_id)
@@ -2153,7 +2149,7 @@ class TaskRuntimeServiceMixin:
                 )
                 if not same_execution:
                     return
-                self._enqueue_state_event(
+                failure_event = self._build_inline_state_event(
                     db,
                     task_id=task.id,
                     project_id=task.project_id,
@@ -2169,6 +2165,7 @@ class TaskRuntimeServiceMixin:
                         "execution_token": execution_token or current_token,
                     },
                 )
+                await self._apply_task_execution_failed_locked(db, failure_event)
                 db.commit()
         finally:
             self._mark_runner_exited_keep_owner(
@@ -2380,7 +2377,7 @@ class TaskRuntimeServiceMixin:
                     to_stage=stage_name,
                     reason="stage_worker_start_requested",
                 )
-                start_event = self._enqueue_state_event(
+                start_event = self._build_inline_state_event(
                     db,
                     task=task,
                     task_id=task.id,
@@ -2398,6 +2395,7 @@ class TaskRuntimeServiceMixin:
                         "target_stage_name": target_stage_name,
                     },
                 )
+                self._apply_stage_worker_start_requested_locked(db, start_event)
                 handler = self._run_stage_executor
                 existing_stage_items = self._stage_items(db, task.id, stage_name) if task_retry_mode else []
                 db.commit()
@@ -2408,22 +2406,34 @@ class TaskRuntimeServiceMixin:
                     retry_existing = True
                 status, summary = await handler(db, task, stage_run, token, retry_existing=retry_existing)
                 execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else None
-                self._emit_stage_terminal_event_safely(
+                terminal_event = self._build_inline_state_event(
                     db,
                     task=task,
+                    task_id=task.id,
+                    project_id=task.project_id,
                     stage_name=stage_name,
-                    status=status,
-                    summary=summary,
-                    stage_retry_mode=bool(stage_retry_mode),
-                    task_retry_mode=bool(task_retry_mode),
-                    target_stage_name=target_stage_name,
-                    execution_token=execution_token,
+                    event_type="stage_worker_terminal_observed",
+                    idempotency_key=(
+                        f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
+                        f"{self._stage_terminal_generation_key(task, stage_name, db=db)}:{status}"
+                    ),
+                    payload={
+                        "stage_name": stage_name,
+                        "status": status,
+                        "summary": summary,
+                        "stage_retry_mode": bool(stage_retry_mode),
+                        "task_retry_mode": bool(task_retry_mode),
+                        "target_stage_name": target_stage_name,
+                        "execution_token": execution_token,
+                        "stage_generation": self._stage_terminal_generation_key(task, stage_name, db=db),
+                    },
                 )
+                await self._apply_stage_worker_terminal_event_locked(db, terminal_event)
                 self._record_event(
                     db,
                     task,
-                    "stage_worker_terminal_observed",
-                    f"阶段 worker 已完成，等待 state event inbox 串行收口: {stage_name}",
+                    "stage_worker_terminal_applied_by_owner",
+                    f"阶段 worker 已完成，owner 已直接应用终态事实并继续收口: {stage_name}",
                     stage_name=stage_name,
                     payload={"status": status},
                 )
@@ -2435,17 +2445,29 @@ class TaskRuntimeServiceMixin:
                         task_manager_module.BinarySecurityTask.id == task_id
                     ).first()
                     if task is not None:
-                        self._emit_stage_terminal_event_safely(
+                        terminal_event = self._build_inline_state_event(
                             db,
                             task=task,
+                            task_id=task.id,
+                            project_id=task.project_id,
                             stage_name=stage_name,
-                            status=status,
-                            summary=summary,
-                            stage_retry_mode=bool(stage_retry_mode),
-                            task_retry_mode=bool(task_retry_mode),
-                            target_stage_name=target_stage_name,
-                            execution_token=execution_token,
+                            event_type="stage_worker_terminal_observed",
+                            idempotency_key=(
+                                f"stage_worker_terminal_observed:{task.id}:{stage_name}:"
+                                f"{self._stage_terminal_generation_key(task, stage_name, db=db)}:{status}"
+                            ),
+                            payload={
+                                "stage_name": stage_name,
+                                "status": status,
+                                "summary": summary,
+                                "stage_retry_mode": bool(stage_retry_mode),
+                                "task_retry_mode": bool(task_retry_mode),
+                                "target_stage_name": target_stage_name,
+                                "execution_token": execution_token,
+                                "stage_generation": self._stage_terminal_generation_key(task, stage_name, db=db),
+                            },
                         )
+                        await self._apply_stage_worker_terminal_event_locked(db, terminal_event)
                         self._record_missing_stage_terminal_event(
                             db,
                             task,

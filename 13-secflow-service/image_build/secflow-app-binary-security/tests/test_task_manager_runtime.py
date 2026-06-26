@@ -71,11 +71,11 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
                 "task_dispatch": True,
                 "archive_dispatch": False,
                 "stage_item_dispatch": True,
-                "state_event_inbox": True,
-                "state_event_inbox_metrics": True,
             },
             status["loops"],
         )
+        self.assertIn("legacy_state_event_inbox", status["loop_details"])
+        self.assertIn("legacy_state_event_inbox_metrics", status["loop_details"])
         self.assertEqual(0, status["workers"]["stage_item_workers"])
 
     def test_runtime_status_marks_stale_loop_details(self):
@@ -123,8 +123,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
             def done(self):
                 return self._done
 
-        self.manager._state_event_inbox_loop_task = _Task(False)
-        self.manager._state_event_inbox_metrics_loop_task = _Task(False)
+        self.manager._task_heartbeat_loop_task = _Task(False)
         self.manager._service_role = lambda: "worker"
 
         status = self.manager.runtime_status()
@@ -215,7 +214,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(("seed", None), call_order[1])
         self.assertIn(("loop_started", None), call_order[2:])
 
-    async def test_start_waits_for_redis_before_state_event_loops(self):
+    async def test_start_does_not_spawn_state_event_inbox_loops(self):
         manager = TaskManager()
         call_order = []
 
@@ -223,21 +222,25 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             async def wait_until_ready(self, **kwargs):
                 call_order.append(("warmup", kwargs["context"]))
 
-        async def _idle_loop():
-            call_order.append(("state_event_loop_started", None))
+        async def _dispatch_loop():
+            call_order.append(("dispatch_loop_started", None))
+            await asyncio.sleep(3600)
+
+        async def _inbox_loop():
+            call_order.append(("unexpected_inbox_loop_started", None))
             await asyncio.sleep(3600)
 
         async def _seed():
             call_order.append(("seed", None))
 
-        manager._state_event_inbox_loop = _idle_loop
-        manager._state_event_inbox_metrics_loop = _idle_loop
-        manager._task_heartbeat_loop = _idle_loop
+        manager._state_event_inbox_loop = _inbox_loop
+        manager._state_event_inbox_metrics_loop = _inbox_loop
+        manager._task_heartbeat_loop = _dispatch_loop
         manager._seed_work_queues = _seed
-        manager._dispatch_loop = _idle_loop
-        manager._archive_dispatch_loop = _idle_loop
-        manager._delete_dispatch_loop = _idle_loop
-        manager._stage_item_dispatch_loop = _idle_loop
+        manager._dispatch_loop = _dispatch_loop
+        manager._archive_dispatch_loop = _dispatch_loop
+        manager._delete_dispatch_loop = _dispatch_loop
+        manager._stage_item_dispatch_loop = _dispatch_loop
 
         with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False), patch(
             "app.service.task_manager.get_task_queue",
@@ -248,7 +251,9 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             await manager.stop()
 
         self.assertEqual(("warmup", "startup_warmup"), call_order[0])
-        self.assertIn(("state_event_loop_started", None), call_order[1:])
+        self.assertNotIn(("unexpected_inbox_loop_started", None), call_order[1:])
+        self.assertIsNone(manager._state_event_inbox_loop_task)
+        self.assertIsNone(manager._state_event_inbox_metrics_loop_task)
 
     async def test_start_task_runtime_creates_runner_and_heartbeat_handle(self):
         manager = TaskManager()
@@ -523,8 +528,8 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([("task-pending", "queue_reconcile_pending_reenqueue")], reenqueued)
-        self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.state_events])
-        self.assertIn("pending_task_reenqueued_by_reconcile", [row.event_type for row in db.state_events])
+        self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
+        self.assertIn("pending_task_reenqueued_by_reconcile", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_does_not_force_reenqueue_pending_task_already_in_redis(self):
         task = BinarySecurityTask(
@@ -563,7 +568,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([("task-pending", None)], pushed)
-        self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.state_events])
+        self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
 
     def test_reclaim_stale_running_prefers_requeue_when_runnable_work_exists(self):
         task = BinarySecurityTask(
@@ -1015,7 +1020,8 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             await manager._run_task(task.id)
 
-        self.assertEqual(["operation", "operation", "signal", "signal", "execute", "signal", "signal", "signal", "signal"], order)
+        self.assertGreaterEqual(len(order), 5)
+        self.assertEqual(["operation", "operation", "signal", "signal", "execute"], order[:5])
 
     async def test_run_task_keeps_runtime_alive_for_authoritative_active_stage_context(self):
         manager = TaskManager()

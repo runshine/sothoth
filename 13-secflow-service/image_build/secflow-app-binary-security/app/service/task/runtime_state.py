@@ -891,14 +891,7 @@ class TaskRuntimeStateServiceMixin:
         return True, None
 
     def _runtime_lease_capable(self: TaskManager) -> bool:
-        if not self._can_consume_state_events():
-            return False
-        return bool(
-            self._state_event_inbox_loop_task
-            and not self._state_event_inbox_loop_task.done()
-            and self._state_event_inbox_metrics_loop_task
-            and not self._state_event_inbox_metrics_loop_task.done()
-        )
+        return bool(self._task_heartbeat_loop_task and not self._task_heartbeat_loop_task.done())
 
     def _task_base_policy(self: TaskManager, task: BinarySecurityTask) -> dict[str, Any]:
         return dict(task.policy or {})
@@ -1404,7 +1397,7 @@ class TaskRuntimeStateServiceMixin:
         self._merge_task_runtime_signal(
             task,
             "pending_task_layer_reconcile",
-            source="state_event_inbox",
+            source="owner_fact_apply",
             reason=reconcile_reason,
             stage_name=signal_stage_name,
             extra={

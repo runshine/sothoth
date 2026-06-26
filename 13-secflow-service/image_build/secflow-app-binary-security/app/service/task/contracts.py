@@ -454,6 +454,9 @@ class TaskContractServiceMixin:
     def _entry_analysis_inputs(self: TaskManager, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         from app.service import task_manager as task_manager_module
 
+        # 清除 _summary_cache，强制 getter 从文件 task-summary.json 重新读取。
+        # archive_dispatch_loop（不同 session）可能已更新文件但本 session 的 cache 仍 stale。
+        task._summary_cache = None
         if self._task_type(task) == task_manager_module.TASK_TYPE_SOURCE:
             selected_modules = [dict(module) for module in (task.summary.get("selected_modules") or []) if isinstance(module, dict)]
             archived_modules = self._system_analysis_modules_for_task(db, task)
