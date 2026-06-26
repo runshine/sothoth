@@ -4438,7 +4438,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIsNone(task.finished_at)
         self.assertIsNone(task.last_error)
 
-    def test_list_reducer_event_records_filters_and_summarizes(self):
+    def test_list_state_event_inbox_records_filters_and_summarizes(self):
         created_at = _now() - timedelta(minutes=5)
         started_at = created_at + timedelta(seconds=1)
         finished_at = started_at + timedelta(seconds=2)
@@ -4496,7 +4496,7 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(state_events=[processed, retryable, pending])
 
-        page = self.manager.list_reducer_event_records(
+        page = self.manager.list_state_event_inbox_records(
             db,
             page=1,
             page_size=10,
@@ -4522,7 +4522,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(2000, page.items[0].processing_duration_ms)
         self.assertIsNone(page.items[2].processing_duration_ms)
 
-        failed_only_page = self.manager.list_reducer_event_records(
+        failed_only_page = self.manager.list_state_event_inbox_records(
             db,
             page=1,
             page_size=10,
@@ -4538,7 +4538,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual(1, failed_only_page.total)
         self.assertEqual("sev-retry", failed_only_page.items[0].event_id)
 
-    def test_list_reducer_event_records_reports_lock_busy_as_non_failure_retryable_noise(self):
+    def test_list_state_event_inbox_records_reports_lock_busy_as_non_failure_retryable_noise(self):
         created_at = _now() - timedelta(minutes=2)
         started_at = created_at + timedelta(seconds=1)
         finished_at = started_at + timedelta(seconds=1)
@@ -4564,7 +4564,7 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(state_events=[lock_busy])
 
-        page = self.manager.list_reducer_event_records(
+        page = self.manager.list_state_event_inbox_records(
             db,
             page=1,
             page_size=10,

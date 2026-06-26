@@ -30,8 +30,8 @@ from app.schemas import (
     BinarySecurityProjectConfigResponse,
     BinarySecurityTaskPolicyConfigPayload,
     BinarySecurityTaskPolicyConfigResponse,
-    BinarySecurityReducerEventPageResponse,
     BinarySecurityServiceConfigResponse,
+    BinarySecurityStateEventInboxPageResponse,
     BinarySecurityStageItemPageResponse,
     BinarySecuritySyncEventPageResponse,
     BinarySecurityTaskConcurrencyUpdatePayload,
@@ -125,7 +125,7 @@ def list_tasks(
     )
 
 
-@router.get("/state-events", response_model=BinarySecurityReducerEventPageResponse)
+@router.get("/state-events", response_model=BinarySecurityStateEventInboxPageResponse)
 def list_state_events(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=1000),
@@ -140,7 +140,7 @@ def list_state_events(
     _: TokenUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    return get_task_manager().list_reducer_event_records(
+    return get_task_manager().list_state_event_inbox_records(
         db,
         page=page,
         page_size=page_size,

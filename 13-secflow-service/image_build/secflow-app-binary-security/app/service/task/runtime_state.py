@@ -1028,7 +1028,7 @@ class TaskRuntimeStateServiceMixin:
             return "archive_copy_io_error"
         if any(token in lowered for token in {"metadata", "task-metadata.json"}):
             return "task_metadata_write_failed"
-        if any(token in lowered for token in {"state event", "state reducer", "state_event_inbox"}):
+        if any(token in lowered for token in {"state event", "state_event_inbox"}):
             return "state_event_persist_failed"
         if self._is_retryable_lock_error(exc):
             return "retryable_lock_conflict"

@@ -495,7 +495,7 @@ class TaskItemSyncServiceMixin:
         lowered = str(exc or "").strip().lower()
         if self._is_retryable_lock_error(exc):
             return True
-        if any(token in lowered for token in {"metadata", "task-metadata.json", "state event", "state reducer", "state_event_inbox"}):
+        if any(token in lowered for token in {"metadata", "task-metadata.json", "state event", "state_event_inbox"}):
             return True
         return self._classify_downstream_sync_error(exc) in {
             "db_connection_refused",

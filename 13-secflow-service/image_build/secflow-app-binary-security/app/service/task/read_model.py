@@ -1216,7 +1216,7 @@ class TaskReadModelServiceMixin:
             },
         }
 
-    def list_reducer_event_records(
+    def list_state_event_inbox_records(
         self: TaskManager,
         db: Session,
         *,
@@ -1244,7 +1244,7 @@ class TaskReadModelServiceMixin:
             .limit(task_manager_module.REDUCER_EVENT_LIMIT_CAP)
             .all()
         )
-        filtered_events = self._filter_reducer_events(
+        filtered_events = self._filter_state_event_inbox_records(
             events,
             statuses=normalized_statuses,
             event_type=event_type,
@@ -1253,21 +1253,21 @@ class TaskReadModelServiceMixin:
             failed_only=failed_only,
             slow_only=slow_only,
         )
-        sort_descriptor = self._reducer_event_sort_key(sort_by=sort_by, sort_order=sort_order)
+        sort_descriptor = self._state_event_inbox_record_sort_key(sort_by=sort_by, sort_order=sort_order)
         filtered_events.sort(key=sort_descriptor["key"], reverse=sort_descriptor["reverse"])
         total = len(filtered_events)
         start = max(0, (page - 1) * page_size)
         end = start + page_size
-        return task_manager_module.BinarySecurityReducerEventPageResponse(
+        return task_manager_module.BinarySecurityStateEventInboxPageResponse(
             total=min(total, task_manager_module.REDUCER_EVENT_LIMIT_CAP),
             page=page,
             page_size=page_size,
             truncated=total >= task_manager_module.REDUCER_EVENT_LIMIT_CAP,
-            items=[self._build_reducer_event_record(event) for event in filtered_events[start:end]],
-            summary=self._build_reducer_event_summary(filtered_events),
+            items=[self._build_state_event_inbox_record(event) for event in filtered_events[start:end]],
+            summary=self._build_state_event_inbox_summary(filtered_events),
         )
 
-    def _filter_reducer_events(
+    def _filter_state_event_inbox_records(
         self: TaskManager,
         events,
         *,
@@ -1294,7 +1294,7 @@ class TaskReadModelServiceMixin:
                 continue
             if normalized_task_id and str(event.task_id or "").strip() != normalized_task_id:
                 continue
-            record = self._build_reducer_event_record(event)
+            record = self._build_state_event_inbox_record(event)
             if failed_only and record.failure_kind == "none":
                 continue
             if slow_only and (record.processing_duration_ms or 0) < task_manager_module.REDUCER_EVENT_SLOW_THRESHOLD_MS:
@@ -1302,7 +1302,7 @@ class TaskReadModelServiceMixin:
             result.append(event)
         return result
 
-    def _reducer_event_sort_key(self: TaskManager, *, sort_by: str, sort_order: str) -> dict[str, Any]:
+    def _state_event_inbox_record_sort_key(self: TaskManager, *, sort_by: str, sort_order: str) -> dict[str, Any]:
         normalized_sort_by = str(sort_by or "processed_at").strip()
         reverse = str(sort_order or "desc").strip().lower() != "asc"
         if normalized_sort_by == "duration_ms":
@@ -1333,7 +1333,7 @@ class TaskReadModelServiceMixin:
             "reverse": reverse,
         }
 
-    def _build_reducer_event_summary(self: TaskManager, events):
+    def _build_state_event_inbox_summary(self: TaskManager, events):
         from app.service import task_manager as task_manager_module
 
         counts = {"pending": 0, "processing": 0, "retryable": 0, "dead_letter": 0, "processed": 0}
@@ -1344,7 +1344,7 @@ class TaskReadModelServiceMixin:
             status = str(event.status or "pending").strip()
             if status in counts:
                 counts[status] += 1
-            record = self._build_reducer_event_record(event)
+            record = self._build_state_event_inbox_record(event)
             if record.failure_kind != "none":
                 failed_like_count += 1
             if record.processing_duration_ms is not None:
@@ -1355,7 +1355,7 @@ class TaskReadModelServiceMixin:
         avg_duration = round(sum(durations) / len(durations), 2) if durations else None
         p95_duration = durations[max(0, int(round((len(durations) - 1) * 0.95)))] if durations else None
         max_duration = durations[-1] if durations else None
-        return task_manager_module.BinarySecurityReducerEventSummaryResponse(
+        return task_manager_module.BinarySecurityStateEventInboxSummaryResponse(
             pending_count=counts["pending"],
             processing_count=counts["processing"],
             retryable_count=counts["retryable"],
@@ -1368,7 +1368,7 @@ class TaskReadModelServiceMixin:
             avg_processing_duration_ms=avg_duration,
         )
 
-    def _build_reducer_event_record(self: TaskManager, event):
+    def _build_state_event_inbox_record(self: TaskManager, event):
         from app.service import task_manager as task_manager_module
 
         processed_at = self._event_processed_at(event)
@@ -1377,7 +1377,7 @@ class TaskReadModelServiceMixin:
         queue_wait_ms = self._duration_ms(event.created_at, processing_started_at)
         end_to_end_duration_ms = self._duration_ms(event.created_at, processed_at)
         handler = str(getattr(event, "processed_by", None) or event.leased_by or "").strip() or None
-        return task_manager_module.BinarySecurityReducerEventRecordResponse(
+        return task_manager_module.BinarySecurityStateEventInboxRecordResponse(
             event_id=event.id,
             task_id=event.task_id,
             project_id=event.project_id,

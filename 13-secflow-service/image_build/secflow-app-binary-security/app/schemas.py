@@ -362,7 +362,7 @@ class BinarySecurityProjectStageAggregate(BinarySecurityBaseModel):
     archive: BinarySecurityProjectStageArchiveAggregate = Field(default_factory=BinarySecurityProjectStageArchiveAggregate)
 
 
-class BinarySecurityReducerEventSummaryResponse(BinarySecurityBaseModel):
+class BinarySecurityStateEventInboxSummaryResponse(BinarySecurityBaseModel):
     pending_count: int = 0
     processing_count: int = 0
     retryable_count: int = 0
@@ -375,7 +375,7 @@ class BinarySecurityReducerEventSummaryResponse(BinarySecurityBaseModel):
     avg_processing_duration_ms: Optional[float] = None
 
 
-class BinarySecurityReducerEventRecordResponse(BinarySecurityBaseModel):
+class BinarySecurityStateEventInboxRecordResponse(BinarySecurityBaseModel):
     event_id: str
     task_id: str
     project_id: str
@@ -401,13 +401,14 @@ class BinarySecurityReducerEventRecordResponse(BinarySecurityBaseModel):
     idempotency_key: Optional[str] = None
 
 
-class BinarySecurityReducerEventPageResponse(BinarySecurityBaseModel):
+class BinarySecurityStateEventInboxPageResponse(BinarySecurityBaseModel):
     total: int = 0
     page: int = 1
     page_size: int = 50
     truncated: bool = False
-    items: list[BinarySecurityReducerEventRecordResponse] = Field(default_factory=list)
-    summary: BinarySecurityReducerEventSummaryResponse = Field(default_factory=BinarySecurityReducerEventSummaryResponse)
+    items: list[BinarySecurityStateEventInboxRecordResponse] = Field(default_factory=list)
+    summary: BinarySecurityStateEventInboxSummaryResponse = Field(default_factory=BinarySecurityStateEventInboxSummaryResponse)
+
 
 
 class BinarySecurityTaskListResponse(BinarySecurityBaseModel):

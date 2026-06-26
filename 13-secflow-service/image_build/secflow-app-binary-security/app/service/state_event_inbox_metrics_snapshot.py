@@ -25,9 +25,6 @@ logger = logging.getLogger(__name__)
 _SNAPSHOT_TTL_SECONDS = 1800
 _SNAPSHOT_STALE_AFTER_SECONDS = 30.0
 _SNAPSHOT_KEY = "secflow:binary-security:state-event-inbox:metrics-snapshot:v1"
-_LEGACY_SNAPSHOT_KEY = "secflow:binary-security:reducer:metrics-snapshot:v1"
-
-
 class StateEventInboxMetricsSnapshotStore:
     def __init__(self) -> None:
         self._redis_url = get_config().queue.redis_url
@@ -82,8 +79,6 @@ class StateEventInboxMetricsSnapshotStore:
         client = await self._client_or_create(context="state_event_inbox_metrics_snapshot")
         try:
             raw = await client.get(_SNAPSHOT_KEY)
-            if not raw:
-                raw = await client.get(_LEGACY_SNAPSHOT_KEY)
         except Exception:
             await self._close_client(client)
             raise
