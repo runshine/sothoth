@@ -180,6 +180,7 @@ class BinarySecurityAbnormalReasonEventSummary(BinarySecurityBaseModel):
 class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     id: str
     project_id: str
+    project_name: Optional[str] = None
     task_type: str = TASK_TYPE_BINARY
     pipeline_profile: str = PIPELINE_PROFILE_DEFAULT
     name: str
@@ -363,6 +364,7 @@ class BinarySecurityProjectStageAggregate(BinarySecurityBaseModel):
 
 
 class BinarySecurityStateEventInboxSummaryResponse(BinarySecurityBaseModel):
+    """Historical/compatibility view over persisted state-event replay records."""
     pending_count: int = 0
     processing_count: int = 0
     retryable_count: int = 0
@@ -376,6 +378,7 @@ class BinarySecurityStateEventInboxSummaryResponse(BinarySecurityBaseModel):
 
 
 class BinarySecurityStateEventInboxRecordResponse(BinarySecurityBaseModel):
+    """Historical/compatibility record for owner replay and legacy state-event artifacts."""
     event_id: str
     task_id: str
     project_id: str
@@ -402,6 +405,7 @@ class BinarySecurityStateEventInboxRecordResponse(BinarySecurityBaseModel):
 
 
 class BinarySecurityStateEventInboxPageResponse(BinarySecurityBaseModel):
+    """Historical/compatibility page for persisted state-event records."""
     total: int = 0
     page: int = 1
     page_size: int = 50
@@ -419,6 +423,7 @@ class BinarySecurityTaskListResponse(BinarySecurityBaseModel):
     running_count: int = 0
     queued_count: int = 0
     max_concurrent_tasks: int = 50
+    scope: str = "current"
     project_stats: BinarySecurityProjectStats = Field(default_factory=BinarySecurityProjectStats)
     project_stage_aggregates: list[BinarySecurityProjectStageAggregate] = Field(default_factory=list)
     queue_runtime: dict[str, Any] = Field(default_factory=dict)

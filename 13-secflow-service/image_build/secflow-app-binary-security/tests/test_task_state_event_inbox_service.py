@@ -1,11 +1,12 @@
 import unittest
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
-from app.model import BinarySecurityArchiveJob, BinarySecurityStateEvent, BinarySecurityTask
+from app.model import BinarySecurityArchiveJob, BinarySecurityStateEvent, BinarySecurityTask, BinarySecurityTaskRuntimeLease
 from app.service.task.owner_fact_apply import TaskOwnerFactApplyServiceMixin
 from app.service.task.state_event_inbox import TaskStateEventInboxServiceMixin
 from app.service.task_manager import TaskManager
-from test_task_manager import _ModelAwareDb
+from test_task_manager import _ModelAwareDb, _now
 
 
 class TaskStateEventInboxServiceStructureTests(unittest.TestCase):
@@ -20,6 +21,12 @@ class TaskStateEventInboxServiceStructureTests(unittest.TestCase):
         self.assertIs(TaskManager._release_task_state_lease, TaskStateEventInboxServiceMixin._release_task_state_lease)
         self.assertIs(TaskManager._reduce_state_event, TaskStateEventInboxServiceMixin._reduce_state_event)
         self.assertIs(TaskManager._repair_retryable_state_events, TaskStateEventInboxServiceMixin._repair_retryable_state_events)
+
+    def test_state_event_inbox_apply_is_compat_wrapper_over_owner_fact_apply(self):
+        self.assertIs(
+            TaskManager._apply_compat_state_event_via_owner_fact_apply,
+            TaskOwnerFactApplyServiceMixin._apply_compat_state_event_via_owner_fact_apply,
+        )
 
 
 class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
@@ -212,14 +219,109 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("failed", job.archive_status)
+
+    def test_reduce_state_event_forwards_to_active_owner_instead_of_applying_fact(self):
+        import asyncio
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type="binary",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_path="/tmp/fw.bin",
+            dispatcher_instance_id="other-owner",
+            dispatch_started_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=1),
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="other-owner",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=1),
+        )
+        event = BinarySecurityStateEvent(
+            id="evt-compat-reduce",
+            task_id=task.id,
+            project_id=task.project_id,
+            event_type="downstream_status_observed",
+            stage_name="entry_analysis",
+            status="processing",
+            leased_by=self.manager.instance_id,
+            available_at=_now(),
+            payload={"mapped_status": "running", "downstream_payload": {"task_id": "eat-1", "status": "running"}},
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], state_events=[event], events=[])
+
+        original_factory = __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory
+        original_enqueue = self.manager._enqueue_task
+        queued = []
+        __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = lambda: (lambda: db)
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        try:
+            asyncio.run(self.manager._reduce_state_event(event.id))
+        finally:
+            __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = original_factory
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("processed", event.status)
+        self.assertEqual("owner_signal_requeued", event.processing_result)
         self.assertEqual(["task-1"], queued)
-        event_types = [row.event_type for row in db.events]
-        self.assertIn("main_state_write_blocked", event_types)
-        self.assertIn("downstream_archive_job_copy_failed", event_types)
-        self.assertIn("owned_execution_takeover_requeued", event_types)
         self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
         takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
+        self.assertTrue((takeover_event.payload or {}).get("compat_replay_forwarded"))
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("owned_execution_takeover_requeued", event_types)
         self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+
+    def test_reduce_state_event_without_local_runtime_owner_requeues_instead_of_applying_fact(self):
+        import asyncio
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type="binary",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_path="/tmp/fw.bin",
+        )
+        event = BinarySecurityStateEvent(
+            id="evt-compat-reduce-no-owner",
+            task_id=task.id,
+            project_id=task.project_id,
+            event_type="downstream_status_observed",
+            stage_name="entry_analysis",
+            status="processing",
+            leased_by=self.manager.instance_id,
+            available_at=_now(),
+            payload={"mapped_status": "running", "downstream_payload": {"task_id": "eat-1", "status": "running"}},
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], state_events=[event], events=[])
+
+        original_factory = __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory
+        original_enqueue = self.manager._enqueue_task
+        queued = []
+        __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = lambda: (lambda: db)
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        try:
+            asyncio.run(self.manager._reduce_state_event(event.id))
+        finally:
+            __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = original_factory
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("processed", event.status)
+        self.assertEqual("owner_signal_requeued", event.processing_result)
+        self.assertEqual(["task-1"], queued)
+        self.assertEqual([], db.stage_items)
+        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
+        self.assertEqual("owner_not_active_on_replay_path", (takeover_event.payload or {}).get("forward_reason"))
+        self.assertTrue((takeover_event.payload or {}).get("compat_replay_owner_only"))
 
     def test_stage_worker_terminal_observed_only_records_fact_and_reconcile_request(self):
         task = BinarySecurityTask(

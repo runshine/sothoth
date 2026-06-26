@@ -74,8 +74,8 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
             },
             status["loops"],
         )
-        self.assertIn("legacy_state_event_inbox", status["loop_details"])
-        self.assertIn("legacy_state_event_inbox_metrics", status["loop_details"])
+        self.assertNotIn("legacy_state_event_inbox", status["loop_details"])
+        self.assertNotIn("legacy_state_event_inbox_metrics", status["loop_details"])
         self.assertEqual(0, status["workers"]["stage_item_workers"])
 
     def test_runtime_status_marks_stale_loop_details(self):
@@ -569,6 +569,101 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([("task-pending", None)], pushed)
         self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
+
+    async def test_reconcile_work_queues_skips_pending_task_owned_by_active_runtime(self):
+        task = BinarySecurityTask(
+            id="task-pending-owned",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "_task_row_owner_is_runtime_supported", return_value=True),
+        ):
+            await self.manager._reconcile_work_queues(db)
+
+        self.assertEqual([], pushed)
+        self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
+
+    async def test_reconcile_work_queues_releases_stale_pending_owner_before_reenqueue(self):
+        task = BinarySecurityTask(
+            id="task-pending-stale-owner",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            current_operation_id="op-1",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        reenqueued: list[tuple[str, str | None]] = []
+        release_calls: list[str] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                reenqueued.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                reenqueued.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        def _release(_db, _task, *, active_operation=None, reason):
+            del _db, active_operation
+            release_calls.append(reason)
+            _task.dispatcher_instance_id = None
+            _task.lease_expires_at = None
+            _task.current_operation_id = None
+            return True
+
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "_release_unsupported_task_row_owner", side_effect=_release),
+        ):
+            await self.manager._reconcile_work_queues(db)
+
+        self.assertEqual(["pending_task_not_enqueued_reconcile"], release_calls)
+        self.assertEqual([("task-pending-stale-owner", "queue_reconcile_pending_reenqueue")], reenqueued)
+        self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
 
     def test_reclaim_stale_running_prefers_requeue_when_runnable_work_exists(self):
         task = BinarySecurityTask(
@@ -1485,36 +1580,27 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             operation.resume_cursor["sync_target_stage_state"]["processed_count"],
         )
 
-    async def test_state_event_inbox_loop_recovers_from_observe_failure(self):
+    async def test_state_event_inbox_loop_runs_as_disabled_compat_shell(self):
         manager = TaskManager()
         manager._running = True
         manager.cfg.scheduler.poll_interval_seconds = 1
-        observe_calls = []
         sleep_calls = []
-
-        def _observe_state_runtime_metrics(_db):
-            observe_calls.append("called")
-            raise RuntimeError("boom")
 
         async def _sleep(_seconds):
             sleep_calls.append(_seconds)
             manager._running = False
 
-        manager._observe_state_runtime_metrics = _observe_state_runtime_metrics
-
         with (
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
-            patch("app.service.task_manager.logger.exception") as logger_exception,
+            patch("app.service.task_manager.logger.info") as logger_info,
             patch("app.service.task.state_event_inbox.observe_state_owner_health") as observe_health,
         ):
             await manager._state_event_inbox_loop()
 
-        self.assertEqual(["called"], observe_calls)
         self.assertGreaterEqual(len(sleep_calls), 1)
-        self.assertTrue(all(seconds == 1 for seconds in sleep_calls))
-        logger_exception.assert_called_once()
+        logger_info.assert_called()
         observe_health.assert_called_once()
-        self.assertEqual(1, manager._state_event_inbox_consecutive_crash_count)
+        self.assertEqual(0, manager._state_event_inbox_consecutive_crash_count)
 
     async def test_state_event_inbox_loop_records_healthy_heartbeat_after_iteration(self):
         manager = TaskManager()
@@ -1526,11 +1612,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             sleep_calls.append(_seconds)
             manager._running = False
 
-        manager._observe_state_runtime_metrics = lambda _db: None
-        manager._claim_state_event = lambda _db: None
-        async def _observe_runtime_metrics(_db):
-            return None
-        manager._observe_runtime_metrics = _observe_runtime_metrics
         manager._state_event_inbox_consecutive_crash_count = 3
 
         with (
@@ -1799,61 +1880,28 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         event_id = manager._claim_state_event(session)
 
         self.assertIsNone(event_id)
-        self.assertEqual(1, session.rollbacks)
+        self.assertEqual(0, session.rollbacks)
 
-    async def test_claim_state_event_sets_processing_metadata(self):
+    async def test_claim_state_event_is_compat_noop(self):
         manager = TaskManager()
-        event = type(
-            "Event",
-            (),
-            {
-                "id": "sev-1",
-                "attempts": 0,
-            },
-        )()
-        captured = {}
-
-        class _Query:
-            def __init__(self, rows):
-                self._rows = rows
-
-            def filter(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def order_by(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def first(self):
-                return self._rows[0] if self._rows else None
-
-            def update(self, values, synchronize_session=False):
-                del synchronize_session
-                captured.update({getattr(key, "name", str(key)): value for key, value in values.items()})
-                return 1
-
         class _Session:
             def __init__(self):
                 self.commits = 0
-
-            def query(self, _model):
-                return _Query([event])
+                self.rollbacks = 0
 
             def commit(self):
                 self.commits += 1
 
             def rollback(self):
-                return None
+                self.rollbacks += 1
 
         session = _Session()
 
         event_id = manager._claim_state_event(session)
 
-        self.assertEqual("sev-1", event_id)
-        self.assertEqual("processing", captured.get("status"))
-        self.assertEqual(manager.instance_id, captured.get("processed_by"))
-        self.assertEqual("processing", captured.get("processing_result"))
+        self.assertIsNone(event_id)
+        self.assertEqual(0, session.commits)
+        self.assertEqual(0, session.rollbacks)
 
     def test_refresh_stage_from_authoritative_items_retries_retryable_lock_error(self):
         manager = TaskManager()
@@ -2258,6 +2306,62 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("error", item.result["orchestration_observation"]["last_result"])
         self.assertIsNotNone(item.result.get("next_orchestration_retry_at"))
         self.assertEqual(1, db.commits)
+
+    def test_tail_gate_blocked_keeps_parent_running_when_owner_still_valid(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-tail-gate-running",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_path="/tmp/fw.bin",
+            firmware_source="project_filesystem",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id=manager.instance_id,
+        )
+        task.summary = {
+            "entry_results": [],
+        }
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-gate",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        tail_item = BinarySecurityStageItem(
+            id="si-tail-progress",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="entry-1",
+            status="running",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs-1",
+        )
+
+        class _Db(_ModelAwareDb):
+            def __init__(self):
+                super().__init__(tasks=[task], stage_runs=[entry_run], stage_items=[tail_item], events=[])
+
+        async def _run():
+            with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True), patch.object(
+                manager,
+                "_running_task_has_valid_runtime_ownership",
+                return_value=True,
+            ):
+                await manager._sync_streaming_task_tail_state(task.id)
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: _Db()):
+            asyncio.run(_run())
+
+        self.assertEqual("running", task.status)
 
 
 if __name__ == "__main__":

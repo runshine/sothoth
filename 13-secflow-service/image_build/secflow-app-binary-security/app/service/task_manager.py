@@ -55,7 +55,6 @@ from app.model import (
     BinarySecurityStateEvent,
     BinarySecurityCoordinatorLease,
     BinarySecurityTask,
-    BinarySecurityTaskStateLease,
     BinarySecurityTaskRuntimeLease,
     build_archive_job_dedupe_key,
     build_stage_item_identity_key,
@@ -94,7 +93,6 @@ from app.observability import (
     observe_state_owner_run,
     observe_task_readless_reconcile,
     observe_task_snapshot_lock_retry,
-    observe_task_state_lock,
     observe_task_duration,
     observe_task_error,
     observe_task_heartbeat_candidates,
@@ -2239,6 +2237,8 @@ class TaskManager(
         return False
 
     def _release_task_delete_runtime_state(self, db: Session, task: BinarySecurityTask) -> None:
+        from app.model import BinarySecurityTaskStateLease
+
         task_id = str(getattr(task, "id", "") or "").strip()
         if not task_id:
             return
@@ -6261,7 +6261,7 @@ class TaskManager(
                 return False
         return False
 
-    def _enqueue_state_event(
+    def _enqueue_compat_state_event(
         self,
         db: Session,
         *,
@@ -6275,6 +6275,12 @@ class TaskManager(
         payload: dict[str, Any] | None = None,
         task: BinarySecurityTask | None = None,
     ) -> BinarySecurityStateEvent | None:
+        """Legacy compatibility helper for persisted async state-event records.
+
+        Normal owner-path fact application should prefer `_build_inline_state_event(...)`
+        plus direct owner apply/reconcile. This helper is kept only for historical
+        compatibility and payload-externalization coverage.
+        """
         normalized_payload = dict(payload or {})
         emitted_by = dict(normalized_payload.get("emitted_by") or {})
         emitted_by.update(
@@ -10699,7 +10705,7 @@ class TaskManager(
         deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
         deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
         deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
-        deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
+        deleted_timeline_event_count = 0
         for stage_name in affected_stages:
             stage_run = db.query(BinarySecurityStageRun).filter(
                 BinarySecurityStageRun.task_id == task.id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 from sqlalchemy.orm import Session
@@ -21,14 +22,59 @@ if TYPE_CHECKING:
 
 
 class TaskOwnerFactApplyServiceMixin:
-    def _apply_stage_worker_start_requested_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
+    async def _apply_compat_state_event_via_owner_fact_apply(
+        self: TaskManager,
+        db: Session,
+        event: BinarySecurityStateEvent,
+    ) -> None:
         from app.service import task_manager as task_manager_module
 
-        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == event.task_id).first()
-        if task is None:
-            return
-        payload = dict(event.payload or {})
-        stage_name = str(payload.get("stage_name") or event.stage_name or "").strip()
+        previous_origin = getattr(self, "_active_timeline_origin_state_event", None)
+        self._active_timeline_origin_state_event = event
+        try:
+            payload = dict(event.payload or {})
+            if event.event_type == "archive_job_copied":
+                await self._apply_archive_job_status_locked(
+                    db,
+                    event.archive_job_id or "",
+                    payload.get("archive_root"),
+                    state_event_id=event.id,
+                )
+                return
+            if event.event_type == "archive_job_copy_failed":
+                self._apply_archive_job_copy_failed_locked(db, event)
+                return
+            if event.event_type in {"downstream_status_observed", "downstream_terminal_observed"}:
+                await self._apply_downstream_status_event_locked(db, event)
+                return
+            if event.event_type == "stage_worker_terminal_observed":
+                await self._apply_stage_worker_terminal_event_locked(db, event)
+                return
+            if event.event_type == "task_execution_failed":
+                await self._apply_task_execution_failed_locked(db, event)
+                return
+            if event.event_type == "stage_worker_start_requested":
+                self._apply_stage_worker_start_requested_locked(db, event)
+                return
+            if event.event_type == "manual_policy_update_requested":
+                self._apply_manual_policy_update_requested_locked(db, event)
+                return
+            task_manager_module.logger.info("binary-security compat state event apply ignored event type: %s", event.event_type)
+        finally:
+            self._active_timeline_origin_state_event = previous_origin
+
+    def _apply_stage_worker_start_requested_payload_locked(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        stage_name: str,
+        stage_retry_mode: bool = False,
+        task_retry_mode: bool = False,
+        target_stage_name: str | None = None,
+        state_event_id: str | None = None,
+        source_event_type: str = "stage_worker_start_requested",
+    ) -> None:
         if not stage_name:
             return
         sequence = self._stage_sequence_for_task(task)
@@ -45,13 +91,13 @@ class TaskOwnerFactApplyServiceMixin:
                 level="info",
                 stage_name=stage_name,
                 payload={
-                    "state_event_id": event.id,
+                    "state_event_id": state_event_id,
                     "stage_name": stage_name,
                     "guard_id": guard.get("guard_id"),
                     "takeover_suppressed": True,
-                    "stage_retry_mode": bool(payload.get("stage_retry_mode")),
-                    "task_retry_mode": bool(payload.get("task_retry_mode")),
-                    "target_stage_name": payload.get("target_stage_name"),
+                    "stage_retry_mode": bool(stage_retry_mode),
+                    "task_retry_mode": bool(task_retry_mode),
+                    "target_stage_name": target_stage_name,
                 },
             )
             return
@@ -68,14 +114,14 @@ class TaskOwnerFactApplyServiceMixin:
                 db,
                 task,
                 stage_name=stage_name,
-                source_event_type=event.event_type,
-                state_event_id=event.id,
+                source_event_type=source_event_type,
+                state_event_id=state_event_id,
                 reconcile_reason="stage_worker_start_requested",
                 message="阶段启动请求已收到，但当前阶段尚无真实可执行输入，已等待 owner worker 后续接管",
                 event_payload={
-                    "stage_retry_mode": bool(payload.get("stage_retry_mode")),
-                    "task_retry_mode": bool(payload.get("task_retry_mode")),
-                    "target_stage_name": payload.get("target_stage_name"),
+                    "stage_retry_mode": bool(stage_retry_mode),
+                    "task_retry_mode": bool(task_retry_mode),
+                    "target_stage_name": target_stage_name,
                 },
             )
             return
@@ -111,16 +157,69 @@ class TaskOwnerFactApplyServiceMixin:
             db,
             task,
             stage_name=stage_name,
-            source_event_type=event.event_type,
-            state_event_id=event.id,
+            source_event_type=source_event_type,
+            state_event_id=state_event_id,
             reconcile_reason="stage_worker_start_requested",
             message="阶段启动事实已落库，等待 owner worker 接管并推进任务主状态",
             event_payload={
-                "stage_retry_mode": bool(payload.get("stage_retry_mode")),
-                "task_retry_mode": bool(payload.get("task_retry_mode")),
-                "target_stage_name": payload.get("target_stage_name"),
+                "stage_retry_mode": bool(stage_retry_mode),
+                "task_retry_mode": bool(task_retry_mode),
+                "target_stage_name": target_stage_name,
             },
         )
+
+    def _apply_stage_worker_start_requested_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
+        from app.service import task_manager as task_manager_module
+
+        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == event.task_id).first()
+        if task is None:
+            return
+        payload = dict(event.payload or {})
+        self._apply_stage_worker_start_requested_payload_locked(
+            db,
+            task,
+            stage_name=str(payload.get("stage_name") or event.stage_name or "").strip(),
+            stage_retry_mode=bool(payload.get("stage_retry_mode")),
+            task_retry_mode=bool(payload.get("task_retry_mode")),
+            target_stage_name=str(payload.get("target_stage_name") or "").strip() or None,
+            state_event_id=event.id,
+            source_event_type=event.event_type,
+        )
+
+    async def _apply_stage_worker_terminal_direct_locked(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        stage_name: str,
+        status: str,
+        summary: dict[str, object] | None = None,
+        stage_retry_mode: bool = False,
+        task_retry_mode: bool = False,
+        target_stage_name: str | None = None,
+        execution_token: str | None = None,
+        stage_generation: str | None = None,
+        state_event_id: str | None = None,
+        source_event_type: str = "stage_worker_terminal_observed",
+    ) -> None:
+        terminal_event = SimpleNamespace(
+            id=state_event_id,
+            event_type=source_event_type,
+            task_id=str(getattr(task, "id", "") or "").strip(),
+            project_id=str(getattr(task, "project_id", "") or "").strip(),
+            stage_name=stage_name,
+            payload={
+                "stage_name": stage_name,
+                "status": status,
+                "summary": dict(summary or {}),
+                "stage_retry_mode": bool(stage_retry_mode),
+                "task_retry_mode": bool(task_retry_mode),
+                "target_stage_name": target_stage_name,
+                "execution_token": execution_token,
+                "stage_generation": stage_generation,
+            },
+        )
+        await self._apply_stage_worker_terminal_event_locked(db, terminal_event)  # type: ignore[arg-type]
 
     async def _apply_downstream_status_event_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
         from app.service import task_manager as task_manager_module
@@ -317,13 +416,10 @@ class TaskOwnerFactApplyServiceMixin:
         before_status = str(item.status or "").strip().lower()
         if self._should_apply_current_child_intermediate_recovery(item, mapped_status=mapped_status, payload=payload):
             return True
-        normalized_stage_name = normalize_stage_name(item.stage_name)
         if mapped_status == "running":
-            if normalized_stage_name == "dataflow_vuln_scan":
-                return before_status in {"pending", "queued", "running", "dispatching", "success", "failed"}
             return before_status in {"pending", "queued", "running", "dispatching", "success", "failed"}
-        if mapped_status == "queued":
-            return before_status in {"running", "queued"}
+        if mapped_status in {"queued", "dispatching"}:
+            return before_status in {"pending", "queued", "dispatching", "running", "success", "failed", "cancelled"}
         if mapped_status == "pending":
             if before_status != "running":
                 return False
@@ -672,15 +768,19 @@ class TaskOwnerFactApplyServiceMixin:
                 },
             )
         await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
-    async def _apply_task_execution_failed_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
-        from app.service import task_manager as task_manager_module
-
-        payload = dict(event.payload or {})
-        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == event.task_id).first()
-        if task is None:
-            return
-        expected_dispatcher = str(payload.get("dispatcher_instance_id") or "").strip()
-        expected_execution_token = str(payload.get("execution_token") or "").strip()
+    async def _apply_task_execution_failed_payload_locked(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        error_message: str,
+        dispatcher_instance_id: str | None = None,
+        execution_token: str | None = None,
+        state_event_id: str | None = None,
+        source_event_type: str = "task_execution_failed",
+    ) -> None:
+        expected_dispatcher = str(dispatcher_instance_id or "").strip()
+        expected_execution_token = str(execution_token or "").strip()
         current_execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else ""
         if expected_dispatcher and task.dispatcher_instance_id not in {None, expected_dispatcher}:
             self._record_event(
@@ -690,7 +790,7 @@ class TaskOwnerFactApplyServiceMixin:
                 "执行失败事件已过期，当前 dispatcher 已变化",
                 level="warning",
                 stage_name=task.current_stage,
-                payload={"state_event_id": event.id, "dispatcher_instance_id": expected_dispatcher},
+                payload={"state_event_id": state_event_id, "dispatcher_instance_id": expected_dispatcher},
             )
             return
         if expected_execution_token and current_execution_token and expected_execution_token != current_execution_token:
@@ -701,7 +801,7 @@ class TaskOwnerFactApplyServiceMixin:
                 "执行失败事件已过期，当前执行 token 已变化",
                 level="warning",
                 stage_name=task.current_stage,
-                payload={"state_event_id": event.id, "execution_token": expected_execution_token},
+                payload={"state_event_id": state_event_id, "execution_token": expected_execution_token},
             )
             return
         if task.status not in {"dispatching", "running"}:
@@ -712,10 +812,9 @@ class TaskOwnerFactApplyServiceMixin:
                 "执行失败事件已过期，当前任务不在运行态",
                 level="warning",
                 stage_name=task.current_stage,
-                payload={"state_event_id": event.id, "status": task.status},
+                payload={"state_event_id": state_event_id, "status": task.status},
             )
             return
-        error_message = str(payload.get("error") or "任务执行失败")
         self._record_main_state_write_blocked(
             db,
             task,
@@ -731,19 +830,36 @@ class TaskOwnerFactApplyServiceMixin:
             f"任务执行失败: {error_message}",
             level="error",
             stage_name=task.current_stage,
-            payload={"state_event_id": event.id, "error": error_message},
+            payload={"state_event_id": state_event_id, "error": error_message},
         )
         self._request_task_layer_reconcile(
             db,
             task,
             stage_name=str(task.current_stage or "").strip() or None,
-            source_event_type=event.event_type,
-            state_event_id=event.id,
+            source_event_type=source_event_type,
+            state_event_id=state_event_id,
             reconcile_reason="task_execution_failed",
             message="任务执行失败事实已落库，等待 owner worker 统一收口任务主状态",
             event_payload={"error": error_message},
         )
         await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+
+    async def _apply_task_execution_failed_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
+        from app.service import task_manager as task_manager_module
+
+        payload = dict(event.payload or {})
+        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == event.task_id).first()
+        if task is None:
+            return
+        await self._apply_task_execution_failed_payload_locked(
+            db,
+            task,
+            error_message=str(payload.get("error") or "任务执行失败"),
+            dispatcher_instance_id=str(payload.get("dispatcher_instance_id") or "").strip() or None,
+            execution_token=str(payload.get("execution_token") or "").strip() or None,
+            state_event_id=event.id,
+            source_event_type=event.event_type,
+        )
 
     def _apply_manual_policy_update_payload_locked(
         self: TaskManager,
@@ -823,19 +939,19 @@ class TaskOwnerFactApplyServiceMixin:
             applied_by="owner_fact_apply",
         )
 
-    def _apply_archive_job_copy_failed_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
-        from app.service import task_manager as task_manager_module
-
-        job = db.query(task_manager_module.BinarySecurityArchiveJob).filter(task_manager_module.BinarySecurityArchiveJob.id == event.archive_job_id).first()
-        if job is None:
-            return
-        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == job.task_id).first()
-        item = db.query(task_manager_module.BinarySecurityStageItem).filter(task_manager_module.BinarySecurityStageItem.id == job.item_id).first()
-        if task is None:
-            return
-        payload = dict(event.payload or {})
+    def _apply_archive_job_copy_failed_payload_locked(
+        self: TaskManager,
+        db: Session,
+        task,
+        job,
+        item,
+        *,
+        error_message: str,
+        state_event_id: str | None = None,
+        source_event_type: str = "archive_job_copy_failed",
+    ) -> None:
         job.archive_status = "failed"
-        job.error_message = payload.get("error") or job.error_message or "下游产物归档失败"
+        job.error_message = error_message or job.error_message or "下游产物归档失败"
         job.completed_at = job.completed_at or task_shared._now()
         job.updated_at = task_shared._now()
         if task.status not in TASK_TERMINAL_STATUSES:
@@ -855,15 +971,15 @@ class TaskOwnerFactApplyServiceMixin:
             level="warning",
             stage_name=job.stage_name,
             item=item,
-            payload={"state_event_id": event.id, "archive_job_id": job.id, "archive_status": job.archive_status, "error": job.error_message},
+            payload={"state_event_id": state_event_id, "archive_job_id": job.id, "archive_status": job.archive_status, "error": job.error_message},
         )
         if task.status not in TASK_TERMINAL_STATUSES:
             self._request_task_layer_reconcile(
                 db,
                 task,
                 stage_name=job.stage_name,
-                source_event_type=event.event_type,
-                state_event_id=event.id,
+                source_event_type=source_event_type,
+                state_event_id=state_event_id,
                 reconcile_reason="archive_job_copy_failed",
                 message="下游产物归档失败事实已落库，等待 owner worker 统一收口任务主状态",
                 event_payload={
@@ -872,3 +988,24 @@ class TaskOwnerFactApplyServiceMixin:
                 },
             )
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
+
+    def _apply_archive_job_copy_failed_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
+        from app.service import task_manager as task_manager_module
+
+        job = db.query(task_manager_module.BinarySecurityArchiveJob).filter(task_manager_module.BinarySecurityArchiveJob.id == event.archive_job_id).first()
+        if job is None:
+            return
+        task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == job.task_id).first()
+        item = db.query(task_manager_module.BinarySecurityStageItem).filter(task_manager_module.BinarySecurityStageItem.id == job.item_id).first()
+        if task is None:
+            return
+        payload = dict(event.payload or {})
+        self._apply_archive_job_copy_failed_payload_locked(
+            db,
+            task,
+            job,
+            item,
+            error_message=str(payload.get("error") or ""),
+            state_event_id=event.id,
+            source_event_type=event.event_type,
+        )

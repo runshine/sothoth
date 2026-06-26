@@ -818,7 +818,7 @@ class TaskOperationServiceMixin:
         self._delete_task_event_payload_dirs(task)
         self._delete_workspace_runtime_children(task)
         self._delete_task_summary_file(task)
-        cleanup_snapshot["cleanup_counts"]["timeline_events_deleted"] = self._delete_task_timeline_rows(db, task.id)
+        cleanup_snapshot["cleanup_counts"]["timeline_events_deleted"] = 0
         cleanup_snapshot["cleanup_counts"]["state_events_deleted"] = self._delete_task_state_event_rows(db, task.id)
         task.cleanup_snapshot = cleanup_snapshot
         self._validate_hard_restart_cleanup(db, task)
@@ -1175,7 +1175,7 @@ class TaskOperationServiceMixin:
         deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
         deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
         deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
-        deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
+        deleted_timeline_event_count = 0
         for stage_name in affected_stages:
             if (
                 phase == "prepare"
@@ -1317,7 +1317,7 @@ class TaskOperationServiceMixin:
                     token=self._service_token(),
                     record_request_event=False,
                     record_noop_events=False,
-                    apply_state=(target_stage != "entry_analysis"),
+                    apply_state=True,
                 )
             except AttributeError:
                 matched_items = {
@@ -1416,7 +1416,6 @@ class TaskOperationServiceMixin:
                 retry_items = non_success_retry_items
         if not retry_items:
             raise ValidationError("失败项重试未找到目标阶段子任务")
-        sync_apply_state = target_stage != "entry_analysis"
         try:
             await self.sync_downstream_status(
                 db,
@@ -1427,28 +1426,10 @@ class TaskOperationServiceMixin:
                 token=self._service_token(),
                 record_request_event=False,
                 record_noop_events=False,
-                apply_state=sync_apply_state,
+                apply_state=True,
             )
         except AttributeError:
             pass
-        if target_stage == "entry_analysis":
-            for item in retry_items:
-                result = self._load_stage_item_result_payload(item)
-                sync_observation = dict(result.get("sync_observation") or {})
-                item.status = "pending"
-                item.finished_at = None
-                self._mark_stage_item_sync_observation(
-                    item,
-                    sync_status=self._string_or_none(sync_observation.get("sync_status")) or "observed",
-                    synced_at=task_manager_module._now(),
-                    error_message=None,
-                    http_status=None,
-                    error_type=None,
-                    status_raw=None,
-                    mapped_status=None,
-                    downstream_status=None,
-                    state_applied=False,
-                )
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         validation_affected_stages = list(affected_stages)
@@ -1903,6 +1884,17 @@ class TaskOperationServiceMixin:
                 continue
             strategy = str(action.get("strategy") or "").strip()
             if strategy != "recreate_from_abnormal":
+                replacement_state = self._replacement_in_progress_state(item)
+                if (
+                    strategy == "adopt_active"
+                    and replacement_state.get("verification_status") == "pending"
+                ):
+                    self._update_retry_item_action(
+                        task,
+                        item_id=item_id,
+                        updates={"verification_status": "pending"},
+                    )
+                    continue
                 if (
                     strategy == "adopt_active"
                     and str(item.downstream_task_id or "").strip()
@@ -2314,7 +2306,7 @@ class TaskOperationServiceMixin:
             "archive_jobs_deleted": self._delete_archive_children_for_stages(db, task, stage_names),
             "stage_items_deleted": self._delete_stage_items_for_stages(db, task.id, stage_names),
             "stage_runs_deleted": self._delete_stage_run_rows(db, task.id),
-            "timeline_events_deleted": self._delete_task_timeline_rows(db, task.id),
+            "timeline_events_deleted": 0,
             "state_events_deleted": self._delete_task_state_event_rows(db, task.id),
         }
         self._record_event(
