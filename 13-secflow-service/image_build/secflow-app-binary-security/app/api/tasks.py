@@ -136,7 +136,7 @@ def list_tasks_global(
     sort_order: str = Query("desc"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=1000),
-    _: TokenUser = Depends(get_current_context),
+    _: TokenUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     return get_task_manager().list_tasks(

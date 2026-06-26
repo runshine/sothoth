@@ -416,7 +416,7 @@ class _RouteManagerStub:
             items=[
                 BinarySecurityTaskResponse(
                     id="t-list-1",
-                    project_id=project_id,
+                    project_id=project_id or "global-project",
                     task_type=task_type or "source",
                     name="list-task",
                     status="running",
@@ -667,6 +667,27 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertTrue(payload["items"][0]["manual_operation_state"]["requeue_applied"])
         self.assertEqual(
             ("list_tasks", fake_db, "p1", "pending", "source", None, None, "created_at", "desc", 1, 50),
+            manager.calls[0],
+        )
+
+    def test_list_tasks_global_route_allows_missing_project_id(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/tasks",
+                    params={"task_type": "source", "page": 1, "page_size": 50},
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual(1, payload["page"])
+        self.assertEqual(50, payload["page_size"])
+        self.assertEqual(
+            ("list_tasks", fake_db, None, None, "source", None, None, "created_at", "desc", 1, 50),
             manager.calls[0],
         )
 
