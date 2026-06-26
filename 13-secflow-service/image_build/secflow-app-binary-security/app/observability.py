@@ -376,7 +376,7 @@ ARCHIVE_DURATION_SECONDS = Histogram(
 
 STATE_EVENTS_TOTAL = Counter(
     "secflow_binary_security_state_events_total",
-    "Total state reducer events by event type and enqueue result.",
+    "Total state event inbox events by event type and enqueue result.",
     labelnames=("event_type", "result"),
 )
 
@@ -394,53 +394,53 @@ STATE_EVENT_OLDEST_AGE_SECONDS = Gauge(
 
 STATE_EVENT_LAG_SECONDS = Histogram(
     "secflow_binary_security_state_event_lag_seconds",
-    "State event lag from creation to reducer processing.",
+    "State event lag from creation to owner processing.",
     labelnames=("event_type",),
     buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 900, 1800),
 )
 
 STATE_REDUCER_RUNS_TOTAL = Counter(
-    "secflow_binary_security_state_reducer_runs_total",
-    "Total state reducer runs by result and pod.",
+    "secflow_binary_security_state_owner_runs_total",
+    "Total state event inbox runs by result and pod.",
     labelnames=("result", "pod"),
 )
 
 STATE_REDUCER_EVENTS_TOTAL = Counter(
-    "secflow_binary_security_state_reducer_events_total",
-    "Total state reducer event applications.",
+    "secflow_binary_security_state_owner_events_total",
+    "Total state event inbox applications.",
     labelnames=("event_type", "result"),
 )
 
 STATE_REDUCER_DURATION_SECONDS = Histogram(
-    "secflow_binary_security_state_reducer_duration_seconds",
-    "State reducer run duration in seconds.",
+    "secflow_binary_security_state_owner_duration_seconds",
+    "State event inbox run duration in seconds.",
     labelnames=("result",),
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
 )
 
 STATE_REDUCER_HEALTH = Gauge(
-    "secflow_binary_security_state_reducer_health",
-    "Reducer heartbeat, crash and event-processing health signals by pod.",
+    "secflow_binary_security_state_owner_health",
+    "State event inbox heartbeat, crash and event-processing health signals by pod.",
     labelnames=("pod", "signal"),
 )
 
 TASK_STATE_LOCK_WAIT_SECONDS = Histogram(
     "secflow_binary_security_task_state_lock_wait_seconds",
-    "Task state reducer lock wait duration in seconds.",
+    "Task state event inbox lock wait duration in seconds.",
     labelnames=("operation",),
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
 )
 
 TASK_STATE_LOCK_HELD_SECONDS = Histogram(
     "secflow_binary_security_task_state_lock_held_seconds",
-    "Task state reducer lock held duration in seconds.",
+    "Task state event inbox lock held duration in seconds.",
     labelnames=("operation",),
     buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60),
 )
 
 TASK_STATE_LOCK_ACTIVE = Gauge(
     "secflow_binary_security_task_state_lock_active",
-    "Current active task state reducer locks.",
+    "Current active task state event inbox locks.",
     labelnames=("operation",),
 )
 
@@ -452,13 +452,13 @@ STATE_DEAD_LETTERS_TOTAL = Counter(
 
 STATE_FILE_WRITES_TOTAL = Counter(
     "secflow_binary_security_state_file_writes_total",
-    "Total reducer-owned file writes.",
+    "Total owner-owned file writes.",
     labelnames=("target", "result"),
 )
 
 STATE_FILE_WRITE_DURATION_SECONDS = Histogram(
     "secflow_binary_security_state_file_write_duration_seconds",
-    "Reducer-owned file write duration in seconds.",
+    "Owner-owned file write duration in seconds.",
     labelnames=("target", "result"),
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5),
 )
@@ -808,17 +808,15 @@ def observe_state_event_lag(event_type: str, duration_seconds: float | None) -> 
     STATE_EVENT_LAG_SECONDS.labels(event_type=str(event_type or "unknown")).observe(max(0.0, float(duration_seconds)))
 
 
-def observe_state_reducer_run(*, result: str, pod: str, duration_seconds: float | None) -> None:
+def observe_state_owner_run(*, result: str, pod: str, duration_seconds: float | None) -> None:
     STATE_REDUCER_RUNS_TOTAL.labels(result=str(result or "unknown"), pod=str(pod or "unknown")).inc()
     if duration_seconds is not None:
         STATE_REDUCER_DURATION_SECONDS.labels(result=str(result or "unknown")).observe(max(0.0, float(duration_seconds)))
 
-
-def observe_state_reducer_event(event_type: str, result: str) -> None:
+def observe_state_owner_event(event_type: str, result: str) -> None:
     STATE_REDUCER_EVENTS_TOTAL.labels(event_type=str(event_type or "unknown"), result=str(result or "unknown")).inc()
 
-
-def observe_state_reducer_health(
+def observe_state_owner_health(
     *,
     pod: str,
     loop_ok_at: float | None = None,

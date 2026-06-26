@@ -47,32 +47,32 @@ class MetricsAggregateTests(unittest.TestCase):
         )
         self.assertEqual(5.0, worker_series.samples[((("kind", "task"),))])
 
-    def test_authoritative_reducer_metrics_prefer_reducer_max(self):
-        worker = ScrapeResult(
+    def test_authoritative_owner_metrics_prefer_worker_max(self):
+        api = ScrapeResult(
+            target=PodTarget(pod_name="api-1", role="api", ip="10.0.0.2"),
+            raw_text=(
+                "# TYPE secflow_binary_security_queue_depth gauge\n"
+                "secflow_binary_security_queue_depth{queue=\"pending_tasks\"} 4\n"
+            ),
+        )
+        worker_1 = ScrapeResult(
             target=PodTarget(pod_name="worker-1", role="worker", ip="10.0.0.3"),
             raw_text=(
                 "# TYPE secflow_binary_security_queue_depth gauge\n"
                 "secflow_binary_security_queue_depth{queue=\"pending_tasks\"} 9\n"
             ),
         )
-        reducer_1 = ScrapeResult(
-            target=PodTarget(pod_name="reducer-1", role="reducer", ip="10.0.0.4"),
-            raw_text=(
-                "# TYPE secflow_binary_security_queue_depth gauge\n"
-                "secflow_binary_security_queue_depth{queue=\"pending_tasks\"} 4\n"
-            ),
-        )
-        reducer_2 = ScrapeResult(
-            target=PodTarget(pod_name="reducer-2", role="reducer", ip="10.0.0.5"),
+        worker_2 = ScrapeResult(
+            target=PodTarget(pod_name="worker-2", role="worker", ip="10.0.0.4"),
             raw_text=(
                 "# TYPE secflow_binary_security_queue_depth gauge\n"
                 "secflow_binary_security_queue_depth{queue=\"pending_tasks\"} 6\n"
             ),
         )
 
-        aggregated = aggregate_prometheus_samples([worker, reducer_1, reducer_2])
+        aggregated = aggregate_prometheus_samples([api, worker_1, worker_2])
         queue_series = aggregated["secflow_binary_security_queue_depth"]
-        self.assertEqual(6.0, queue_series.samples[((("queue", "pending_tasks"),))])
+        self.assertEqual(9.0, queue_series.samples[((("queue", "pending_tasks"),))])
 
     def test_render_aggregated_metrics_includes_metadata(self):
         payload = render_aggregated_metrics(
@@ -84,8 +84,8 @@ class MetricsAggregateTests(unittest.TestCase):
                 )
             },
             metadata=AggregateMetadata(
-                attempted_by_role={"api": 4, "worker": 3, "reducer": 2},
-                successful_by_role={"api": 4, "worker": 2, "reducer": 2},
+                attempted_by_role={"api": 4, "worker": 3},
+                successful_by_role={"api": 4, "worker": 2},
                 partial=True,
                 generated_at=1234.5,
             ),
@@ -120,12 +120,12 @@ class MetricsAggregateTests(unittest.TestCase):
                         ((("stage", "dataflow_vuln_scan"), ("status", "queued"))): 4.0,
                     },
                 ),
-                "secflow_binary_security_state_reducer_duration_seconds_sum": SimpleNamespace(
+                "secflow_binary_security_state_owner_duration_seconds_sum": SimpleNamespace(
                     metric_type="histogram",
                     help_text="Reducer duration sum",
                     samples={(): 12.0},
                 ),
-                "secflow_binary_security_state_reducer_duration_seconds_count": SimpleNamespace(
+                "secflow_binary_security_state_owner_duration_seconds_count": SimpleNamespace(
                     metric_type="histogram",
                     help_text="Reducer duration count",
                     samples={(): 4.0},
@@ -160,20 +160,20 @@ class MetricsAggregateTests(unittest.TestCase):
                     help_text="Lock held count",
                     samples={(): 3.0},
                 ),
-                "secflow_binary_security_state_reducer_health": SimpleNamespace(
+                "secflow_binary_security_state_owner_health": SimpleNamespace(
                     metric_type="gauge",
                     help_text="Reducer health",
                     samples={
-                        ((("pod", "reducer-a"), ("signal", "loop_ok_at"))): 5600.0,
-                        ((("pod", "reducer-a"), ("signal", "event_processed_at"))): 5605.0,
-                        ((("pod", "reducer-a"), ("signal", "crash_at"))): 5610.0,
-                        ((("pod", "reducer-a"), ("signal", "consecutive_crash_count"))): 2.0,
+                        ((("pod", "owner-a"), ("signal", "loop_ok_at"))): 5600.0,
+                        ((("pod", "owner-a"), ("signal", "event_processed_at"))): 5605.0,
+                        ((("pod", "owner-a"), ("signal", "crash_at"))): 5610.0,
+                        ((("pod", "owner-a"), ("signal", "consecutive_crash_count"))): 2.0,
                     },
                 ),
             },
             metadata=AggregateMetadata(
-                attempted_by_role={"api": 2, "worker": 0, "reducer": 1},
-                successful_by_role={"api": 2, "worker": 0, "reducer": 1},
+                attempted_by_role={"api": 2, "worker": 0},
+                successful_by_role={"api": 2, "worker": 0},
                 partial=False,
                 generated_at=5678.9,
             ),
@@ -184,14 +184,14 @@ class MetricsAggregateTests(unittest.TestCase):
         self.assertIn("secflow_binary_security_health_dead_letter_depth 2.0", payload)
         self.assertIn("secflow_binary_security_health_archive_queued_jobs 7.0", payload)
         self.assertIn("secflow_binary_security_health_archive_running_jobs 1.0", payload)
-        self.assertIn("secflow_binary_security_health_reducer_avg_duration_seconds 3.0", payload)
+        self.assertIn("secflow_binary_security_health_owner_avg_duration_seconds 3.0", payload)
         self.assertIn("secflow_binary_security_health_event_avg_lag_seconds 8.0", payload)
         self.assertIn("secflow_binary_security_health_lock_wait_avg_seconds 0.5", payload)
         self.assertIn("secflow_binary_security_health_lock_held_avg_seconds 3.0", payload)
-        self.assertIn("secflow_binary_security_health_reducer_consecutive_crash_count 2.0", payload)
-        self.assertRegex(payload, r"secflow_binary_security_health_reducer_loop_ok_age_seconds 78\.8[0-9]+")
-        self.assertRegex(payload, r"secflow_binary_security_health_reducer_last_event_processed_age_seconds 73\.8[0-9]+")
-        self.assertRegex(payload, r"secflow_binary_security_health_reducer_last_crash_age_seconds 68\.8[0-9]+")
+        self.assertIn("secflow_binary_security_health_owner_consecutive_crash_count 2.0", payload)
+        self.assertRegex(payload, r"secflow_binary_security_health_owner_loop_ok_age_seconds 78\.8[0-9]+")
+        self.assertRegex(payload, r"secflow_binary_security_health_owner_last_event_processed_age_seconds 73\.8[0-9]+")
+        self.assertRegex(payload, r"secflow_binary_security_health_owner_last_crash_age_seconds 68\.8[0-9]+")
         self.assertIn('secflow_binary_security_metrics_aggregate_role_covered{role="worker"} 0.0', payload)
 
     def test_aggregate_endpoint_returns_partial_result_when_some_scrapes_fail(self):
@@ -201,8 +201,8 @@ class MetricsAggregateTests(unittest.TestCase):
             payload=b"# TYPE demo gauge\ndemo 1\n",
             content_type="text/plain; version=0.0.4; charset=utf-8",
             metadata=AggregateMetadata(
-                attempted_by_role={"api": 2, "worker": 1, "reducer": 1},
-                successful_by_role={"api": 1, "worker": 1, "reducer": 1},
+                attempted_by_role={"api": 2, "worker": 1},
+                successful_by_role={"api": 1, "worker": 1},
                 partial=True,
                 generated_at=1234.5,
             ),
@@ -227,17 +227,6 @@ class MetricsAggregateTests(unittest.TestCase):
                         }
                     ]
                 }
-            if path.endswith("/endpoints/secflow-app-binary-security-reducer"):
-                return {
-                    "subsets": [
-                        {
-                            "addresses": [
-                                {"ip": "10.0.1.1", "targetRef": {"name": "reducer-1"}},
-                            ],
-                            "ports": [{"port": 8080}],
-                        }
-                    ]
-                }
             return {}
 
         with patch("app.metrics_aggregate._fetch_k8s_resource", side_effect=fake_fetch):
@@ -247,7 +236,6 @@ class MetricsAggregateTests(unittest.TestCase):
             [
                 PodTarget(pod_name="api-1", role="api", ip="10.0.0.1", port=8080),
                 PodTarget(pod_name="api-2", role="api", ip="10.0.0.2", port=8080),
-                PodTarget(pod_name="reducer-1", role="reducer", ip="10.0.1.1", port=8080),
             ],
             pods,
         )

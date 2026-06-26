@@ -495,7 +495,7 @@ class TaskItemSyncServiceMixin:
         lowered = str(exc or "").strip().lower()
         if self._is_retryable_lock_error(exc):
             return True
-        if any(token in lowered for token in {"metadata", "task-metadata.json", "state event", "state reducer"}):
+        if any(token in lowered for token in {"metadata", "task-metadata.json", "state event", "state reducer", "state_event_inbox"}):
             return True
         return self._classify_downstream_sync_error(exc) in {
             "db_connection_refused",
@@ -2384,7 +2384,7 @@ class TaskItemSyncServiceMixin:
                         db,
                         task,
                         "downstream_status_synced",
-                        "下游子任务不存在，已投递 reducer 串行更新事件",
+                        "下游子任务不存在，已投递 state event inbox 串行更新事件",
                         level="warning",
                         stage_name=item_stage_name,
                         item=item,

@@ -2,26 +2,26 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.model import BinarySecurityArchiveJob, BinarySecurityStateEvent, BinarySecurityTask
-from app.service.task.reducer import TaskReducerServiceMixin
+from app.service.task.state_event_inbox import TaskStateEventInboxServiceMixin
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb
 
 
-class TaskReducerServiceStructureTests(unittest.TestCase):
-    def test_task_manager_reducer_methods_are_bound_to_mixin(self):
-        self.assertIs(TaskManager._apply_stage_worker_start_requested_locked, TaskReducerServiceMixin._apply_stage_worker_start_requested_locked)
-        self.assertIs(TaskManager._state_reducer_loop, TaskReducerServiceMixin._state_reducer_loop)
-        self.assertIs(TaskManager._reducer_metrics_snapshot_loop, TaskReducerServiceMixin._reducer_metrics_snapshot_loop)
-        self.assertIs(TaskManager._publish_reducer_metrics_snapshot, TaskReducerServiceMixin._publish_reducer_metrics_snapshot)
-        self.assertIs(TaskManager._observe_state_runtime_metrics, TaskReducerServiceMixin._observe_state_runtime_metrics)
-        self.assertIs(TaskManager._claim_state_event, TaskReducerServiceMixin._claim_state_event)
-        self.assertIs(TaskManager._acquire_task_state_lease, TaskReducerServiceMixin._acquire_task_state_lease)
-        self.assertIs(TaskManager._release_task_state_lease, TaskReducerServiceMixin._release_task_state_lease)
-        self.assertIs(TaskManager._reduce_state_event, TaskReducerServiceMixin._reduce_state_event)
-        self.assertIs(TaskManager._repair_retryable_state_events, TaskReducerServiceMixin._repair_retryable_state_events)
+class TaskStateEventInboxServiceStructureTests(unittest.TestCase):
+    def test_task_manager_state_event_inbox_methods_are_bound_to_mixin(self):
+        self.assertIs(TaskManager._apply_stage_worker_start_requested_locked, TaskStateEventInboxServiceMixin._apply_stage_worker_start_requested_locked)
+        self.assertIs(TaskManager._state_event_inbox_loop, TaskStateEventInboxServiceMixin._state_event_inbox_loop)
+        self.assertIs(TaskManager._state_event_inbox_metrics_loop, TaskStateEventInboxServiceMixin._state_event_inbox_metrics_loop)
+        self.assertIs(TaskManager._publish_state_event_inbox_metrics_snapshot, TaskStateEventInboxServiceMixin._publish_state_event_inbox_metrics_snapshot)
+        self.assertIs(TaskManager._observe_state_runtime_metrics, TaskStateEventInboxServiceMixin._observe_state_runtime_metrics)
+        self.assertIs(TaskManager._claim_state_event, TaskStateEventInboxServiceMixin._claim_state_event)
+        self.assertIs(TaskManager._acquire_task_state_lease, TaskStateEventInboxServiceMixin._acquire_task_state_lease)
+        self.assertIs(TaskManager._release_task_state_lease, TaskStateEventInboxServiceMixin._release_task_state_lease)
+        self.assertIs(TaskManager._reduce_state_event, TaskStateEventInboxServiceMixin._reduce_state_event)
+        self.assertIs(TaskManager._repair_retryable_state_events, TaskStateEventInboxServiceMixin._repair_retryable_state_events)
 
 
-class TaskReducerServiceBehaviorTests(unittest.TestCase):
+class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
 
@@ -58,8 +58,7 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
 
         self.assertEqual("pending", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
-        self.assertEqual(1, len(db.stage_runs))
-        self.assertEqual("running", db.stage_runs[0].status)
+        self.assertEqual(0, len(db.stage_runs))
         event_types = [row.event_type for row in db.events]
         self.assertNotIn("stage_started", event_types)
         self.assertIn("main_state_write_blocked", event_types)
@@ -114,8 +113,7 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         finally:
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual(1, len(db.stage_runs))
-        self.assertEqual("running", db.stage_runs[0].status)
+        self.assertEqual(0, len(db.stage_runs))
         event_types = [row.event_type for row in db.events]
         self.assertIn("stage_worker_start_observed_during_guard", event_types)
         self.assertNotIn("main_state_write_blocked", event_types)
@@ -310,19 +308,19 @@ class TaskReducerServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("downstream_status_observed", (takeover_event.payload or {}).get("source_event_type"))
         self.assertTrue((takeover_event.payload or {}).get("fact_applied"))
 
-    def test_publish_reducer_metrics_snapshot_lightweight_skips_full_render(self):
+    def test_publish_state_event_inbox_metrics_snapshot_lightweight_skips_full_render(self):
         store = AsyncMock()
         with (
             patch("app.service.task_manager.render_metrics", side_effect=AssertionError("full render should be skipped")),
-            patch("app.service.task_manager.get_reducer_metrics_snapshot_store", return_value=store),
+            patch("app.service.task_manager.get_state_event_inbox_metrics_snapshot_store", return_value=store),
         ):
             import asyncio
 
-            asyncio.run(self.manager._publish_reducer_metrics_snapshot(lightweight=True))
+            asyncio.run(self.manager._publish_state_event_inbox_metrics_snapshot(lightweight=True))
 
         store.write_snapshot.assert_awaited_once()
         payload = store.write_snapshot.await_args.kwargs["metrics_payload"]
-        self.assertIn("secflow_binary_security_reducer_bootstrap_snapshot", payload)
+        self.assertIn("secflow_binary_security_state_event_inbox_bootstrap_snapshot", payload)
 
 
 if __name__ == "__main__":

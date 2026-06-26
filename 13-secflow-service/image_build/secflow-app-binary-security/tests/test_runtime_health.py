@@ -5,16 +5,16 @@ from app import runtime_health
 
 
 class RuntimeHealthTests(unittest.TestCase):
-    def test_reducer_readiness_requires_snapshot_loop(self):
+    def test_owner_readiness_requires_snapshot_loop(self):
         fake_runtime = {
             "running": True,
             "loops": {
-                "state_reducer": True,
-                "reducer_metrics_snapshot": False,
+                "state_event_inbox": True,
+                "state_event_inbox_metrics": False,
             },
             "loop_details": {
-                "state_reducer": {"alive": True, "stale": False},
-                "reducer_metrics_snapshot": {"alive": False, "stale": False},
+                "state_event_inbox": {"alive": True, "stale": False},
+                "state_event_inbox_metrics": {"alive": False, "stale": False},
             },
             "lease_auditor_active": True,
         }
@@ -23,20 +23,20 @@ class RuntimeHealthTests(unittest.TestCase):
         ) as mock_get_task_manager:
             mock_get_config.return_value.scheduler.enabled = True
             mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
-            ok, detail = runtime_health._reducer_readiness()
+            ok, detail = runtime_health._owner_readiness()
         self.assertFalse(ok)
-        self.assertEqual(["reducer_metrics_snapshot"], detail["missing_loops"])
+        self.assertEqual(["state_event_inbox_metrics"], detail["missing_loops"])
 
-    def test_reducer_readiness_passes_when_both_loops_alive(self):
+    def test_owner_readiness_passes_when_both_loops_alive(self):
         fake_runtime = {
             "running": True,
             "loops": {
-                "state_reducer": True,
-                "reducer_metrics_snapshot": True,
+                "state_event_inbox": True,
+                "state_event_inbox_metrics": True,
             },
             "loop_details": {
-                "state_reducer": {"alive": True, "stale": False},
-                "reducer_metrics_snapshot": {"alive": True, "stale": False},
+                "state_event_inbox": {"alive": True, "stale": False},
+                "state_event_inbox_metrics": {"alive": True, "stale": False},
             },
             "lease_auditor_active": True,
         }
@@ -45,20 +45,20 @@ class RuntimeHealthTests(unittest.TestCase):
         ) as mock_get_task_manager:
             mock_get_config.return_value.scheduler.enabled = True
             mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
-            ok, detail = runtime_health._reducer_readiness()
+            ok, detail = runtime_health._owner_readiness()
         self.assertTrue(ok)
         self.assertEqual([], detail["missing_loops"])
 
-    def test_reducer_readiness_requires_lease_capability_even_when_idle(self):
+    def test_owner_readiness_requires_lease_capability_even_when_idle(self):
         fake_runtime = {
             "running": True,
             "loops": {
-                "state_reducer": True,
-                "reducer_metrics_snapshot": True,
+                "state_event_inbox": True,
+                "state_event_inbox_metrics": True,
             },
             "loop_details": {
-                "state_reducer": {"alive": True, "stale": False},
-                "reducer_metrics_snapshot": {"alive": True, "stale": False},
+                "state_event_inbox": {"alive": True, "stale": False},
+                "state_event_inbox_metrics": {"alive": True, "stale": False},
             },
             "lease_auditor_active": False,
         }
@@ -67,20 +67,20 @@ class RuntimeHealthTests(unittest.TestCase):
         ) as mock_get_task_manager:
             mock_get_config.return_value.scheduler.enabled = True
             mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
-            ok, detail = runtime_health._reducer_readiness()
+            ok, detail = runtime_health._owner_readiness()
         self.assertFalse(ok)
         self.assertFalse(detail["lease_auditor_active"])
 
-    def test_reducer_readiness_no_longer_requires_compat_heartbeat_loop(self):
+    def test_owner_readiness_no_longer_requires_compat_heartbeat_loop(self):
         fake_runtime = {
             "running": True,
             "loops": {
-                "state_reducer": True,
-                "reducer_metrics_snapshot": True,
+                "state_event_inbox": True,
+                "state_event_inbox_metrics": True,
             },
             "loop_details": {
-                "state_reducer": {"alive": True, "stale": False},
-                "reducer_metrics_snapshot": {"alive": True, "stale": False},
+                "state_event_inbox": {"alive": True, "stale": False},
+                "state_event_inbox_metrics": {"alive": True, "stale": False},
             },
             "lease_auditor_active": True,
         }
@@ -89,7 +89,7 @@ class RuntimeHealthTests(unittest.TestCase):
         ) as mock_get_task_manager:
             mock_get_config.return_value.scheduler.enabled = True
             mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
-            ok, detail = runtime_health._reducer_readiness()
+            ok, detail = runtime_health._owner_readiness()
         self.assertTrue(ok)
         self.assertEqual([], detail["missing_loops"])
 

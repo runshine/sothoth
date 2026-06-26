@@ -44,7 +44,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
         self.assertEqual("owned_execution", self.manager._task_runtime_phase(task))
 
-    def test_runtime_status_reports_reducer_snapshot_loop(self):
+    def test_runtime_status_reports_state_event_snapshot_loop(self):
         self.manager._running = True
 
         class _Task:
@@ -60,8 +60,8 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.manager._stage_item_loop_task = _Task(False)
         self.manager._downstream_reconcile_task = _Task(False)
         self.manager._readless_reconcile_task = _Task(False)
-        self.manager._state_reducer_loop_task = _Task(False)
-        self.manager._reducer_metrics_snapshot_loop_task = _Task(False)
+        self.manager._state_event_inbox_loop_task = _Task(False)
+        self.manager._state_event_inbox_metrics_loop_task = _Task(False)
 
         status = self.manager.runtime_status()
 
@@ -71,8 +71,8 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
                 "task_dispatch": True,
                 "archive_dispatch": False,
                 "stage_item_dispatch": True,
-                "state_reducer": True,
-                "reducer_metrics_snapshot": True,
+                "state_event_inbox": True,
+                "state_event_inbox_metrics": True,
             },
             status["loops"],
         )
@@ -113,7 +113,7 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
         self.assertFalse(status["loop_details"]["archive_dispatch"]["task_running"])
         self.assertTrue(status["loop_details"]["archive_dispatch"]["heartbeat_alive"])
 
-    def test_runtime_status_marks_lease_auditor_capable_for_live_reducer_loops(self):
+    def test_runtime_status_marks_lease_auditor_capable_for_live_state_event_loops(self):
         self.manager._running = True
 
         class _Task:
@@ -123,9 +123,9 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
             def done(self):
                 return self._done
 
-        self.manager._state_reducer_loop_task = _Task(False)
-        self.manager._reducer_metrics_snapshot_loop_task = _Task(False)
-        self.manager._service_role = lambda: "reducer"
+        self.manager._state_event_inbox_loop_task = _Task(False)
+        self.manager._state_event_inbox_metrics_loop_task = _Task(False)
+        self.manager._service_role = lambda: "worker"
 
         status = self.manager.runtime_status()
 
@@ -215,7 +215,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(("seed", None), call_order[1])
         self.assertIn(("loop_started", None), call_order[2:])
 
-    async def test_start_waits_for_redis_before_reducer_loops(self):
+    async def test_start_waits_for_redis_before_state_event_loops(self):
         manager = TaskManager()
         call_order = []
 
@@ -224,14 +224,22 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 call_order.append(("warmup", kwargs["context"]))
 
         async def _idle_loop():
-            call_order.append(("reducer_loop_started", None))
+            call_order.append(("state_event_loop_started", None))
             await asyncio.sleep(3600)
 
-        manager._state_reducer_loop = _idle_loop
-        manager._reducer_metrics_snapshot_loop = _idle_loop
-        manager._task_heartbeat_loop = _idle_loop
+        async def _seed():
+            call_order.append(("seed", None))
 
-        with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False), patch(
+        manager._state_event_inbox_loop = _idle_loop
+        manager._state_event_inbox_metrics_loop = _idle_loop
+        manager._task_heartbeat_loop = _idle_loop
+        manager._seed_work_queues = _seed
+        manager._dispatch_loop = _idle_loop
+        manager._archive_dispatch_loop = _idle_loop
+        manager._delete_dispatch_loop = _idle_loop
+        manager._stage_item_dispatch_loop = _idle_loop
+
+        with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False), patch(
             "app.service.task_manager.get_task_queue",
             return_value=_Queue(),
         ):
@@ -240,7 +248,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             await manager.stop()
 
         self.assertEqual(("warmup", "startup_warmup"), call_order[0])
-        self.assertIn(("reducer_loop_started", None), call_order[1:])
+        self.assertIn(("state_event_loop_started", None), call_order[1:])
 
     async def test_start_task_runtime_creates_runner_and_heartbeat_handle(self):
         manager = TaskManager()
@@ -585,7 +593,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         reclaimed = self.manager._reclaim_stale_running_locked(db)
 
         self.assertTrue(reclaimed)
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(["task-1"], enqueued)
         self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
 
@@ -1471,7 +1479,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             operation.resume_cursor["sync_target_stage_state"]["processed_count"],
         )
 
-    async def test_state_reducer_loop_recovers_from_observe_failure(self):
+    async def test_state_event_inbox_loop_recovers_from_observe_failure(self):
         manager = TaskManager()
         manager._running = True
         manager.cfg.scheduler.poll_interval_seconds = 1
@@ -1491,18 +1499,18 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
             patch("app.service.task_manager.logger.exception") as logger_exception,
-            patch("app.service.task.reducer.observe_state_reducer_health") as observe_health,
+            patch("app.service.task.state_event_inbox.observe_state_owner_health") as observe_health,
         ):
-            await manager._state_reducer_loop()
+            await manager._state_event_inbox_loop()
 
         self.assertEqual(["called"], observe_calls)
         self.assertGreaterEqual(len(sleep_calls), 1)
         self.assertTrue(all(seconds == 1 for seconds in sleep_calls))
         logger_exception.assert_called_once()
         observe_health.assert_called_once()
-        self.assertEqual(1, manager._state_reducer_consecutive_crash_count)
+        self.assertEqual(1, manager._state_event_inbox_consecutive_crash_count)
 
-    async def test_state_reducer_loop_records_healthy_heartbeat_after_iteration(self):
+    async def test_state_event_inbox_loop_records_healthy_heartbeat_after_iteration(self):
         manager = TaskManager()
         manager._running = True
         manager.cfg.scheduler.poll_interval_seconds = 1
@@ -1517,16 +1525,16 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _observe_runtime_metrics(_db):
             return None
         manager._observe_runtime_metrics = _observe_runtime_metrics
-        manager._state_reducer_consecutive_crash_count = 3
+        manager._state_event_inbox_consecutive_crash_count = 3
 
         with (
             patch("app.service.task_manager.asyncio.sleep", new=_sleep),
-            patch("app.service.task.reducer.observe_state_reducer_health") as observe_health,
+            patch("app.service.task.state_event_inbox.observe_state_owner_health") as observe_health,
         ):
-            await manager._state_reducer_loop()
+            await manager._state_event_inbox_loop()
 
         self.assertGreaterEqual(len(sleep_calls), 1)
-        self.assertEqual(0, manager._state_reducer_consecutive_crash_count)
+        self.assertEqual(0, manager._state_event_inbox_consecutive_crash_count)
         observe_health.assert_called_once()
         self.assertEqual(0, observe_health.call_args.kwargs["consecutive_crash_count"])
 

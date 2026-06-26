@@ -15,11 +15,10 @@ from app.observability import CONTENT_TYPE_LATEST
 from app.service.http_client import get_shared_async_client
 
 
-_ROLE_LABELS = {"api", "worker", "reducer"}
-_AGGREGATED_ROLE_LABELS = ("api", "reducer")
+_ROLE_LABELS = {"api", "worker"}
+_AGGREGATED_ROLE_LABELS = ("api",)
 _ROLE_SERVICE_NAMES = {
     "api": "secflow-app-binary-security",
-    "reducer": "secflow-app-binary-security-reducer",
 }
 _POD_DISCOVERY_CACHE_TTL_SECONDS = 30.0
 _AGGREGATED_METRICS_CACHE_TTL_SECONDS = 5.0
@@ -30,7 +29,7 @@ _HELP_RE = re.compile(r"^# HELP ([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(.+)$")
 _TYPE_RE = re.compile(r"^# TYPE ([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(counter|gauge|histogram|summary|untyped)$")
 _LABEL_RE = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:\\.|[^"\\])*)"')
 
-_AUTHORITATIVE_REDUCER_MAX_METRICS = {
+_AUTHORITATIVE_OWNER_MAX_METRICS = {
     "secflow_binary_security_queue_depth",
     "secflow_binary_security_queue_oldest_age_seconds",
     "secflow_binary_security_state_event_queue_depth",
@@ -161,9 +160,9 @@ def _append_binary_security_health_metrics(
         for label_key, value in (aggregated.get("secflow_binary_security_archive_jobs_by_status") or AggregatedMetricSeries("gauge", None)).samples.items()
         if dict(label_key).get("status") == "running"
     )
-    reducer_avg_duration = _histogram_average(
+    owner_avg_duration = _histogram_average(
         aggregated,
-        "secflow_binary_security_state_reducer_duration_seconds",
+        "secflow_binary_security_state_owner_duration_seconds",
     )
     event_avg_lag = _histogram_average(
         aggregated,
@@ -177,27 +176,30 @@ def _append_binary_security_health_metrics(
         aggregated,
         "secflow_binary_security_task_state_lock_held_seconds",
     )
-    reducer_health_series = aggregated.get("secflow_binary_security_state_reducer_health") or AggregatedMetricSeries("gauge", None)
-    reducer_loop_ok_at = max(
-        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "loop_ok_at"),
+    owner_health_series = (
+        aggregated.get("secflow_binary_security_state_owner_health")
+        or AggregatedMetricSeries("gauge", None)
+    )
+    owner_loop_ok_at = max(
+        (value for label_key, value in owner_health_series.samples.items() if dict(label_key).get("signal") == "loop_ok_at"),
         default=0.0,
     )
-    reducer_event_processed_at = max(
-        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "event_processed_at"),
+    owner_event_processed_at = max(
+        (value for label_key, value in owner_health_series.samples.items() if dict(label_key).get("signal") == "event_processed_at"),
         default=0.0,
     )
-    reducer_crash_at = max(
-        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "crash_at"),
+    owner_crash_at = max(
+        (value for label_key, value in owner_health_series.samples.items() if dict(label_key).get("signal") == "crash_at"),
         default=0.0,
     )
-    reducer_consecutive_crashes = max(
-        (value for label_key, value in reducer_health_series.samples.items() if dict(label_key).get("signal") == "consecutive_crash_count"),
+    owner_consecutive_crashes = max(
+        (value for label_key, value in owner_health_series.samples.items() if dict(label_key).get("signal") == "consecutive_crash_count"),
         default=0.0,
     )
     generated_at = float(metadata.generated_at or 0.0)
-    reducer_loop_ok_age = max(0.0, generated_at - reducer_loop_ok_at) if reducer_loop_ok_at > 0 else 0.0
-    reducer_event_processed_age = max(0.0, generated_at - reducer_event_processed_at) if reducer_event_processed_at > 0 else 0.0
-    reducer_crash_age = max(0.0, generated_at - reducer_crash_at) if reducer_crash_at > 0 else 0.0
+    owner_loop_ok_age = max(0.0, generated_at - owner_loop_ok_at) if owner_loop_ok_at > 0 else 0.0
+    owner_event_processed_age = max(0.0, generated_at - owner_event_processed_at) if owner_event_processed_at > 0 else 0.0
+    owner_crash_age = max(0.0, generated_at - owner_crash_at) if owner_crash_at > 0 else 0.0
     health_metrics = {
         "secflow_binary_security_health_aggregate_partial": (
             "Whether the current aggregate snapshot is partial.",
@@ -212,7 +214,7 @@ def _append_binary_security_health_metrics(
             float(oldest_pending_age or 0.0),
         ),
         "secflow_binary_security_health_dead_letter_depth": (
-            "Current dead-letter queue depth for reducer state events.",
+            "Current dead-letter queue depth for state event inbox events.",
             float(dead_letter_depth or 0.0),
         ),
         "secflow_binary_security_health_archive_queued_jobs": (
@@ -223,12 +225,12 @@ def _append_binary_security_health_metrics(
             "Current running archive jobs across stages.",
             float(archive_running_jobs),
         ),
-        "secflow_binary_security_health_reducer_avg_duration_seconds": (
-            "Average reducer run duration in seconds.",
-            float(reducer_avg_duration or 0.0),
+        "secflow_binary_security_health_owner_avg_duration_seconds": (
+            "Average owner state event inbox run duration in seconds.",
+            float(owner_avg_duration or 0.0),
         ),
         "secflow_binary_security_health_event_avg_lag_seconds": (
-            "Average reducer event lag in seconds.",
+            "Average state event lag in seconds.",
             float(event_avg_lag or 0.0),
         ),
         "secflow_binary_security_health_lock_wait_avg_seconds": (
@@ -239,21 +241,21 @@ def _append_binary_security_health_metrics(
             "Average task state lock held duration in seconds.",
             float(lock_held_avg or 0.0),
         ),
-        "secflow_binary_security_health_reducer_loop_ok_age_seconds": (
-            "Age in seconds since the reducer loop last completed a healthy iteration.",
-            float(reducer_loop_ok_age),
+        "secflow_binary_security_health_owner_loop_ok_age_seconds": (
+            "Age in seconds since the owner state event inbox last completed a healthy iteration.",
+            float(owner_loop_ok_age),
         ),
-        "secflow_binary_security_health_reducer_last_event_processed_age_seconds": (
-            "Age in seconds since the latest successful reducer event processing across pods.",
-            float(reducer_event_processed_age),
+        "secflow_binary_security_health_owner_last_event_processed_age_seconds": (
+            "Age in seconds since the latest successful state event inbox processing across pods.",
+            float(owner_event_processed_age),
         ),
-        "secflow_binary_security_health_reducer_last_crash_age_seconds": (
-            "Age in seconds since the latest observed reducer loop crash.",
-            float(reducer_crash_age),
+        "secflow_binary_security_health_owner_last_crash_age_seconds": (
+            "Age in seconds since the latest observed owner state event inbox crash.",
+            float(owner_crash_age),
         ),
-        "secflow_binary_security_health_reducer_consecutive_crash_count": (
-            "Maximum consecutive reducer loop crash count across pods.",
-            float(reducer_consecutive_crashes),
+        "secflow_binary_security_health_owner_consecutive_crash_count": (
+            "Maximum consecutive owner state event inbox crash count across pods.",
+            float(owner_consecutive_crashes),
         ),
     }
     for metric_name, (help_text, value) in health_metrics.items():
@@ -348,15 +350,15 @@ def parse_prometheus_text(raw_text: str) -> list[MetricSample]:
 
 
 def _source_priority_for_metric(metric_name: str) -> tuple[str, ...] | None:
-    if metric_name in _AUTHORITATIVE_REDUCER_MAX_METRICS:
-        return ("reducer", "worker", "api")
+    if metric_name in _AUTHORITATIVE_OWNER_MAX_METRICS:
+        return ("worker", "api")
     return None
 
 
 def _aggregate_values(metric_name: str, metric_type: str, values: list[float]) -> float:
     if metric_type in {"counter", "histogram", "summary"}:
         return sum(values)
-    if metric_name in _AUTHORITATIVE_REDUCER_MAX_METRICS or metric_name in _MAX_METRICS:
+    if metric_name in _AUTHORITATIVE_OWNER_MAX_METRICS or metric_name in _MAX_METRICS:
         return max(values)
     if metric_name in _SUM_GAUGES:
         return sum(values)

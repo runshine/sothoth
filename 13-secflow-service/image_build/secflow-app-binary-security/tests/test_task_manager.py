@@ -35323,7 +35323,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
     self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))
 
 
-def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task(self):
+def _test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task(self):
     manager = TaskManager()
     task = BinarySecurityTask(
         id="tail-reconcile-pending-1",
@@ -35372,7 +35372,7 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
     original_fetch = manager._fetch_downstream_task_payload
     try:
         manager._fetch_downstream_task_payload = _fetch
-        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False):
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
             asyncio.run(
                 manager.sync_downstream_status(
                     db,
@@ -35396,7 +35396,7 @@ def _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_ta
     self.assertEqual([], takeover_events)
 
 
-def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task(self):
+def _test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task(self):
     manager = TaskManager()
     task = BinarySecurityTask(
         id="tail-reconcile-running-1",
@@ -35463,7 +35463,7 @@ def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_ta
     try:
         manager._fetch_downstream_task_payload = _fetch
         manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
-        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False):
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
             asyncio.run(
                 manager.sync_downstream_status(
                     db,
@@ -35486,7 +35486,7 @@ def _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_ta
     self.assertEqual([], requested_events)
 
 
-def _test_start_reducer_role_runs_reconcile_loops(self):
+def _test_start_worker_role_runs_state_event_loops(self):
     manager = TaskManager()
 
     async def _noop():
@@ -35494,25 +35494,29 @@ def _test_start_reducer_role_runs_reconcile_loops(self):
             await asyncio.sleep(3600)
 
     original_seed = manager._seed_work_queues
-    original_state_reducer = manager._state_reducer_loop
-    original_metrics = manager._reducer_metrics_snapshot_loop
+    original_state_event_inbox = manager._state_event_inbox_loop
+    original_metrics = manager._state_event_inbox_metrics_loop
     original_wait_until_ready = task_manager_module.get_task_queue().wait_until_ready
     try:
         manager._seed_work_queues = AsyncMock()
-        manager._state_reducer_loop = _noop
-        manager._reducer_metrics_snapshot_loop = _noop
+        manager._state_event_inbox_loop = _noop
+        manager._state_event_inbox_metrics_loop = _noop
+        manager._dispatch_loop = _noop
+        manager._archive_dispatch_loop = _noop
+        manager._delete_dispatch_loop = _noop
+        manager._stage_item_dispatch_loop = _noop
         task_manager_module.get_task_queue().wait_until_ready = AsyncMock()
-        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=False):
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False):
             asyncio.run(manager.start())
-            self.assertIsNotNone(manager._state_reducer_loop_task)
-            self.assertIsNotNone(manager._reducer_metrics_snapshot_loop_task)
+            self.assertIsNotNone(manager._state_event_inbox_loop_task)
+            self.assertIsNotNone(manager._state_event_inbox_metrics_loop_task)
             self.assertIsNotNone(manager._task_heartbeat_loop_task)
-            self.assertIsNone(manager._loop_task)
+            self.assertIsNotNone(manager._loop_task)
         asyncio.run(manager.stop())
     finally:
         manager._seed_work_queues = original_seed
-        manager._state_reducer_loop = original_state_reducer
-        manager._reducer_metrics_snapshot_loop = original_metrics
+        manager._state_event_inbox_loop = original_state_event_inbox
+        manager._state_event_inbox_metrics_loop = original_metrics
         task_manager_module.get_task_queue().wait_until_ready = original_wait_until_ready
 
 
@@ -42413,9 +42417,9 @@ TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test
 TaskManagerTests.test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership = _test_task_heartbeat_controller_refreshes_running_task_without_dispatcher_ownership
 TaskManagerTests.test_worker_does_not_take_tail_runtime_lease_on_refresh = _test_worker_does_not_take_tail_runtime_lease_on_refresh
 TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
-TaskManagerTests.test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_reducer_sync_downstream_status_reclaims_pending_tail_reconciliation_task
-TaskManagerTests.test_reducer_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task = _test_reducer_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task
-TaskManagerTests.test_start_reducer_role_runs_reconcile_loops = _test_start_reducer_role_runs_reconcile_loops
+TaskManagerTests.test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task
+TaskManagerTests.test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task = _test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task
+TaskManagerTests.test_start_worker_role_runs_state_event_loops = _test_start_worker_role_runs_state_event_loops
 TaskManagerTests.test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running = _test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running
 TaskManagerTests.test_effective_stage_item_downstream_status_allows_recoverable_running_display = _test_effective_stage_item_downstream_status_allows_recoverable_running_display
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error

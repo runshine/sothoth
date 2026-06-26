@@ -18,9 +18,9 @@ from app.observability import (
     observe_state_dead_letter,
     observe_state_event_lag,
     observe_state_event_queues,
-    observe_state_reducer_event,
-    observe_state_reducer_health,
-    observe_state_reducer_run,
+    observe_state_owner_event,
+    observe_state_owner_health,
+    observe_state_owner_run,
     observe_task_duration,
     observe_task_error,
     observe_task_lifecycle,
@@ -33,13 +33,13 @@ if TYPE_CHECKING:
     from app.service.task_manager import TaskManager
 
 
-class TaskReducerServiceMixin:
-    def _bootstrap_reducer_metrics_snapshot_payload(self: TaskManager) -> str:
+class TaskStateEventInboxServiceMixin:
+    def _bootstrap_state_event_inbox_metrics_snapshot_payload(self: TaskManager) -> str:
         return "\n".join(
             [
-                "# HELP secflow_binary_security_reducer_bootstrap_snapshot Reducer bootstrap snapshot placeholder.",
-                "# TYPE secflow_binary_security_reducer_bootstrap_snapshot gauge",
-                "secflow_binary_security_reducer_bootstrap_snapshot 1",
+                "# HELP secflow_binary_security_state_event_inbox_bootstrap_snapshot State event inbox bootstrap snapshot placeholder.",
+                "# TYPE secflow_binary_security_state_event_inbox_bootstrap_snapshot gauge",
+                "secflow_binary_security_state_event_inbox_bootstrap_snapshot 1",
             ]
         )
 
@@ -57,11 +57,31 @@ class TaskReducerServiceMixin:
         current_stage = str(getattr(task, "current_stage", "") or "").strip()
         if current_stage and current_stage in sequence and stage_name in sequence and sequence.index(current_stage) > sequence.index(stage_name):
             return
+        if self._task_runtime_transition_guard_active(task):
+            guard = self._task_runtime_transition_guard(task)
+            self._record_event(
+                db,
+                task,
+                "stage_worker_start_observed_during_guard",
+                "阶段启动事实已落库，任务仍处于 owner 接管保护窗口，暂不记录主状态阻塞或 takeover 信号",
+                level="info",
+                stage_name=stage_name,
+                payload={
+                    "state_event_id": event.id,
+                    "stage_name": stage_name,
+                    "guard_id": guard.get("guard_id"),
+                    "takeover_suppressed": True,
+                    "stage_retry_mode": bool(payload.get("stage_retry_mode")),
+                    "task_retry_mode": bool(payload.get("task_retry_mode")),
+                    "target_stage_name": payload.get("target_stage_name"),
+                },
+            )
+            return
         if not self._stage_start_ready(db, task, stage_name, allow_rebuild=False):
             self._record_main_state_write_blocked(
                 db,
                 task,
-                source="state_reducer",
+                source="state_event_inbox",
                 attempted_stage_name=stage_name,
                 attempted_status="running",
                 reason="stage_worker_start_requested_not_materialized",
@@ -101,30 +121,10 @@ class TaskReducerServiceMixin:
             "finished_at": None,
         }
         task.stage_summary = stage_summary
-        if self._task_runtime_transition_guard_active(task):
-            guard = self._task_runtime_transition_guard(task)
-            self._record_event(
-                db,
-                task,
-                "stage_worker_start_observed_during_guard",
-                "阶段启动事实已落库，任务仍处于 owner 接管保护窗口，暂不记录主状态阻塞或 takeover 信号",
-                level="info",
-                stage_name=stage_name,
-                payload={
-                    "state_event_id": event.id,
-                    "stage_name": stage_name,
-                    "guard_id": guard.get("guard_id"),
-                    "takeover_suppressed": True,
-                    "stage_retry_mode": bool(payload.get("stage_retry_mode")),
-                    "task_retry_mode": bool(payload.get("task_retry_mode")),
-                    "target_stage_name": payload.get("target_stage_name"),
-                },
-            )
-            return
         self._record_main_state_write_blocked(
             db,
             task,
-            source="state_reducer",
+            source="state_event_inbox",
             attempted_stage_name=stage_name,
             attempted_status="running",
             reason="stage_worker_start_requested_requires_owner_worker",
@@ -144,15 +144,15 @@ class TaskReducerServiceMixin:
             },
         )
 
-    async def _state_reducer_loop(self: TaskManager) -> None:
+    async def _state_event_inbox_loop(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module
 
         interval_seconds = max(1, int(self.cfg.scheduler.poll_interval_seconds or 5))
         while self._running:
             db = task_manager_module.get_session_factory()()
             try:
-                with task_manager_module.observe_scheduler_loop("state_reducer"):
-                    self._mark_loop_heartbeat("state_reducer")
+                with task_manager_module.observe_scheduler_loop("state_event_inbox"):
+                    self._mark_loop_heartbeat("state_event_inbox")
                     await asyncio.to_thread(self._observe_state_runtime_metrics, db)
                     processed = 0
                     for _ in range(max(1, int(self.cfg.scheduler.downstream_action_concurrency or 1))):
@@ -162,54 +162,54 @@ class TaskReducerServiceMixin:
                         processed += 1
                         await self._reduce_state_event(event_id)
                     await self._observe_runtime_metrics(db)
-                    self._state_reducer_consecutive_crash_count = 0
-                    observe_state_reducer_health(
+                    self._state_event_inbox_consecutive_crash_count = 0
+                    observe_state_owner_health(
                         pod=self.instance_id,
                         loop_ok_at=time.time(),
                         consecutive_crash_count=0,
                     )
-                    self._mark_loop_heartbeat("state_reducer")
+                    self._mark_loop_heartbeat("state_event_inbox")
                     if processed:
                         continue
             except asyncio.CancelledError:
                 raise
             except Exception:
-                self._state_reducer_consecutive_crash_count += 1
-                observe_state_reducer_health(
+                self._state_event_inbox_consecutive_crash_count += 1
+                observe_state_owner_health(
                     pod=self.instance_id,
                     crash_at=time.time(),
-                    consecutive_crash_count=self._state_reducer_consecutive_crash_count,
+                    consecutive_crash_count=self._state_event_inbox_consecutive_crash_count,
                 )
-                task_manager_module.logger.exception("binary-security state reducer loop crashed and recovered")
+                task_manager_module.logger.exception("binary-security state event inbox loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
                 db.close()
             await asyncio.sleep(interval_seconds)
 
-    async def _reducer_metrics_snapshot_loop(self: TaskManager) -> None:
+    async def _state_event_inbox_metrics_loop(self: TaskManager) -> None:
         interval_seconds = max(5, int(self.cfg.scheduler.poll_interval_seconds or 5))
-        self._mark_loop_heartbeat("reducer_metrics_snapshot")
-        await self._publish_reducer_metrics_snapshot(lightweight=True)
-        self._mark_loop_heartbeat("reducer_metrics_snapshot")
+        self._mark_loop_heartbeat("state_event_inbox_metrics")
+        await self._publish_state_event_inbox_metrics_snapshot(lightweight=True)
+        self._mark_loop_heartbeat("state_event_inbox_metrics")
         while self._running:
             await asyncio.sleep(interval_seconds)
-            await self._publish_reducer_metrics_snapshot()
-            self._mark_loop_heartbeat("reducer_metrics_snapshot")
+            await self._publish_state_event_inbox_metrics_snapshot()
+            self._mark_loop_heartbeat("state_event_inbox_metrics")
 
-    async def _publish_reducer_metrics_snapshot(self: TaskManager, *, lightweight: bool = False) -> None:
+    async def _publish_state_event_inbox_metrics_snapshot(self: TaskManager, *, lightweight: bool = False) -> None:
         from app.service import task_manager as task_manager_module
 
         try:
             if lightweight:
-                payload = self._bootstrap_reducer_metrics_snapshot_payload().encode("utf-8")
+                payload = self._bootstrap_state_event_inbox_metrics_snapshot_payload().encode("utf-8")
             else:
                 payload, _ = await asyncio.to_thread(task_manager_module.render_metrics)
-            await task_manager_module.get_reducer_metrics_snapshot_store().write_snapshot(
+            await task_manager_module.get_state_event_inbox_metrics_snapshot_store().write_snapshot(
                 metrics_payload=payload.decode("utf-8", errors="ignore"),
                 source_pod=self.instance_id,
             )
         except Exception:
-            task_manager_module.logger.exception("binary-security failed to publish reducer metrics snapshot")
+            task_manager_module.logger.exception("binary-security failed to publish state event inbox metrics snapshot")
 
     def _observe_state_runtime_metrics(self: TaskManager, db: Session) -> None:
         from app.service import task_manager as task_manager_module
@@ -272,7 +272,7 @@ class TaskReducerServiceMixin:
             if not self._is_retryable_lock_error(exc):
                 raise
             db.rollback()
-            task_manager_module.logger.warning("binary-security state reducer skipped event claim after retryable lock conflict during lookup")
+            task_manager_module.logger.warning("binary-security state event inbox skipped event claim after retryable lock conflict during lookup")
             return None
         if event is None:
             return None
@@ -310,7 +310,7 @@ class TaskReducerServiceMixin:
                 raise
             db.rollback()
             task_manager_module.logger.warning(
-                "binary-security state reducer skipped event claim after retryable lock conflict: event_id=%s",
+                "binary-security state event inbox skipped event claim after retryable lock conflict: event_id=%s",
                 getattr(event, "id", None),
             )
             return None
@@ -472,8 +472,8 @@ class TaskReducerServiceMixin:
             event.last_error_message = None
             event.updated_at = finished_at
             observe_state_event_lag(event_type, (task_shared._now() - event.created_at).total_seconds() if event.created_at else None)
-            observe_state_reducer_event(event_type, "processed")
-            observe_state_reducer_health(pod=self.instance_id, event_processed_at=time.time())
+            observe_state_owner_event(event_type, "processed")
+            observe_state_owner_health(pod=self.instance_id, event_processed_at=time.time())
             result = "success"
             db.commit()
         except Exception as exc:
@@ -502,7 +502,7 @@ class TaskReducerServiceMixin:
                         db.commit()
                 except Exception:
                     db.rollback()
-            task_manager_module.logger.exception("binary-security state reducer failed: event=%s", event_id)
+            task_manager_module.logger.exception("binary-security state event inbox failed: event=%s", event_id)
         finally:
             if lease_token and event is not None:
                 try:
@@ -511,7 +511,7 @@ class TaskReducerServiceMixin:
                 except Exception:
                     db.rollback()
             db.close()
-            observe_state_reducer_run(result=result, pod=self.instance_id, duration_seconds=time.perf_counter() - started)
+            observe_state_owner_run(result=result, pod=self.instance_id, duration_seconds=time.perf_counter() - started)
 
     async def _apply_state_event_locked(self: TaskManager, db: Session, event: BinarySecurityStateEvent) -> None:
         from app.service import task_manager as task_manager_module
@@ -546,7 +546,7 @@ class TaskReducerServiceMixin:
             if event.event_type == "manual_policy_update_requested":
                 self._apply_manual_policy_update_requested_locked(db, event)
                 return
-            task_manager_module.logger.info("binary-security state reducer ignored event type: %s", event.event_type)
+            task_manager_module.logger.info("binary-security state event inbox ignored event type: %s", event.event_type)
         finally:
             self._active_timeline_origin_state_event = previous_origin
 
@@ -643,7 +643,7 @@ class TaskReducerServiceMixin:
             db,
             task=task,
             item=item,
-            change_source="state_reducer",
+            change_source="state_event_inbox",
             after_status=mapped_status,
             downstream_payload=downstream_payload,
             sync_status="synced",
@@ -683,7 +683,7 @@ class TaskReducerServiceMixin:
             db,
             task,
             "downstream_status_event_applied",
-            "下游状态事件已由 reducer 串行应用",
+            "下游状态事件已由 state event inbox 串行应用",
             level="warning" if mapped_status in {"failed", "cancelled", "downstream_missing"} else "info",
             stage_name=item.stage_name,
             item=item,
@@ -1008,7 +1008,7 @@ class TaskReducerServiceMixin:
             self._record_main_state_write_blocked(
                 db,
                 task,
-                source="state_reducer",
+                source="state_event_inbox",
                 attempted_stage_name=stage_name,
                 attempted_status="running",
                 reason="stage_waiting_downstream_progress_requires_owner_worker",
@@ -1077,7 +1077,7 @@ class TaskReducerServiceMixin:
             self._record_main_state_write_blocked(
                 db,
                 task,
-                source="state_reducer",
+                source="state_event_inbox",
                 attempted_stage_name=stage_name,
                 attempted_status="failed",
                 reason="stage_terminal_failure_requires_owner_worker",
@@ -1152,7 +1152,7 @@ class TaskReducerServiceMixin:
         self._record_main_state_write_blocked(
             db,
             task,
-            source="state_reducer",
+            source="state_event_inbox",
             attempted_stage_name=str(task.current_stage or "").strip() or None,
             attempted_status="failed",
             reason="task_execution_failed_requires_owner_worker",
@@ -1199,7 +1199,7 @@ class TaskReducerServiceMixin:
                 db,
                 task,
                 "task_runtime_policy_updated",
-                "任务运行时策略已由 reducer 更新",
+                "任务运行时策略已由 state event inbox 更新",
                 payload={"before": before, "after": after, "effective_scope": payload.get("effective_scope") or "tail_claim_immediate", "state_event_id": event.id},
             )
             return
@@ -1209,7 +1209,7 @@ class TaskReducerServiceMixin:
                 db,
                 task,
                 "task_concurrency_updated",
-                "任务阶段并发配置已由 reducer 更新",
+                "任务阶段并发配置已由 state event inbox 更新",
                 payload={"before": payload.get("concurrency_before") or before.get("stage_parallelism") or {}, "after": payload.get("concurrency_after") or after.get("stage_parallelism") or {}, "state_event_id": event.id},
             )
         else:
@@ -1217,7 +1217,7 @@ class TaskReducerServiceMixin:
                 db,
                 task,
                 "task_policy_updated",
-                "任务策略已由 reducer 更新",
+                "任务策略已由 state event inbox 更新",
                 payload={"before": before, "after": after, "effective_scope": payload.get("effective_scope") or "future_stages_only", "state_event_id": event.id},
             )
 
@@ -1240,7 +1240,7 @@ class TaskReducerServiceMixin:
             self._record_main_state_write_blocked(
                 db,
                 task,
-                source="state_reducer",
+                source="state_event_inbox",
                 attempted_stage_name=job.stage_name,
                 attempted_status="failed",
                 reason="archive_job_copy_failed_requires_owner_worker",
@@ -1249,7 +1249,7 @@ class TaskReducerServiceMixin:
             db,
             task,
             "downstream_archive_job_copy_failed",
-            "下游产物归档复制失败，已由 reducer 记录失败事实",
+            "下游产物归档复制失败，已由 state event inbox 记录失败事实",
             level="warning",
             stage_name=job.stage_name,
             item=item,
@@ -1301,7 +1301,7 @@ class TaskReducerServiceMixin:
                 db,
                 task,
                 "task_state_repair_reconcile_triggered",
-                "检测到 retryable/dead-letter reducer 事件，已重新排队修复",
+                "检测到 retryable/dead-letter state event inbox 事件，已重新排队修复",
                 stage_name=event.stage_name,
                 payload={
                     "state_event_id": event.id,

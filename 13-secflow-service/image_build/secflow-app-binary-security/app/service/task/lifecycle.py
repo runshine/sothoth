@@ -182,8 +182,8 @@ class TaskLifecycleServiceMixin:
             "archive_runtime_reconcile": self._archive_runtime_reconcile_interval_seconds(),
             "state_repair_reconcile": self._state_repair_reconcile_interval_seconds(),
             "readless_reconcile": max(1, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300)),
-            "state_reducer": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
-            "reducer_metrics_snapshot": max(5, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "state_event_inbox": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
+            "state_event_inbox_metrics": max(5, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
             "task_heartbeat": max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15)),
         }.get(loop_name, configured)
         return max(configured, interval_seconds * 2 + 15)
@@ -231,8 +231,8 @@ class TaskLifecycleServiceMixin:
             "task_dispatch": self._loop_runtime_detail("task_dispatch", self._loop_task),
             "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
             "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
-            "state_reducer": self._loop_runtime_detail("state_reducer", self._state_reducer_loop_task),
-            "reducer_metrics_snapshot": self._loop_runtime_detail("reducer_metrics_snapshot", self._reducer_metrics_snapshot_loop_task),
+            "state_event_inbox": self._loop_runtime_detail("state_event_inbox", self._state_event_inbox_loop_task),
+            "state_event_inbox_metrics": self._loop_runtime_detail("state_event_inbox_metrics", self._state_event_inbox_metrics_loop_task),
             "compat_heartbeat_fallback": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
         }
         return {
@@ -249,7 +249,7 @@ class TaskLifecycleServiceMixin:
                 "stage_item_workers": len([task for task in self._stage_item_workers.values() if not task.done()]),
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
-            "lease_auditor_active": bool(self._is_reducer_role() and self._runtime_lease_capable()),
+            "lease_auditor_active": bool(self._can_consume_state_events() and self._runtime_lease_capable()),
         }
 
     def _collect_runtime_metrics_snapshot_sync(self: TaskManager) -> dict[str, int]:

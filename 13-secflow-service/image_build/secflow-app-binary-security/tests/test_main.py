@@ -55,37 +55,36 @@ class MainRoleTests(unittest.TestCase):
         body = response.body.decode("utf-8", errors="ignore")
         self.assertIn("secflow_binary_security_http_requests_total", body)
 
-    def test_reducer_metrics_endpoint_reads_snapshot_when_running_as_api(self):
+    def test_state_event_metrics_endpoint_reads_snapshot_when_running_as_api(self):
         fake_store = SimpleNamespace(
             render_metrics=AsyncMock(
                 return_value=(b"# HELP demo metric\n# TYPE demo gauge\ndemo 1\n", "text/plain; version=0.0.4; charset=utf-8")
             )
         )
         with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "api"}, clear=True), patch(
-            "app.main.get_reducer_metrics_snapshot_store",
+            "app.main.get_state_event_inbox_metrics_snapshot_store",
             return_value=fake_store,
         ):
-            response = asyncio.run(main.reducer_metrics_endpoint())
+            response = asyncio.run(main.state_event_metrics_endpoint())
         self.assertEqual(200, response.status_code)
         self.assertIn("text/plain", response.media_type or "")
         body = response.body.decode("utf-8", errors="ignore")
         self.assertIn("# HELP demo metric", body)
         fake_store.render_metrics.assert_awaited_once_with(fallback_payload=None)
 
-    def test_reducer_metrics_endpoint_passes_local_fallback_when_running_as_reducer(self):
+    def test_state_event_metrics_endpoint_does_not_pass_local_fallback_when_running_as_worker(self):
         fake_store = SimpleNamespace(
             render_metrics=AsyncMock(return_value=(b"demo 1\n", "text/plain; version=0.0.4; charset=utf-8"))
         )
-        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "reducer"}, clear=True), patch(
-            "app.main.get_reducer_metrics_snapshot_store",
+        with patch.dict(os.environ, {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=True), patch(
+            "app.main.get_state_event_inbox_metrics_snapshot_store",
             return_value=fake_store,
         ):
-            response = asyncio.run(main.reducer_metrics_endpoint())
+            response = asyncio.run(main.state_event_metrics_endpoint())
         self.assertEqual(200, response.status_code)
         self.assertIn("text/plain", response.media_type or "")
         fallback_payload = fake_store.render_metrics.await_args.kwargs.get("fallback_payload")
-        self.assertIsInstance(fallback_payload, str)
-        self.assertIn("secflow_binary_security_http_requests_total", fallback_payload)
+        self.assertIsNone(fallback_payload)
 
     def test_ready_route_returns_503_when_checks_fail(self):
         async def fake_collect():

@@ -1,4 +1,4 @@
-"""Redis-backed reducer metrics snapshot store."""
+"""Redis-backed state event inbox metrics snapshot store."""
 
 from __future__ import annotations
 
@@ -24,18 +24,19 @@ logger = logging.getLogger(__name__)
 
 _SNAPSHOT_TTL_SECONDS = 1800
 _SNAPSHOT_STALE_AFTER_SECONDS = 30.0
-_SNAPSHOT_KEY = "secflow:binary-security:reducer:metrics-snapshot:v1"
+_SNAPSHOT_KEY = "secflow:binary-security:state-event-inbox:metrics-snapshot:v1"
+_LEGACY_SNAPSHOT_KEY = "secflow:binary-security:reducer:metrics-snapshot:v1"
 
 
-class ReducerMetricsSnapshotStore:
+class StateEventInboxMetricsSnapshotStore:
     def __init__(self) -> None:
         self._redis_url = get_config().queue.redis_url
         self._lock = asyncio.Lock()
         self._client: Redis | None = None
 
-    def _new_client(self, *, context: str = "reducer_metrics_snapshot") -> Redis:
+    def _new_client(self, *, context: str = "state_event_inbox_metrics_snapshot") -> Redis:
         logger.info(
-            "binary-security reducer metrics redis client creating: context=%s redis_url=%s socket_connect_timeout=%s socket_timeout=%s",
+            "binary-security state event inbox metrics redis client creating: context=%s redis_url=%s socket_connect_timeout=%s socket_timeout=%s",
             str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
             str(self._redis_url or "").strip() or None,
             REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
@@ -50,7 +51,7 @@ class ReducerMetricsSnapshotStore:
             socket_keepalive=True,
         )
 
-    async def _client_or_create(self, *, context: str = "reducer_metrics_snapshot") -> Redis:
+    async def _client_or_create(self, *, context: str = "state_event_inbox_metrics_snapshot") -> Redis:
         async with self._lock:
             if self._client is None:
                 self._client = self._new_client(context=context)
@@ -63,7 +64,7 @@ class ReducerMetricsSnapshotStore:
         source_pod: str,
         generated_at: float | None = None,
     ) -> None:
-        client = await self._client_or_create(context="reducer_metrics_snapshot")
+        client = await self._client_or_create(context="state_event_inbox_metrics_snapshot")
         created_at = float(generated_at or time.time())
         payload = {
             "metrics_payload": str(metrics_payload or ""),
@@ -71,15 +72,18 @@ class ReducerMetricsSnapshotStore:
             "generated_at": created_at,
         }
         try:
-            await client.set(_SNAPSHOT_KEY, json.dumps(payload, ensure_ascii=True), ex=_SNAPSHOT_TTL_SECONDS)
+            encoded = json.dumps(payload, ensure_ascii=True)
+            await client.set(_SNAPSHOT_KEY, encoded, ex=_SNAPSHOT_TTL_SECONDS)
         except Exception:
             await self._close_client(client)
             raise
 
     async def read_snapshot(self) -> dict[str, Any] | None:
-        client = await self._client_or_create(context="reducer_metrics_snapshot")
+        client = await self._client_or_create(context="state_event_inbox_metrics_snapshot")
         try:
             raw = await client.get(_SNAPSHOT_KEY)
+            if not raw:
+                raw = await client.get(_LEGACY_SNAPSHOT_KEY)
         except Exception:
             await self._close_client(client)
             raise
@@ -124,21 +128,21 @@ class ReducerMetricsSnapshotStore:
             lines.append(snapshot_payload)
         lines.extend(
             [
-                "# HELP secflow_binary_security_reducer_snapshot_available Whether a reducer metrics snapshot is available.",
-                "# TYPE secflow_binary_security_reducer_snapshot_available gauge",
-                f"secflow_binary_security_reducer_snapshot_available {available}",
-                "# HELP secflow_binary_security_reducer_snapshot_age_seconds Age in seconds of the reducer metrics snapshot.",
-                "# TYPE secflow_binary_security_reducer_snapshot_age_seconds gauge",
-                f"secflow_binary_security_reducer_snapshot_age_seconds {age_seconds}",
-                "# HELP secflow_binary_security_reducer_snapshot_stale Whether the reducer metrics snapshot is stale.",
-                "# TYPE secflow_binary_security_reducer_snapshot_stale gauge",
-                f"secflow_binary_security_reducer_snapshot_stale {stale}",
-                "# HELP secflow_binary_security_reducer_snapshot_generated_at_timestamp_seconds Unix timestamp for the reducer metrics snapshot generation time.",
-                "# TYPE secflow_binary_security_reducer_snapshot_generated_at_timestamp_seconds gauge",
-                f"secflow_binary_security_reducer_snapshot_generated_at_timestamp_seconds {generated_at}",
-                "# HELP secflow_binary_security_reducer_snapshot_source_info Reducer pod that produced the latest snapshot.",
-                "# TYPE secflow_binary_security_reducer_snapshot_source_info gauge",
-                f'secflow_binary_security_reducer_snapshot_source_info{{pod="{_escape_label_value(source_pod)}"}} 1',
+                "# HELP secflow_binary_security_state_event_inbox_snapshot_available Whether a state event inbox metrics snapshot is available.",
+                "# TYPE secflow_binary_security_state_event_inbox_snapshot_available gauge",
+                f"secflow_binary_security_state_event_inbox_snapshot_available {available}",
+                "# HELP secflow_binary_security_state_event_inbox_snapshot_age_seconds Age in seconds of the state event inbox metrics snapshot.",
+                "# TYPE secflow_binary_security_state_event_inbox_snapshot_age_seconds gauge",
+                f"secflow_binary_security_state_event_inbox_snapshot_age_seconds {age_seconds}",
+                "# HELP secflow_binary_security_state_event_inbox_snapshot_stale Whether the state event inbox metrics snapshot is stale.",
+                "# TYPE secflow_binary_security_state_event_inbox_snapshot_stale gauge",
+                f"secflow_binary_security_state_event_inbox_snapshot_stale {stale}",
+                "# HELP secflow_binary_security_state_event_inbox_snapshot_generated_at_timestamp_seconds Unix timestamp for the state event inbox metrics snapshot generation time.",
+                "# TYPE secflow_binary_security_state_event_inbox_snapshot_generated_at_timestamp_seconds gauge",
+                f"secflow_binary_security_state_event_inbox_snapshot_generated_at_timestamp_seconds {generated_at}",
+                "# HELP secflow_binary_security_state_event_inbox_snapshot_source_info Owner pod that produced the latest state event inbox snapshot.",
+                "# TYPE secflow_binary_security_state_event_inbox_snapshot_source_info gauge",
+                f'secflow_binary_security_state_event_inbox_snapshot_source_info{{pod="{_escape_label_value(source_pod)}"}} 1',
             ]
         )
         return ("\n".join(line for line in lines if line).strip() + "\n").encode("utf-8"), CONTENT_TYPE_LATEST
@@ -165,17 +169,17 @@ def _escape_label_value(value: str) -> str:
     return str(value or "unknown").replace("\\", r"\\").replace("\n", r"\n").replace('"', r"\"")
 
 
-_snapshot_store: ReducerMetricsSnapshotStore | None = None
+_snapshot_store: StateEventInboxMetricsSnapshotStore | None = None
 
 
-def get_reducer_metrics_snapshot_store() -> ReducerMetricsSnapshotStore:
+def get_state_event_inbox_metrics_snapshot_store() -> StateEventInboxMetricsSnapshotStore:
     global _snapshot_store
     if _snapshot_store is None:
-        _snapshot_store = ReducerMetricsSnapshotStore()
+        _snapshot_store = StateEventInboxMetricsSnapshotStore()
     return _snapshot_store
 
 
-async def close_reducer_metrics_snapshot_store() -> None:
+async def close_state_event_inbox_metrics_snapshot_store() -> None:
     global _snapshot_store
     store = _snapshot_store
     _snapshot_store = None

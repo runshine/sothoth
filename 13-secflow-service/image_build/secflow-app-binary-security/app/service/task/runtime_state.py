@@ -448,7 +448,7 @@ class TaskRuntimeStateServiceMixin:
     ) -> bool:
         normalized_source = str(source or "").strip().lower()
         guarded_sources = {
-            "state_reducer",
+            "state_event_inbox",
             "runtime_state",
             "runtime_worker",
             "state_machine",
@@ -891,13 +891,13 @@ class TaskRuntimeStateServiceMixin:
         return True, None
 
     def _runtime_lease_capable(self: TaskManager) -> bool:
-        if not self._is_reducer_role():
+        if not self._can_consume_state_events():
             return False
         return bool(
-            self._state_reducer_loop_task
-            and not self._state_reducer_loop_task.done()
-            and self._reducer_metrics_snapshot_loop_task
-            and not self._reducer_metrics_snapshot_loop_task.done()
+            self._state_event_inbox_loop_task
+            and not self._state_event_inbox_loop_task.done()
+            and self._state_event_inbox_metrics_loop_task
+            and not self._state_event_inbox_metrics_loop_task.done()
         )
 
     def _task_base_policy(self: TaskManager, task: BinarySecurityTask) -> dict[str, Any]:
@@ -1028,7 +1028,7 @@ class TaskRuntimeStateServiceMixin:
             return "archive_copy_io_error"
         if any(token in lowered for token in {"metadata", "task-metadata.json"}):
             return "task_metadata_write_failed"
-        if any(token in lowered for token in {"state event", "state reducer"}):
+        if any(token in lowered for token in {"state event", "state reducer", "state_event_inbox"}):
             return "state_event_persist_failed"
         if self._is_retryable_lock_error(exc):
             return "retryable_lock_conflict"
@@ -1404,7 +1404,7 @@ class TaskRuntimeStateServiceMixin:
         self._merge_task_runtime_signal(
             task,
             "pending_task_layer_reconcile",
-            source="state_reducer",
+            source="state_event_inbox",
             reason=reconcile_reason,
             stage_name=signal_stage_name,
             extra={

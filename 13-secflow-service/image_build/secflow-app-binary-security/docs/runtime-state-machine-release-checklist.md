@@ -4,7 +4,7 @@
 - Service: `13-secflow-service/image_build/secflow-app-binary-security`
 - Goal: keep `_apply_task_main_state_update(...)` as the only runtime task main-state write entry
 - Non-goals for this release:
-  - reducer redesign
+  - state_event_inbox redesign
   - DB schema changes
   - cross-repo coordination changes
 
@@ -12,7 +12,7 @@
 - Run:
   - `python -m py_compile app/service/task/runtime_state.py app/service/task/runtime.py app/service/task/state_machine.py tests/test_task_state_machine.py tests/test_task_manager.py`
   - `PYTHONPATH=. conda run -n sothoth pytest tests/test_task_state_machine.py -q`
-  - `PYTHONPATH=. conda run -n sothoth pytest tests/test_task_reducer_service.py -q`
+  - `PYTHONPATH=. conda run -n sothoth pytest tests/test_task_state_event_inbox_service.py -q`
   - `PYTHONPATH=. conda run -n sothoth pytest tests/test_task_manager.py -k "finalize_task or refresh_task_status_after_sync or running_without_active_lease or requeue_released_running_locked or owned_execution_takeover_requeue_uses_stage_name_for_main_state or stale_execution_keeps_parent_on_current_stage or sync_streaming_task_tail_state" -q`
   - `PYTHONPATH=. conda run -n sothoth pytest tests/test_task_manager.py -k "cancelling or cancel_failed or authoritative_failure or run_task_finally_preserves_tail_runtime_lease or stale_running_streaming_tail_requeues_for_takeover or sync_task_row_lease_view_from_owner_blocks_non_owner or run_task_records_takeover_resume_event_for_streaming_tail" -q`
 - Static search checks:
@@ -63,7 +63,7 @@
 - Inspect:
   - `secflow-app-binary-security`
   - `secflow-app-binary-security-worker`
-  - reducer logs as read-only reference if reducer is still deployed
+  - state_event_inbox logs as read-only reference if legacy reducer-compatible telemetry is still present
 - Look for:
   - repeated blocked events without later owner progress
   - task row lease sync blocked events on paths that should be owner-owned

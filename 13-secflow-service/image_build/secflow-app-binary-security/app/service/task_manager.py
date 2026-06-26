@@ -89,9 +89,9 @@ from app.observability import (
     observe_state_event_lag,
     observe_state_event_queues,
     observe_state_file_write,
-    observe_state_reducer_health,
-    observe_state_reducer_event,
-    observe_state_reducer_run,
+    observe_state_owner_health,
+    observe_state_owner_event,
+    observe_state_owner_run,
     observe_task_readless_reconcile,
     observe_task_snapshot_lock_retry,
     observe_task_state_lock,
@@ -167,7 +167,7 @@ from app.service.firmware_unpacker import get_firmware_unpacker_client
 from app.service.system_analyse import get_system_analyse_client
 from app.service.fileserver import get_fileserver_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
-from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
+from app.service.state_event_inbox_metrics_snapshot import get_state_event_inbox_metrics_snapshot_store
 from app.service.readless_sync import ReadlessSyncStats, run_readless_sync_loop
 from app.service.task_queue import get_task_queue
 from app.service.task.archive import TaskArchiveServiceMixin
@@ -181,7 +181,7 @@ from app.service.task.operation import TaskOperationServiceMixin
 from app.service.task.operation_events import TaskOperationEventServiceMixin
 from app.service.task.query import TaskQueryServiceMixin
 from app.service.task.read_model import TaskReadModelServiceMixin
-from app.service.task.reducer import TaskReducerServiceMixin
+from app.service.task.state_event_inbox import TaskStateEventInboxServiceMixin
 from app.service.task.results import TaskResultServiceMixin
 from app.service.task.runtime import TaskRuntimeServiceMixin
 from app.service.task.runtime_state import TaskRuntimeStateServiceMixin
@@ -673,7 +673,7 @@ class TaskManager(
     TaskEventServiceMixin,
     TaskRuntimeServiceMixin,
     TaskContractServiceMixin,
-    TaskReducerServiceMixin,
+    TaskStateEventInboxServiceMixin,
     TaskResultServiceMixin,
     TaskArchiveServiceMixin,
     TaskItemSyncServiceMixin,
@@ -700,8 +700,8 @@ class TaskManager(
         self._stage_item_sync_reconcile_task: Optional[asyncio.Task] = None
         self._archive_runtime_reconcile_task: Optional[asyncio.Task] = None
         self._state_repair_reconcile_task: Optional[asyncio.Task] = None
-        self._state_reducer_loop_task: Optional[asyncio.Task] = None
-        self._reducer_metrics_snapshot_loop_task: Optional[asyncio.Task] = None
+        self._state_event_inbox_loop_task: Optional[asyncio.Task] = None
+        self._state_event_inbox_metrics_loop_task: Optional[asyncio.Task] = None
         self._task_heartbeat_loop_task: Optional[asyncio.Task] = None
         self._stage_item_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, TaskRuntimeHandle] = {}
@@ -716,7 +716,7 @@ class TaskManager(
         self._task_execution_owners: dict[str, set[str]] = {}
         self._task_execution_owner_lock = threading.Lock()
         self._last_queue_reconcile_at: datetime | None = None
-        self._state_reducer_consecutive_crash_count = 0
+        self._state_event_inbox_consecutive_crash_count = 0
         self._task_list_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
         self._task_list_cache_lock = threading.Lock()
         self._readonly_projection_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
@@ -1016,13 +1016,13 @@ class TaskManager(
     def _service_role(self) -> str:
         raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all"
         normalized = str(raw_role).strip().lower()
-        return normalized if normalized in {"api", "worker", "reducer"} else "all"
+        return normalized if normalized in {"api", "worker"} else "all"
 
     def _is_worker_role(self) -> bool:
         return self._service_role() in {"all", "worker"}
 
-    def _is_reducer_role(self) -> bool:
-        return self._service_role() in {"all", "reducer"}
+    def _can_consume_state_events(self) -> bool:
+        return self._service_role() in {"all", "worker"}
 
     def _can_own_runtime_phase(self, phase: str | None) -> bool:
         normalized = str(phase or "").strip().lower()
@@ -1629,20 +1629,19 @@ class TaskManager(
             return
         self._running = True
         observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
-        role = str(os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or "all").strip().lower()
+        role = self._service_role()
         run_worker_loops = role in {"", "all", "worker"}
-        run_reducer_loop = role in {"", "all", "reducer"}
         logger.info(
-            "binary-security task manager starting: role=%s run_worker_loops=%s run_reducer_loop=%s "
+            "binary-security task manager starting: role=%s run_worker_loops=%s state_event_consumer=%s "
             "queue_redis=%s task_queue_key=%s",
             role or "all",
             run_worker_loops,
-            run_reducer_loop,
+            self._can_consume_state_events(),
             str(getattr(self.cfg.queue, "redis_url", "") or "").strip() or None,
             str(getattr(self.cfg.queue, "task_queue_key", "") or "").strip() or None,
         )
         try:
-            if run_worker_loops or run_reducer_loop:
+            if run_worker_loops or self._can_consume_state_events():
                 logger.info(
                     "binary-security task manager redis_warmup starting: timeout_seconds=%s retry_interval_seconds=%s",
                     int(getattr(self.cfg.queue, "startup_ready_timeout_seconds", 60) or 60),
@@ -1666,19 +1665,20 @@ class TaskManager(
                     self._stage_item_dispatch_loop(),
                     name="binary-security-stage-item-dispatcher",
                 )
-            if run_worker_loops or run_reducer_loop:
+            if self._can_consume_state_events():
                 self._task_heartbeat_loop_task = asyncio.create_task(
                     self._task_heartbeat_loop(),
                     name="binary-security-task-heartbeat",
                 )
-            if run_reducer_loop:
-                self._state_reducer_loop_task = asyncio.create_task(
-                    self._state_reducer_loop(),
-                    name="binary-security-state-reducer",
+            if self._can_consume_state_events():
+                # owner/worker 主链接管 state_event inbox。
+                self._state_event_inbox_loop_task = asyncio.create_task(
+                    self._state_event_inbox_loop(),
+                    name="binary-security-state-event-inbox",
                 )
-                self._reducer_metrics_snapshot_loop_task = asyncio.create_task(
-                    self._reducer_metrics_snapshot_loop(),
-                    name="binary-security-reducer-metrics-snapshot",
+                self._state_event_inbox_metrics_loop_task = asyncio.create_task(
+                    self._state_event_inbox_metrics_loop(),
+                    name="binary-security-state-event-inbox-metrics",
                 )
             logger.info("binary-security task manager started")
         except Exception:
@@ -1702,8 +1702,8 @@ class TaskManager(
         await self._cancel_loop_task(self._delete_loop_task)
         await self._cancel_loop_task(self._stage_item_loop_task)
         await self._cancel_loop_task(self._task_heartbeat_loop_task)
-        await self._cancel_loop_task(self._state_reducer_loop_task)
-        await self._cancel_loop_task(self._reducer_metrics_snapshot_loop_task)
+        await self._cancel_loop_task(self._state_event_inbox_loop_task)
+        await self._cancel_loop_task(self._state_event_inbox_metrics_loop_task)
         archive_active = list(self._archive_workers)
         for task in archive_active:
             task.cancel()
@@ -6354,7 +6354,7 @@ class TaskManager(
             db,
             task,
             "stage_worker_terminal_event_missing",
-            f"检测到阶段终态事件漏信，已补投 reducer 事件: {stage_name}",
+            f"检测到阶段终态事件漏信，已补投 state event inbox 事件: {stage_name}",
             level="warning",
             stage_name=stage_name,
             payload={

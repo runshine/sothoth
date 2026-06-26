@@ -92,7 +92,7 @@ runtime_policy:
 
 ## 验证覆盖
 
-- 生命周期：阶段完成后切换到流式尾部的 reducer 序列。
+- 生命周期：阶段完成后切换到流式尾部的状态事件收件箱收口序列。
 - 调度行为：`binary-to-source -> entry-analyse -> dataflow-vuln-scan` 的逐级派生。
 - 状态同步：任务详情、阶段摘要、手工操作状态与尾部阶段快照一致。
 - 重试逻辑：尾部失败项按 lineage 清理后代结果，避免整阶段回滚。
@@ -116,7 +116,7 @@ python /app/scripts/normalize_legacy_dataflow_names.py
 
 推荐按以下顺序灰度上线 `mixed_streaming`：
 
-1. 保持 `runtime_policy.pipeline_mode: barrier` 部署新版本，先验证服务启动、路由、worker、reducer 正常。
+1. 保持 `runtime_policy.pipeline_mode: barrier` 部署新版本，先验证服务启动、路由、worker、state_event_inbox 正常。
 2. 选择单个低风险项目，通过项目级配置切换 `pipeline_mode: mixed_streaming`，不要直接改全局默认值。
 3. 先跑一批源码任务，重点观察 `entry-analyse / dataflow-vuln-scan` 是否出现按 item 流式推进。
 4. 验证任务详情、`stage-items`、`orchestration-observability` 三个视图对尾部运行态与失败态的展示是否一致。

@@ -2353,7 +2353,7 @@ class TaskReadModelServiceMixin:
             "archive_dispatch": "归档分发 loop",
             "archive_runtime_reconcile": "归档 reconcile loop",
             "state_repair_reconcile": "状态修复 loop",
-            "state_reducer": "状态归约 reducer loop",
+            "state_event_inbox": "状态事件 inbox loop",
             "readless_reconcile": "readless reconcile loop",
         }.get(str(loop_key or "").strip(), loop_key)
 
@@ -2376,7 +2376,7 @@ class TaskReadModelServiceMixin:
             "archive_runtime_reconcile": getattr(self, "_archive_runtime_reconcile_task", None),
             "stage_item_sync_reconcile": getattr(self, "_stage_item_sync_reconcile_task", None),
             "state_repair_reconcile": getattr(self, "_state_repair_reconcile_task", None),
-            "state_reducer": getattr(self, "_state_reducer_loop_task", None),
+            "state_event_inbox": getattr(self, "_state_event_inbox_loop_task", None),
             "readless_reconcile": getattr(self, "_readless_reconcile_task", None),
         }
         loops: list[dict[str, Any]] = []

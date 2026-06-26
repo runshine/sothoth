@@ -125,8 +125,8 @@ def list_tasks(
     )
 
 
-@router.get("/reducer/events", response_model=BinarySecurityReducerEventPageResponse)
-def list_reducer_events(
+@router.get("/state-events", response_model=BinarySecurityReducerEventPageResponse)
+def list_state_events(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=10, le=1000),
     sort_by: str = Query("processed_at"),

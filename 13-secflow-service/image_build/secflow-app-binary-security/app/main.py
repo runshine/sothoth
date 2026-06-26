@@ -38,8 +38,10 @@ from app.observability import (
 from app.probe_server import ThreadedProbeServer
 from app.runtime_health import collect_probe_snapshot, mark_startup_state
 from app.service.http_client import close_all_async_clients
-from app.service.reducer_metrics_snapshot import close_reducer_metrics_snapshot_store
-from app.service.reducer_metrics_snapshot import get_reducer_metrics_snapshot_store
+from app.service.state_event_inbox_metrics_snapshot import (
+    close_state_event_inbox_metrics_snapshot_store,
+    get_state_event_inbox_metrics_snapshot_store,
+)
 from app.service.registry import get_registry_service
 from app.service.task_queue import close_task_queue
 from app.service.task_manager import get_task_manager
@@ -119,7 +121,7 @@ def _mark_external_probe_startup_complete() -> None:
 def _service_role() -> str:
     raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or ""
     normalized = str(raw_role).strip().lower()
-    return normalized if normalized in {"api", "worker", "reducer"} else "all"
+    return normalized if normalized in {"api", "worker"} else "all"
 
 
 def _scheduler_enabled() -> bool:
@@ -129,14 +131,14 @@ def _scheduler_enabled() -> bool:
     role = _service_role()
     if role == "api":
         return False
-    if role in {"worker", "reducer"}:
+    if role == "worker":
         return True
     return bool(get_config().scheduler.enabled)
 
 
 def _registry_enabled() -> bool:
     role = _service_role()
-    if role in {"worker", "reducer"}:
+    if role == "worker":
         return False
     return bool(get_config().registry.enabled)
 
@@ -338,7 +340,7 @@ async def lifespan(_: FastAPI):
         if _registry_enabled():
             await get_registry_service().stop()
         await close_task_queue()
-        await close_reducer_metrics_snapshot_store()
+        await close_state_event_inbox_metrics_snapshot_store()
         await close_all_async_clients()
     except Exception as exc:
         logger.warning("Binary Security 服务关闭警告: %s", exc)
@@ -424,7 +426,7 @@ async def prometheus_http_middleware(request: FastAPIRequest, call_next):
 @app.middleware("http")
 async def service_role_route_guard(request: FastAPIRequest, call_next):
     role = _service_role()
-    if role in {"worker", "reducer"}:
+    if role == "worker":
         path = request.url.path
         allowed = (
             path in {
@@ -432,7 +434,7 @@ async def service_role_route_guard(request: FastAPIRequest, call_next):
                 "/api/app/binary-security/ready",
                 "/api/app/binary-security/metrics",
                 "/api/app/binary-security/metrics/aggregate",
-                "/api/app/binary-security/metrics/reducer",
+                "/api/app/binary-security/metrics/state-events",
                 "/metrics",
                 "/openapi.json",
             }
@@ -500,27 +502,25 @@ async def metrics_ai_summary_endpoint():
     return build_ai_summary(rows, coverage_text="编排器 AI 指标聚合，覆盖调度、状态同步与下游协同相关调用。")
 
 
-@app.get("/api/app/binary-security/metrics/reducer", include_in_schema=False)
-async def reducer_metrics_endpoint():
+@app.get("/api/app/binary-security/metrics/state-events", include_in_schema=False)
+async def state_event_metrics_endpoint():
     started = time.perf_counter()
     try:
         fallback_payload = None
-        if _service_role() == "reducer":
-            fallback_payload = render_metrics()[0].decode("utf-8", errors="ignore")
-        payload, content_type = await get_reducer_metrics_snapshot_store().render_metrics(
+        payload, content_type = await get_state_event_inbox_metrics_snapshot_store().render_metrics(
             fallback_payload=fallback_payload
         )
     except Exception as exc:
         observe_downstream_request(
-            service="binary_security_reducer",
+            service="binary_security_state_event_inbox",
             method="GET",
             operation="metrics_snapshot",
             status="error",
             duration_seconds=None,
         )
-        raise HTTPException(status_code=502, detail=f"Reducer metrics snapshot failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"State event inbox metrics snapshot failed: {exc}") from exc
     observe_downstream_request(
-        service="binary_security_reducer",
+        service="binary_security_state_event_inbox",
         method="GET",
         operation="metrics_snapshot",
         status="200",

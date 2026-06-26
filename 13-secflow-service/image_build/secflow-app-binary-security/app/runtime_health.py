@@ -25,7 +25,7 @@ _startup_state: dict[str, Any] = {
 def _service_role() -> str:
     raw_role = os.environ.get("SECFLOW_BINARY_SECURITY_ROLE") or ""
     normalized = str(raw_role).strip().lower()
-    return normalized if normalized in {"api", "worker", "reducer"} else "all"
+    return normalized if normalized in {"api", "worker"} else "all"
 
 
 def mark_startup_state(
@@ -88,7 +88,7 @@ def _scheduler_readiness() -> tuple[bool, dict[str, Any]]:
     }
 
 
-def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
+def _owner_readiness() -> tuple[bool, dict[str, Any]]:
     scheduler_enabled = bool(get_config().scheduler.enabled)
     runtime = get_task_manager().runtime_status()
     loops = runtime.get("loops") if isinstance(runtime.get("loops"), dict) else {}
@@ -97,7 +97,7 @@ def _reducer_readiness() -> tuple[bool, dict[str, Any]]:
         return True, {"enabled": False, "running": False, "loops": loops, "loop_details": loop_details}
 
     running = bool(runtime.get("running"))
-    required_loops = ("state_reducer", "reducer_metrics_snapshot")
+    required_loops = ("state_event_inbox", "state_event_inbox_metrics")
     missing = [loop_name for loop_name in required_loops if not _loop_ready(loop_name, runtime)]
     lease_capable = bool(runtime.get("lease_auditor_active"))
     return running and not missing and lease_capable, {
@@ -118,17 +118,15 @@ def collect_probe_snapshot() -> dict[str, object]:
         "process": {"ok": True, "detail": "alive"},
         "database": {"ok": bool(startup.get("database_ready")), "detail": {"cached": True}},
         "auth": {"ok": bool(startup.get("auth_ready")), "detail": {"cached": True}},
-        "registry": {"ok": bool(startup.get("registry_ready") or role in {"worker", "reducer"}), "detail": {"cached": True}},
+        "registry": {"ok": bool(startup.get("registry_ready") or role == "worker"), "detail": {"cached": True}},
     }
 
     scheduler_ok = True
-    reducer_ok = True
     if role in {"worker", "all"}:
         scheduler_ok, scheduler_detail = _scheduler_readiness()
         checks["scheduler"] = {"ok": scheduler_ok, "detail": scheduler_detail}
-    if role in {"reducer", "all"}:
-        reducer_ok, reducer_detail = _reducer_readiness()
-        checks["reducer"] = {"ok": reducer_ok, "detail": reducer_detail}
+    owner_ok, owner_detail = _owner_readiness()
+    checks["owner"] = {"ok": owner_ok, "detail": owner_detail}
 
     startup_ready = bool(startup.get("startup_ready"))
     shutting_down = bool(startup.get("shutting_down"))
@@ -136,8 +134,6 @@ def collect_probe_snapshot() -> dict[str, object]:
     readiness_ok = startup_ready and not shutting_down
     if role in {"worker", "all"}:
         readiness_ok = readiness_ok and scheduler_ok
-    if role in {"reducer", "all"}:
-        readiness_ok = readiness_ok and reducer_ok
     if role == "api":
         readiness_ok = readiness_ok and bool(startup.get("auth_ready"))
 

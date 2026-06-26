@@ -1653,13 +1653,26 @@ class TaskRuntimeServiceMixin:
                     self._tail_requires_execution_takeover(db, task)
                     or self._tail_has_runnable_unbound_work(db, task)
                 )
-            if runnable_work_exists and self._repair_running_lease_invariant(
-                db,
-                task,
-                reason="stale_running_without_active_runtime_lease",
-                stage_name=current_stage_name or None,
-                event_payload={"source": "reclaim_stale_running"},
-            ):
+            if runnable_work_exists:
+                task_manager_module.observe_running_requeue("stale_running_without_active_runtime_lease")
+                self._record_event(
+                    db,
+                    task,
+                    "running_without_active_lease_requeued",
+                    "检测到 running 任务缺少有效租约，但当前仍有可执行工作，已保留 running 并重新排队等待 owner 接管",
+                    level="warning",
+                    stage_name=current_stage_name or None,
+                    payload={
+                        "reason": "stale_running_without_active_runtime_lease",
+                        "runtime_phase": self._task_runtime_phase(task),
+                        "previous_task_status": "running",
+                        "runtime_lease_owner": str(getattr(lease, "owner_instance_id", "") or "").strip() or None if lease is not None else None,
+                        "runtime_lease_expires_at": getattr(lease, "lease_expires_at", None) if lease is not None else None,
+                        "repair_action": "running_requeue_owned_execution",
+                        "source": "reclaim_stale_running",
+                    },
+                )
+                self._enqueue_task(task.id)
                 reclaimed = True
                 continue
             reference_time = task.updated_at or task.dispatch_started_at or task.started_at
@@ -2410,7 +2423,7 @@ class TaskRuntimeServiceMixin:
                     db,
                     task,
                     "stage_worker_terminal_observed",
-                    f"阶段 worker 已完成，等待 reducer 串行收口: {stage_name}",
+                    f"阶段 worker 已完成，等待 state event inbox 串行收口: {stage_name}",
                     stage_name=stage_name,
                     payload={"status": status},
                 )
