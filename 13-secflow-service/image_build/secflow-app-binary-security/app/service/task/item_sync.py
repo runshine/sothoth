@@ -713,6 +713,41 @@ class TaskItemSyncServiceMixin:
             return "observation_only", "policy"
         return "state_write_skipped", "state_transition"
 
+    def _should_apply_authoritative_downstream_state(
+        self: TaskManager,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any] | None,
+        mapped_status: str | None,
+        apply_state: bool,
+        binding_mismatch: bool = False,
+        replacement_state: dict[str, Any] | None = None,
+    ) -> bool:
+        if not apply_state:
+            return False
+        if mapped_status not in {
+            "pending",
+            "queued",
+            "dispatching",
+            "running",
+            "success",
+            "partial_success",
+            "failed",
+            "cancelled",
+            "downstream_missing",
+        }:
+            return False
+        if binding_mismatch:
+            return False
+        if not str(getattr(item, "downstream_task_id", "") or "").strip():
+            return False
+        if not isinstance(payload, dict) or not self._payload_matches_current_child(item, payload):
+            return False
+        replacement = replacement_state or self._replacement_in_progress_state(item)
+        if replacement.get("replacement_in_progress") or replacement.get("binding_cleared"):
+            return False
+        return True
+
     def _refresh_stage_item_downstream_observation(
         self: TaskManager,
         item: BinarySecurityStageItem,
@@ -1498,6 +1533,15 @@ class TaskItemSyncServiceMixin:
                         or str(before_status or "").strip().lower() in {"queued", "running", "dispatching", "cancelled"}
                         or mapped_status == "downstream_missing"
                     )
+                authoritative_apply = self._should_apply_authoritative_downstream_state(
+                    item,
+                    payload=payload,
+                    mapped_status=mapped_status,
+                    apply_state=observed_apply_state,
+                    replacement_state=self._replacement_in_progress_state(item),
+                )
+                if authoritative_apply:
+                    observed_apply_state = True
                 observe_downstream_reconcile_observation(
                     stage=item_stage_name,
                     service=item_downstream_service,
@@ -2066,7 +2110,7 @@ class TaskItemSyncServiceMixin:
                     skipped_count += 1
                     continue
                 should_apply = observed_apply_state and mapped_status != before_status
-                if should_apply and mapped_status in {"pending", "queued", "running"}:
+                if should_apply and mapped_status in {"pending", "queued", "dispatching", "running"}:
                     should_apply = self._should_apply_downstream_intermediate_status(
                         item,
                         mapped_status=mapped_status,
@@ -2122,6 +2166,44 @@ class TaskItemSyncServiceMixin:
                     touched_stages.add(item.stage_name)
                     stage_takeover_candidates.add(str(item.stage_name or "").strip())
                     synced_count += 1
+                    if mapped_status in {"pending", "queued", "dispatching", "running"} and mapped_status != before_status:
+                        self._record_event(
+                            db,
+                            task,
+                            "downstream_intermediate_state_applied",
+                            "当前 authoritative child 的中间态已回写到父任务子项",
+                            stage_name=item.stage_name,
+                            item=item,
+                            payload={
+                                "downstream_service": item.downstream_service,
+                                "downstream_task_id": item.downstream_task_id,
+                                "before_status": before_status,
+                                "after_status": mapped_status,
+                                "status_raw": downstream_status,
+                                "mapped_status": mapped_status,
+                                "state_applied": True,
+                                "reason": "authoritative_current_child_intermediate_state",
+                            },
+                        )
+                        if not apply_state:
+                            self._record_event(
+                                db,
+                                task,
+                                "downstream_intermediate_state_write_unblocked",
+                                "当前 authoritative child 中间态原本会被 observation-only 阻断，现已放开回写",
+                                stage_name=item.stage_name,
+                                item=item,
+                                payload={
+                                    "downstream_service": item.downstream_service,
+                                    "downstream_task_id": item.downstream_task_id,
+                                    "before_status": before_status,
+                                    "after_status": mapped_status,
+                                    "status_raw": downstream_status,
+                                    "mapped_status": mapped_status,
+                                    "state_applied": True,
+                                    "reason": "authoritative_current_child_intermediate_state",
+                                },
+                            )
                     if recovery_applied:
                         self._record_event(
                             db,
@@ -2427,18 +2509,53 @@ class TaskItemSyncServiceMixin:
             else:
                 self._refresh_stage_run_from_items(db, task, current_stage)
         if touched_stages:
-            await self._run_task_layer_reconcile_signal(
-                db,
-                task,
-                signal={
-                    "source_event_type": "downstream_status_observed",
-                    "reconcile_reason": "system_analysis_sync_next_stage_active_without_owner"
-                    if "system_analysis" in stage_takeover_candidates
-                    else "downstream_sync",
-                    "stage_name": "system_analysis" if "system_analysis" in stage_takeover_candidates else str(task.current_stage or "").strip() or None,
-                    "fact_applied": True,
-                },
+            reconcile_reason = (
+                "system_analysis_sync_next_stage_active_without_owner"
+                if "system_analysis" in stage_takeover_candidates
+                else "downstream_sync"
             )
+            reconcile_stage_name = (
+                "system_analysis"
+                if "system_analysis" in stage_takeover_candidates
+                else str(task.current_stage or "").strip() or None
+            )
+            signal = {
+                "source_event_type": "downstream_status_observed",
+                "reconcile_reason": reconcile_reason,
+                "stage_name": reconcile_stage_name,
+                "fact_applied": True,
+            }
+            if (
+                self._task_runtime_owner_matches_current_instance(db, task)
+                or self._task_runtime_transition_guard_owned_by_current_instance(task)
+            ):
+                await self._run_task_layer_reconcile_signal(
+                    db,
+                    task,
+                    signal=signal,
+                )
+            else:
+                self._request_task_layer_reconcile(
+                    db,
+                    task,
+                    stage_name=reconcile_stage_name,
+                    source_event_type="downstream_status_observed",
+                    state_event_id=None,
+                    reconcile_reason=reconcile_reason,
+                    message="下游状态事实已更新，已转交 owner worker 串行收口任务主状态",
+                    event_type="owned_execution_takeover_requeued",
+                    event_level="info",
+                    event_payload={
+                        "sync_source": "sync_downstream_status",
+                        "touched_stages": sorted(
+                            {
+                                str(current_stage or "").strip()
+                                for current_stage in touched_stages
+                                if str(current_stage or "").strip()
+                            }
+                        ),
+                    },
+                )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
         db.commit()
         response_synced_count = synced_count if apply_state else min(synced_count, len(touched_stages))

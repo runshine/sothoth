@@ -53,7 +53,7 @@ class TaskQueryServiceMixin:
         self: TaskManager,
         db: Session,
         *,
-        project_id: str,
+        project_id: str | None,
         status: str | None = None,
         task_type: str | None = None,
         pipeline_profile: str | None = None,
@@ -64,6 +64,7 @@ class TaskQueryServiceMixin:
         page_size: int = 50,
     ) -> BinarySecurityTaskListResponse:
         started = time.perf_counter()
+        normalized_project_id = str(project_id or "").strip() or None
         normalized_task_type = self._validate_task_type(task_type) if task_type else None
         normalized_pipeline_profile = (
             self._validate_pipeline_profile(normalized_task_type or TASK_TYPE_SOURCE, pipeline_profile)
@@ -75,7 +76,9 @@ class TaskQueryServiceMixin:
         stage_durations: dict[str, float] = {}
         try:
             stage_started = time.perf_counter()
-            base_query = db.query(BinarySecurityTask).filter(BinarySecurityTask.project_id == project_id)
+            base_query = db.query(BinarySecurityTask)
+            if normalized_project_id:
+                base_query = base_query.filter(BinarySecurityTask.project_id == normalized_project_id)
             if normalized_task_type:
                 if normalized_task_type == "binary":
                     base_query = base_query.filter(
@@ -176,11 +179,11 @@ class TaskQueryServiceMixin:
             stage_started = time.perf_counter()
             queue_info = self._load_task_list_cached_value(
                 cache_group="queue_info",
-                project_id=project_id,
+                project_id=normalized_project_id or "__all__",
                 task_type=normalized_task_type,
                 pipeline_profile=normalized_pipeline_profile,
                 ttl_seconds=3.0,
-                loader=lambda: self._build_queue_info(db, project_id=project_id),
+                loader=lambda: self._build_queue_info(db, project_id=normalized_project_id),
                 fallback={"running_count": 0, "queued_count": 0, "pending_positions": {}, "last_reconcile_at": None},
             )
             observe_task_list_query_stage(
@@ -200,19 +203,23 @@ class TaskQueryServiceMixin:
             stage_durations["service_config"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
-            project_stats = self._load_task_list_cached_value(
-                cache_group="project_stats",
-                project_id=project_id,
-                task_type=normalized_task_type,
-                pipeline_profile=normalized_pipeline_profile,
-                ttl_seconds=5.0,
-                loader=lambda: self._build_project_stats_sql(
-                    db,
-                    project_id=project_id,
+            project_stats = (
+                self._load_task_list_cached_value(
+                    cache_group="project_stats",
+                    project_id=normalized_project_id,
                     task_type=normalized_task_type,
                     pipeline_profile=normalized_pipeline_profile,
-                ),
-                fallback=BinarySecurityProjectStats(total=0),
+                    ttl_seconds=5.0,
+                    loader=lambda: self._build_project_stats_sql(
+                        db,
+                        project_id=normalized_project_id,
+                        task_type=normalized_task_type,
+                        pipeline_profile=normalized_pipeline_profile,
+                    ),
+                    fallback=BinarySecurityProjectStats(total=0),
+                )
+                if normalized_project_id
+                else BinarySecurityProjectStats(total=0)
             )
             observe_task_list_query_stage(
                 stage="project_stats",
@@ -222,19 +229,23 @@ class TaskQueryServiceMixin:
             stage_durations["project_stats"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
-            project_stage_aggregates = self._load_task_list_cached_value(
-                cache_group="project_stage_aggregates",
-                project_id=project_id,
-                task_type=normalized_task_type,
-                pipeline_profile=normalized_pipeline_profile,
-                ttl_seconds=5.0,
-                loader=lambda: self._build_project_stage_aggregates_sql(
-                    db,
-                    project_id=project_id,
+            project_stage_aggregates = (
+                self._load_task_list_cached_value(
+                    cache_group="project_stage_aggregates",
+                    project_id=normalized_project_id,
                     task_type=normalized_task_type,
                     pipeline_profile=normalized_pipeline_profile,
-                ),
-                fallback=[],
+                    ttl_seconds=5.0,
+                    loader=lambda: self._build_project_stage_aggregates_sql(
+                        db,
+                        project_id=normalized_project_id,
+                        task_type=normalized_task_type,
+                        pipeline_profile=normalized_pipeline_profile,
+                    ),
+                    fallback=[],
+                )
+                if normalized_project_id
+                else []
             )
             observe_task_list_query_stage(
                 stage="project_stage_aggregates",
@@ -279,6 +290,7 @@ class TaskQueryServiceMixin:
                 page=page,
                 page_size=page_size,
                 total_pages=max(1, (total + page_size - 1) // page_size),
+                scope="current" if normalized_project_id else "all",
                 running_count=queue_info["running_count"],
                 queued_count=queue_info["queued_count"],
                 max_concurrent_tasks=service_config.max_concurrent_tasks,
@@ -294,8 +306,8 @@ class TaskQueryServiceMixin:
             total_duration = time.perf_counter() - started
             if result != "success":
                 self._log_task_list_query(
-                    project_id=project_id,
-                    task_type=metrics_task_type,
+                project_id=normalized_project_id or "__all__",
+                task_type=metrics_task_type,
                     page=page,
                     page_size=page_size,
                     total=None,

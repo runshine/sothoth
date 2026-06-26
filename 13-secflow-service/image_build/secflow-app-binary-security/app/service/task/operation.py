@@ -1317,7 +1317,7 @@ class TaskOperationServiceMixin:
                     token=self._service_token(),
                     record_request_event=False,
                     record_noop_events=False,
-                    apply_state=(target_stage != "entry_analysis"),
+                    apply_state=True,
                 )
             except AttributeError:
                 matched_items = {
@@ -1416,7 +1416,6 @@ class TaskOperationServiceMixin:
                 retry_items = non_success_retry_items
         if not retry_items:
             raise ValidationError("失败项重试未找到目标阶段子任务")
-        sync_apply_state = target_stage != "entry_analysis"
         try:
             await self.sync_downstream_status(
                 db,
@@ -1427,28 +1426,10 @@ class TaskOperationServiceMixin:
                 token=self._service_token(),
                 record_request_event=False,
                 record_noop_events=False,
-                apply_state=sync_apply_state,
+                apply_state=True,
             )
         except AttributeError:
             pass
-        if target_stage == "entry_analysis":
-            for item in retry_items:
-                result = self._load_stage_item_result_payload(item)
-                sync_observation = dict(result.get("sync_observation") or {})
-                item.status = "pending"
-                item.finished_at = None
-                self._mark_stage_item_sync_observation(
-                    item,
-                    sync_status=self._string_or_none(sync_observation.get("sync_status")) or "observed",
-                    synced_at=task_manager_module._now(),
-                    error_message=None,
-                    http_status=None,
-                    error_type=None,
-                    status_raw=None,
-                    mapped_status=None,
-                    downstream_status=None,
-                    state_applied=False,
-                )
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         validation_affected_stages = list(affected_stages)

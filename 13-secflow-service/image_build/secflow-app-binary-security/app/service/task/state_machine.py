@@ -923,7 +923,11 @@ class TaskStateMachineMixin:
             failure_category=snapshot.get("failure_category"),
         ):
             return False
-        if normalized_status in {"cancelled", "downstream_missing"}:
+        if normalized_status == "downstream_missing":
+            return False
+        if normalized_status == "cancelled":
+            return True
+        if normalized_status == "failed":
             return True
         failure_code = str(snapshot.get("failure_code") or "").strip().lower()
         failure_category = str(snapshot.get("failure_category") or "").strip().lower()
@@ -958,16 +962,23 @@ class TaskStateMachineMixin:
                 }
         if (
             stage_run is not None
-            and self._stage_ready_to_escalate_failure(workflow_snapshots, stage_name)
             and self._should_terminalize_parent_for_failed_stage(task, stage_run)
         ):
             snapshot = self._stage_failure_snapshot(task, stage_run)
+            failure_code = snapshot.get("failure_code")
+            failure_category = snapshot.get("failure_category")
+            failure_message = snapshot.get("failure_message") or snapshot.get("error") or stage_run.last_error
+            failure_message_text = str(failure_message or "").strip().lower()
+            if not failure_code and "owner_lost_retry_exhausted" in failure_message_text:
+                failure_code = "owner_lost_retry_exhausted"
+            if not failure_category and failure_code == "owner_lost_retry_exhausted":
+                failure_category = "infrastructure"
             return {
                 "stage_name": stage_name,
                 "stage_run": stage_run,
-                "failure_code": snapshot.get("failure_code"),
-                "failure_category": snapshot.get("failure_category"),
-                "failure_message": snapshot.get("failure_message") or snapshot.get("error") or stage_run.last_error,
+                "failure_code": failure_code,
+                "failure_category": failure_category,
+                "failure_message": failure_message,
                 "reason": "stage_run_failed",
             }
         items = self._stage_items(db, task.id, stage_name)
@@ -981,6 +992,8 @@ class TaskStateMachineMixin:
             return None
         aggregate_status = self._aggregate_item_statuses(normalized_statuses)
         if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
+            return None
+        if aggregate_status == "downstream_missing":
             return None
         snapshot = self._stage_failure_snapshot(task, stage_run)
         if aggregate_status == "failed":
@@ -1064,6 +1077,8 @@ class TaskStateMachineMixin:
                 continue
             aggregate_status = self._aggregate_item_statuses(normalized_statuses)
             if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
+                continue
+            if aggregate_status == "downstream_missing":
                 continue
             if aggregate_status == "failed":
                 snapshot = self._stage_failure_snapshot(task, stage_run)
@@ -1154,6 +1169,8 @@ class TaskStateMachineMixin:
                 continue
             aggregate_status = self._aggregate_item_statuses(normalized_statuses)
             if aggregate_status not in {"failed", "cancelled", "downstream_missing", "partial_success"}:
+                continue
+            if aggregate_status == "downstream_missing":
                 continue
             if aggregate_status == "failed":
                 snapshot = self._stage_failure_snapshot(task, stage_run)
@@ -1981,6 +1998,8 @@ class TaskStateMachineMixin:
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             finished_at=None,
             last_error=None,
+            preserve_running_event_type="task_resume_kept_running_due_to_owned_execution",
+            preserve_running_message=f"任务继续进入下一阶段并保持 owned execution 运行语义: {decision.next_stage}",
         )
         task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
         self._clear_task_abnormal_reason_snapshot(db, task)
@@ -2781,8 +2800,11 @@ class TaskStateMachineMixin:
 
     def _refresh_task_status_after_sync(self: TaskManager, db: Session, task: BinarySecurityTask) -> None:
         current_status = str(task.status or "").strip()
+        skip_running_lease_invariant_repair = False
 
         def _normalize_running_lease_invariant(reason: str) -> bool:
+            if skip_running_lease_invariant_repair:
+                return False
             return self._repair_running_lease_invariant(
                 db,
                 task,
@@ -2805,17 +2827,30 @@ class TaskStateMachineMixin:
             for run in stage_runs
             )
         ):
-            self._apply_task_main_state_update(
+            failure_run = next(
+                (
+                    run for run in stage_runs
+                    if str(run.status or "").strip() == "failed"
+                    and str(getattr(run, "stage_name", "") or "").strip() == str(task.current_stage or "").strip()
+                    and self._is_terminal_business_stage_failure(task, run)
+                ),
+                None,
+            )
+            failure_snapshot = self._stage_failure_snapshot(task, failure_run)
+            self._finalize_task_after_authoritative_failure(
                 db,
                 task,
-                source="state_machine",
-                reason="当前阶段出现终态业务失败，任务回到待执行等待后续处理",
-                status="pending",
-                stage_name=task.current_stage,
-                finished_at=None,
-                last_error=None,
+                failure_ctx={
+                    "stage_name": getattr(failure_run, "stage_name", None) or task.current_stage,
+                    "stage_run": failure_run,
+                    "failure_code": failure_snapshot.get("failure_code"),
+                    "failure_category": failure_snapshot.get("failure_category"),
+                    "failure_message": failure_snapshot.get("failure_message") or failure_snapshot.get("error") or getattr(failure_run, "last_error", None),
+                    "reason": "current_stage_business_failure_after_sync",
+                },
+                previous_status=current_status,
+                event_type="dispatching_state_force_terminalized",
             )
-            self._clear_task_abnormal_reason_snapshot(db, task)
             return
         if any(str(run.status or "").strip() == "running" for run in stage_runs):
             task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
@@ -2860,6 +2895,26 @@ class TaskStateMachineMixin:
                 else "dispatching_state_force_terminalized",
             )
             return
+        if authoritative_failure is not None:
+            failure_code = str(authoritative_failure.get("failure_code") or "").strip().lower()
+            failure_category = str(authoritative_failure.get("failure_category") or "").strip().lower()
+            failure_message = str(authoritative_failure.get("failure_message") or "").strip().lower()
+            if (
+                failure_code != "owner_lost_retry_exhausted"
+                and "owner_lost" not in failure_code
+                and "owner pod lost" not in failure_message
+                and "task owner pod lost" not in failure_message
+                and failure_category != "infrastructure"
+            ):
+                skip_running_lease_invariant_repair = True
+                self._finalize_task_after_authoritative_failure(
+                    db,
+                    task,
+                    failure_ctx=authoritative_failure,
+                    previous_status=current_status,
+                    event_type="dispatching_state_force_terminalized",
+                )
+                return
         if current_status not in TASK_TERMINAL_STATUSES:
             if self._recover_streaming_parent_running_state_locked(
                 db,
@@ -2879,6 +2934,8 @@ class TaskStateMachineMixin:
                 stage_name=task.current_stage,
                 finished_at=None,
                 last_error=None,
+                preserve_running_event_type="task_sync_pending_downgrade_suppressed_by_owner_guard",
+                preserve_running_message="权威阶段记录暂未齐全，但任务仍处于 owner 保护窗口，保持 running",
             )
             self._clear_task_failure_state(task)
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -2929,6 +2986,7 @@ class TaskStateMachineMixin:
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 finished_at=None,
                 clear_runtime_owner=False,
+                downgrade_reason_category="retry_requeue",
             )
             return True
         active_cancel_operation = self._active_cancel_operation(db, task.id)
@@ -3106,6 +3164,7 @@ class TaskStateMachineMixin:
                 finished_at=None,
                 last_error=None,
                 clear_runtime_owner=False,
+                downgrade_reason_category="stale_reclaim",
             )
             self._clear_task_failure_state(task)
             self._clear_task_abnormal_reason_snapshot(db, task)
@@ -3313,6 +3372,7 @@ class TaskStateMachineMixin:
             and not self._is_streaming_tail_stage(task, failed_stage_run.stage_name)
         ):
             failed_stage_name = str(failed_stage_run.stage_name or task.current_stage or "").strip() or None
+            failed_stage_status = str(getattr(failed_stage_run, "status", "") or "").strip().lower()
             if self._stage_ready_to_escalate_failure(workflow_snapshots, failed_stage_name or "") and self._try_finalize_failed_stage(
                 db,
                 task,
@@ -3330,6 +3390,8 @@ class TaskStateMachineMixin:
                 error_type=self._stage_item_sync_error_type_value(item),
                 item=item,
             ) for item in failed_items)
+            if failed_stage_status == "downstream_missing":
+                return False
             if recoverable_owner_lost:
                 _apply_retry_reopen_patch(
                     status="pending",
@@ -3395,16 +3457,21 @@ class TaskStateMachineMixin:
                     stage_name=task.current_stage,
                 )
                 return True
-            self._apply_lease_loss_requeue_state(
+            failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+            self._finalize_task_after_authoritative_failure(
                 db,
                 task,
-                reason="失败阶段等待重新接管，任务回到待执行",
-                status="pending",
-                stage_name=failed_stage_run.stage_name or task.current_stage,
-                finished_at=None,
-                last_error=None,
+                failure_ctx={
+                    "stage_name": failed_stage_run.stage_name or task.current_stage,
+                    "stage_run": failed_stage_run,
+                    "failure_code": failure_snapshot.get("failure_code"),
+                    "failure_category": failure_snapshot.get("failure_category"),
+                    "failure_message": failure_snapshot.get("failure_message") or failure_snapshot.get("error") or getattr(failed_stage_run, "last_error", None),
+                    "reason": "failed_stage_run_recovery_suppressed",
+                },
+                previous_status=current_status,
+                event_type="dispatching_state_force_terminalized",
             )
-            self._clear_task_abnormal_reason_snapshot(db, task)
             return True
         if (
             failed_stage_run is not None
@@ -3470,6 +3537,9 @@ class TaskStateMachineMixin:
             and not had_stage_retry_mode
             and not had_task_retry_mode
         ):
+            failed_stage_status = str(getattr(failed_stage_run, "status", "") or "").strip().lower()
+            if failed_stage_status == "downstream_missing":
+                return False
             if not self._stage_ready_to_escalate_failure(workflow_snapshots, str(failed_stage_run.stage_name or "").strip()):
                 has_active_work = any(
                     bool(snapshot.get("has_active_items"))
@@ -3477,15 +3547,21 @@ class TaskStateMachineMixin:
                     for snapshot in workflow_snapshots
                 )
                 if has_active_work or self._task_has_resumable_execution_path(db, task, stage_runs=stage_runs):
-                    _apply_retry_reopen_patch(
-                        status="running" if has_active_work else "pending",
-                        reason="失败阶段尚未满足升级失败条件，任务保持活跃",
-                        stage_name=self._workflow_blocked_on_stage(task, workflow_snapshots) or failed_stage_run.stage_name or task.current_stage,
-                        runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                        finished_at=None,
-                        last_error=None,
+                    failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx={
+                            "stage_name": failed_stage_run.stage_name or task.current_stage,
+                            "stage_run": failed_stage_run,
+                            "failure_code": failure_snapshot.get("failure_code"),
+                            "failure_category": failure_snapshot.get("failure_category"),
+                            "failure_message": failure_snapshot.get("failure_message") or failure_snapshot.get("error") or getattr(failed_stage_run, "last_error", None),
+                            "reason": "failed_stage_run_active_recovery_suppressed",
+                        },
+                        previous_status=current_status,
+                        event_type="dispatching_state_force_terminalized",
                     )
-                    self._clear_task_abnormal_reason_snapshot(db, task)
                     return True
             failed_stage_name = failed_stage_run.stage_name or task.current_stage
             if self._is_streaming_tail_stage(task, failed_stage_run.stage_name) and self._tail_requires_execution_takeover(db, task):
@@ -3500,13 +3576,17 @@ class TaskStateMachineMixin:
                 return True
             if self._task_has_resumable_execution_path(db, task, stage_runs=stage_runs):
                 next_runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
-                self._apply_lease_loss_requeue_state(
+                self._apply_task_main_state_update(
                     db,
                     task,
+                    source="state_machine",
                     reason="失败阶段等待重新接管，任务保持待执行",
                     status="pending",
                     stage_name=failed_stage_name,
+                    runtime_phase=next_runtime_phase,
                     finished_at=None,
+                    preserve_running_event_type="task_running_state_preserved_for_downstream_resume",
+                    preserve_running_message=f"失败阶段仍存在可恢复执行路径，保持 running 等待继续推进: {failed_stage_name}",
                 )
                 return True
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
@@ -3595,6 +3675,40 @@ class TaskStateMachineMixin:
                 or self._stage_has_real_runnable_work(db, task, next_stage)
             )
         ):
+            if (
+                failed_stage_run is not None
+                and not had_stage_retry_mode
+                and not had_task_retry_mode
+            ):
+                failed_stage_status = str(getattr(failed_stage_run, "status", "") or "").strip().lower()
+                failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
+                recoverable_owner_lost = any(
+                    self._owner_lost_retry_exhausted(task, item) is False
+                    and self._is_owner_lost_recoverable_failure(
+                        failure_message=str(item.error_message or "").strip() or None,
+                        failure_category=self._stage_failure_snapshot(task, failed_stage_run).get("failure_category"),
+                        error_type=self._stage_item_sync_error_type_value(item),
+                        item=item,
+                    )
+                    for item in failed_items
+                )
+                if failed_stage_status != "downstream_missing" and not recoverable_owner_lost:
+                    failure_snapshot = self._stage_failure_snapshot(task, failed_stage_run)
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx={
+                            "stage_name": failed_stage_run.stage_name or task.current_stage,
+                            "stage_run": failed_stage_run,
+                            "failure_code": failure_snapshot.get("failure_code"),
+                            "failure_category": failure_snapshot.get("failure_category"),
+                            "failure_message": failure_snapshot.get("failure_message") or failure_snapshot.get("error") or getattr(failed_stage_run, "last_error", None),
+                            "reason": "failed_stage_run_next_stage_resume_suppressed",
+                        },
+                        previous_status=current_status,
+                        event_type="dispatching_state_force_terminalized",
+                    )
+                    return True
             previous_stage_name = str(task.current_stage or "").strip()
             next_task_status = (
                 "running"
@@ -3977,6 +4091,8 @@ class TaskStateMachineMixin:
                 clear_runtime_owner=False,
                 finished_at=None,
                 last_error=None,
+                preserve_running_event_type="task_running_state_preserved_for_downstream_resume",
+                preserve_running_message=f"任务仍在等待后续阶段推进，保持 running: {blocked_stage}",
             )
             task.tail_reconcile_state = "idle"
             self._last_task_heartbeat_at.pop(task.id, None)
@@ -4268,17 +4384,33 @@ class TaskStateMachineMixin:
                 next_stage_items = self._stage_items(db, task.id, next_stage)
                 next_snapshot = next((snapshot for snapshot in self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs) if str(snapshot.get("stage_name") or "").strip() == next_stage), next_snapshot)
                 next_stage_status = str((next_snapshot or {}).get("status") or next_stage_status).strip()
+            next_stage_has_active_ownerless_progress = bool((next_snapshot or {}).get("has_active_items"))
+            keep_running_during_stage_handoff = (
+                not workflow_blocked_stage
+                and str(self._task_runtime_phase(task) or "").strip() == task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
+                and str(getattr(task, "status", "") or "").strip() == "running"
+            )
             self._apply_task_main_state_update(
                 db,
                 task,
                 source="state_machine",
                 reason="任务仍有未完成阶段，保持活跃等待继续推进",
-                status="running" if next_stage_status in {"running", "dispatching", "applying"} or bool((next_snapshot or {}).get("has_active_items")) else "pending",
+                status=(
+                    "running"
+                    if (
+                        next_stage_status in {"running", "dispatching", "applying"}
+                        or next_stage_has_active_ownerless_progress
+                        or keep_running_during_stage_handoff
+                    )
+                    else "pending"
+                ),
                 stage_name=workflow_blocked_stage or next_stage,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 clear_runtime_owner=False,
                 finished_at=None,
                 last_error=None,
+                preserve_running_event_type="task_running_state_preserved_for_stage_handoff",
+                preserve_running_message=f"任务继续切换到下一阶段并保持 running: {workflow_blocked_stage or next_stage}",
             )
             task.tail_reconcile_state = "idle"
             self._last_task_heartbeat_at.pop(task.id, None)
@@ -4337,6 +4469,8 @@ class TaskStateMachineMixin:
                     clear_runtime_owner=False,
                     finished_at=None,
                     last_error=None,
+                    preserve_running_event_type="task_running_state_preserved_for_downstream_resume",
+                    preserve_running_message=f"缺少阶段执行记录但 owner 仍有效，保持 running 等待补跑: {missing_enabled_stage}",
                 ):
                     return True
                 self._last_task_heartbeat_at.pop(task.id, None)

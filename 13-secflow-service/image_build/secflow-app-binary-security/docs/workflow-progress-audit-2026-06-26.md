@@ -322,7 +322,12 @@ Static conclusion:
 - reducer is no longer the normal control plane
 - owner loop already performs the main stage start / stage terminal / downstream fact apply path inline
 - remaining reducer pieces are compat shell, metrics shell, and historical queue plumbing
-- `TaskManager.start()` no longer starts the legacy `state_event_inbox` loops; the handles remain in the manager only for shutdown compatibility and read-model/metrics surface cleanup
+- legacy `TaskStateLease` claim/lease helpers are now compatibility no-ops; owner runtime lease is the only live write-ownership proof
+- `TaskManager.start()` no longer starts the legacy `state_event_inbox` loops; the handles remain in the manager only for shutdown compatibility
+- compat state-event apply now dispatches through owner fact-apply helpers rather than maintaining an independent reducer-side business apply tree
+- retryable/dead-letter state-event repair no longer requeues old inbox work; it now signals owner reconcile directly
+- compat replay now forwards to the active owner instead of building a second write-control path when an external owner lease is still alive
+- `_enqueue_compat_state_event(...)` no longer has production callers; it survives only as a legacy compatibility enqueue helper and payload-externalization test surface
 
 Primary evidence:
 - [app/service/task_manager.py](/home/runshine/CLionProjects/sothoth/13-secflow-service/image_build/secflow-app-binary-security/app/service/task_manager.py:1026)
@@ -340,12 +345,14 @@ Primary evidence:
 - missing-entry-results failure escalation
 - fake active-shell protection in finalize/snapshot logic
 - normal-path reducer demotion
+- compat state-event fact apply delegation to `owner_fact_apply.py`
+- retryable/dead-letter state-event repair delegation to owner reconcile signal
 
 ### Not fully aligned yet
 
 - streaming seed helper ownership over first `stage_run` creation remains too implicit
-- compat event paths still preserve old event-driven stage-run creation semantics
-- repair/self-heal code is still too close to activation paths
+- compat state-event replay shell still exists as a legacy bridge
+- state-event inbox loop / claim / reduce runtime shell still exists even though it is no longer normal-path control plane
 - some failure bookkeeping still materializes stage runs in ways that can muddy timelines
 
 ## Async Vs Sync Boundary
@@ -365,8 +372,8 @@ Current static judgment against the target “sync where possible, async only wh
   - queue wakeup / retry / lease recovery
 - legacy async compatibility that still exists but should keep shrinking:
   - state-event inbox record replay shell
-  - retryable/dead-letter state-event repair
   - metrics snapshot publishing
+  - persisted pending `state_event` enqueue helper kept only for historical compatibility/tests
 
 This means the remaining refactor should not reintroduce reducer-style delayed business apply. The preferred direction is:
 
@@ -379,7 +386,7 @@ This means the remaining refactor should not reintroduce reducer-style delayed b
 Priority order:
 
 1. Tighten `downstream.py` streaming seed helpers so stage-run creation only happens as part of first real item materialization by owner-authoritative paths.
-2. Continue shrinking compatibility stage-run creation in `state_event_inbox.py` and residual compat apply paths.
+2. Continue collapsing `state_event_inbox.py` from replay executor into pure compat bridge or removable shell.
 3. Separate owner repair/self-heal signals from generic stage-start readiness calls.
 4. Audit failure-projection-only `stage_run` creation for timeline purity.
 5. Re-run full tests, then execute broad E2E and compare live timelines against this audit.
@@ -388,4 +395,4 @@ Priority order:
 
 Verified on this audit pass:
 - `PYTHONPATH=tests:. python -m unittest discover -q tests`
-- Result: `Ran 962 tests ... OK`
+- Result: `Ran 968 tests ... OK`

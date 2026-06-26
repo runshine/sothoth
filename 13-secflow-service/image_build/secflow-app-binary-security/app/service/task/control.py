@@ -5,14 +5,13 @@ import json
 import shutil
 import zipfile
 import os
-import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from sqlalchemy.orm import Session
 
 from app.exception import NotFoundError, ValidationError
-from app.model import BinarySecurityProjectConfig, BinarySecurityServiceConfig, BinarySecurityStateEvent, BinarySecurityTaskOperation
+from app.model import BinarySecurityProjectConfig, BinarySecurityServiceConfig, BinarySecurityTaskOperation
 from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityGlobalConfigPayload,
@@ -41,18 +40,11 @@ class TaskControlServiceMixin:
         *,
         payload: dict[str, Any],
     ) -> None:
-        synthetic_event = BinarySecurityStateEvent(
-            id=f"owner_sev_{uuid.uuid4().hex[:24]}",
-            task_id=task.id,
-            project_id=task.project_id,
-            event_type="manual_policy_update_requested",
-        )
-        synthetic_event.payload = dict(payload or {})
         self._apply_manual_policy_update_payload_locked(
             db,
             task,
-            payload=dict(synthetic_event.payload or {}),
-            state_event_id=synthetic_event.id,
+            payload=dict(payload or {}),
+            state_event_id=None,
             applied_by="owner_direct",
         )
         self._enqueue_task(task.id)

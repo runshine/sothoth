@@ -1220,17 +1220,11 @@ class TaskArchiveServiceMixin:
 
         db = task_manager_module.get_session_factory()()
         try:
-            synthetic_event = BinarySecurityStateEvent(
-                id=f"owner_sev_{uuid.uuid4().hex[:24]}",
-                event_type="archive_job_copied",
-                archive_job_id=job_id,
-            )
-            synthetic_event.payload = {"archive_root": archived_root, "source": "owner_direct_apply_request"}
             await self._apply_archive_job_status_locked(
                 db,
                 job_id,
                 archived_root,
-                state_event_id=synthetic_event.id,
+                state_event_id=None,
             )
             db.commit()
         except Exception:
