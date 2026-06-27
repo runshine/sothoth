@@ -4574,6 +4574,7 @@ class TaskManager(
 
     def _streaming_has_active_upstream_stage(
         self,
+        db: Session,
         task: BinarySecurityTask,
         stage_runs: list[BinarySecurityStageRun],
     ) -> tuple[bool, str | None, str | None]:
@@ -4586,6 +4587,14 @@ class TaskManager(
                 continue
             if self._is_streaming_tail_stage(task, stage_name):
                 continue
+            stage_start_allowed = bool(self._evaluate_stage_start_gate(db, task, stage_name).get("allowed"))
+            stage_items = self._stage_items(db, task.id, stage_name)
+            has_real_active_progress = bool(
+                self._stage_has_active_items(stage_items)
+                or self._stage_has_live_downstream_children(stage_items)
+                or self._stage_has_real_runnable_work(db, task, stage_name)
+                or self._stage_has_unresolved_expected_outputs(db, task, stage_name, None, stage_items)
+            )
             stage_candidates = [
                 run
                 for run in stage_runs
@@ -4595,7 +4604,11 @@ class TaskManager(
                 continue
             for run in sorted(stage_candidates, key=lambda row: int(getattr(row, "sequence_no", 0) or 0)):
                 normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
-                if normalized_status in active_statuses:
+                if normalized_status in active_statuses and (
+                    has_real_active_progress
+                    or normalized_status in {"running", "dispatching", "applying"}
+                    or stage_start_allowed
+                ):
                     active_candidates.append((stage_name, normalized_status))
         if active_candidates:
             stage_name, normalized_status = active_candidates[-1]
@@ -4618,6 +4631,20 @@ class TaskManager(
         for stage_name in self._stage_sequence_for_task(task):
             if not self._stage_enabled(task, stage_name):
                 continue
+            stage_start_allowed = bool(self._evaluate_stage_start_gate(db, task, stage_name).get("allowed"))
+            stage_items = self._stage_items(db, task.id, stage_name)
+            has_real_active_progress = bool(
+                self._stage_has_active_items(stage_items)
+                or self._stage_has_live_downstream_children(stage_items)
+                or self._stage_has_real_runnable_work(db, task, stage_name)
+            )
+            has_unresolved_expected_outputs = self._stage_has_unresolved_expected_outputs(
+                db,
+                task,
+                stage_name,
+                None,
+                stage_items,
+            )
             stage_candidates = [
                 run
                 for run in stage_runs
@@ -4629,10 +4656,19 @@ class TaskManager(
                 normalized_status = self._normalize_downstream_status(run.status) or str(run.status or "").strip()
                 if task_retry_target_stage and stage_name == task_retry_target_stage and normalized_status == "success":
                     continue
-                if normalized_status in {"pending", "queued"} and not self._stage_has_real_runnable_work(db, task, stage_name):
+                if (
+                    normalized_status in {"pending", "queued"}
+                    and not has_real_active_progress
+                    and not (has_unresolved_expected_outputs and stage_start_allowed)
+                ):
                     continue
                 if normalized_status in active_statuses:
-                    active_candidates.append((stage_name, normalized_status))
+                    if (
+                        has_real_active_progress
+                        or normalized_status in {"running", "dispatching", "applying"}
+                        or (has_unresolved_expected_outputs and stage_start_allowed)
+                    ):
+                        active_candidates.append((stage_name, normalized_status))
         if active_candidates:
             stage_name, normalized_status = active_candidates[-1]
             return True, stage_name, normalized_status
@@ -8192,6 +8228,20 @@ class TaskManager(
         upstream_retried, _ = self._upstream_stage_retried(db, task, stage_name)
         if upstream_retried:
             return False
+        stage_run = (
+            db.query(BinarySecurityStageRun)
+            .filter(
+                BinarySecurityStageRun.task_id == task.id,
+                BinarySecurityStageRun.stage_name == stage_name,
+            )
+            .order_by(
+                BinarySecurityStageRun.sequence_no.desc(),
+                BinarySecurityStageRun.created_at.desc(),
+                BinarySecurityStageRun.id.desc(),
+            )
+            .first()
+        )
+        normalized_stage_status = self._normalize_downstream_status(getattr(stage_run, "status", None)) or str(getattr(stage_run, "status", "") or "").strip()
         items = self._stage_items(db, task.id, stage_name)
         if items:
             if self._is_streaming_tail_stage(task, stage_name):
@@ -8202,6 +8252,8 @@ class TaskManager(
                 ) or any(self._is_streaming_active_item_status(item.status) for item in items)
             return True
         if self._is_streaming_tail_stage(task, stage_name):
+            return False
+        if normalized_stage_status in {"success", "partial_success"}:
             return False
         return self._stage_has_materialized_inputs(db, task, stage_name)
 
@@ -9896,9 +9948,6 @@ class TaskManager(
             if self._pipeline_profile(task) != PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
                 self._refresh_system_analysis_stage_from_synced_items(db, task)
                 summary = dict(task.summary or {})
-                if summary.get("selected_modules") and not self._stage_items(db, task.id, "entry_analysis"):
-                    task.current_stage = "entry_analysis"
-                    stage_name = "entry_analysis"
         if stage_name == "entry_analysis" and self._task_type(task) != TASK_TYPE_SOURCE and not summary.get("b2s_results"):
             self._rebuild_summary_results_from_stage_items(db, task, "binary_to_source", "b2s_results")
             summary = dict(task.summary or {})
@@ -10014,7 +10063,16 @@ class TaskManager(
         if resolved_items:
             return True
         if normalized_stage == "entry_analysis":
-            return self._entry_analysis_historical_child_count(db, task) > 0
+            rebuild_state = self._entry_analysis_authoritative_rebuild_required(
+                db,
+                task,
+                stage_run=stage_run,
+            )
+            return bool(
+                rebuild_state.get("required")
+                and rebuild_state.get("reason") == "historical_children_exist_but_authoritative_items_missing"
+                and int(rebuild_state.get("input_count") or 0) > 0
+            )
         if normalized_stage == "dataflow_vuln_scan":
             upstream_stage = self._streaming_upstream_stage(task, normalized_stage)
             if upstream_stage and self._stage_requires_archive_success_gate(task, upstream_stage):

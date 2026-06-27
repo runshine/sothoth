@@ -86,6 +86,28 @@ class TaskDownstreamServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("entry_analysis", seeded.stage_name)
         self.assertEqual("pending", seeded.status)
 
+    def test_streaming_stage_run_for_seed_prefers_existing_stage_run(self):
+        task = self._task()
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+        resolved = self.manager._streaming_stage_run_for_seed(
+            db,
+            task,
+            "entry_analysis",
+            reason="test_seed",
+        )
+
+        self.assertIs(resolved, stage_run)
+        self.assertEqual("pending", resolved.status)
+
     def test_prepare_stage_items_for_execution_rejects_empty_item_key(self):
         task = self._task()
         stage_run = BinarySecurityStageRun(

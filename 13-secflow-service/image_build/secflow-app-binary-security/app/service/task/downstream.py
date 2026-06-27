@@ -108,6 +108,31 @@ class TaskDownstreamServiceMixin:
             stage_run.updated_at = task_manager_module._now()
         return stage_run
 
+    def _streaming_stage_run_for_seed(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        reason: str,
+    ) -> BinarySecurityStageRun:
+        normalized_stage = normalize_stage_name(stage_name)
+        stage_run = self._latest_stage_run(db, task.id, normalized_stage)
+        if stage_run is not None:
+            normalized_status = str(getattr(stage_run, "status", "") or "").strip().lower()
+            if normalized_status in {"failed", "cancelled", "downstream_missing", "success", "partial_success"}:
+                stage_run.status = "pending"
+                stage_run.finished_at = None
+                stage_run.last_error = None
+                stage_run.updated_at = task_manager_module._now()
+            return stage_run
+        return self._ensure_streaming_stage_run_for_materialization(
+            db,
+            task,
+            normalized_stage,
+            reason=reason,
+        )
+
     def _recover_entry_output_contract(
         self,
         db: Session,
@@ -276,7 +301,7 @@ class TaskDownstreamServiceMixin:
             item_key=module_key,
             parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
         )
-        stage_run = self._ensure_streaming_stage_run_for_materialization(
+        stage_run = self._streaming_stage_run_for_seed(
             db,
             task,
             "entry_analysis",
@@ -334,7 +359,7 @@ class TaskDownstreamServiceMixin:
         )
         if not entries:
             return []
-        stage_run = self._ensure_streaming_stage_run_for_materialization(
+        stage_run = self._streaming_stage_run_for_seed(
             db,
             task,
             "dataflow_vuln_scan",
@@ -432,7 +457,7 @@ class TaskDownstreamServiceMixin:
             item_key=entry_key,
             parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
         )
-        stage_run = self._ensure_streaming_stage_run_for_materialization(
+        stage_run = self._streaming_stage_run_for_seed(
             db,
             task,
             "dataflow_vuln_scan",

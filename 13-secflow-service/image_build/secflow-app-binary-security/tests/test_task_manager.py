@@ -1781,6 +1781,7 @@ class TaskManagerTests(unittest.TestCase):
             workspace_root="/tmp/ws",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
+        original_task_state = (task.status, task.current_stage, task.runtime_phase)
         upstream_item = BinarySecurityStageItem(
             id="si-b2s",
             task_id="t1",
@@ -1824,6 +1825,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("binary_to_source", seeded.input_ref["triggered_by_stage"])
         self.assertTrue(any(run.stage_name == "entry_analysis" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_entry_item_seeded" for event in db.events))
+        self.assertEqual(original_task_state, (task.status, task.current_stage, task.runtime_phase))
 
     def test_trigger_entry_items_from_b2s_result_rebuilds_descriptor_for_binary_task(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -1888,6 +1890,76 @@ class TaskManagerTests(unittest.TestCase):
                 files_list.read_text(encoding="utf-8").splitlines(),
             )
 
+    def test_trigger_entry_items_from_b2s_result_reuses_existing_stage_run_without_advancing_current_stage(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            current_stage="binary_to_source",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-b2s",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="binary_to_source",
+        )
+        existing_run = BinarySecurityStageRun(
+            id="sr-entry-existing",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=3,
+            status="pending",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="other-worker",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_items=[],
+            runtime_leases=[lease],
+            stage_runs=[existing_run],
+            events=[],
+        )
+
+        seeded = self.manager._trigger_entry_items_from_b2s_result(
+            db,
+            task,
+            {
+                "module_key": "module-1",
+                "module_name": "mod.so",
+                "firmware_key": "fw-1",
+                "source_dir": "/tmp/source/module-1",
+                "source_root": "/tmp/source/module-1",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIsNotNone(seeded)
+        self.assertEqual("sr-entry-existing", seeded.stage_run_id)
+        self.assertEqual(1, len([run for run in db.stage_runs if run.stage_name == "entry_analysis"]))
+        blocked = [event for event in db.events if event.event_type == "main_state_write_blocked"]
+        self.assertFalse(blocked)
+        self.assertEqual("binary_to_source", task.current_stage)
+
     def test_trigger_dataflow_items_from_entry_result_creates_pending_dataflow_items_in_streaming_mode(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -1902,6 +1974,7 @@ class TaskManagerTests(unittest.TestCase):
             workspace_root="/tmp/ws",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
+        original_task_state = (task.status, task.current_stage, task.runtime_phase)
         upstream_item = BinarySecurityStageItem(
             id="si-entry",
             task_id="t1",
@@ -1952,6 +2025,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(all(item.input_ref["upstream_item_id"] == "si-entry" for item in seeded))
         self.assertTrue(any(run.stage_name == "dataflow_vuln_scan" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_dataflow_vuln_scan_items_seeded" for event in db.events))
+        self.assertEqual(original_task_state, (task.status, task.current_stage, task.runtime_phase))
 
     def test_trigger_dataflow_items_from_entry_result_requires_current_owner_for_stage_run_materialization(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -2010,6 +2084,73 @@ class TaskManagerTests(unittest.TestCase):
         blocked = [event for event in db.events if event.event_type == "main_state_write_blocked"]
         self.assertTrue(blocked)
 
+    def test_trigger_dataflow_items_from_entry_result_reuses_existing_stage_run_without_current_owner(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            dispatcher_instance_id="other-worker",
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="entry_analyse",
+        )
+        existing_run = BinarySecurityStageRun(
+            id="sr-dfs",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="pending",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="other-worker",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[lease], stage_runs=[existing_run], events=[])
+
+        seeded = self.manager._trigger_dataflow_items_from_entry_result(
+            db,
+            task,
+            {
+                "entries": [
+                    {
+                        "entry_key": "entry-1",
+                        "module_key": "module-1",
+                        "function_name": "handle_req",
+                        "file_name": "main.c",
+                    }
+                ]
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertEqual(1, len(seeded))
+        self.assertEqual("sr-dfs", seeded[0].stage_run_id)
+        self.assertEqual(1, len([run for run in db.stage_runs if run.stage_name == "dataflow_vuln_scan"]))
+        blocked = [event for event in db.events if event.event_type == "main_state_write_blocked"]
+        self.assertFalse(blocked)
+        self.assertIsNone(task.current_stage)
+
     def test_trigger_vuln_items_from_dataflow_result_creates_pending_vuln_item_in_streaming_mode(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -2024,6 +2165,7 @@ class TaskManagerTests(unittest.TestCase):
             workspace_root="/tmp/ws",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
+        original_task_state = (task.status, task.current_stage, task.runtime_phase)
         upstream_item = BinarySecurityStageItem(
             id="si-df",
             task_id="t1",
@@ -2066,6 +2208,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("dataflow_vuln_scan", seeded.input_ref["triggered_by_stage"])
         self.assertTrue(any(run.stage_name == "dataflow_vuln_scan" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_vuln_item_seeded" for event in db.events))
+        self.assertEqual(original_task_state, (task.status, task.current_stage, task.runtime_phase))
 
     def test_trigger_vuln_items_from_dataflow_result_refreshes_stale_cancelled_stage_run(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -6361,6 +6504,66 @@ class TaskManagerTests(unittest.TestCase):
         self.assertFalse(rebuild_state["required"])
         self.assertEqual("no_historical_entry_analysis_children", rebuild_state["reason"])
 
+    def test_stage_has_authoritative_materialization_for_entry_analysis_requires_rebuildable_current_inputs(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        with patch.object(
+            self.manager,
+            "_entry_analysis_authoritative_rebuild_required",
+            return_value={
+                "required": True,
+                "reason": "historical_children_exist_but_authoritative_items_missing",
+                "input_count": 1,
+                "historical_child_count": 1,
+                "current_stage_item_count": 0,
+            },
+        ):
+            self.assertTrue(
+                self.manager._stage_has_authoritative_materialization(
+                    db,
+                    task,
+                    "entry_analysis",
+                    stage_run=stage_run,
+                    stage_items=[],
+                )
+            )
+
+        with patch.object(
+            self.manager,
+            "_entry_analysis_authoritative_rebuild_required",
+            return_value={
+                "required": False,
+                "reason": "no_historical_entry_analysis_children",
+                "input_count": 0,
+                "historical_child_count": 0,
+                "current_stage_item_count": 0,
+            },
+        ):
+            self.assertFalse(
+                self.manager._stage_has_authoritative_materialization(
+                    db,
+                    task,
+                    "entry_analysis",
+                    stage_run=stage_run,
+                    stage_items=[],
+                )
+            )
+
     def test_rebuild_missing_entry_analysis_stage_items_from_inputs_creates_pending_authoritative_items(self):
         task = BinarySecurityTask(
             id="task-1",
@@ -8943,7 +9146,8 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual("running", task.status)
-        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIsNone(task.dispatch_started_at)
 
@@ -34522,7 +34726,7 @@ def _test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision
     )
     db = _AppendingModelAwareDb(tasks=[task], stage_runs=[current_run, next_run], stage_items=[], events=[])
 
-    original_next = self.manager._next_incomplete_stage
+    original_next = self.manager._next_stage_candidate
     original_items = self.manager._stage_items
     original_runnable = self.manager._stage_has_real_runnable_work
     original_nonterminal = self.manager._stage_has_nonterminal_items
@@ -34531,7 +34735,7 @@ def _test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision
     applied = []
     queued = []
 
-    self.manager._next_incomplete_stage = lambda *_args, **_kwargs: "entry_analysis"
+    self.manager._next_stage_candidate = lambda *_args, **_kwargs: "entry_analysis"
     self.manager._stage_items = lambda *_args, **_kwargs: []
     self.manager._stage_has_real_runnable_work = lambda *_args, **_kwargs: True
     self.manager._stage_has_nonterminal_items = lambda *_args, **_kwargs: False
@@ -34553,7 +34757,7 @@ def _test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision
         with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
             self.manager._refresh_task_status_after_sync(db, task)
     finally:
-        self.manager._next_incomplete_stage = original_next
+        self.manager._next_stage_candidate = original_next
         self.manager._stage_items = original_items
         self.manager._stage_has_real_runnable_work = original_runnable
         self.manager._stage_has_nonterminal_items = original_nonterminal
@@ -34661,11 +34865,10 @@ def _test_run_task_layer_reconcile_signal_applies_stage_terminal_decision(self):
         self.manager._apply_task_action_after_stage_terminal = original_apply
         self.manager._write_task_metadata_async = original_write
 
-    self.assertTrue(changed)
+    self.assertFalse(changed)
     self.assertEqual("refresh", calls[0][0])
-    self.assertEqual("apply", calls[1][0])
-    self.assertEqual("system_analysis", calls[1][1]["stage_name"])
-    self.assertEqual("success", calls[1][1]["status"])
+    self.assertEqual(1, len(calls))
+    self.assertEqual("system_analysis", task.current_stage)
 
 
 TaskManagerTests.test_run_task_layer_reconcile_signal_applies_stage_terminal_decision = _test_run_task_layer_reconcile_signal_applies_stage_terminal_decision
@@ -34798,10 +35001,10 @@ def _test_finalize_deferred_keeps_running_during_owned_stage_handoff(self):
         stage_items=[entry_item],
         events=[],
     )
-    original_next_incomplete_stage = self.manager._next_incomplete_stage
+    original_next_incomplete_stage = self.manager._next_stage_candidate
     original_workflow_blocked_on_stage = self.manager._workflow_blocked_on_stage
 
-    self.manager._next_incomplete_stage = lambda _db, _task: "entry_analysis"
+    self.manager._next_stage_candidate = lambda _db, _task: "entry_analysis"
     self.manager._workflow_blocked_on_stage = lambda _task, _snapshots: None
     try:
         changed = self.manager._finalize_task_handle_resume_or_missing_stage(
@@ -34810,7 +35013,7 @@ def _test_finalize_deferred_keeps_running_during_owned_stage_handoff(self):
             stage_runs=[system_run, entry_run],
         )
     finally:
-        self.manager._next_incomplete_stage = original_next_incomplete_stage
+        self.manager._next_stage_candidate = original_next_incomplete_stage
         self.manager._workflow_blocked_on_stage = original_workflow_blocked_on_stage
 
     self.assertTrue(changed)
@@ -38650,6 +38853,7 @@ def _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_
         workspace_root="/w",
         policy_json='{"pipeline_mode": "mixed_streaming"}',
     )
+    original_current_stage = task.current_stage
     task.summary = {}
     stage_run = BinarySecurityStageRun(
         id="sr-system-rebuild",
@@ -38691,7 +38895,7 @@ def _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_
 
     manager._ensure_stage_inputs_available(db, task, "dataflow_vuln_scan")
 
-    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual(original_current_stage, task.current_stage)
     self.assertEqual(["m1"], [module["module_key"] for module in task.summary["selected_modules"]])
 
 
@@ -46721,6 +46925,7 @@ TaskManagerTests.test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_mater
 TaskManagerTests.test_should_not_auto_advance_to_entry_analysis_with_only_empty_stage_run = _test_should_not_auto_advance_to_entry_analysis_with_only_empty_stage_run
 TaskManagerTests.test_reducer_stage_worker_start_requested_does_not_materialize_future_stage_run_without_inputs = _test_reducer_stage_worker_start_requested_does_not_materialize_future_stage_run_without_inputs
 TaskManagerTests.test_ensure_stage_run_records_timeline_event_when_created = _test_ensure_stage_run_records_timeline_event_when_created
+TaskManagerTests.test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage = _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
 TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync

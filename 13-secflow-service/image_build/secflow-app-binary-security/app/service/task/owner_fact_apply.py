@@ -101,7 +101,13 @@ class TaskOwnerFactApplyServiceMixin:
                 },
             )
             return
-        if not self._stage_start_ready(db, task, stage_name, allow_rebuild=False):
+        stage_gate = self._evaluate_stage_start_gate(
+            db,
+            task,
+            stage_name,
+            allow_entry_rebuild=False,
+        )
+        if not bool(stage_gate.get("allowed")):
             self._record_main_state_write_blocked(
                 db,
                 task,
@@ -119,6 +125,8 @@ class TaskOwnerFactApplyServiceMixin:
                 reconcile_reason="stage_worker_start_requested",
                 message="阶段启动请求已收到，但当前阶段尚无真实可执行输入，已等待 owner worker 后续接管",
                 event_payload={
+                    "stage_start_allowed": False,
+                    "blocked_reason": stage_gate.get("blocked_reason"),
                     "stage_retry_mode": bool(stage_retry_mode),
                     "task_retry_mode": bool(task_retry_mode),
                     "target_stage_name": target_stage_name,

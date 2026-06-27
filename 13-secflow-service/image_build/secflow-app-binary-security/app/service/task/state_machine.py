@@ -121,7 +121,7 @@ class TaskStateMachineMixin:
         *,
         stage_runs: list[BinarySecurityStageRun] | None = None,
     ) -> bool:
-        next_stage = self._next_incomplete_stage(db, task)
+        next_stage = self._next_stage_candidate(db, task)
         if not next_stage:
             return False
         normalized_stage = normalize_stage_name(next_stage)
@@ -145,7 +145,7 @@ class TaskStateMachineMixin:
     ) -> bool:
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
-        next_stage = self._next_incomplete_stage(db, task)
+        next_stage = self._next_stage_candidate(db, task)
         authoritative_failure = (
             self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
             or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
@@ -258,15 +258,32 @@ class TaskStateMachineMixin:
 
         runs = list(stage_runs or db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all())
         items = list(stage_items or db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())
-        next_stage = self._next_incomplete_stage(db, task)
+        next_stage = self._next_stage_candidate(db, task)
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=runs)
         blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
         next_snapshot = next(
             (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == str(next_stage or "").strip()),
             None,
         )
+        next_stage_gate = self._evaluate_stage_start_gate(
+            db,
+            task,
+            next_stage,
+            stage_runs=runs,
+            snapshots=snapshots,
+        )
         if next_snapshot is not None and self._stage_snapshot_is_shell_active(db, task, next_snapshot):
             next_stage = None
+            next_stage_gate = {
+                "stage_name": None,
+                "allowed": False,
+                "blocked_reason": None,
+                "stage_run": None,
+                "stage_items": [],
+                "snapshot": None,
+                "stage_status": None,
+                "has_active_ownerless_progress": False,
+            }
         has_authoritative_failure = (
             self._current_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
             or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=runs) is not None
@@ -290,6 +307,15 @@ class TaskStateMachineMixin:
                     and not bool(snapshot.get("has_stage_run"))
                     and bool(snapshot.get("enabled"))
                     and bool(snapshot.get("has_materialized_inputs"))
+                    and bool(
+                        self._evaluate_stage_start_gate(
+                            db,
+                            task,
+                            str(snapshot.get("stage_name") or "").strip(),
+                            stage_runs=runs,
+                            snapshots=snapshots,
+                        ).get("allowed")
+                    )
                 )
             ),
             None,
@@ -374,7 +400,7 @@ class TaskStateMachineMixin:
                 has_authoritative_failure=has_authoritative_failure,
             )
 
-        if next_stage:
+        if next_stage and bool(next_stage_gate.get("allowed")):
             return task_manager_module._TaskFinalizeGateDecision(
                 allowed=False,
                 reason_code="next_stage_resumable",
@@ -1629,7 +1655,7 @@ class TaskStateMachineMixin:
             clear_runtime_owner=True,
         )
 
-    def _next_incomplete_stage(
+    def _next_stage_candidate(
         self: TaskManager,
         db: Session,
         task: BinarySecurityTask,
@@ -1637,7 +1663,7 @@ class TaskStateMachineMixin:
         summary = dict(task.summary or {})
         if (
             self._source_entry_analysis_barrier_enabled(task)
-            and self._stage_has_archived_success_progress(db, task, "system_analysis")
+            and self._system_analysis_authoritative_complete(db, task)
             and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
             and bool(self._entry_analysis_inputs(db, task))
             and (
@@ -1648,7 +1674,7 @@ class TaskStateMachineMixin:
             return "entry_analysis"
         if (
             self._binary_system_analysis_binary_to_source_barrier_enabled(task)
-            and self._stage_has_archived_success_progress(db, task, "system_analysis")
+            and self._system_analysis_authoritative_complete(db, task)
             and not self._stage_has_archived_success_progress(db, task, "binary_to_source")
             and (
                 self._stage_status_for_task(db, task, "system_analysis") != "partial_success"
@@ -1680,6 +1706,14 @@ class TaskStateMachineMixin:
             if str(snapshot.get("status") or "").strip() == "partial_success" and not self._partial_success_advancement_enabled(task, stage_name):
                 return stage_name
         return None
+
+    def _next_incomplete_stage(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> str | None:
+        # Compatibility wrapper during migration to the explicit candidate/stage-start split.
+        return self._next_stage_candidate(db, task)
 
     def _should_skip_stage_without_runnable_work(
         self: TaskManager,
@@ -1933,8 +1967,8 @@ class TaskStateMachineMixin:
         normalized_next_stage = str(next_stage or "").strip() or None
         if not normalized_next_stage:
             return decision
-        if not self._should_auto_advance_to_stage(db, task, normalized_next_stage):
-            blocked_reason = self._continue_stage_input_error(db, task, normalized_next_stage)
+        stage_gate = self._evaluate_stage_start_gate(db, task, normalized_next_stage)
+        if not bool(stage_gate.get("allowed")):
             decision.event_type = "task_resume_blocked"
             decision.payload = {
                 **dict(payload or {}),
@@ -1942,7 +1976,8 @@ class TaskStateMachineMixin:
                 "resume_reason": resume_reason,
                 "source": source,
                 "authoritative_active_progress": False,
-                "blocked_reason": blocked_reason,
+                "stage_start_allowed": False,
+                "blocked_reason": stage_gate.get("blocked_reason"),
             }
             return decision
         decision.should_resume = True
@@ -1959,6 +1994,7 @@ class TaskStateMachineMixin:
             "resume_reason": resume_reason,
             "source": source,
             "authoritative_active_progress": has_authoritative_progress,
+            "stage_start_allowed": True,
         }
         return decision
 
@@ -1973,14 +2009,25 @@ class TaskStateMachineMixin:
     ) -> bool:
         if not decision.should_resume or not decision.next_stage:
             return False
+        decision_payload = dict(getattr(decision, "payload", {}) or {})
+        allow_entry_rebuild = bool(decision_payload.get("stage_start_allowed"))
+        stage_start_prevalidated = bool(decision_payload.get("stage_start_allowed"))
         if (
             self._streaming_mode_enabled(task)
             and str(getattr(task, "status", "") or "").strip() in {"running", "dispatching"}
             and str(getattr(task, "current_stage", "") or "").strip()
             and not self._is_streaming_tail_stage(task, task.current_stage)
             and self._is_streaming_tail_stage(task, decision.next_stage)
+            and not stage_start_prevalidated
         ):
-            return False
+            stage_gate = self._evaluate_stage_start_gate(
+                db,
+                task,
+                decision.next_stage,
+                allow_entry_rebuild=allow_entry_rebuild,
+            )
+            if not bool(stage_gate.get("allowed")):
+                return False
         previous_stage = str(getattr(task, "current_stage", "") or "").strip() or None
         self._set_task_runtime_transition_guard(
             task,
@@ -2083,6 +2130,98 @@ class TaskStateMachineMixin:
             return False
         return self._stage_has_real_runnable_work(db, task, normalized_stage) or self._stage_has_materialized_inputs(db, task, normalized_stage)
 
+    def _streaming_stage_start_ready(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+    ) -> bool:
+        normalized_stage = str(stage_name or "").strip()
+        if not normalized_stage:
+            return False
+        if not self._should_auto_advance_to_stage(db, task, normalized_stage):
+            return False
+        if normalize_stage_name(normalized_stage) == "entry_analysis":
+            return bool(self._stage_has_materialized_inputs(db, task, normalized_stage, allow_rebuild=False))
+        return bool(self._stage_has_authoritative_materialization(db, task, normalized_stage))
+
+    def _evaluate_stage_start_gate(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+        *,
+        stage_runs: list[BinarySecurityStageRun] | None = None,
+        snapshots: list[dict[str, Any]] | None = None,
+        allow_entry_rebuild: bool = False,
+    ) -> dict[str, Any]:
+        normalized_stage = str(stage_name or "").strip()
+        if not normalized_stage:
+            return {
+                "stage_name": None,
+                "allowed": False,
+                "blocked_reason": None,
+                "stage_run": None,
+                "stage_items": [],
+                "snapshot": None,
+                "stage_status": None,
+                "has_active_ownerless_progress": False,
+            }
+        resolved_runs = stage_runs
+        if resolved_runs is None:
+            resolved_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        stage_run = next((run for run in resolved_runs if str(run.stage_name or "").strip() == normalized_stage), None)
+        stage_items = self._stage_items(db, task.id, normalized_stage)
+        if (
+            allow_entry_rebuild
+            and normalized_stage == "entry_analysis"
+            and self._entry_analysis_pending_requires_materialization(
+                db,
+                task,
+                stage_run=stage_run,
+                stage_items=stage_items,
+            )
+        ):
+            self._rebuild_missing_entry_analysis_stage_items_from_inputs(
+                db,
+                task,
+                stage_run=stage_run,
+            )
+            stage_items = self._stage_items(db, task.id, normalized_stage)
+        resolved_snapshots = snapshots
+        if resolved_snapshots is None:
+            resolved_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=resolved_runs)
+        snapshot = next(
+            (item for item in resolved_snapshots if str(item.get("stage_name") or "").strip() == normalized_stage),
+            None,
+        )
+        if snapshot is None and allow_entry_rebuild and normalized_stage == "entry_analysis":
+            resolved_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=resolved_runs)
+            snapshot = next(
+                (item for item in resolved_snapshots if str(item.get("stage_name") or "").strip() == normalized_stage),
+                None,
+            )
+        stage_status = str(
+            (snapshot or {}).get("status")
+            or (
+                self._normalize_downstream_status(stage_run.status) or str(stage_run.status or "").strip()
+                if stage_run is not None
+                else "pending"
+            )
+        ).strip() or None
+        allowed = self._should_auto_advance_to_stage(db, task, normalized_stage)
+        blocked_reason = None if allowed else self._continue_stage_input_error(db, task, normalized_stage)
+        return {
+            "stage_name": normalized_stage,
+            "allowed": allowed,
+            "blocked_reason": blocked_reason,
+            "stage_run": stage_run,
+            "stage_items": stage_items,
+            "snapshot": snapshot,
+            "stage_status": stage_status,
+            "has_active_ownerless_progress": bool((snapshot or {}).get("has_active_items")),
+        }
+
     def _stage_retry_failed_items_support(
         self: TaskManager,
         db: Session,
@@ -2145,7 +2284,7 @@ class TaskStateMachineMixin:
         reason: str | None = None
         stage_name = self._first_failed_terminal_stage(db, task)
         if not stage_name:
-            stage_name = self._next_incomplete_stage(db, task)
+            stage_name = self._next_stage_candidate(db, task)
         if stage_name:
             archive_stage_name, archive_reason = self._archive_pending_full_retry_stage(db, task, stage_name)
             if archive_stage_name:
@@ -2231,7 +2370,7 @@ class TaskStateMachineMixin:
         )
         failed_terminal_stage = self._first_failed_terminal_stage(db, task)
         target_stage = recoverable_terminal_stage or failed_terminal_stage or (
-            current_stage if prioritize_current_stage else self._next_incomplete_stage(db, task)
+            current_stage if prioritize_current_stage else self._next_stage_candidate(db, task)
         )
         if target_stage is None:
             return False, "当前任务所有阶段都已成功，没有可继续的后续阶段", None
@@ -2331,9 +2470,9 @@ class TaskStateMachineMixin:
                     "selected_module_count": 0,
                 }
                 return decision
-        next_stage = self._next_incomplete_stage(db, task)
-        if next_stage and not self._should_auto_advance_to_stage(db, task, next_stage):
-            blocked_reason = self._continue_stage_input_error(db, task, next_stage)
+        next_stage = self._next_stage_candidate(db, task)
+        next_stage_gate = self._evaluate_stage_start_gate(db, task, next_stage) if next_stage else None
+        if next_stage and not bool((next_stage_gate or {}).get("allowed")):
             decision.action = "advance_blocked"
             decision.next_stage = None
             decision.event_type = "next_stage_auto_advance_blocked"
@@ -2342,7 +2481,8 @@ class TaskStateMachineMixin:
             decision.payload = {
                 "state_event_id": state_event_id,
                 "completed_stage": stage_name,
-                "blocked_reason": blocked_reason,
+                "next_stage": next_stage,
+                "blocked_reason": (next_stage_gate or {}).get("blocked_reason"),
             }
             return decision
         if (
@@ -2350,6 +2490,7 @@ class TaskStateMachineMixin:
             and next_stage
             and self._streaming_mode_enabled(task)
             and self._is_streaming_tail_stage(task, next_stage)
+            and self._streaming_stage_start_ready(db, task, next_stage)
             and not (
                 next_stage == "entry_analysis"
                 and stage_name == "system_analysis"
@@ -2367,16 +2508,6 @@ class TaskStateMachineMixin:
                     or self._binary_entry_analysis_barrier_enabled(task)
                 )
                 and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
-            )
-            and (
-                (
-                    normalize_stage_name(next_stage) == "entry_analysis"
-                    and self._stage_has_materialized_inputs(db, task, next_stage, allow_rebuild=False)
-                )
-                or (
-                    normalize_stage_name(next_stage) != "entry_analysis"
-                    and self._stage_has_authoritative_materialization(db, task, next_stage)
-                )
             )
             and (
                 not self._stage_requires_archive_success_gate(task, stage_name)
@@ -2685,12 +2816,25 @@ class TaskStateMachineMixin:
                 # 本阶段终态后若下一阶段是 entry_analysis 且其输入（selected_modules）尚未就绪，
                 # 延迟 stage_terminal_apply，避免在 summary 未刷新时空跑/跳过/提前收口。
                 # 就绪判据：system_analysis 已 success 且 summary 已刷新（selected_modules 键存在）。
+                next_stage = self._next_stage_candidate(db, task)
+                next_stage_gate = self._evaluate_stage_start_gate(db, task, next_stage) if next_stage else None
                 if (
                     normalize_stage_name(resolved_stage_name) == "system_analysis"
                     and self._task_type(task) == TASK_TYPE_SOURCE
                     and not self._system_analysis_authoritative_complete(db, task)
+                    and not bool((next_stage_gate or {}).get("allowed"))
                 ):
                     decision.action = "refresh_only"
+                    return decision
+                if (
+                    source_event_type == "archive_job_copied"
+                    and next_stage
+                    and bool((next_stage_gate or {}).get("allowed"))
+                ):
+                    decision.action = "stage_terminal_apply"
+                    decision.stage_name = resolved_stage_name
+                    decision.stage_status = stage_status
+                    decision.summary = dict(getattr(stage_run, "output_summary", None) or {})
                     return decision
                 decision.action = "stage_terminal_apply"
                 decision.stage_name = resolved_stage_name
@@ -2800,6 +2944,7 @@ class TaskStateMachineMixin:
 
     def _refresh_task_status_after_sync(self: TaskManager, db: Session, task: BinarySecurityTask) -> None:
         current_status = str(task.status or "").strip()
+        previous_last_error = task.last_error
         skip_running_lease_invariant_repair = False
 
         def _normalize_running_lease_invariant(reason: str) -> bool:
@@ -2813,151 +2958,160 @@ class TaskStateMachineMixin:
                 event_payload={"source": "refresh_task_status_after_sync"},
             )
 
-        early_outcome = self._refresh_task_status_after_sync_early_return(db, task)
-        if early_outcome:
-            _normalize_running_lease_invariant("refresh_task_status_after_sync_early_return")
-            return
-        stage_runs = self._refresh_task_status_after_sync_refresh_authoritative_stages(db, task)
-        if (
-            current_status not in TASK_TERMINAL_STATUSES
-            and any(
-            str(run.status or "").strip() == "failed"
-            and str(getattr(run, "stage_name", "") or "").strip() == str(task.current_stage or "").strip()
-            and self._is_terminal_business_stage_failure(task, run)
-            for run in stage_runs
-            )
-        ):
-            failure_run = next(
-                (
-                    run for run in stage_runs
-                    if str(run.status or "").strip() == "failed"
-                    and str(getattr(run, "stage_name", "") or "").strip() == str(task.current_stage or "").strip()
-                    and self._is_terminal_business_stage_failure(task, run)
-                ),
-                None,
-            )
-            failure_snapshot = self._stage_failure_snapshot(task, failure_run)
-            self._finalize_task_after_authoritative_failure(
-                db,
-                task,
-                failure_ctx={
-                    "stage_name": getattr(failure_run, "stage_name", None) or task.current_stage,
-                    "stage_run": failure_run,
-                    "failure_code": failure_snapshot.get("failure_code"),
-                    "failure_category": failure_snapshot.get("failure_category"),
-                    "failure_message": failure_snapshot.get("failure_message") or failure_snapshot.get("error") or getattr(failure_run, "last_error", None),
-                    "reason": "current_stage_business_failure_after_sync",
-                },
-                previous_status=current_status,
-                event_type="dispatching_state_force_terminalized",
-            )
-            return
-        if any(str(run.status or "").strip() == "running" for run in stage_runs):
-            task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
-            self._clear_task_abnormal_reason_snapshot(db, task)
-        authoritative_failure = self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
-        if authoritative_failure is None:
-            authoritative_failure = self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
-        if authoritative_failure is None:
-            authoritative_failure = self._later_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
-        if authoritative_failure is None:
-            failure_run = next(
-                (
-                    run for run in stage_runs
-                    if str(run.status or "").strip() in {"failed", "downstream_missing", "cancelled"}
-                    and "owner_lost_retry_exhausted" in str(getattr(run, "last_error", "") or "").strip().lower()
-                ),
-                None,
-            )
-            if failure_run is not None:
-                authoritative_failure = {
-                    "stage_name": failure_run.stage_name or task.current_stage,
-                    "stage_run": failure_run,
-                    "failure_code": "owner_lost_retry_exhausted",
-                    "failure_category": "infrastructure",
-                    "failure_message": str(getattr(failure_run, "last_error", None) or "owner_lost_retry_exhausted"),
-                    "reason": "owner_lost_retry_exhausted_stage_run",
-                }
-        if authoritative_failure is not None and self._should_finalize_after_authoritative_failure(
-            db,
-            task,
-            failure_ctx=authoritative_failure,
-            stage_runs=stage_runs,
-        ):
-            failure_code = str(authoritative_failure.get("failure_code") or "").strip()
-            self._finalize_task_after_authoritative_failure(
+        try:
+            early_outcome = self._refresh_task_status_after_sync_early_return(db, task)
+            if early_outcome:
+                _normalize_running_lease_invariant("refresh_task_status_after_sync_early_return")
+                return
+            stage_runs = self._refresh_task_status_after_sync_refresh_authoritative_stages(db, task)
+            if (
+                current_status not in TASK_TERMINAL_STATUSES
+                and any(
+                str(run.status or "").strip() == "failed"
+                and str(getattr(run, "stage_name", "") or "").strip() == str(task.current_stage or "").strip()
+                and self._is_terminal_business_stage_failure(task, run)
+                for run in stage_runs
+                )
+            ):
+                failure_run = next(
+                    (
+                        run for run in stage_runs
+                        if str(run.status or "").strip() == "failed"
+                        and str(getattr(run, "stage_name", "") or "").strip() == str(task.current_stage or "").strip()
+                        and self._is_terminal_business_stage_failure(task, run)
+                    ),
+                    None,
+                )
+                failure_snapshot = self._stage_failure_snapshot(task, failure_run)
+                self._finalize_task_after_authoritative_failure(
+                    db,
+                    task,
+                    failure_ctx={
+                        "stage_name": getattr(failure_run, "stage_name", None) or task.current_stage,
+                        "stage_run": failure_run,
+                        "failure_code": failure_snapshot.get("failure_code"),
+                        "failure_category": failure_snapshot.get("failure_category"),
+                        "failure_message": failure_snapshot.get("failure_message") or failure_snapshot.get("error") or getattr(failure_run, "last_error", None),
+                        "reason": "current_stage_business_failure_after_sync",
+                    },
+                    previous_status=current_status,
+                    event_type="dispatching_state_force_terminalized",
+                )
+                return
+            if any(str(run.status or "").strip() == "running" for run in stage_runs):
+                task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
+                self._clear_task_abnormal_reason_snapshot(db, task)
+            authoritative_failure = self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+            if authoritative_failure is None:
+                authoritative_failure = self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+            if authoritative_failure is None:
+                authoritative_failure = self._later_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
+            if authoritative_failure is None:
+                failure_run = next(
+                    (
+                        run for run in stage_runs
+                        if str(run.status or "").strip() in {"failed", "downstream_missing", "cancelled"}
+                        and "owner_lost_retry_exhausted" in str(getattr(run, "last_error", "") or "").strip().lower()
+                    ),
+                    None,
+                )
+                if failure_run is not None:
+                    authoritative_failure = {
+                        "stage_name": failure_run.stage_name or task.current_stage,
+                        "stage_run": failure_run,
+                        "failure_code": "owner_lost_retry_exhausted",
+                        "failure_category": "infrastructure",
+                        "failure_message": str(getattr(failure_run, "last_error", None) or "owner_lost_retry_exhausted"),
+                        "reason": "owner_lost_retry_exhausted_stage_run",
+                    }
+            if authoritative_failure is not None and self._should_finalize_after_authoritative_failure(
                 db,
                 task,
                 failure_ctx=authoritative_failure,
-                previous_status=current_status,
-                event_type="task_owner_lost_final_failed"
-                if failure_code == "owner_lost_retry_exhausted"
-                else "dispatching_state_force_terminalized",
-            )
-            return
-        if authoritative_failure is not None:
-            failure_code = str(authoritative_failure.get("failure_code") or "").strip().lower()
-            failure_category = str(authoritative_failure.get("failure_category") or "").strip().lower()
-            failure_message = str(authoritative_failure.get("failure_message") or "").strip().lower()
-            if (
-                failure_code != "owner_lost_retry_exhausted"
-                and "owner_lost" not in failure_code
-                and "owner pod lost" not in failure_message
-                and "task owner pod lost" not in failure_message
-                and failure_category != "infrastructure"
+                stage_runs=stage_runs,
             ):
-                skip_running_lease_invariant_repair = True
+                failure_code = str(authoritative_failure.get("failure_code") or "").strip()
                 self._finalize_task_after_authoritative_failure(
                     db,
                     task,
                     failure_ctx=authoritative_failure,
                     previous_status=current_status,
-                    event_type="dispatching_state_force_terminalized",
+                    event_type="task_owner_lost_final_failed"
+                    if failure_code == "owner_lost_retry_exhausted"
+                    else "dispatching_state_force_terminalized",
                 )
                 return
-        if current_status not in TASK_TERMINAL_STATUSES:
-            if self._recover_streaming_parent_running_state_locked(
-                db,
-                task,
-                record_event=current_status == "dispatching",
-                reason="refresh_task_status_after_sync",
-            ):
-                _normalize_running_lease_invariant("refresh_task_status_after_sync_streaming_parent_recovered")
+            if authoritative_failure is not None:
+                failure_code = str(authoritative_failure.get("failure_code") or "").strip().lower()
+                failure_category = str(authoritative_failure.get("failure_category") or "").strip().lower()
+                failure_message = str(authoritative_failure.get("failure_message") or "").strip().lower()
+                if (
+                    failure_code != "owner_lost_retry_exhausted"
+                    and "owner_lost" not in failure_code
+                    and "owner pod lost" not in failure_message
+                    and "task owner pod lost" not in failure_message
+                    and failure_category != "infrastructure"
+                ):
+                    skip_running_lease_invariant_repair = True
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx=authoritative_failure,
+                        previous_status=current_status,
+                        event_type="dispatching_state_force_terminalized",
+                    )
+                    return
+            if current_status not in TASK_TERMINAL_STATUSES:
+                if self._recover_streaming_parent_running_state_locked(
+                    db,
+                    task,
+                    record_event=current_status == "dispatching",
+                    reason="refresh_task_status_after_sync",
+                ):
+                    _normalize_running_lease_invariant("refresh_task_status_after_sync_streaming_parent_recovered")
+                    return
+            if str(task.status or "").strip() == "running" and str(task.current_stage or "").strip() and not stage_runs:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="state_machine",
+                    reason="任务缺少权威阶段运行记录，回退为待执行",
+                    status="pending",
+                    stage_name=task.current_stage,
+                    finished_at=None,
+                    last_error=None,
+                    preserve_running_event_type="task_sync_pending_downgrade_suppressed_by_owner_guard",
+                    preserve_running_message="权威阶段记录暂未齐全，但任务仍处于 owner 保护窗口，保持 running",
+                )
+                self._clear_task_failure_state(task)
+                self._clear_task_abnormal_reason_snapshot(db, task)
+            if self._refresh_task_status_after_sync_handle_active_running_stages(db, task, stage_runs=stage_runs, previous_status=current_status):
+                _normalize_running_lease_invariant("refresh_task_status_after_sync_active_running_stages")
                 return
-        if str(task.status or "").strip() == "running" and str(task.current_stage or "").strip() and not stage_runs:
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="state_machine",
-                reason="任务缺少权威阶段运行记录，回退为待执行",
-                status="pending",
-                stage_name=task.current_stage,
-                finished_at=None,
-                last_error=None,
-                preserve_running_event_type="task_sync_pending_downgrade_suppressed_by_owner_guard",
-                preserve_running_message="权威阶段记录暂未齐全，但任务仍处于 owner 保护窗口，保持 running",
-            )
-            self._clear_task_failure_state(task)
-            self._clear_task_abnormal_reason_snapshot(db, task)
-        if self._refresh_task_status_after_sync_handle_active_running_stages(db, task, stage_runs=stage_runs, previous_status=current_status):
-            _normalize_running_lease_invariant("refresh_task_status_after_sync_active_running_stages")
-            return
-        if self._refresh_task_status_after_sync_handle_retry_and_reopen(db, task, stage_runs=stage_runs, previous_status=current_status):
-            _normalize_running_lease_invariant("refresh_task_status_after_sync_retry_or_reopen")
-            return
-        finalize_gate = self._evaluate_task_finalization_gate(db, task, stage_runs=stage_runs)
-        if not finalize_gate.allowed:
-            self._handle_finalize_gate_blocked_active_path(
-                db,
-                task,
-                stage_runs=stage_runs,
-                finalize_gate=finalize_gate,
-            )
-            return
-        if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
+            if self._refresh_task_status_after_sync_handle_retry_and_reopen(db, task, stage_runs=stage_runs, previous_status=current_status):
+                _normalize_running_lease_invariant("refresh_task_status_after_sync_retry_or_reopen")
+                return
+            finalize_gate = self._evaluate_task_finalization_gate(db, task, stage_runs=stage_runs)
+            if not finalize_gate.allowed:
+                self._handle_finalize_gate_blocked_active_path(
+                    db,
+                    task,
+                    stage_runs=stage_runs,
+                    finalize_gate=finalize_gate,
+                )
+                return
+            if task.status == "failed" and not self._task_has_active_reconcile_items(db, task):
+                self._finalize_task(db, task)
+                return
             self._finalize_task(db, task)
-            return
-        self._finalize_task(db, task)
+        finally:
+            if (
+                current_status in TASK_TERMINAL_STATUSES
+                and str(task.status or "").strip() in TASK_TERMINAL_STATUSES
+                and task.last_error is None
+                and previous_last_error is not None
+            ):
+                task.last_error = previous_last_error
 
     def _task_has_active_reconcile_items(
         self: TaskManager,
@@ -3339,7 +3493,7 @@ class TaskStateMachineMixin:
                     stage_name=failed_stage_name,
                     runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     finished_at=None,
-                    last_error=None,
+                    last_error=task.last_error,
                 )
                 task.tail_reconcile_state = "idle"
             else:
@@ -3350,11 +3504,11 @@ class TaskStateMachineMixin:
                     stage_name=failed_stage_name,
                     runtime_phase=next_runtime_phase,
                     finished_at=None,
-                    last_error=None,
+                    last_error=task.last_error,
                     clear_runtime_owner=False,
                 )
             return True
-        next_stage = self._next_incomplete_stage(db, task)
+        next_stage = self._next_stage_candidate(db, task)
         if had_task_retry_mode and not next_stage and original_target_stage_name:
             stage_sequence = self._stage_sequence_for_task(task)
             if original_target_stage_name in stage_sequence:
@@ -3591,6 +3745,14 @@ class TaskStateMachineMixin:
                 return True
         next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
         next_stage_status = next_stage_run.status if next_stage_run else "pending"
+        next_stage_gate = self._evaluate_stage_start_gate(
+            db,
+            task,
+            next_stage,
+            stage_runs=stage_runs,
+            snapshots=workflow_snapshots,
+            allow_entry_rebuild=True,
+        ) if next_stage else {"allowed": False}
         summary_after_retry_clear = dict(task.summary or {})
         current_stage_name = str(task.current_stage or "").strip()
         current_stage_items = self._stage_items(db, task.id, current_stage_name) if current_stage_name else []
@@ -3608,6 +3770,7 @@ class TaskStateMachineMixin:
             and self._streaming_mode_enabled(task)
             and current_stage_has_live_work
             and self._is_streaming_tail_stage(task, next_stage)
+            and not bool((next_stage_gate or {}).get("allowed"))
         ):
             if next_stage == "entry_analysis":
                 rebuilt = self._rebuild_missing_entry_analysis_stage_items_from_inputs(
@@ -4036,6 +4199,37 @@ class TaskStateMachineMixin:
             self._last_task_heartbeat_at.pop(task.id, None)
             return True
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=runs)
+        if gate.reason_code == "pending_stage_materialization" and gate.next_stage:
+            resume_decision = self._decide_task_resume_after_stage_reset(
+                db,
+                task,
+                next_stage=gate.next_stage,
+                resume_reason="finalize_gate_pending_materialization",
+                source="stage_terminal",
+                message=f"任务仍可继续推进，转入下一阶段继续执行: {gate.next_stage}",
+                payload={
+                    "reason_code": gate.reason_code,
+                    "stage_start_allowed": True,
+                },
+            )
+            resume_decision.event_type = "task_requeued_after_stage_completion"
+            resume_decision.should_resume = True
+            resume_decision.next_stage = gate.next_stage
+            resume_decision.payload = {
+                **dict(resume_decision.payload or {}),
+                "next_stage": gate.next_stage,
+                "resume_reason": "finalize_gate_pending_materialization",
+                "source": "stage_terminal",
+                "authoritative_active_progress": self._has_authoritative_active_stage(
+                    db,
+                    task,
+                    exclude_stage=gate.next_stage,
+                ),
+                "stage_start_allowed": True,
+            }
+            self._apply_task_resume_decision(db, task, resume_decision)
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
+            return True
         blocked_stage = str(gate.next_stage or gate.blocked_by_stage or self._workflow_blocked_on_stage(task, snapshots) or task.current_stage or "").strip()
         blocked_snapshot = next(
             (snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == blocked_stage),
@@ -4076,6 +4270,11 @@ class TaskStateMachineMixin:
                 and active_stage_name
                 and active_stage_name == current_stage_name
             ) or bool(self._stage_has_active_items(current_stage_items))
+            if has_active_incomplete_stage and active_stage_name:
+                blocked_stage = active_stage_name
+                blocked_status = str(active_stage_status or "").strip()
+            elif current_stage_name:
+                blocked_stage = current_stage_name
             next_status = "running" if keep_running else "pending"
         else:
             next_status = "running" if blocked_status in {"running", "dispatching", "applying"} or bool((blocked_snapshot or {}).get("has_active_items")) else "pending"
@@ -4090,7 +4289,7 @@ class TaskStateMachineMixin:
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 clear_runtime_owner=False,
                 finished_at=None,
-                last_error=None,
+                last_error=task.last_error,
                 preserve_running_event_type="task_running_state_preserved_for_downstream_resume",
                 preserve_running_message=f"任务仍在等待后续阶段推进，保持 running: {blocked_stage}",
             )
@@ -4193,7 +4392,11 @@ class TaskStateMachineMixin:
             return False
 
         vuln_run = next((run for run in stage_runs if normalize_stage_name(run.stage_name) == "dataflow_vuln_scan"), None)
-        has_active_streaming_upstream, active_streaming_stage, active_streaming_status = self._streaming_has_active_upstream_stage(task, stage_runs)
+        has_active_streaming_upstream, active_streaming_stage, active_streaming_status = self._streaming_has_active_upstream_stage(
+            db,
+            task,
+            stage_runs,
+        )
         original_runtime_phase = str(getattr(task, "runtime_phase", "") or "").strip()
         if has_active_streaming_upstream:
             self._apply_task_main_state_update(
@@ -4333,62 +4536,86 @@ class TaskStateMachineMixin:
 
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
-        next_stage = self._next_incomplete_stage(db, task)
+        next_stage = self._next_stage_candidate(db, task)
         if workflow_blocked_stage is None and self._workflow_ready_for_finalization(snapshots):
             return False
         if workflow_blocked_stage:
             next_stage = workflow_blocked_stage
         if next_stage:
-            next_stage_run = next((run for run in stage_runs if run.stage_name == next_stage), None)
-            next_stage_items = self._stage_items(db, task.id, next_stage)
-            next_snapshot = next((snapshot for snapshot in snapshots if str(snapshot.get("stage_name") or "").strip() == next_stage), None)
-            next_stage_status = str((next_snapshot or {}).get("status") or (
-                self._normalize_downstream_status(next_stage_run.status) or str(next_stage_run.status or "").strip()
-                if next_stage_run is not None
-                else "pending"
-            )).strip()
+            next_stage_gate = self._evaluate_stage_start_gate(
+                db,
+                task,
+                next_stage,
+                stage_runs=stage_runs,
+                snapshots=snapshots,
+                allow_entry_rebuild=True,
+            )
+            next_stage_run = next_stage_gate.get("stage_run")
+            next_stage_status = str(next_stage_gate.get("stage_status") or "").strip()
             if (
                 str(next_stage or "").strip() == "entry_analysis"
+                and not bool(next_stage_gate.get("allowed"))
                 and self._entry_analysis_pending_requires_materialization(
                     db,
                     task,
                     stage_run=next_stage_run,
-                    stage_items=next_stage_items,
+                    stage_items=list(next_stage_gate.get("stage_items") or []),
                 )
             ):
-                rebuilt = self._rebuild_missing_entry_analysis_stage_items_from_inputs(
+                self._record_event(
                     db,
                     task,
-                    stage_run=next_stage_run,
+                    "task_resume_blocked_for_missing_authoritative_items",
+                    "入口分析 authoritative item 尚未就绪，暂不按普通 pending 恢复任务",
+                    level="warning",
+                    stage_name=next_stage,
+                    payload={
+                        "stage_status": next_stage_status or None,
+                        "blocked_reason": next_stage_gate.get("blocked_reason"),
+                    },
                 )
-                if self._entry_analysis_pending_requires_materialization(
+                self._sync_task_abnormal_reason_snapshot(db, task, None)
+                return True
+            if bool(next_stage_gate.get("allowed")):
+                resume_decision = self._decide_task_resume_after_stage_reset(
                     db,
                     task,
-                    stage_run=next_stage_run,
-                    stage_items=self._stage_items(db, task.id, next_stage),
-                ):
-                    self._record_event(
+                    next_stage=next_stage,
+                    resume_reason="finalize_resume_missing_stage",
+                    source="state_machine",
+                    message=f"任务仍有未完成阶段，转入下一阶段继续执行: {next_stage}",
+                    payload={
+                        "stage_status": next_stage_status or None,
+                        "candidate_next_stage": next_stage,
+                        "stage_start_allowed": True,
+                    },
+                )
+                resume_decision.should_resume = True
+                resume_decision.next_stage = next_stage
+                resume_decision.payload = {
+                    **dict(resume_decision.payload or {}),
+                    "next_stage": next_stage,
+                    "resume_reason": "finalize_resume_missing_stage",
+                    "source": "state_machine",
+                    "authoritative_active_progress": self._has_authoritative_active_stage(
                         db,
                         task,
-                        "task_resume_blocked_for_missing_authoritative_items",
-                        "入口分析 authoritative item 尚未就绪，暂不按普通 pending 恢复任务",
-                        level="warning",
-                        stage_name=next_stage,
-                        payload={
-                            "stage_status": next_stage_status,
-                            "rebuild_state": dict(rebuilt or {}),
-                        },
-                    )
-                    self._sync_task_abnormal_reason_snapshot(db, task, None)
-                    return True
-                next_stage_items = self._stage_items(db, task.id, next_stage)
-                next_snapshot = next((snapshot for snapshot in self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs) if str(snapshot.get("stage_name") or "").strip() == next_stage), next_snapshot)
-                next_stage_status = str((next_snapshot or {}).get("status") or next_stage_status).strip()
-            next_stage_has_active_ownerless_progress = bool((next_snapshot or {}).get("has_active_items"))
+                        exclude_stage=next_stage,
+                    ),
+                    "stage_start_allowed": True,
+                }
+                self._apply_task_resume_decision(db, task, resume_decision)
+                self._sync_task_abnormal_reason_snapshot(db, task, None)
+                return True
+            next_stage_has_active_ownerless_progress = bool(next_stage_gate.get("has_active_ownerless_progress"))
             keep_running_during_stage_handoff = (
                 not workflow_blocked_stage
                 and str(self._task_runtime_phase(task) or "").strip() == task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
                 and str(getattr(task, "status", "") or "").strip() == "running"
+            )
+            target_stage_name = (
+                workflow_blocked_stage
+                or (next_stage if bool(next_stage_gate.get("allowed")) else (str(task.current_stage or "").strip() or next_stage))
             )
             self._apply_task_main_state_update(
                 db,
@@ -4404,40 +4631,50 @@ class TaskStateMachineMixin:
                     )
                     else "pending"
                 ),
-                stage_name=workflow_blocked_stage or next_stage,
+                stage_name=target_stage_name,
                 runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 clear_runtime_owner=False,
                 finished_at=None,
                 last_error=None,
                 preserve_running_event_type="task_running_state_preserved_for_stage_handoff",
-                preserve_running_message=f"任务继续切换到下一阶段并保持 running: {workflow_blocked_stage or next_stage}",
+                preserve_running_message=f"任务继续保持活跃等待阶段推进: {target_stage_name}",
             )
             task.tail_reconcile_state = "idle"
             self._last_task_heartbeat_at.pop(task.id, None)
             if self._should_requeue_for_owned_execution(
                 db,
                 task,
-                next_stage=next_stage,
+                next_stage=target_stage_name,
                 next_stage_status=str(next_stage_status or "").strip(),
             ):
                 self._requeue_owned_execution_takeover(
                     db,
                     task,
-                    stage_name=next_stage,
+                    stage_name=target_stage_name,
                     reason="finalize_deferred_no_active_owner",
                     event_type="owned_execution_takeover_requeued",
-                    message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {next_stage}",
-                    event_payload={"stage_status": next_stage_status},
+                    message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {target_stage_name}",
+                    event_payload={
+                        "stage_status": next_stage_status or None,
+                        "candidate_next_stage": next_stage,
+                        "stage_start_allowed": bool(next_stage_gate.get("allowed")),
+                        "blocked_reason": next_stage_gate.get("blocked_reason"),
+                    },
                 )
             else:
                 self._record_event(
                     db,
                     task,
                     "task_finalize_deferred_for_incomplete_stage",
-                    f"任务仍有未完成阶段，保持活跃状态等待继续推进: {next_stage}",
+                    f"任务仍有未完成阶段，保持活跃状态等待继续推进: {target_stage_name}",
                     level="warning",
-                    stage_name=next_stage,
-                    payload={"stage_status": next_stage_status},
+                    stage_name=target_stage_name,
+                    payload={
+                        "stage_status": next_stage_status or None,
+                        "candidate_next_stage": next_stage,
+                        "stage_start_allowed": bool(next_stage_gate.get("allowed")),
+                        "blocked_reason": next_stage_gate.get("blocked_reason"),
+                    },
                 )
                 self._sync_task_abnormal_reason_snapshot(db, task, None)
                 if next_stage_status in {"pending", "queued"} or next_stage_run is None:

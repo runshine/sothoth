@@ -377,6 +377,71 @@ def list_tasks(
     return TaskListResponse(total=total, items=items)
 
 
+@router.get("/tasks", response_model=TaskListResponse)
+def list_tasks_global(
+    project_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
+    task_origin_type: Optional[str] = Query(None),
+    input_filename: Optional[str] = Query(None),
+    sort_by: str = Query("created_at"),
+    sort_order: str = Query("desc"),
+    limit: int = Query(50, ge=10, le=1000),
+    offset: int = Query(0, ge=0),
+    _: TokenUser = Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    query = db.query(B2STask)
+    if project_id:
+        query = query.filter(B2STask.project_id == project_id)
+    if status:
+        query = query.filter(B2STask.status == status)
+    if parent_task_id:
+        query = query.filter(B2STask.parent_task_id == parent_task_id)
+    if parent_stage_item_id:
+        query = query.filter(B2STask.parent_stage_item_id == parent_stage_item_id)
+    if task_origin_type:
+        query = query.filter(B2STask.task_origin_type == task_origin_type)
+    search_text = str(search or "").strip()
+    if search_text:
+        escaped = search_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(or_(
+            B2STask.id.ilike(pattern, escape="\\"),
+            B2STask.name.ilike(pattern, escape="\\"),
+            B2STask.parent_task_id.ilike(pattern, escape="\\"),
+            B2STask.parent_task_type.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_name.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_item_id.ilike(pattern, escape="\\"),
+            B2STask.origin_label.ilike(pattern, escape="\\"),
+            B2STask.parent_task_display.ilike(pattern, escape="\\"),
+        ))
+    filename_text = str(input_filename or "").strip()
+    if filename_text:
+        escaped = filename_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(
+            B2STask.id.in_(
+                db.query(B2STaskItem.task_id)
+                .filter(B2STaskItem.task_id == B2STask.id)
+                .filter(B2STaskItem.elf_path.ilike(pattern, escape="\\"))
+            )
+        )
+    total = query.count()
+    sort_column = {
+        "created_at": B2STask.created_at,
+        "updated_at": B2STask.updated_at,
+        "status": B2STask.status,
+        "name": B2STask.name,
+    }.get(sort_by, B2STask.created_at)
+    order_expr = sort_column.asc() if str(sort_order or "").lower() == "asc" else sort_column.desc()
+    tasks = query.order_by(order_expr, B2STask.created_at.desc()).offset(offset).limit(limit).all()
+    items = [build_task_response(db, task) for task in tasks]
+    return TaskListResponse(total=total, items=items)
+
+
 @router.get("/projects/{project_id}/tasks/stats", response_model=B2STaskListStatsResponse)
 def get_task_stats(
     project_id: str,
@@ -390,6 +455,58 @@ def get_task_stats(
     db: Session = Depends(get_db),
 ):
     query = db.query(B2STask).filter(B2STask.project_id == project_id)
+    if status:
+        query = query.filter(B2STask.status == status)
+    if parent_task_id:
+        query = query.filter(B2STask.parent_task_id == parent_task_id)
+    if parent_stage_item_id:
+        query = query.filter(B2STask.parent_stage_item_id == parent_stage_item_id)
+    if task_origin_type:
+        query = query.filter(B2STask.task_origin_type == task_origin_type)
+    search_text = str(search or "").strip()
+    if search_text:
+        escaped = search_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(or_(
+            B2STask.id.ilike(pattern, escape="\\"),
+            B2STask.name.ilike(pattern, escape="\\"),
+            B2STask.parent_task_id.ilike(pattern, escape="\\"),
+            B2STask.parent_task_type.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_name.ilike(pattern, escape="\\"),
+            B2STask.parent_stage_item_id.ilike(pattern, escape="\\"),
+            B2STask.origin_label.ilike(pattern, escape="\\"),
+            B2STask.parent_task_display.ilike(pattern, escape="\\"),
+        ))
+    filename_text = str(input_filename or "").strip()
+    if filename_text:
+        escaped = filename_text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped}%"
+        query = query.filter(
+            B2STask.id.in_(
+                db.query(B2STaskItem.task_id)
+                .filter(B2STaskItem.task_id == B2STask.id)
+                .filter(B2STaskItem.elf_path.ilike(pattern, escape="\\"))
+            )
+        )
+    tasks = query.all()
+    return build_task_list_stats(db, tasks)
+
+
+@router.get("/tasks/stats", response_model=B2STaskListStatsResponse)
+def get_task_stats_global(
+    project_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    search: Optional[str] = Query(None),
+    parent_task_id: Optional[str] = Query(None),
+    parent_stage_item_id: Optional[str] = Query(None),
+    task_origin_type: Optional[str] = Query(None),
+    input_filename: Optional[str] = Query(None),
+    _: TokenUser = Depends(get_current_user_context),
+    db: Session = Depends(get_db),
+):
+    query = db.query(B2STask)
+    if project_id:
+        query = query.filter(B2STask.project_id == project_id)
     if status:
         query = query.filter(B2STask.status == status)
     if parent_task_id:

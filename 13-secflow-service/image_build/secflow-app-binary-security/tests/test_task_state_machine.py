@@ -86,6 +86,7 @@ class TaskStateMachineTests(unittest.TestCase):
                 return_value={
                     "required": True,
                     "reason": "historical_children_exist_but_authoritative_items_missing",
+                    "input_count": 1,
                     "historical_child_count": 1,
                     "current_stage_item_count": 0,
                 },
@@ -96,13 +97,99 @@ class TaskStateMachineTests(unittest.TestCase):
 
         self.assertFalse(should_advance)
 
+    def test_should_auto_advance_to_stage_blocks_entry_analysis_when_only_historical_children_remain(self):
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_stage_items", return_value=[]),
+            patch.object(
+                self.manager,
+                "_entry_analysis_authoritative_rebuild_required",
+                return_value={
+                    "required": False,
+                    "reason": "no_historical_entry_analysis_children",
+                    "input_count": 0,
+                    "historical_child_count": 1,
+                    "current_stage_item_count": 0,
+                },
+            ),
+            patch.object(self.manager, "_mark_entry_analysis_authoritative_rebuild_summary"),
+        ):
+            should_advance = self.manager._should_auto_advance_to_stage(db, task, "entry_analysis")
+
+        self.assertFalse(should_advance)
+
+    def test_streaming_stage_start_ready_reuses_auto_advance_gate_for_entry_analysis(self):
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
+        db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=True),
+            patch.object(self.manager, "_stage_has_materialized_inputs", return_value=True),
+        ):
+            self.assertTrue(self.manager._streaming_stage_start_ready(db, task, "entry_analysis"))
+
+        with (
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=False),
+            patch.object(self.manager, "_stage_has_materialized_inputs", return_value=True),
+        ):
+            self.assertFalse(self.manager._streaming_stage_start_ready(db, task, "entry_analysis"))
+
+    def test_streaming_stage_start_ready_requires_authoritative_materialization_for_non_entry_stage(self):
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
+        db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=True),
+            patch.object(self.manager, "_stage_has_authoritative_materialization", return_value=True),
+        ):
+            self.assertTrue(self.manager._streaming_stage_start_ready(db, task, "dataflow_vuln_scan"))
+
+        with (
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=True),
+            patch.object(self.manager, "_stage_has_authoritative_materialization", return_value=False),
+        ):
+            self.assertFalse(self.manager._streaming_stage_start_ready(db, task, "dataflow_vuln_scan"))
+
+    def test_evaluate_stage_start_gate_reports_blocked_reason(self):
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
+        db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=False),
+            patch.object(self.manager, "_continue_stage_input_error", return_value="missing archive success"),
+            patch.object(self.manager, "_stage_items", return_value=[]),
+            patch.object(self.manager, "_build_workflow_stage_snapshots", return_value=[]),
+        ):
+            gate = self.manager._evaluate_stage_start_gate(db, task, "entry_analysis")
+
+        self.assertFalse(gate["allowed"])
+        self.assertEqual("entry_analysis", gate["stage_name"])
+        self.assertEqual("missing archive success", gate["blocked_reason"])
+
     def test_decide_task_resume_after_stage_reset_reports_blocked_reason(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
         db = _ModelAwareDb(tasks=[task])
 
         with (
-            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=False),
-            patch.object(self.manager, "_continue_stage_input_error", return_value="missing inputs"),
+            patch.object(
+                self.manager,
+                "_evaluate_stage_start_gate",
+                return_value={
+                    "stage_name": "entry_analysis",
+                    "allowed": False,
+                    "blocked_reason": "missing inputs",
+                },
+            ),
         ):
             decision = self.manager._decide_task_resume_after_stage_reset(
                 db,
@@ -116,6 +203,7 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertFalse(decision.should_resume)
         self.assertEqual("task_resume_blocked", decision.event_type)
         self.assertEqual("missing inputs", decision.payload["blocked_reason"])
+        self.assertFalse(decision.payload["stage_start_allowed"])
 
     def test_decide_task_action_after_stage_terminal_keeps_system_analysis_final_when_no_next_stage(self):
         task = BinarySecurityTask(
@@ -457,6 +545,248 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(2, record_event.call_count)
+
+    def test_finalize_task_handle_resume_or_missing_stage_does_not_jump_current_stage_when_candidate_not_start_ready(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="system_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_build_workflow_stage_snapshots", return_value=[]),
+            patch.object(self.manager, "_workflow_blocked_on_stage", return_value=None),
+            patch.object(self.manager, "_workflow_ready_for_finalization", return_value=False),
+            patch.object(self.manager, "_next_stage_candidate", return_value="entry_analysis"),
+            patch.object(
+                self.manager,
+                "_evaluate_stage_start_gate",
+                return_value={
+                    "stage_name": "entry_analysis",
+                    "allowed": False,
+                    "blocked_reason": "missing archive success",
+                    "stage_run": None,
+                    "stage_items": [],
+                    "snapshot": None,
+                    "stage_status": "pending",
+                    "has_active_ownerless_progress": False,
+                },
+            ),
+            patch.object(self.manager, "_entry_analysis_pending_requires_materialization", return_value=False),
+            patch.object(self.manager, "_should_requeue_for_owned_execution", return_value=False),
+            patch.object(self.manager, "_record_event") as record_event,
+            patch.object(self.manager, "_sync_task_abnormal_reason_snapshot"),
+            patch.object(self.manager, "_enqueue_task") as enqueue_task,
+        ):
+            handled = self.manager._finalize_task_handle_resume_or_missing_stage(
+                db,
+                task,
+                stage_runs=[system_run],
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual("running", task.status)
+        enqueue_task.assert_called_once_with(task.id)
+        payload = record_event.call_args.kwargs["payload"]
+        self.assertEqual("entry_analysis", payload["candidate_next_stage"])
+        self.assertFalse(payload["stage_start_allowed"])
+        self.assertEqual("missing archive success", payload["blocked_reason"])
+
+    def test_evaluate_task_finalization_gate_does_not_treat_blocked_candidate_as_resumable_next_stage(self):
+        task = BinarySecurityTask(
+            id="task-finalize-gate-blocked-candidate",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="system_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_build_workflow_stage_snapshots", return_value=[]),
+            patch.object(self.manager, "_workflow_blocked_on_stage", return_value=None),
+            patch.object(self.manager, "_next_stage_candidate", return_value="entry_analysis"),
+            patch.object(
+                self.manager,
+                "_evaluate_stage_start_gate",
+                return_value={
+                    "stage_name": "entry_analysis",
+                    "allowed": False,
+                    "blocked_reason": "missing authoritative postprocess",
+                    "stage_run": None,
+                    "stage_items": [],
+                    "snapshot": None,
+                    "stage_status": "pending",
+                    "has_active_ownerless_progress": False,
+                },
+            ),
+            patch.object(self.manager, "_task_has_any_active_children", return_value=False),
+            patch.object(self.manager, "_task_has_pending_stage_materialization", return_value=False),
+            patch.object(self.manager, "_task_requires_runtime_takeover_or_requeue", return_value=False),
+            patch.object(self.manager, "_task_has_resumable_execution_path", return_value=False),
+            patch.object(self.manager, "_current_stage_authoritative_failure_context", return_value=None),
+            patch.object(self.manager, "_earlier_stage_authoritative_failure_context", return_value=None),
+            patch.object(self.manager, "_later_stage_authoritative_failure_context", return_value=None),
+        ):
+            decision = self.manager._evaluate_task_finalization_gate(
+                db,
+                task,
+                stage_runs=[system_run],
+                stage_items=[],
+            )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual("workflow_not_ready_for_finalization", decision.reason_code)
+        self.assertEqual("entry_analysis", decision.next_stage)
+        self.assertIn(decision.blocked_by_stage, {None, "system_analysis"})
+
+    def test_finalize_task_handle_resume_or_missing_stage_keeps_binary_module_current_stage_when_entry_analysis_not_start_ready(self):
+        task = BinarySecurityTask(
+            id="task-bmod-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="binary_to_source",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            task_type="binary_module",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        b2s_run = BinarySecurityStageRun(
+            id="sr-b2s",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="binary_to_source",
+            sequence_no=1,
+            status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[b2s_run], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_build_workflow_stage_snapshots", return_value=[]),
+            patch.object(self.manager, "_workflow_blocked_on_stage", return_value=None),
+            patch.object(self.manager, "_workflow_ready_for_finalization", return_value=False),
+            patch.object(self.manager, "_next_stage_candidate", return_value="entry_analysis"),
+            patch.object(
+                self.manager,
+                "_evaluate_stage_start_gate",
+                return_value={
+                    "stage_name": "entry_analysis",
+                    "allowed": False,
+                    "blocked_reason": "missing b2s archive success",
+                    "stage_run": None,
+                    "stage_items": [],
+                    "snapshot": None,
+                    "stage_status": "pending",
+                    "has_active_ownerless_progress": False,
+                },
+            ),
+            patch.object(self.manager, "_entry_analysis_pending_requires_materialization", return_value=False),
+            patch.object(self.manager, "_should_requeue_for_owned_execution", return_value=False),
+            patch.object(self.manager, "_record_event") as record_event,
+            patch.object(self.manager, "_sync_task_abnormal_reason_snapshot"),
+            patch.object(self.manager, "_enqueue_task") as enqueue_task,
+        ):
+            handled = self.manager._finalize_task_handle_resume_or_missing_stage(
+                db,
+                task,
+                stage_runs=[b2s_run],
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual("binary_to_source", task.current_stage)
+        enqueue_task.assert_called_once_with(task.id)
+        payload = record_event.call_args.kwargs["payload"]
+        self.assertEqual("entry_analysis", payload["candidate_next_stage"])
+        self.assertFalse(payload["stage_start_allowed"])
+        self.assertEqual("missing b2s archive success", payload["blocked_reason"])
+
+    def test_finalize_task_handle_resume_or_missing_stage_keeps_kg_current_stage_when_dataflow_not_start_ready(self):
+        task = BinarySecurityTask(
+            id="task-kg-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="knowledge_graph_entry_fetch",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            task_type="source",
+            policy_json='{"pipeline_profile":"kg_source_vuln_scan"}',
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        kg_run = BinarySecurityStageRun(
+            id="sr-kg",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="knowledge_graph_entry_fetch",
+            sequence_no=1,
+            status="success",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[kg_run], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_build_workflow_stage_snapshots", return_value=[]),
+            patch.object(self.manager, "_workflow_blocked_on_stage", return_value=None),
+            patch.object(self.manager, "_workflow_ready_for_finalization", return_value=False),
+            patch.object(self.manager, "_next_stage_candidate", return_value="dataflow_vuln_scan"),
+            patch.object(
+                self.manager,
+                "_evaluate_stage_start_gate",
+                return_value={
+                    "stage_name": "dataflow_vuln_scan",
+                    "allowed": False,
+                    "blocked_reason": "missing knowledge graph entry results",
+                    "stage_run": None,
+                    "stage_items": [],
+                    "snapshot": None,
+                    "stage_status": "pending",
+                    "has_active_ownerless_progress": False,
+                },
+            ),
+            patch.object(self.manager, "_should_requeue_for_owned_execution", return_value=False),
+            patch.object(self.manager, "_record_event") as record_event,
+            patch.object(self.manager, "_sync_task_abnormal_reason_snapshot"),
+            patch.object(self.manager, "_enqueue_task") as enqueue_task,
+        ):
+            handled = self.manager._finalize_task_handle_resume_or_missing_stage(
+                db,
+                task,
+                stage_runs=[kg_run],
+            )
+
+        self.assertTrue(handled)
+        self.assertEqual("knowledge_graph_entry_fetch", task.current_stage)
+        enqueue_task.assert_called_once_with(task.id)
+        payload = record_event.call_args.kwargs["payload"]
+        self.assertEqual("dataflow_vuln_scan", payload["candidate_next_stage"])
+        self.assertFalse(payload["stage_start_allowed"])
+        self.assertEqual("missing knowledge graph entry results", payload["blocked_reason"])
 
     def test_finalize_task_marks_terminal_success(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="dataflow_vuln_scan", workspace_root="/tmp/ws", output_root="/tmp/out")

@@ -59,7 +59,18 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         original_enqueue = self.manager._enqueue_task
         self.manager._enqueue_task = lambda task_id: queued.append(task_id)
         try:
-            with patch.object(self.manager, "_task_runtime_transition_guard_active", return_value=False):
+            with (
+                patch.object(self.manager, "_task_runtime_transition_guard_active", return_value=False),
+                patch.object(
+                    self.manager,
+                    "_evaluate_stage_start_gate",
+                    return_value={
+                        "stage_name": "entry_analysis",
+                        "allowed": False,
+                        "blocked_reason": "missing archive success",
+                    },
+                ),
+            ):
                 self.manager._apply_stage_worker_start_requested_locked(db, event)
         finally:
             self.manager._enqueue_task = original_enqueue
@@ -74,6 +85,8 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
         takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
         self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+        self.assertFalse((takeover_event.payload or {}).get("stage_start_allowed"))
+        self.assertEqual("missing archive success", (takeover_event.payload or {}).get("blocked_reason"))
         self.assertEqual(["task-1"], queued)
 
     def test_apply_stage_worker_start_requested_locked_suppresses_blocked_and_takeover_during_guard(self):
