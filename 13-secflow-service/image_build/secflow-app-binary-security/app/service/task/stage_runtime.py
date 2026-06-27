@@ -69,6 +69,31 @@ class TaskStageRuntimeMixin:
             "ready_for_terminal_status": ready_for_terminal_status,
         }
 
+    def _streaming_dataflow_gate_should_defer_terminal_status(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        items: list[BinarySecurityStageItem],
+        gate: dict[str, object] | None,
+        *,
+        aggregated_status: str | None,
+    ) -> bool:
+        if not gate:
+            return False
+        if aggregated_status not in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+            return False
+        if bool(gate.get("ready_for_terminal_status")):
+            return False
+        expected_entry_count = int(gate.get("expected_entry_count") or 0)
+        materialized_item_count = int(gate.get("materialized_item_count") or 0)
+        if expected_entry_count == materialized_item_count:
+            return False
+        if not items:
+            return True
+        item_statuses = [str(getattr(item, "status", "") or "").strip() for item in items]
+        if all(status in {"success", "partial_success"} for status in item_statuses):
+            return False
+        return True
+
     def _streaming_dataflow_gate_deferred_status(
         self: TaskManager,
         items: list[BinarySecurityStageItem],
@@ -268,13 +293,12 @@ class TaskStageRuntimeMixin:
                 and self._is_streaming_tail_stage(task, stage_name)
             ):
                 streaming_dataflow_gate = self._build_streaming_dataflow_completion_gate(db, task)
-                if not bool(streaming_dataflow_gate.get("ready_for_terminal_status")) and status in {
-                    "success",
-                    "partial_success",
-                    "failed",
-                    "cancelled",
-                    "downstream_missing",
-                }:
+                if self._streaming_dataflow_gate_should_defer_terminal_status(
+                    task,
+                    items,
+                    streaming_dataflow_gate,
+                    aggregated_status=status,
+                ):
                     deferred_status = self._streaming_dataflow_gate_deferred_status(items)
                     if deferred_status != status:
                         self._record_event(

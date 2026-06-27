@@ -146,6 +146,9 @@ class TaskStateMachineMixin:
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_blocked_stage = self._workflow_blocked_on_stage(task, snapshots)
         next_stage = self._next_stage_candidate(db, task)
+        current_stage = normalize_stage_name(str(task.current_stage or "").strip())
+        stage_sequence = [stage for stage in self._stage_sequence_for_task(task) if str(stage or "").strip()]
+        final_stage = normalize_stage_name(stage_sequence[-1] if stage_sequence else "")
         authoritative_failure = (
             self._current_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
             or self._earlier_stage_authoritative_failure_context(db, task, stage_runs=stage_runs)
@@ -164,6 +167,17 @@ class TaskStateMachineMixin:
             )
             if next_snapshot is not None and self._stage_snapshot_is_shell_active(db, task, next_snapshot):
                 next_stage = None
+        if current_stage and final_stage and current_stage == final_stage:
+            current_snapshot = next(
+                (snapshot for snapshot in snapshots if normalize_stage_name(snapshot.get("stage_name")) == current_stage),
+                None,
+            )
+            current_status = str((current_snapshot or {}).get("status") or "").strip()
+            if current_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+                if workflow_blocked_stage and normalize_stage_name(workflow_blocked_stage) == current_stage:
+                    workflow_blocked_stage = None
+                if next_stage and normalize_stage_name(next_stage) == current_stage:
+                    next_stage = None
         if workflow_blocked_stage or next_stage:
             return True
         return False
@@ -2122,7 +2136,7 @@ class TaskStateMachineMixin:
                     stage_run=existing_run,
                 )
                 self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
-                if rebuild_state.get("required"):
+                if rebuild_state.get("required") or str(rebuild_state.get("reason") or "").strip() == "active_operation_in_progress":
                     return False
             if existing_run_status in {"queued", "running", "dispatching"}:
                 return True

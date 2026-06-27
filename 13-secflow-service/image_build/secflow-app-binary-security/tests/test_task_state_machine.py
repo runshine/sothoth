@@ -218,7 +218,7 @@ class TaskStateMachineTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task])
 
         with (
-            patch.object(self.manager, "_next_incomplete_stage", return_value=None),
+            patch.object(self.manager, "_next_stage_candidate", return_value=None),
             patch.object(self.manager, "_should_auto_advance_to_stage", return_value=True),
         ):
             decision = self.manager._decide_task_action_after_stage_terminal(
@@ -330,11 +330,14 @@ class TaskStateMachineTests(unittest.TestCase):
     def test_decide_task_action_after_stage_terminal_blocks_when_next_stage_cannot_advance(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="system_analysis", workspace_root="/tmp/ws", output_root="/tmp/out")
         db = _ModelAwareDb(tasks=[task])
+        task.summary = {"candidate_modules": [{"module_key": "mod-a"}], "selected_modules": [{"module_key": "mod-a"}]}
 
         with (
-            patch.object(self.manager, "_next_incomplete_stage", return_value="entry_analysis"),
-            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=False),
-            patch.object(self.manager, "_continue_stage_input_error", return_value="missing inputs"),
+            patch.object(self.manager, "_next_stage_candidate", return_value="entry_analysis"),
+            patch.object(self.manager, "_evaluate_stage_start_gate", return_value={"allowed": False, "blocked_reason": "missing inputs"}),
+            patch.object(self.manager, "_entry_analysis_inputs", return_value=[{"module_key": "mod-a"}]),
+            patch.object(self.manager, "_system_analysis_authoritative_complete", return_value=True),
+            patch.object(self.manager, "_source_entry_analysis_barrier_enabled", return_value=True),
         ):
             decision = self.manager._decide_task_action_after_stage_terminal(
                 db,
@@ -346,7 +349,7 @@ class TaskStateMachineTests(unittest.TestCase):
                 state_event_id="evt-1",
             )
 
-        self.assertEqual("finalize_success", decision.action)
+        self.assertEqual("advance_blocked", decision.action)
         self.assertIsNone(decision.next_stage)
 
     def test_decide_task_action_after_system_analysis_terminal_waits_for_archive(self):

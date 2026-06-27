@@ -2713,6 +2713,9 @@ class TaskItemSyncServiceMixin:
                 )
                 current_touched: set[str] = set()
                 for item in candidates:
+                    if self._maybe_reconcile_stale_dataflow_stage_item(session, task, item):
+                        current_touched.add(normalize_stage_name(item.stage_name))
+                        continue
                     if self._sync_stage_item_downstream_fact(session, task, item):
                         current_touched.add(normalize_stage_name(item.stage_name))
                 session.commit()

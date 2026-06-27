@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import uuid
@@ -74,6 +75,287 @@ class TaskDownstreamServiceMixin:
             == str(target.get("definition_line") or target.get("line_no") or "").strip()
         )
 
+    @staticmethod
+    def _normalize_dataflow_execution_string(value: Any) -> str:
+        return str(value or "").strip()
+
+    @classmethod
+    def _normalize_dataflow_execution_list(cls, values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        normalized = {
+            cls._normalize_dataflow_execution_string(value)
+            for value in values
+            if cls._normalize_dataflow_execution_string(value)
+        }
+        return sorted(normalized)
+
+    def _dataflow_entry_execution_fingerprint_payload(self, entry: dict[str, Any] | None) -> dict[str, Any]:
+        candidate = dict(entry or {})
+        return {
+            "source_file": self._normalize_dataflow_execution_string(
+                candidate.get("source_file")
+                or candidate.get("definition_file")
+                or candidate.get("file_name")
+            ),
+            "function_name": self._normalize_dataflow_execution_string(candidate.get("function_name")),
+            "taint_params": self._normalize_dataflow_execution_list(candidate.get("taint_params")),
+            "signature_params": self._normalize_dataflow_execution_list(candidate.get("signature_params")),
+        }
+
+    def _dataflow_entry_execution_fingerprint(self, entry: dict[str, Any] | None) -> str:
+        payload = self._dataflow_entry_execution_fingerprint_payload(entry)
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _dataflow_entry_execution_changed_fields(
+        self,
+        previous_entry: dict[str, Any] | None,
+        current_entry: dict[str, Any] | None,
+    ) -> list[str]:
+        previous_payload = self._dataflow_entry_execution_fingerprint_payload(previous_entry)
+        current_payload = self._dataflow_entry_execution_fingerprint_payload(current_entry)
+        return [
+            field
+            for field in ("source_file", "function_name", "taint_params", "signature_params")
+            if previous_payload.get(field) != current_payload.get(field)
+        ]
+
+    def _entry_analysis_execution_fingerprint_payload(self, module: dict[str, Any] | None) -> dict[str, Any]:
+        candidate = dict(module or {})
+        return {
+            "module_dir": self._normalize_dataflow_execution_string(
+                candidate.get("module_dir") or candidate.get("module_input_path") or candidate.get("source_dir")
+            ),
+            "source_root": self._normalize_dataflow_execution_string(
+                candidate.get("source_root_path") or candidate.get("source_root") or candidate.get("source_dir")
+            ),
+            "entry_files_list": self._normalize_dataflow_execution_string(
+                candidate.get("entry_files_list") or candidate.get("files_list_path") or candidate.get("files_list")
+            ),
+        }
+
+    def _entry_analysis_execution_fingerprint(self, module: dict[str, Any] | None) -> str:
+        payload = self._entry_analysis_execution_fingerprint_payload(module)
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _legacy_vuln_execution_fingerprint_payload(self, result: dict[str, Any] | None) -> dict[str, Any]:
+        candidate = dict(result or {})
+        return {
+            "data_flow_path": self._normalize_dataflow_execution_string(
+                candidate.get("module_input_path")
+                or candidate.get("data_flow_root")
+                or candidate.get("dataflow_dir")
+                or candidate.get("data_flow_file")
+            ),
+            "source_dir": self._normalize_dataflow_execution_string(
+                candidate.get("source_root_path") or candidate.get("source_dir")
+            ),
+            "function_name": self._normalize_dataflow_execution_string(candidate.get("function_name")),
+            "entry_key": self._normalize_dataflow_execution_string(candidate.get("entry_key")),
+        }
+
+    def _legacy_vuln_execution_fingerprint(self, result: dict[str, Any] | None) -> str:
+        payload = self._legacy_vuln_execution_fingerprint_payload(result)
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _payload_changed_fields(
+        self,
+        previous_payload: dict[str, Any],
+        current_payload: dict[str, Any],
+    ) -> list[str]:
+        return [field for field in previous_payload.keys() if previous_payload.get(field) != current_payload.get(field)]
+
+    def _dataflow_item_execution_fingerprint(self, item: BinarySecurityStageItem | None) -> str | None:
+        if item is None:
+            return None
+        input_ref = dict(getattr(item, "input_ref", None) or {})
+        stored = str(input_ref.get("execution_fingerprint") or "").strip()
+        if stored:
+            return stored
+        result = self._load_stage_item_result_payload(item)
+        stored = str(result.get("execution_fingerprint") or "").strip()
+        if stored:
+            return stored
+        if not input_ref:
+            return None
+        return self._dataflow_entry_execution_fingerprint(input_ref)
+
+    def _decorate_dataflow_entry_with_execution_fingerprint(self, entry: dict[str, Any]) -> dict[str, Any]:
+        normalized = dict(entry or {})
+        fingerprint = self._dataflow_entry_execution_fingerprint(normalized)
+        normalized["execution_fingerprint"] = fingerprint
+        return normalized
+
+    def _update_stage_item_metadata_only(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        item_name: str | None,
+        input_ref: dict[str, Any],
+        output_ref: dict[str, Any] | None = None,
+    ) -> BinarySecurityStageItem:
+        item.item_name = item_name
+        item.input_ref = dict(input_ref or {})
+        if output_ref is not None:
+            item.output_ref = dict(output_ref or {})
+        result = self._load_stage_item_result_payload(item)
+        result["execution_fingerprint"] = str(input_ref.get("execution_fingerprint") or "").strip() or None
+        item.result = result
+        return item
+
+    def _prepare_dataflow_stage_item_for_signature_change(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> None:
+        old_task_id = str(item.downstream_task_id or "").strip() or None
+        if old_task_id:
+            self._supersede_archive_jobs_for_downstream_task(
+                db,
+                task,
+                item,
+                old_downstream_task_id=old_task_id,
+                reason="streaming_entry_execution_signature_changed",
+            )
+            self._mark_superseded_downstream_state(
+                item,
+                old_downstream_task_id=old_task_id,
+                message="执行契约已变化，旧 child 结果已失效，等待新 child 重建",
+            )
+        if old_task_id:
+            self._record_event(
+                db,
+                task,
+                "stale_dataflow_item_requeued_after_signature_change",
+                "DFVS 执行契约已变化，旧下游绑定已废弃，等待定点重建",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "item_id": item.id,
+                    "item_key": item.item_key,
+                    "old_downstream_task_id": old_task_id,
+                    "reason": "streaming_entry_execution_signature_changed",
+                },
+            )
+        self._clear_item_downstream_runtime_state(item)
+        self._mark_replacement_in_progress(
+            item,
+            old_downstream_task_id=old_task_id,
+            binding_cleared=True,
+            verification_status="pending",
+            transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
+        )
+        self._set_downstream_binding_snapshot(
+            item,
+            state="not_started",
+            attempts=0,
+            first_attempt_at=None,
+            last_attempt_at=None,
+            next_retry_at=None,
+            last_error=None,
+            last_error_type=None,
+            recoverable=None,
+            message="执行契约变化后等待重建新的下游任务",
+        )
+        item.status = "pending"
+        item.finished_at = None
+        item.started_at = None
+        item.error_message = None
+        self._clear_stage_item_claim(item)
+
+    def _prepare_entry_analysis_stage_item_for_signature_change(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> None:
+        old_task_id = str(item.downstream_task_id or "").strip() or None
+        if old_task_id:
+            self._supersede_archive_jobs_for_downstream_task(
+                db,
+                task,
+                item,
+                old_downstream_task_id=old_task_id,
+                reason="streaming_entry_execution_signature_changed",
+            )
+            self._mark_superseded_downstream_state(
+                item,
+                old_downstream_task_id=old_task_id,
+                message="入口分析执行契约已变化，旧 child 结果已失效，等待新 child 重建",
+            )
+        self._clear_item_downstream_runtime_state(item)
+        self._set_downstream_binding_snapshot(
+            item,
+            state="not_started",
+            attempts=0,
+            first_attempt_at=None,
+            last_attempt_at=None,
+            next_retry_at=None,
+            last_error=None,
+            last_error_type=None,
+            recoverable=None,
+            message="执行契约变化后等待重建新的下游任务",
+        )
+        item.status = "pending"
+        item.finished_at = None
+        item.started_at = None
+        item.error_message = None
+        self._clear_stage_item_claim(item)
+
+    def _dataflow_item_archive_success(self, db: Session, item: BinarySecurityStageItem) -> bool:
+        jobs = self._archive_jobs_for_stage_items(db, item.task_id, item.stage_name, [item.id])
+        return any(str(getattr(job, "archive_status", "") or "").strip().lower() == "success" for job in jobs)
+
+    def _maybe_reconcile_stale_dataflow_stage_item(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> bool:
+        if normalize_stage_name(item.stage_name) != "dataflow_vuln_scan":
+            return False
+        normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if normalized_status not in {"pending", "queued", "dispatching", "running"}:
+            return False
+        downstream_status = self._latest_observed_downstream_status(item)
+        mapped_downstream_status = self._normalize_downstream_status(downstream_status) or str(downstream_status or "").strip().lower()
+        if mapped_downstream_status not in {"success", "partial_success"}:
+            return False
+        if not self._dataflow_item_archive_success(db, item):
+            return False
+        fingerprint = self._dataflow_item_execution_fingerprint(item)
+        if fingerprint:
+            input_ref = dict(item.input_ref or {})
+            input_ref["execution_fingerprint"] = fingerprint
+            item.input_ref = input_ref
+            result = self._load_stage_item_result_payload(item)
+            result["execution_fingerprint"] = fingerprint
+            item.result = result
+        self._apply_child_task_status_change(
+            db,
+            task=task,
+            item=item,
+            change_source="stale_dataflow_item_reconcile",
+            after_status=mapped_downstream_status,
+            downstream_payload=dict(self._load_stage_item_result_payload(item).get("downstream") or {}),
+            sync_status="synced",
+            downstream_status_raw=downstream_status,
+            downstream_status_mapped=mapped_downstream_status,
+            downstream_status=downstream_status or mapped_downstream_status,
+            state_applied=True,
+            event_type="stale_dataflow_item_reconciled_to_success",
+            extra_payload={
+                "archive_reconciled": True,
+                "execution_fingerprint": fingerprint,
+            },
+        )
+        return True
+
     def _ensure_streaming_stage_run_for_materialization(
         self,
         db: Session,
@@ -81,6 +363,7 @@ class TaskDownstreamServiceMixin:
         stage_name: str,
         *,
         reason: str,
+        reopen_terminal: bool = True,
     ) -> BinarySecurityStageRun:
         normalized_stage = normalize_stage_name(stage_name)
         if not normalized_stage:
@@ -101,7 +384,7 @@ class TaskDownstreamServiceMixin:
             raise ValidationError(f"流式阶段物化失败: 当前实例不是任务 {task.id} 的活跃 owner")
         stage_run = self._ensure_stage_run(db, task, normalized_stage)
         normalized_status = str(getattr(stage_run, "status", "") or "").strip().lower()
-        if normalized_status in {"failed", "cancelled", "downstream_missing", "success", "partial_success"}:
+        if reopen_terminal and normalized_status in {"failed", "cancelled", "downstream_missing", "success", "partial_success"}:
             stage_run.status = "pending"
             stage_run.finished_at = None
             stage_run.last_error = None
@@ -115,12 +398,13 @@ class TaskDownstreamServiceMixin:
         stage_name: str,
         *,
         reason: str,
+        reopen_terminal: bool = True,
     ) -> BinarySecurityStageRun:
         normalized_stage = normalize_stage_name(stage_name)
         stage_run = self._latest_stage_run(db, task.id, normalized_stage)
         if stage_run is not None:
             normalized_status = str(getattr(stage_run, "status", "") or "").strip().lower()
-            if normalized_status in {"failed", "cancelled", "downstream_missing", "success", "partial_success"}:
+            if reopen_terminal and normalized_status in {"failed", "cancelled", "downstream_missing", "success", "partial_success"}:
                 stage_run.status = "pending"
                 stage_run.finished_at = None
                 stage_run.last_error = None
@@ -131,6 +415,7 @@ class TaskDownstreamServiceMixin:
             task,
             normalized_stage,
             reason=reason,
+            reopen_terminal=reopen_terminal,
         )
 
     def _recover_entry_output_contract(
@@ -294,6 +579,7 @@ class TaskDownstreamServiceMixin:
                 "triggered_by_stage": upstream_item.stage_name,
             },
         )
+        normalized_input["execution_fingerprint"] = self._entry_analysis_execution_fingerprint(normalized_input)
         existing = self._find_stage_item(
             db,
             task_id=task.id,
@@ -301,26 +587,92 @@ class TaskDownstreamServiceMixin:
             item_key=module_key,
             parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
         )
+        previous_fingerprint = None
+        current_fingerprint = str(normalized_input.get("execution_fingerprint") or "").strip() or None
+        should_reopen_stage_run = True
+        if existing is not None:
+            previous_fingerprint = str(
+                dict(existing.input_ref or {}).get("execution_fingerprint")
+                or self._load_stage_item_result_payload(existing).get("execution_fingerprint")
+                or self._entry_analysis_execution_fingerprint(existing.input_ref or {})
+            ).strip() or None
+            should_reopen_stage_run = not (previous_fingerprint and current_fingerprint and previous_fingerprint == current_fingerprint)
         stage_run = self._streaming_stage_run_for_seed(
             db,
             task,
             "entry_analysis",
             reason="streaming_entry_item_materialization",
+            reopen_terminal=should_reopen_stage_run,
         )
-        item = self._upsert_stage_item(
-            db,
-            task=task,
-            stage_run=stage_run,
-            stage_name="entry_analysis",
-            item_key=module_key,
-            item_name=str(normalized_input.get("module_name") or b2s_result.get("module_name") or "").strip() or None,
-            parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
-            downstream_service="entry_analyse",
-            input_ref=normalized_input,
-            output_ref={},
-            retrying=False,
-            running_status="pending",
-        )
+        if existing is None:
+            item = self._upsert_stage_item(
+                db,
+                task=task,
+                stage_run=stage_run,
+                stage_name="entry_analysis",
+                item_key=module_key,
+                item_name=str(normalized_input.get("module_name") or b2s_result.get("module_name") or "").strip() or None,
+                parent_key=str(b2s_result.get("firmware_key") or "").strip() or None,
+                downstream_service="entry_analyse",
+                input_ref=normalized_input,
+                output_ref={},
+                retrying=False,
+                running_status="pending",
+            )
+            result = self._load_stage_item_result_payload(item)
+            result["execution_fingerprint"] = normalized_input["execution_fingerprint"]
+            item.result = result
+        else:
+            if previous_fingerprint and current_fingerprint and previous_fingerprint == current_fingerprint:
+                item = self._update_stage_item_metadata_only(
+                    existing,
+                    item_name=str(normalized_input.get("module_name") or b2s_result.get("module_name") or "").strip() or None,
+                    input_ref=normalized_input,
+                    output_ref=dict(existing.output_ref or {}),
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "streaming_entry_item_metadata_refreshed",
+                    f"binary-to-source 刷新未改变入口分析执行契约，已仅更新元数据: {module_key}",
+                    stage_name="entry_analysis",
+                    item=item,
+                    payload={
+                        "upstream_item_id": upstream_item.id,
+                        "module_key": module_key,
+                        "refresh_mode": "metadata_only",
+                        "execution_fingerprint": current_fingerprint,
+                    },
+                )
+            else:
+                item = self._update_stage_item_metadata_only(
+                    existing,
+                    item_name=str(normalized_input.get("module_name") or b2s_result.get("module_name") or "").strip() or None,
+                    input_ref=normalized_input,
+                    output_ref=dict(existing.output_ref or {}),
+                )
+                changed_fields = self._payload_changed_fields(
+                    self._entry_analysis_execution_fingerprint_payload(existing.input_ref or {}),
+                    self._entry_analysis_execution_fingerprint_payload(normalized_input),
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "entry_analysis_execution_signature_changed",
+                    f"binary-to-source 刷新改变了入口分析执行契约，已准备定点重建: {module_key}",
+                    stage_name="entry_analysis",
+                    item=item,
+                    level="warning",
+                    payload={
+                        "upstream_item_id": upstream_item.id,
+                        "module_key": module_key,
+                        "item_id": item.id,
+                        "old_execution_fingerprint": previous_fingerprint,
+                        "new_execution_fingerprint": current_fingerprint,
+                        "changed_fields": changed_fields,
+                    },
+                )
+                self._prepare_entry_analysis_stage_item_for_signature_change(db, task, item)
         self._record_event(
             db,
             task,
@@ -359,15 +711,13 @@ class TaskDownstreamServiceMixin:
         )
         if not entries:
             return []
-        stage_run = self._streaming_stage_run_for_seed(
-            db,
-            task,
-            "dataflow_vuln_scan",
-            reason="streaming_dataflow_item_materialization",
-        )
         created_items: list[BinarySecurityStageItem] = []
         created_count = 0
         refreshed_count = 0
+        metadata_only_count = 0
+        recreate_count = 0
+        materialized_any_work = False
+        stage_run: BinarySecurityStageRun | None = None
         for entry in entries:
             entry_key = str(entry.get("entry_key") or "").strip()
             if not entry_key:
@@ -390,40 +740,129 @@ class TaskDownstreamServiceMixin:
                 "upstream_item_id": upstream_item.id,
                 "triggered_by_stage": upstream_item.stage_name,
             }
-            item = self._upsert_stage_item(
-                db,
-                task=task,
-                stage_run=stage_run,
-                stage_name="dataflow_vuln_scan",
-                item_key=entry_key,
-                item_name=str(entry.get("function_name") or "").strip() or None,
-                parent_key=str(entry.get("module_key") or "").strip() or None,
-                downstream_service="dataflow_vuln_scan",
-                input_ref=normalized_entry,
-                output_ref={},
-                retrying=False,
-                running_status="pending",
-            )
-            if existing is not None and str(existing.status or "").strip().lower() in task_manager_module.STREAMING_ACTIVE_ITEM_STATUSES:
-                item.retry_count = existing.retry_count
-                item.rerun_count = existing.rerun_count
-            created_items.append(item)
+            normalized_entry = self._decorate_dataflow_entry_with_execution_fingerprint(normalized_entry)
             if existing is None:
+                if stage_run is None:
+                    stage_run = self._streaming_stage_run_for_seed(
+                        db,
+                        task,
+                        "dataflow_vuln_scan",
+                        reason="streaming_dataflow_item_materialization",
+                        reopen_terminal=True,
+                    )
+                item = self._upsert_stage_item(
+                    db,
+                    task=task,
+                    stage_run=stage_run,
+                    stage_name="dataflow_vuln_scan",
+                    item_key=entry_key,
+                    item_name=str(entry.get("function_name") or "").strip() or None,
+                    parent_key=str(entry.get("module_key") or "").strip() or None,
+                    downstream_service="dataflow_vuln_scan",
+                    input_ref=normalized_entry,
+                    output_ref={},
+                    retrying=False,
+                    running_status="pending",
+                )
+                result = self._load_stage_item_result_payload(item)
+                result["execution_fingerprint"] = normalized_entry["execution_fingerprint"]
+                item.result = result
                 created_count += 1
+                materialized_any_work = True
             else:
+                previous_entry = dict(existing.input_ref or {})
+                previous_fingerprint = self._dataflow_item_execution_fingerprint(existing)
+                current_fingerprint = str(normalized_entry.get("execution_fingerprint") or "").strip() or None
+                if previous_fingerprint and current_fingerprint and previous_fingerprint == current_fingerprint:
+                    item = self._update_stage_item_metadata_only(
+                        existing,
+                        item_name=str(entry.get("function_name") or "").strip() or None,
+                        input_ref=normalized_entry,
+                        output_ref=dict(existing.output_ref or {}),
+                    )
+                    metadata_only_count += 1
+                    self._record_event(
+                        db,
+                        task,
+                        "streaming_dataflow_item_metadata_refreshed",
+                        f"入口刷新未改变 DFVS 执行契约，已仅更新展示元数据: {entry_key}",
+                        stage_name="dataflow_vuln_scan",
+                        item=item,
+                        payload={
+                            "upstream_item_id": upstream_item.id,
+                            "entry_key": entry_key,
+                            "refresh_mode": "metadata_only",
+                            "execution_fingerprint": current_fingerprint,
+                        },
+                    )
+                else:
+                    if stage_run is None:
+                        stage_run = self._streaming_stage_run_for_seed(
+                            db,
+                            task,
+                            "dataflow_vuln_scan",
+                            reason="streaming_dataflow_item_materialization",
+                            reopen_terminal=True,
+                        )
+                    item = self._update_stage_item_metadata_only(
+                        existing,
+                        item_name=str(entry.get("function_name") or "").strip() or None,
+                        input_ref=normalized_entry,
+                        output_ref=dict(existing.output_ref or {}),
+                    )
+                    changed_fields = self._dataflow_entry_execution_changed_fields(previous_entry, normalized_entry)
+                    self._record_event(
+                        db,
+                        task,
+                        "dataflow_entry_execution_signature_changed",
+                        f"入口刷新改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
+                        stage_name="dataflow_vuln_scan",
+                        item=item,
+                        level="warning",
+                        payload={
+                            "upstream_item_id": upstream_item.id,
+                            "entry_key": entry_key,
+                            "item_id": item.id,
+                            "old_execution_fingerprint": previous_fingerprint,
+                            "new_execution_fingerprint": current_fingerprint,
+                            "changed_fields": changed_fields,
+                        },
+                    )
+                    self._prepare_dataflow_stage_item_for_signature_change(
+                        db,
+                        task,
+                        item,
+                    )
+                    recreate_count += 1
+                    materialized_any_work = True
+            created_items.append(item)
+            if existing is not None:
                 refreshed_count += 1
+        if stage_run is None and created_items and not materialized_any_work:
+            stage_run = self._streaming_stage_run_for_seed(
+                db,
+                task,
+                "dataflow_vuln_scan",
+                reason="streaming_dataflow_item_materialization",
+                reopen_terminal=False,
+            )
         if created_items:
             self._record_event(
                 db,
                 task,
                 "streaming_dataflow_vuln_scan_items_seeded",
-                f"入口分析成功后已生成数据流漏洞挖掘待执行条目: 新增 {created_count}，刷新 {refreshed_count}",
+                (
+                    "入口分析成功后已生成数据流漏洞挖掘待执行条目: "
+                    f"新增 {created_count}，刷新 {refreshed_count}，仅元数据更新 {metadata_only_count}，定点重建 {recreate_count}"
+                ),
                 stage_name="dataflow_vuln_scan",
                 item=upstream_item,
                 payload={
                     "upstream_item_id": upstream_item.id,
                     "created_count": created_count,
                     "refreshed_count": refreshed_count,
+                    "metadata_only_count": metadata_only_count,
+                    "recreate_count": recreate_count,
                     "entry_count": len(created_items),
                     "pipeline_mode": self._pipeline_mode(task),
                 },
@@ -450,6 +889,7 @@ class TaskDownstreamServiceMixin:
             "upstream_item_id": upstream_item.id,
             "triggered_by_stage": upstream_item.stage_name,
         }
+        normalized_result["execution_fingerprint"] = self._legacy_vuln_execution_fingerprint(normalized_result)
         existing = self._find_stage_item(
             db,
             task_id=task.id,
@@ -457,27 +897,91 @@ class TaskDownstreamServiceMixin:
             item_key=entry_key,
             parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
         )
-        stage_run = self._streaming_stage_run_for_seed(
-            db,
-            task,
-            "dataflow_vuln_scan",
-            reason="streaming_vuln_item_materialization",
-        )
-        item = self._upsert_stage_item(
-            db,
-            task=task,
-            stage_run=stage_run,
-            stage_name="dataflow_vuln_scan",
-            item_key=entry_key,
-            item_name=str(dataflow_result.get("function_name") or "").strip() or None,
-            parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
-            downstream_service="dataflow_vuln_scan",
-            input_ref=normalized_result,
-            output_ref={},
-            retrying=False,
-            running_status="pending",
-            preserve_active_status=bool(existing is not None and str(existing.status or "").strip().lower() == "running"),
-        )
+        previous_fingerprint = self._dataflow_item_execution_fingerprint(existing) if existing is not None else None
+        current_fingerprint = str(normalized_result.get("execution_fingerprint") or "").strip() or None
+        if existing is None:
+            stage_run = self._streaming_stage_run_for_seed(
+                db,
+                task,
+                "dataflow_vuln_scan",
+                reason="streaming_vuln_item_materialization",
+                reopen_terminal=True,
+            )
+            item = self._upsert_stage_item(
+                db,
+                task=task,
+                stage_run=stage_run,
+                stage_name="dataflow_vuln_scan",
+                item_key=entry_key,
+                item_name=str(dataflow_result.get("function_name") or "").strip() or None,
+                parent_key=str(dataflow_result.get("module_key") or "").strip() or None,
+                downstream_service="dataflow_vuln_scan",
+                input_ref=normalized_result,
+                output_ref={},
+                retrying=False,
+                running_status="pending",
+            )
+            result = self._load_stage_item_result_payload(item)
+            result["execution_fingerprint"] = normalized_result["execution_fingerprint"]
+            item.result = result
+        else:
+            if previous_fingerprint and current_fingerprint and previous_fingerprint == current_fingerprint:
+                item = self._update_stage_item_metadata_only(
+                    existing,
+                    item_name=str(dataflow_result.get("function_name") or "").strip() or None,
+                    input_ref=normalized_result,
+                    output_ref=dict(existing.output_ref or {}),
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "streaming_vuln_item_metadata_refreshed",
+                    f"历史兼容路径刷新未改变 DFVS 执行契约，已仅更新元数据: {entry_key}",
+                    stage_name="dataflow_vuln_scan",
+                    item=item,
+                    payload={
+                        "upstream_item_id": upstream_item.id,
+                        "entry_key": entry_key,
+                        "refresh_mode": "metadata_only",
+                        "execution_fingerprint": current_fingerprint,
+                    },
+                )
+            else:
+                stage_run = self._streaming_stage_run_for_seed(
+                    db,
+                    task,
+                    "dataflow_vuln_scan",
+                    reason="streaming_vuln_item_materialization",
+                    reopen_terminal=True,
+                )
+                item = self._update_stage_item_metadata_only(
+                    existing,
+                    item_name=str(dataflow_result.get("function_name") or "").strip() or None,
+                    input_ref=normalized_result,
+                    output_ref=dict(existing.output_ref or {}),
+                )
+                changed_fields = self._payload_changed_fields(
+                    self._legacy_vuln_execution_fingerprint_payload(existing.input_ref or {}),
+                    self._legacy_vuln_execution_fingerprint_payload(normalized_result),
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "legacy_vuln_execution_signature_changed",
+                    f"历史兼容路径改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
+                    stage_name="dataflow_vuln_scan",
+                    item=item,
+                    level="warning",
+                    payload={
+                        "upstream_item_id": upstream_item.id,
+                        "entry_key": entry_key,
+                        "item_id": item.id,
+                        "old_execution_fingerprint": previous_fingerprint,
+                        "new_execution_fingerprint": current_fingerprint,
+                        "changed_fields": changed_fields,
+                    },
+                )
+                self._prepare_dataflow_stage_item_for_signature_change(db, task, item)
         self._record_event(
             db,
             task,

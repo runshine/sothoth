@@ -1960,6 +1960,282 @@ class TaskManagerTests(unittest.TestCase):
         self.assertFalse(blocked)
         self.assertEqual("binary_to_source", task.current_stage)
 
+    def test_trigger_entry_items_from_b2s_result_metadata_only_refresh_preserves_success_item(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-b2s",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="binary_to_source",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        existing_input = {
+            "module_key": "module-1",
+            "module_name": "mod.so",
+            "firmware_key": "fw-1",
+            "module_dir": "/tmp/source/module-1",
+            "source_root": "/tmp/source/module-1",
+            "source_root_path": "/tmp/source/module-1",
+            "entry_files_list": "/tmp/source/module-1/files.list",
+        }
+        existing_input["execution_fingerprint"] = self.manager._entry_analysis_execution_fingerprint(existing_input)
+        existing_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-1",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing_item], stage_runs=[stage_run], runtime_leases=[lease], events=[])
+
+        seeded = self.manager._trigger_entry_items_from_b2s_result(
+            db,
+            task,
+            {
+                "module_key": "module-1",
+                "module_name": "mod.so",
+                "firmware_key": "fw-1",
+                "source_dir": "/tmp/source/module-1",
+                "source_root": "/tmp/source/module-1",
+                "entry_files_list": "/tmp/source/module-1/files.list",
+                "function_description": "display only",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIs(seeded, existing_item)
+        self.assertEqual("success", seeded.status)
+        self.assertEqual("ea-1", seeded.downstream_task_id)
+        self.assertEqual(existing_input["execution_fingerprint"], seeded.input_ref["execution_fingerprint"])
+        self.assertTrue(any(event.event_type == "streaming_entry_item_metadata_refreshed" for event in db.events))
+        self.assertFalse(any(event.event_type == "entry_analysis_execution_signature_changed" for event in db.events))
+
+    def test_trigger_entry_items_metadata_only_refresh_does_not_reopen_terminal_stage_run(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-b2s",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="binary_to_source",
+        )
+        terminal_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="success",
+            finished_at=_now(),
+        )
+        existing_input = {
+            "module_key": "module-1",
+            "module_name": "mod.so",
+            "firmware_key": "fw-1",
+            "module_dir": "/tmp/source/module-1",
+            "source_root": "/tmp/source/module-1",
+            "source_root_path": "/tmp/source/module-1",
+            "entry_files_list": "/tmp/source/module-1/files.list",
+        }
+        existing_input["execution_fingerprint"] = self.manager._entry_analysis_execution_fingerprint(existing_input)
+        existing_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-1",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing_item], stage_runs=[terminal_run], runtime_leases=[lease], events=[])
+
+        self.manager._trigger_entry_items_from_b2s_result(
+            db,
+            task,
+            {
+                "module_key": "module-1",
+                "module_name": "mod.so",
+                "firmware_key": "fw-1",
+                "source_dir": "/tmp/source/module-1",
+                "source_root": "/tmp/source/module-1",
+                "entry_files_list": "/tmp/source/module-1/files.list",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertEqual("success", terminal_run.status)
+        self.assertIsNotNone(terminal_run.finished_at)
+
+    def test_trigger_entry_items_from_b2s_result_signature_change_requeues_target_item(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-b2s",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-b2s",
+            stage_name="binary_to_source",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="binary_to_source",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        existing_input = {
+            "module_key": "module-1",
+            "module_name": "mod.so",
+            "firmware_key": "fw-1",
+            "module_dir": "/tmp/source/module-1",
+            "source_root": "/tmp/source/module-1",
+            "source_root_path": "/tmp/source/module-1",
+            "entry_files_list": "/tmp/source/module-1/files.list",
+        }
+        existing_input["execution_fingerprint"] = self.manager._entry_analysis_execution_fingerprint(existing_input)
+        existing_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod.so",
+            parent_key="fw-1",
+            item_identity_key="module-1::fw-1",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-1",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-entry-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si-entry",
+            archive_status="success",
+            payload={"downstream_payload": {"task_id": "ea-1", "status": "passed"}},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing_item], stage_runs=[stage_run], archive_jobs=[archive_job], runtime_leases=[lease], events=[])
+
+        seeded = self.manager._trigger_entry_items_from_b2s_result(
+            db,
+            task,
+            {
+                "module_key": "module-1",
+                "module_name": "mod.so",
+                "firmware_key": "fw-1",
+                "source_dir": "/tmp/source/module-1-v2",
+                "source_root": "/tmp/source/module-1-v2",
+                "entry_files_list": "/tmp/source/module-1-v2/files.list",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIs(seeded, existing_item)
+        self.assertEqual("pending", seeded.status)
+        self.assertIsNone(seeded.downstream_task_id)
+        self.assertEqual("superseded", archive_job.archive_status)
+        self.assertTrue(any(event.event_type == "entry_analysis_execution_signature_changed" for event in db.events))
+
     def test_trigger_dataflow_items_from_entry_result_creates_pending_dataflow_items_in_streaming_mode(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -2023,6 +2299,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertTrue(all(item.stage_name == "dataflow_vuln_scan" for item in seeded))
         self.assertTrue(all(item.status == "pending" for item in seeded))
         self.assertTrue(all(item.input_ref["upstream_item_id"] == "si-entry" for item in seeded))
+        self.assertTrue(all(str(item.input_ref.get("execution_fingerprint") or "").strip() for item in seeded))
         self.assertTrue(any(run.stage_name == "dataflow_vuln_scan" for run in db.stage_runs))
         self.assertTrue(any(event.event_type == "streaming_dataflow_vuln_scan_items_seeded" for event in db.events))
         self.assertEqual(original_task_state, (task.status, task.current_stage, task.runtime_phase))
@@ -2408,6 +2685,250 @@ class TaskManagerTests(unittest.TestCase):
         self.assertIs(seeded, existing)
         self.assertEqual("running", seeded.status)
         self.assertEqual("si-df", seeded.input_ref["upstream_item_id"])
+
+    def test_trigger_vuln_items_from_dataflow_result_metadata_only_refresh_preserves_success_item(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+        )
+        existing_input = {
+            "entry_key": "entry-1",
+            "module_key": "module-1",
+            "function_name": "handle_req",
+            "data_flow_file": "/tmp/flow.md",
+            "module_input_path": "/tmp/flow.md",
+            "source_dir": "/tmp/source/module-1",
+        }
+        existing_input["execution_fingerprint"] = self.manager._legacy_vuln_execution_fingerprint(existing_input)
+        existing = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs_existing",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing], runtime_leases=[lease], events=[])
+
+        seeded = self.manager._trigger_vuln_items_from_dataflow_result(
+            db,
+            task,
+            {
+                "entry_key": "entry-1",
+                "module_key": "module-1",
+                "function_name": "handle_req",
+                "data_flow_file": "/tmp/flow.md",
+                "source_dir": "/tmp/source/module-1",
+                "note": "display only",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIs(seeded, existing)
+        self.assertEqual("success", seeded.status)
+        self.assertEqual("dvs_existing", seeded.downstream_task_id)
+        self.assertTrue(any(event.event_type == "streaming_vuln_item_metadata_refreshed" for event in db.events))
+        self.assertFalse(any(event.event_type == "legacy_vuln_execution_signature_changed" for event in db.events))
+
+    def test_trigger_vuln_items_metadata_only_refresh_keeps_success_item(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+        )
+        existing_input = {
+            "entry_key": "entry-1",
+            "module_key": "module-1",
+            "function_name": "handle_req",
+            "data_flow_file": "/tmp/flow.md",
+            "module_input_path": "/tmp/flow.md",
+            "source_dir": "/tmp/source/module-1",
+        }
+        existing_input["execution_fingerprint"] = self.manager._legacy_vuln_execution_fingerprint(existing_input)
+        existing = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs_existing",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing], runtime_leases=[lease], events=[])
+
+        self.manager._trigger_vuln_items_from_dataflow_result(
+            db,
+            task,
+            {
+                "entry_key": "entry-1",
+                "module_key": "module-1",
+                "function_name": "handle_req",
+                "data_flow_file": "/tmp/flow.md",
+                "source_dir": "/tmp/source/module-1",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertEqual("success", existing.status)
+        self.assertEqual("dvs_existing", existing.downstream_task_id)
+
+    def test_trigger_vuln_items_from_dataflow_result_signature_change_requeues_target_item(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+        )
+        existing_input = {
+            "entry_key": "entry-1",
+            "module_key": "module-1",
+            "function_name": "handle_req",
+            "data_flow_file": "/tmp/flow.md",
+            "module_input_path": "/tmp/flow.md",
+            "source_dir": "/tmp/source/module-1",
+        }
+        existing_input["execution_fingerprint"] = self.manager._legacy_vuln_execution_fingerprint(existing_input)
+        existing = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs_existing",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-vuln-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si-vuln",
+            archive_status="success",
+            payload={"downstream_payload": {"task_id": "dvs_existing", "status": "passed"}},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing], archive_jobs=[archive_job], runtime_leases=[lease], events=[])
+
+        seeded = self.manager._trigger_vuln_items_from_dataflow_result(
+            db,
+            task,
+            {
+                "entry_key": "entry-1",
+                "module_key": "module-1",
+                "function_name": "handle_req",
+                "data_flow_file": "/tmp/flow-v2.md",
+                "source_dir": "/tmp/source/module-1",
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIs(seeded, existing)
+        self.assertEqual("pending", seeded.status)
+        self.assertIsNone(seeded.downstream_task_id)
+        self.assertEqual("superseded", archive_job.archive_status)
+        self.assertTrue(any(event.event_type == "legacy_vuln_execution_signature_changed" for event in db.events))
 
     def test_reclaim_stale_streaming_stage_items_resets_dispatching_vuln_item(self):
         self.manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
@@ -18077,6 +18598,99 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, run.output_summary["missing_entry_count"])
         self.assertTrue(any(row.event_type == "dataflow_terminalization_deferred_for_missing_streaming_items" for row in db.events))
 
+    def test_refresh_stage_run_from_items_keeps_success_for_metadata_only_streaming_tail(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            status="success",
+        )
+        entry_item.input_ref = {
+            "module_key": "mod-a",
+            "module_name": "mod-a",
+            "source_dir": "/src/mod-a",
+            "task_type": TASK_TYPE_SOURCE,
+        }
+        entry_item.result = {
+            "entries": [
+                {"entry_key": "entry-a", "function_name": "entry_a", "module_key": "mod-a"},
+                {"entry_key": "entry-b", "function_name": "entry_b", "module_key": "mod-a"},
+            ]
+        }
+        entry_archive_job = BinarySecurityArchiveJob(
+            id="aj-entry",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si-entry",
+            archive_status="success",
+        )
+        run = BinarySecurityStageRun(
+            id="sr-df",
+            task_id="task1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="success",
+            finished_at=_now(),
+        )
+        item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-a",
+            parent_key="mod-a",
+            item_identity_key="entry-a::mod-a",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa-1",
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run, run],
+            stage_items=[entry_item, item],
+            archive_jobs=[entry_archive_job],
+            events=[],
+        )
+
+        self.manager._refresh_stage_run_from_items(db, task, "dataflow_vuln_scan")
+
+        self.assertEqual("success", run.status)
+        self.assertEqual("success", task.stage_summary["dataflow_vuln_scan"]["status"])
+        self.assertTrue(run.output_summary["streaming_completion_gate_ready"] is False)
+        self.assertEqual(2, run.output_summary["expected_entry_count"])
+        self.assertEqual(1, run.output_summary["materialized_item_count"])
+        self.assertEqual(1, run.output_summary["missing_entry_count"])
+        self.assertFalse(any(row.event_type == "dataflow_terminalization_deferred_for_missing_streaming_items" for row in db.events))
+
     def test_refresh_stage_run_from_items_keeps_empty_streaming_tail_pending_without_started_at(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -30459,7 +31073,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             patch.object(self.manager, "_streaming_tail_stage_names", return_value=("dataflow_vuln_scan",)),
             patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
             patch.object(self.manager, "_find_stage_item", return_value=existing_item),
-            patch.object(self.manager, "_upsert_stage_item", side_effect=fake_upsert),
             patch.object(self.manager, "_record_event"),
         ):
             self.manager._trigger_dataflow_items_from_entry_result(
@@ -30470,6 +31083,260 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             )
 
         self.assertEqual(144, existing_item.retry_count)
+        self.assertEqual("queued", existing_item.status)
+        self.assertTrue(str(existing_item.input_ref.get("execution_fingerprint") or "").strip())
+        self.assertFalse(any(event.event_type == "dataflow_entry_execution_signature_changed" for event in fake_session.events))
+
+    def test_trigger_dataflow_items_from_entry_result_metadata_only_refresh_preserves_success_item(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="module-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            downstream_service="entry_analyse",
+            status="success",
+        )
+        existing_input = {
+            "entry_key": "entry-1",
+            "module_key": "IPSEC",
+            "function_name": "handle",
+            "source_file": "libipsec.c",
+            "taint_params": ["ctx", "buf"],
+            "signature_params": ["sig_b", "sig_a"],
+        }
+        existing_input["execution_fingerprint"] = self.manager._dataflow_entry_execution_fingerprint(existing_input)
+        existing_item = BinarySecurityStageItem(
+            id="si-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-dfa",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle",
+            parent_key="IPSEC",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfvs-1",
+            status="success",
+            retry_count=7,
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        entry_result = {
+            "entries": [
+                {
+                    "entry_key": "entry-1",
+                    "module_key": "IPSEC",
+                    "function_name": "handle",
+                    "source_file": "libipsec.c",
+                    "file_name": "libipsec.c",
+                    "taint_params": ["buf", "ctx"],
+                    "signature_params": ["sig_a", "sig_b"],
+                    "function_description": "new description only",
+                }
+            ]
+        }
+        fake_session = _ModelAwareDb(stage_items=[existing_item], events=[])
+
+        with (
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=True),
+            patch.object(self.manager, "_streaming_tail_stage_names", return_value=("dataflow_vuln_scan",)),
+            patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_find_stage_item", return_value=existing_item),
+        ):
+            items = self.manager._trigger_dataflow_items_from_entry_result(
+                fake_session,
+                task,
+                entry_result,
+                upstream_item=upstream_item,
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertIs(existing_item, items[0])
+        self.assertEqual("success", existing_item.status)
+        self.assertEqual("dfvs-1", existing_item.downstream_task_id)
+        self.assertEqual(7, existing_item.retry_count)
+        self.assertEqual(existing_input["execution_fingerprint"], existing_item.input_ref["execution_fingerprint"])
+        self.assertTrue(any(event.event_type == "streaming_dataflow_item_metadata_refreshed" for event in fake_session.events))
+        self.assertFalse(any(event.event_type == "dataflow_entry_execution_signature_changed" for event in fake_session.events))
+
+    def test_trigger_dataflow_items_from_entry_result_signature_change_requeues_only_target_item(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="module-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            downstream_service="entry_analyse",
+            status="success",
+        )
+        existing_input = {
+            "entry_key": "entry-1",
+            "module_key": "IPSEC",
+            "function_name": "handle",
+            "source_file": "libipsec.c",
+            "taint_params": ["ctx"],
+            "signature_params": ["sig_a"],
+        }
+        existing_input["execution_fingerprint"] = self.manager._dataflow_entry_execution_fingerprint(existing_input)
+        existing_item = BinarySecurityStageItem(
+            id="si-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-dfa",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle",
+            parent_key="IPSEC",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfvs-1",
+            status="success",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si-dfa",
+            archive_status="success",
+            payload={"downstream_payload": {"task_id": "dfvs-1", "status": "passed"}},
+        )
+        entry_result = {
+            "entries": [
+                {
+                    "entry_key": "entry-1",
+                    "module_key": "IPSEC",
+                    "function_name": "handle_changed",
+                    "source_file": "libipsec.c",
+                    "taint_params": ["ctx"],
+                    "signature_params": ["sig_a"],
+                }
+            ]
+        }
+        fake_session = _ModelAwareDb(stage_items=[existing_item], archive_jobs=[archive_job], events=[])
+
+        with (
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=True),
+            patch.object(self.manager, "_streaming_tail_stage_names", return_value=("dataflow_vuln_scan",)),
+            patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_find_stage_item", return_value=existing_item),
+        ):
+            items = self.manager._trigger_dataflow_items_from_entry_result(
+                fake_session,
+                task,
+                entry_result,
+                upstream_item=upstream_item,
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertIs(existing_item, items[0])
+        self.assertEqual("pending", existing_item.status)
+        self.assertIsNone(existing_item.downstream_task_id)
+        self.assertEqual("superseded", archive_job.archive_status)
+        self.assertTrue(any(event.event_type == "dataflow_entry_execution_signature_changed" for event in fake_session.events))
+        self.assertTrue(any(event.event_type == "stale_dataflow_item_requeued_after_signature_change" for event in fake_session.events))
+
+    def test_readless_reconcile_converges_stale_active_dataflow_item_to_success(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        item_input = {
+            "entry_key": "entry-1",
+            "module_key": "source-project",
+            "function_name": "handle",
+            "source_file": "main.c",
+            "taint_params": ["ctx"],
+            "signature_params": [],
+        }
+        item_input["execution_fingerprint"] = self.manager._dataflow_entry_execution_fingerprint(item_input)
+        item = BinarySecurityStageItem(
+            id="si-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle",
+            parent_key="source-project",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfvs-1",
+            status="dispatching",
+            input_ref=item_input,
+            result={
+                "execution_fingerprint": item_input["execution_fingerprint"],
+                "downstream_status": "success",
+                "downstream": {"task_id": "dfvs-1", "status": "passed"},
+                "sync_observation": {
+                    "downstream_status": "success",
+                    "mapped_status": "success",
+                    "sync_status": "synced",
+                },
+            },
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si-dfa",
+            archive_status="success",
+            payload={"downstream_payload": {"task_id": "dfvs-1", "status": "passed"}},
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job], events=[])
+
+        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+            touched = self.manager._readless_reconcile_item_layer("t1")
+
+        self.assertEqual({"dataflow_vuln_scan"}, touched)
+        self.assertEqual("success", item.status)
+        self.assertTrue(any(event.event_type == "stale_dataflow_item_reconciled_to_success" for event in db.events))
 
     def test_run_dataflow_item_recovers_missing_contract_from_entry_stage_result(self):
         task = BinarySecurityTask(
@@ -42807,6 +43674,190 @@ def _test_run_current_task_operation_cancel_success_repairs_reopened_running_tas
     self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
     self.assertIsNone(task.current_operation_id)
     self.assertIsNone(task.dispatcher_instance_id)
+    self.assertEqual("succeeded", operation.status)
+    self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+
+
+def _test_run_current_task_operation_cancel_terminal_finalize_is_atomic(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-cancel-atomic",
+        project_id="p1",
+        name="source",
+        status="cancelling",
+        current_stage="dataflow_vuln_scan",
+        current_operation_id="op-cancel-atomic",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    task.dispatch_started_at = _now()
+    task.lease_expires_at = _now() + timedelta(seconds=120)
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-atomic",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        target_stage="dataflow_vuln_scan",
+        status="running",
+        current_step=task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+    original_factory = task_manager_module.get_session_factory
+    original_prepare_cancel = manager._prepare_cancel_task
+    original_write_metadata = manager._write_task_metadata_async
+    original_ensure = manager._ensure_task_write_ownership
+    original_owner_match = manager._task_runtime_owner_matches_current_instance
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+
+        async def _fake_prepare_cancel_task(_db, _task):
+            return []
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        manager._prepare_cancel_task = _fake_prepare_cancel_task
+        manager._write_task_metadata_async = _noop_write
+        manager._ensure_task_write_ownership = lambda *args, **kwargs: None
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        changed = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._prepare_cancel_task = original_prepare_cancel
+        manager._write_task_metadata_async = original_write_metadata
+        manager._ensure_task_write_ownership = original_ensure
+        manager._task_runtime_owner_matches_current_instance = original_owner_match
+
+    self.assertTrue(changed)
+    self.assertEqual("cancelled", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+    self.assertIsNone(task.current_operation_id)
+    self.assertEqual("succeeded", operation.status)
+    self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("control_operation_terminal_finalize_started", event_types)
+    self.assertIn("control_operation_terminal_finalize_committed", event_types)
+
+
+def _test_run_current_task_operation_returns_after_atomic_terminal_finalize_without_post_tail_ownership_check(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-cancel-atomic-tail",
+        project_id="p1",
+        name="source",
+        status="cancelling",
+        current_stage="dataflow_vuln_scan",
+        current_operation_id="op-cancel-atomic-tail",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-atomic-tail",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        target_stage="dataflow_vuln_scan",
+        status="running",
+        current_step=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+    original_factory = task_manager_module.get_session_factory
+    original_runner = manager._run_task_operation_steps
+    original_ensure = manager._ensure_task_write_ownership
+    ensure_calls: list[str] = []
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+
+        async def _fake_run_task_operation_steps(_db, current_task, current_operation):
+            current_task.status = "cancelled"
+            current_task.runtime_phase = TASK_RUNTIME_PHASE_TERMINAL
+            current_task.current_operation_id = None
+            current_task.dispatcher_instance_id = None
+            current_operation.status = "succeeded"
+            current_operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+            current_operation.finished_at = _now()
+            return {"operation_finalized": True, "task_status": "cancelled"}
+
+        def _fake_ensure_task_write_ownership(*args, **kwargs):
+            del args, kwargs
+            ensure_calls.append("called")
+            if len(ensure_calls) > 1:
+                raise AssertionError("post-finalize ownership check should not run")
+
+        manager._run_task_operation_steps = _fake_run_task_operation_steps
+        manager._ensure_task_write_ownership = _fake_ensure_task_write_ownership
+        changed = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._run_task_operation_steps = original_runner
+        manager._ensure_task_write_ownership = original_ensure
+
+    self.assertTrue(changed)
+    self.assertEqual(["called"], ensure_calls)
+    self.assertEqual("cancelled", task.status)
+    self.assertIsNone(task.current_operation_id)
+
+
+def _test_run_current_task_operation_preserves_cancel_binding_when_terminal_finalize_stales_before_commit(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-cancel-stale-before-commit",
+        project_id="p1",
+        name="source",
+        status="cancelling",
+        current_stage="dataflow_vuln_scan",
+        current_operation_id="op-cancel-stale-before-commit",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-stale-before-commit",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        target_stage="dataflow_vuln_scan",
+        status="running",
+        current_step=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+    original_factory = task_manager_module.get_session_factory
+    original_runner = manager._run_task_operation_steps
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+
+        async def _fake_run_task_operation_steps(_db, current_task, current_operation):
+            current_task.status = "cancelling"
+            current_task.current_operation_id = current_operation.id
+            raise task_manager_module.StaleTaskExecution("ownership changed before terminal commit")
+
+        manager._run_task_operation_steps = _fake_run_task_operation_steps
+        changed = asyncio.run(manager._run_current_task_operation(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._run_task_operation_steps = original_runner
+
+    self.assertFalse(changed)
+    self.assertEqual("cancelling", task.status)
+    self.assertEqual(operation.id, task.current_operation_id)
+    self.assertEqual("running", operation.status)
 
 
 def _test_run_current_task_operation_preserves_cancel_operation_when_quiesce_retry_pending(self):
@@ -46939,6 +47990,9 @@ TaskManagerTests.test_apply_task_main_state_update_records_parent_task_state_tra
 TaskManagerTests.test_control_operation_runtime_lease_coverage_matches_supported_operation_set = _test_control_operation_runtime_lease_coverage_matches_supported_operation_set
 TaskManagerTests.test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease = _test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease
 TaskManagerTests.test_operation_verify_retry_bindings_skips_duplicate_control_for_adopt_active_pending_verification = _test_operation_verify_retry_bindings_skips_duplicate_control_for_adopt_active_pending_verification
+TaskManagerTests.test_run_current_task_operation_cancel_terminal_finalize_is_atomic = _test_run_current_task_operation_cancel_terminal_finalize_is_atomic
+TaskManagerTests.test_run_current_task_operation_returns_after_atomic_terminal_finalize_without_post_tail_ownership_check = _test_run_current_task_operation_returns_after_atomic_terminal_finalize_without_post_tail_ownership_check
+TaskManagerTests.test_run_current_task_operation_preserves_cancel_binding_when_terminal_finalize_stales_before_commit = _test_run_current_task_operation_preserves_cancel_binding_when_terminal_finalize_stales_before_commit
 
 
 if __name__ == "__main__":

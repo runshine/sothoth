@@ -10047,6 +10047,8 @@ class TaskManager(
         stage_run: BinarySecurityStageRun | None = None,
     ) -> bool:
         rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
+        if str(rebuild_state.get("reason") or "").strip() == "active_operation_in_progress":
+            return False
         return not bool(rebuild_state.get("required"))
 
     def _stage_has_authoritative_materialization(

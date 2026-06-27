@@ -26,6 +26,150 @@ if TYPE_CHECKING:
 
 
 class TaskOperationServiceMixin:
+    def _finalize_control_operation_terminal(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        step_name: str,
+        step_message: str,
+        task_status: str,
+        task_reason: str,
+        lease_reason: str,
+        task_event_type: str,
+        task_event_message: str,
+        task_event_payload: dict[str, Any] | None = None,
+        delete_task_row: bool = False,
+    ) -> dict[str, Any]:
+        from app.service import task_manager as task_manager_module
+
+        stage_name = str(getattr(operation, "target_stage", "") or getattr(task, "current_stage", "") or "").strip() or None
+        now_value = task_manager_module._now()
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "control_operation_terminal_finalize_started",
+            f"后台操作开始进入终态原子收口: {operation.operation_type}",
+            stage_name=stage_name,
+            payload={
+                "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                "operation_type": str(getattr(operation, "operation_type", "") or "").strip() or None,
+                "task_status_before": str(getattr(task, "status", "") or "").strip() or None,
+                "runtime_phase_before": self._task_runtime_phase(task),
+                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                "delete_task_row": bool(delete_task_row),
+            },
+        )
+        self._record_operation_step_finished(
+            db,
+            task,
+            operation,
+            step_name=step_name,
+            message=step_message,
+            stage_name=stage_name,
+            payload={"operation_type": operation.operation_type, "atomic_terminal_finalize": True},
+            next_step=task_manager_module.TASK_OPERATION_STEP_SUCCEEDED,
+        )
+        clear_decision = self._can_clear_parent_runtime_ownership(
+            db,
+            task,
+            reason=lease_reason,
+        )
+        if not delete_task_row:
+            self._apply_task_main_state_update(
+                db,
+                task,
+                source="task_operation",
+                reason=task_reason,
+                status=task_status,
+                stage_name=stage_name,
+                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
+                finished_at=getattr(task, "finished_at", None) or now_value,
+                last_error=None,
+                clear_runtime_owner=clear_decision.allowed,
+            )
+        else:
+            task.current_operation_id = None
+            task.last_error = None
+            task.finished_at = getattr(task, "finished_at", None) or now_value
+        if clear_decision.allowed:
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type="parent_runtime_lease_clear_allowed",
+                message="控制操作终态已确认，当前 authoritative owner 允许清理父任务租约",
+                decision=clear_decision,
+                reason=lease_reason,
+                stage_name=stage_name,
+                level="info",
+            )
+        else:
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type="parent_runtime_lease_clear_suppressed",
+                message="控制操作终态已确认，但当前不允许清理父任务租约",
+                decision=clear_decision,
+                reason=lease_reason,
+                stage_name=stage_name,
+            )
+        operation.status = "succeeded"
+        operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
+        operation.finished_at = now_value
+        operation.updated_at = now_value
+        operation.error_code = None
+        operation.error_message = None
+        task.current_operation_id = None
+        self._invalidate_task_execution(task)
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            task_event_type,
+            task_event_message,
+            stage_name=stage_name,
+            payload=dict(task_event_payload or {}),
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "operation_succeeded",
+            f"任务 owner 已完成后台操作: {operation.operation_type}",
+            stage_name=stage_name,
+            payload={"source": "task_owner", "auto_reconciled": False},
+        )
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "control_operation_terminal_finalize_committed",
+            f"后台操作终态原子收口已提交: {operation.operation_type}",
+            stage_name=stage_name,
+            payload={
+                "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                "operation_type": str(getattr(operation, "operation_type", "") or "").strip() or None,
+                "task_status_after": task_status if not delete_task_row else "deleted",
+                "runtime_phase_after": task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
+                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                "delete_task_row": bool(delete_task_row),
+            },
+        )
+        if delete_task_row:
+            db.delete(task)
+        db.commit()
+        return {
+            "operation_finalized": True,
+            "task_status": task_status if not delete_task_row else "deleted",
+            "delete_task_row": bool(delete_task_row),
+        }
+
     def _finalize_delete_operation_after_task_row_removed(
         self: TaskManager,
         db: Session,
@@ -2171,7 +2315,7 @@ class TaskOperationServiceMixin:
             }
         )
 
-    async def _prepare_delete_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> None:
+    async def _prepare_delete_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> dict[str, Any] | None:
         from app.service import task_manager as task_manager_module
 
         def _ensure_force_delete_fallback(
@@ -2535,7 +2679,29 @@ class TaskOperationServiceMixin:
                 "cleanup_counts": cleanup_counts,
             },
         )
+        if operation is not None:
+            return self._finalize_control_operation_terminal(
+                db,
+                task,
+                operation,
+                step_name=task_manager_module.TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+                step_message=f"后台操作准备步骤已完成: {operation.operation_type}",
+                task_status=str(getattr(task, "status", "") or "").strip() or task_manager_module.TASK_STATUS_DELETING,
+                task_reason="删除操作已确认完成并原子收口",
+                lease_reason="delete_operation_confirmed_cleanup",
+                task_event_type=f"{event_prefix}_operation_succeeded",
+                task_event_message="任务删除控制操作已完成",
+                task_event_payload={
+                    "force_delete": force_delete,
+                    "deleted_downstream_count": deleted_downstream_count,
+                    "cleanup_counts": cleanup_counts,
+                    "workspace_cleanup_status": cleanup_status,
+                },
+                delete_task_row=True,
+            )
+        db.delete(task)
         db.commit()
+        return {"operation_finalized": True, "task_status": "deleted", "delete_task_row": True}
 
     async def _run_scheduled_coroutine(self: TaskManager, coro, *, label: str) -> None:
         from app.service import task_manager as task_manager_module
@@ -2971,6 +3137,16 @@ class TaskOperationServiceMixin:
             if isinstance(operation_run_result, dict) and bool(operation_run_result.get("operation_incomplete")):
                 db.commit()
                 return False
+            if isinstance(operation_run_result, dict) and bool(operation_run_result.get("operation_finalized")):
+                task_manager_module.logger.info(
+                    "binary-security task owner completed atomic control terminal finalize: "
+                    "task_id=%s operation_id=%s operation_type=%s",
+                    task_id,
+                    operation.id,
+                    str(operation.operation_type or "").strip(),
+                )
+                task_manager_module.observe_control_operation(operation_type, "succeeded")
+                return True
             if operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
                 task_deleted = (
                     db.query(task_manager_module.BinarySecurityTask.id)
@@ -3008,6 +3184,39 @@ class TaskOperationServiceMixin:
             try:
                 self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             except task_manager_module.StaleTaskExecution:
+                task_after_stale = (
+                    db.query(task_manager_module.BinarySecurityTask)
+                    .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                    .first()
+                )
+                if (
+                    task_after_stale is not None
+                    and str(getattr(task_after_stale, "status", "") or "").strip().lower() in task_manager_module.TASK_TERMINAL_STATUSES
+                    and str(getattr(task_after_stale, "current_operation_id", "") or "").strip() == str(getattr(operation, "id", "") or "").strip()
+                    and str(getattr(operation, "operation_type", "") or "").strip() in {
+                        task_manager_module.TASK_ACTION_CANCEL,
+                        task_manager_module.TASK_ACTION_DELETE,
+                    }
+                ):
+                    self._record_operation_event(
+                        db,
+                        task_after_stale,
+                        operation,
+                        "control_operation_terminal_finalize_stale_before_commit",
+                        "控制操作终态收口前 owner 发生切换，已保留待接管收尾",
+                        level="error",
+                        stage_name=str(getattr(operation, "target_stage", "") or getattr(task_after_stale, "current_stage", "") or "").strip() or None,
+                        payload={
+                            "task_id": task_id,
+                            "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                            "operation_type": str(getattr(operation, "operation_type", "") or "").strip() or None,
+                            "task_status": str(getattr(task_after_stale, "status", "") or "").strip() or None,
+                            "runtime_phase": self._task_runtime_phase(task_after_stale),
+                            "dispatcher_instance_id": str(getattr(task_after_stale, "dispatcher_instance_id", "") or "").strip() or None,
+                            "current_operation_id": str(getattr(task_after_stale, "current_operation_id", "") or "").strip() or None,
+                        },
+                    )
+                    db.commit()
                 if operation.operation_type in self._operation_requeue_family_types() and self._finalize_task_operation_after_requeue(
                     db,
                     task_id=task_id,
@@ -3602,7 +3811,9 @@ class TaskOperationServiceMixin:
                         db.commit()
                         return
                     elif operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
-                        await self._prepare_delete_task(db, task)
+                        delete_result = await self._prepare_delete_task(db, task)
+                        if isinstance(delete_result, dict) and bool(delete_result.get("operation_finalized")):
+                            return delete_result
                         self._record_operation_step_finished(
                             db,
                             task,
@@ -4522,54 +4733,18 @@ class TaskOperationServiceMixin:
                 for target in list(self._operation_result_data(operation).get("ignored_blocking_targets") or [])
                 if isinstance(target, dict)
             ]
-            self._set_task_status(
-                db,
-                task,
-                "cancelled",
-                reason="取消操作已确认完成",
-                source="task_operation",
-                stage_name=operation.target_stage,
-            )
-            task.finished_at = task_manager_module._now()
-            task.last_error = None
-            self._invalidate_task_execution(task)
-            clear_decision = self._can_clear_parent_runtime_ownership(
-                db,
-                task,
-                reason="cancel_operation_confirmed_cleanup",
-            )
-            if clear_decision.allowed:
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
-                self._record_parent_runtime_lease_decision(
-                    db,
-                    task,
-                    event_type="parent_runtime_lease_clear_allowed",
-                    message="取消终态已确认，当前 authoritative owner 允许清理父任务租约",
-                    decision=clear_decision,
-                    reason="cancel_operation_confirmed_cleanup",
-                    stage_name=operation.target_stage,
-                    level="info",
-                )
-            else:
-                self._record_parent_runtime_lease_decision(
-                    db,
-                    task,
-                    event_type="parent_runtime_lease_clear_suppressed",
-                    message="取消终态已确认，但当前不允许清理父任务租约",
-                    decision=clear_decision,
-                    reason="cancel_operation_confirmed_cleanup",
-                    stage_name=operation.target_stage,
-                )
-            self._record_operation_event(
+            finalized = self._finalize_control_operation_terminal(
                 db,
                 task,
                 operation,
-                "task_cancel_succeeded",
-                "任务取消已完成",
-                stage_name=operation.target_stage,
-                payload={
+                step_name=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
+                step_message="取消操作已收口为已取消",
+                task_status="cancelled",
+                task_reason="取消操作已确认完成并原子收口",
+                lease_reason="cancel_operation_confirmed_cleanup",
+                task_event_type="task_cancel_succeeded",
+                task_event_message="任务取消已完成",
+                task_event_payload={
                     "cancel_state": cancel_state,
                     "force_cancelled_after_verify_retries": bool(
                         self._operation_result_data(operation).get("force_cancelled_after_verify_retries")
@@ -4586,7 +4761,7 @@ class TaskOperationServiceMixin:
                 task_manager_module.Path(task.workspace_root) / "input" / "task-metadata.json",
                 status="cancelled",
             )
-            return {"task_status": task.status}
+            return finalized
 
         async def _finalize_cancel_failed(error: Exception) -> dict[str, Any]:
             self._set_task_status(
@@ -4662,13 +4837,8 @@ class TaskOperationServiceMixin:
         if verify_result == "retry":
             return {"operation_incomplete": True, "result": "retry"}
 
-        await _run_step(
-            task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
-            message="取消操作已收口为已取消",
-            next_step=task_manager_module.TASK_OPERATION_STEP_SUCCEEDED,
-            fn=_finalize_cancelled,
-        )
-        return {"operation_incomplete": False, "result": verify_result or "quiesced"}
+        finalized = await _finalize_cancelled()
+        return {"operation_incomplete": False, "result": verify_result or "quiesced", **dict(finalized or {})}
 
     async def _run_retry_failed_items_operation_steps(self: TaskManager, db: Session, task, operation, resume_step: str) -> None:
         from app.service import task_manager as task_manager_module
