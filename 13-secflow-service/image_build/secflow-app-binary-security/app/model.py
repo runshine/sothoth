@@ -145,9 +145,9 @@ class BinarySecurityTask(Base, JsonMixin):
     execution_mode = Column(String(32), nullable=True, index=True)
     target_stage_name = Column(String(64), nullable=True, index=True)
     current_operation_id = Column(String(48), nullable=True, index=True)
-    cleanup_snapshot_json = Column(Text, nullable=True)
+    cleanup_snapshot_json = Column(MEDIUMTEXT, nullable=True)
     last_error = Column(Text, nullable=True)
-    latest_abnormal_reason_json = Column(Text, nullable=True)
+    latest_abnormal_reason_json = Column(MEDIUMTEXT, nullable=True)
     runtime_phase = Column(String(32), nullable=False, default=TASK_RUNTIME_PHASE_OWNED_EXECUTION, index=True)
     tail_reconcile_state = Column(String(32), nullable=False, default="idle", index=True)
     operation_lock_owner = Column(String(128), nullable=True, index=True)
@@ -294,7 +294,7 @@ class BinarySecurityStageRun(Base, JsonMixin):
     input_snapshot_json = Column(Text, nullable=True)
     output_summary_json = Column(Text, nullable=True)
     counts_json = Column(Text, nullable=True)
-    downstream_refs_json = Column(Text, nullable=True)
+    downstream_refs_json = Column(MEDIUMTEXT, nullable=True)
     last_error = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -407,7 +407,7 @@ class BinarySecurityEvent(Base, JsonMixin):
     level = Column(String(16), nullable=False, default="info")
     event_type = Column(String(64), nullable=False, index=True)
     message = Column(Text, nullable=False)
-    payload_json = Column(Text, nullable=True)
+    payload_json = Column(MEDIUMTEXT, nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False, index=True)
 
     @property
@@ -512,8 +512,8 @@ class BinarySecurityTaskOperation(Base, JsonMixin):
     error_message = Column(Text, nullable=True)
     current_step = Column(String(64), nullable=True, index=True)
     step_attempts_json = Column(Text, nullable=True)
-    step_payload_json = Column(Text, nullable=True)
-    resume_cursor_json = Column(Text, nullable=True)
+    step_payload_json = Column(MEDIUMTEXT, nullable=True)
+    resume_cursor_json = Column(MEDIUMTEXT, nullable=True)
     superseded_by_operation_id = Column(String(48), nullable=True, index=True)
     created_at = Column(DateTime, default=now_local, nullable=False, index=True)
     updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)
@@ -732,7 +732,8 @@ def _ensure_compat_columns(engine) -> None:
     inspector = inspect(engine)
     task_table = BinarySecurityTask.__tablename__
     if inspector.has_table(task_table):
-        columns = {column["name"] for column in inspector.get_columns(task_table)}
+        column_defs = {column["name"]: column for column in inspector.get_columns(task_table)}
+        columns = set(column_defs)
         statements = []
         if "dispatcher_instance_id" not in columns:
             statements.append(
@@ -806,6 +807,11 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN cleanup_snapshot_json TEXT NULL"
             )
+        cleanup_snapshot_json_type = str(column_defs.get("cleanup_snapshot_json", {}).get("type") or "").lower()
+        if "cleanup_snapshot_json" in columns and "mediumtext" not in cleanup_snapshot_json_type:
+            statements.append(
+                f"ALTER TABLE {task_table} MODIFY COLUMN cleanup_snapshot_json MEDIUMTEXT NULL"
+            )
         if "runtime_phase" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN runtime_phase VARCHAR(32) NOT NULL DEFAULT '{TASK_RUNTIME_PHASE_OWNED_EXECUTION}'"
@@ -843,6 +849,11 @@ def _ensure_compat_columns(engine) -> None:
         if "latest_abnormal_reason_json" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN latest_abnormal_reason_json TEXT NULL"
+            )
+        latest_abnormal_reason_json_type = str(column_defs.get("latest_abnormal_reason_json", {}).get("type") or "").lower()
+        if "latest_abnormal_reason_json" in columns and "mediumtext" not in latest_abnormal_reason_json_type:
+            statements.append(
+                f"ALTER TABLE {task_table} MODIFY COLUMN latest_abnormal_reason_json MEDIUMTEXT NULL"
             )
         _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(task_table)}
@@ -948,13 +959,30 @@ def _ensure_compat_columns(engine) -> None:
                 "(task_id, stage_name, item_identity_key, created_at)"
             )
         _execute_compat_statements(index_statements)
+    stage_run_table = BinarySecurityStageRun.__tablename__
+    if inspector.has_table(stage_run_table):
+        column_defs = {column["name"]: column for column in inspector.get_columns(stage_run_table)}
+        columns = set(column_defs)
+        statements = []
+        downstream_refs_json_type = str(column_defs.get("downstream_refs_json", {}).get("type") or "").lower()
+        if "downstream_refs_json" in columns and "mediumtext" not in downstream_refs_json_type:
+            statements.append(
+                f"ALTER TABLE {stage_run_table} MODIFY COLUMN downstream_refs_json MEDIUMTEXT NULL"
+            )
+        _execute_compat_statements(statements)
     archive_job_table = BinarySecurityArchiveJob.__tablename__
     if inspector.has_table(archive_job_table):
-        columns = {column["name"] for column in inspector.get_columns(archive_job_table)}
+        column_defs = {column["name"]: column for column in inspector.get_columns(archive_job_table)}
+        columns = set(column_defs)
         statements = []
         if "job_dedupe_key" not in columns:
             statements.append(
                 f"ALTER TABLE {archive_job_table} ADD COLUMN job_dedupe_key VARCHAR(255) NULL"
+            )
+        payload_json_type = str(column_defs.get("payload_json", {}).get("type") or "").lower()
+        if "payload_json" in columns and "mediumtext" not in payload_json_type:
+            statements.append(
+                f"ALTER TABLE {archive_job_table} MODIFY COLUMN payload_json MEDIUMTEXT NULL"
             )
         _execute_compat_statements(statements)
         indexes = {index["name"] for index in inspector.get_indexes(archive_job_table)}
@@ -1025,6 +1053,16 @@ def _ensure_compat_columns(engine) -> None:
         if "resume_cursor_json" not in columns:
             statements.append(
                 f"ALTER TABLE {operation_table} ADD COLUMN resume_cursor_json TEXT NULL"
+            )
+        step_payload_json_type = str(column_defs.get("step_payload_json", {}).get("type") or "").lower()
+        if "step_payload_json" in columns and "mediumtext" not in step_payload_json_type:
+            statements.append(
+                f"ALTER TABLE {operation_table} MODIFY COLUMN step_payload_json MEDIUMTEXT NULL"
+            )
+        resume_cursor_json_type = str(column_defs.get("resume_cursor_json", {}).get("type") or "").lower()
+        if "resume_cursor_json" in columns and "mediumtext" not in resume_cursor_json_type:
+            statements.append(
+                f"ALTER TABLE {operation_table} MODIFY COLUMN resume_cursor_json MEDIUMTEXT NULL"
             )
         request_payload_json_type = str(column_defs.get("request_payload_json", {}).get("type") or "").lower()
         if "request_payload_json" in columns and "mediumtext" not in request_payload_json_type:
