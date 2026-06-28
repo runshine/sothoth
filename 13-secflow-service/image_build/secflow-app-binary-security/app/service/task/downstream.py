@@ -266,7 +266,6 @@ class TaskDownstreamServiceMixin:
         item.finished_at = None
         item.started_at = None
         item.error_message = None
-        self._clear_stage_item_claim(item)
 
     def _prepare_entry_analysis_stage_item_for_signature_change(
         self,
@@ -305,7 +304,6 @@ class TaskDownstreamServiceMixin:
         item.finished_at = None
         item.started_at = None
         item.error_message = None
-        self._clear_stage_item_claim(item)
 
     def _dataflow_item_archive_success(self, db: Session, item: BinarySecurityStageItem) -> bool:
         jobs = self._archive_jobs_for_stage_items(db, item.task_id, item.stage_name, [item.id])
@@ -1059,7 +1057,7 @@ class TaskDownstreamServiceMixin:
                 existing_items_by_identity[identity_key] = existing_item
         processed_identities = set(existing_items_by_identity.keys())
 
-        def _should_requeue_existing_streaming_item(existing_item: BinarySecurityStageItem) -> bool:
+        def _should_preserve_existing_streaming_item(existing_item: BinarySecurityStageItem) -> bool:
             if not self._streaming_mode_enabled(task):
                 return False
             if not self._is_streaming_tail_stage(task, stage_run.stage_name):
@@ -1071,19 +1069,12 @@ class TaskDownstreamServiceMixin:
             if self._task_is_waiting_for_manual_confirmation(task):
                 return False
             normalized_status = str(existing_item.status or "").strip().lower()
-            if normalized_status not in {"failed", "cancelled", "downstream_missing"}:
-                return False
-            claim_token = str(getattr(existing_item, "claim_execution_token", "") or "").strip() or None
-            claim_owner = str(getattr(existing_item, "claim_owner_instance_id", "") or "").strip() or None
-            current_token = self._dispatch_token(task)
-            if claim_token and claim_token == current_token:
-                return False
-            if claim_owner and claim_owner == str(self.instance_id or "").strip() and claim_token == current_token:
+            if normalized_status not in {"failed", "cancelled", "downstream_missing", "pending", "queued", "dispatching", "running"}:
                 return False
             return True
 
         for identity_key, existing_item in existing_items_by_identity.items():
-            if not _should_requeue_existing_streaming_item(existing_item):
+            if not _should_preserve_existing_streaming_item(existing_item):
                 continue
             previous_status = str(existing_item.status or "").strip().lower() or None
             previous_downstream_task_id = str(existing_item.downstream_task_id or "").strip() or None
@@ -1092,11 +1083,10 @@ class TaskDownstreamServiceMixin:
             sync_observation = dict(existing_result.get("sync_observation") or {})
             sync_observation.update(
                 {
-                    "sync_status": "recovered_for_redispatch",
-                    "last_result": "recovered_for_redispatch",
-                    "recovery_reason": "downstream_missing_requeue",
-                    "last_missing_child_task_id": previous_downstream_task_id,
-                    "last_missing_detected_at": observed_at.isoformat(),
+                    "sync_status": "observation_gap_detected",
+                    "last_result": "observation_gap_detected",
+                    "observation_gap_detected_at": observed_at.isoformat(),
+                    "last_observed_downstream_task_id": previous_downstream_task_id,
                     "budget_exhausted": False,
                 }
             )
@@ -1104,21 +1094,17 @@ class TaskDownstreamServiceMixin:
             existing_result.update(
                 {
                     "sync_observation": sync_observation,
-                    "last_sync_result": "recovered_for_redispatch",
+                    "last_sync_result": "observation_gap_detected",
                     "sync_error_budget_exhausted": False,
                     "next_sync_retry_at": None,
-                    "recovery_reason": "downstream_missing_requeue",
-                    "last_missing_child_task_id": previous_downstream_task_id,
-                    "last_missing_detected_at": observed_at.isoformat(),
+                    "observation_gap_detected_at": observed_at.isoformat(),
+                    "last_observed_downstream_task_id": previous_downstream_task_id,
                 }
             )
             existing_item.stage_run_id = stage_run.id
-            existing_item.status = "queued"
-            existing_item.downstream_task_id = None
+            existing_item.status = existing_item.status or "running"
             existing_item.error_message = previous_status == "downstream_missing" and existing_item.error_message or None
-            existing_item.finished_at = None
             existing_item.updated_at = observed_at
-            self._clear_stage_item_claim(existing_item)
             self._persist_stage_item_result(
                 task,
                 existing_item,
@@ -1128,14 +1114,14 @@ class TaskDownstreamServiceMixin:
             self._record_event(
                 db,
                 task,
-                "streaming_stage_item_requeued_after_downstream_missing",
-                "当前执行实例已接管流式阶段，异常下游子任务已回退到 queued 等待重新派发",
+                "streaming_stage_item_observation_gap_detected",
+                "当前执行实例已接管流式阶段，保留已有下游绑定并等待继续观测",
                 level="warning",
                 stage_name=stage_run.stage_name,
                 item=existing_item,
                 payload={
                     "before_status": previous_status,
-                    "after_status": "queued",
+                    "after_status": existing_item.status,
                     "downstream_task_id": previous_downstream_task_id,
                     "task_runtime_phase": self._task_runtime_phase(task),
                     "dispatcher_instance_id": task.dispatcher_instance_id,
@@ -1180,7 +1166,6 @@ class TaskDownstreamServiceMixin:
                                 status="queued",
                                 downstream_service=downstream_service,
                             )
-                            self._clear_stage_item_claim(item)
                             db.add(item)
                             if hasattr(db, "stage_items") and isinstance(getattr(db, "stage_items"), list):
                                 stage_items_list = getattr(db, "stage_items")
@@ -1194,7 +1179,6 @@ class TaskDownstreamServiceMixin:
                             item.parent_key = parent_key
                             item.item_identity_key = identity_key
                             item.status = "queued"
-                            self._clear_stage_item_claim(item)
                             item.downstream_service = downstream_service
                             self._reset_child_runtime_payload(
                                 item,
@@ -1296,13 +1280,13 @@ class TaskDownstreamServiceMixin:
     ) -> dict[str, Any]:
         normalized_status = str(item.status or "").strip().lower()
         if str(item.downstream_task_id or "").strip():
-            if normalized_status in {"running", "dispatching", "failed", "cancelled"}:
+            if normalized_status in {"running", "dispatching", "failed", "cancelled", "cancelling"}:
                 try:
                     payload = await self._fetch_downstream_task_payload(task, item, token or "")
                 except Exception:
                     payload = None
                 mapped = self._map_downstream_status(str((payload or {}).get("status") or ""))
-                if payload and mapped == "running":
+                if payload and mapped in {"queued", "running", "dispatching", "cancelling"}:
                     return {"outcome": "already_running", "payload": payload}
                 if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
                     return {"outcome": "already_running", "payload": payload}

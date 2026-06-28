@@ -1132,8 +1132,8 @@ class TaskItemSyncServiceMixin:
                 self._record_event(
                     session,
                     task,
-                    "child_owner_lost_requeue_scheduled",
-                    "下游 owner 丢失，已安排重试",
+                    "child_owner_lost_waiting_parent_observe",
+                    "下游 owner 丢失，等待父任务恢复观测，不自动重试",
                     level="warning",
                     stage_name=item.stage_name,
                     item=item,
@@ -1144,6 +1144,7 @@ class TaskItemSyncServiceMixin:
                         "error_type": error_type,
                         "http_status": http_status,
                         "retry_count": int(item.retry_count or 0),
+                        "recovery_action": "waiting_parent_observe",
                     },
                 )
             self._persist_child_sync_observation(
@@ -1229,7 +1230,6 @@ class TaskItemSyncServiceMixin:
         item.error_message = error_message
         item.finished_at = None
         item.updated_at = observed_at
-        self._clear_stage_item_claim(item)
         self._mark_stage_item_sync_observation(
             item,
             sync_status="synced",
@@ -1246,8 +1246,8 @@ class TaskItemSyncServiceMixin:
         self._record_event(
             db,
             task,
-            "streaming_stage_item_requeued_after_downstream_missing",
-            "下游子任务不存在，当前阶段项已标记为 downstream_missing",
+            "streaming_stage_item_observation_gap_detected",
+            "下游子任务当前不可观测，已保留绑定并标记 observation gap",
             level="warning",
             stage_name=item.stage_name,
             item=item,

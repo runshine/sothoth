@@ -3812,42 +3812,6 @@ class TaskManager(
             payload=runtime_payload,
         )
 
-    def _stage_item_claim_token(self, item: BinarySecurityStageItem | None) -> str | None:
-        token = str(getattr(item, "claim_execution_token", "") or "").strip()
-        return token or None
-
-    def _bind_stage_item_claim(self, item: BinarySecurityStageItem, *, task: BinarySecurityTask, owner_instance_id: str | None = None) -> str | None:
-        token = self._dispatch_token(task)
-        item.claim_owner_instance_id = str(owner_instance_id or self.instance_id or "").strip() or None
-        item.claim_execution_token = token
-        item.claim_started_at = _now()
-        return token
-
-    def _clear_stage_item_claim(self, item: BinarySecurityStageItem) -> None:
-        item.claim_owner_instance_id = None
-        item.claim_execution_token = None
-        item.claim_started_at = None
-
-    def _stage_item_claim_matches_task_execution(
-        self,
-        item: BinarySecurityStageItem,
-        task: BinarySecurityTask,
-        *,
-        db: Session | None = None,
-    ) -> bool:
-        claim_owner = str(getattr(item, "claim_owner_instance_id", "") or "").strip()
-        claim_token = self._stage_item_claim_token(item)
-        task_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-        task_token = self._dispatch_token(task)
-        if not claim_owner or not claim_token or not task_owner or not task_token:
-            return False
-        return (
-            claim_owner == task_owner
-            and claim_token == task_token
-            and self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            and self._lease_is_active(task, db=db)
-        )
-
     def _bind_execution_token(self, task: BinarySecurityTask) -> None:
         setattr(task, "_execution_dispatcher_id", task.dispatcher_instance_id)
         setattr(task, "_execution_token", self._dispatch_token(task))
@@ -5075,18 +5039,21 @@ class TaskManager(
         if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_AUTO:
             candidates = self._entry_candidates(task, db)
             return candidates or legacy_rows
+        snapshot = self._entry_selection_snapshot(task)
+        if str(snapshot.get("status") or "").strip() != "confirmed":
+            return []
         selected_entries = self._selected_entries(task)
         if selected_entries:
             return selected_entries
         selected_keys = set(self._selected_entry_keys(task))
         if not selected_keys:
-            return legacy_rows
+            return []
         selected = [
             entry
             for entry in self._entry_candidates(task, db)
             if str(entry.get("entry_key") or "").strip() in selected_keys
         ]
-        return selected or legacy_rows
+        return selected
 
     def _entry_selection_metrics(self, task: BinarySecurityTask, db: Session | None = None) -> dict[str, int]:
         module_state = self._entry_module_completion_state(task, None)
@@ -8548,7 +8515,6 @@ class TaskManager(
             self._ensure_stage_item_first_started_at(item)
             item.retry_count = int(item.retry_count or 0)
             item.rerun_count = int(item.rerun_count or 0)
-            self._clear_stage_item_claim(item)
             if retrying:
                 item.rerun_count = 1
             if auto_retrying:
@@ -8560,8 +8526,6 @@ class TaskManager(
             item.item_identity_key = identity_key
             keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(item)
             item.status = item.status if keep_existing_active else running_status
-            if not keep_existing_active:
-                self._clear_stage_item_claim(item)
             item.downstream_service = downstream_service
             self._reset_child_runtime_payload(
                 item,
@@ -8603,8 +8567,6 @@ class TaskManager(
                 existing.item_identity_key = identity_key
                 keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(existing)
                 existing.status = existing.status if keep_existing_active else running_status
-                if not keep_existing_active:
-                    self._clear_stage_item_claim(existing)
                 existing.downstream_service = downstream_service
                 self._reset_child_runtime_payload(
                     existing,
@@ -8960,8 +8922,8 @@ class TaskManager(
                 session,
                 task,
                 item,
-                event_type="retry_item_adopt_active_child",
-                message="重试接管仍在运行中的下游子任务",
+                event_type="retry_item_observe_existing_child",
+                message="重试阶段继续观察已存在的下游子任务",
                 payload={
                     "stage_name": item.stage_name,
                     "item_id": item.id,

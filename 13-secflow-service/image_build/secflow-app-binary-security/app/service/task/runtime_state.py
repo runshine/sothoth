@@ -1200,10 +1200,6 @@ class TaskRuntimeStateServiceMixin:
             return False
         if not str(item.downstream_task_id or "").strip():
             return False
-        if str(getattr(item, "claim_owner_instance_id", "") or "").strip():
-            return False
-        if str(getattr(item, "claim_execution_token", "") or "").strip():
-            return False
         replacement_state = self._replacement_in_progress_state(item)
         if replacement_state["replacement_in_progress"]:
             return False

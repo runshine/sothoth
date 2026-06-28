@@ -452,7 +452,7 @@ class TaskEventServiceMixin:
     def _event_dedupe_window_seconds(self: TaskManager, event_type: str) -> int:
         if str(event_type or "").strip() in {
             "owned_execution_takeover_requeued",
-            "streaming_stage_item_requeued_after_downstream_missing",
+            "streaming_stage_item_observation_gap_detected",
         }:
             return 10
         return 0

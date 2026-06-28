@@ -270,6 +270,9 @@ class TaskManagerLeaseTests(unittest.TestCase):
         cancel_requested_at=None,
         lease_expires_at=None,
         last_progress_at=None,
+        task_origin_type: str | None = None,
+        parent_task_id: str | None = None,
+        parent_stage_item_id: str | None = None,
     ):
         db = get_db_session()
         try:
@@ -288,6 +291,9 @@ class TaskManagerLeaseTests(unittest.TestCase):
                     cancel_requested_at=cancel_requested_at,
                     lease_expires_at=lease_expires_at,
                     last_progress_at=last_progress_at,
+                    task_origin_type=task_origin_type,
+                    parent_task_id=parent_task_id,
+                    parent_stage_item_id=parent_stage_item_id,
                 )
             )
             db.commit()
@@ -465,6 +471,37 @@ class TaskManagerLeaseTests(unittest.TestCase):
             self.assertIn("owner_lost_requeue_scheduled", event_types)
             self.assertIn("orphan_recovered", event_types)
             self.assertNotIn("task_failed", event_types)
+        finally:
+            db.close()
+
+    def test_finalize_orphaned_running_parent_orchestrated_binary_security_task_waits_parent_observe(self):
+        self._add_task(
+            "t-owner-lost-parent",
+            status=TaskStatus.RUNNING.value,
+            owner_id="pod-a:123:owner",
+            assigned_worker_id="pod-a:123:owner",
+            dispatch_token="dispatch-token-parent",
+            task_origin_type="binary_security",
+            parent_task_id="parent-1",
+            parent_stage_item_id="item-1",
+        )
+
+        task_manager_module._finalize_orphaned_task("t-owner-lost-parent", reason="Task owner pod lost", owner_lost=True)
+
+        db = get_db_session()
+        try:
+            task = db.query(UnpackTask).filter(UnpackTask.id == "t-owner-lost-parent").first()
+            self.assertEqual(TaskStatus.RUNNING.value, task.status)
+            self.assertNotEqual("awaiting_takeover", task.current_stage)
+            self.assertIsNone(task.owner_id)
+            self.assertIsNone(task.dispatch_owner_id)
+            self.assertEqual(0, int(task.takeover_count or 0))
+            events = db.query(UnpackTaskEvent).filter(UnpackTaskEvent.task_id == "t-owner-lost-parent").all()
+            event_types = [event.event_type for event in events]
+            self.assertIn("owner_lost", event_types)
+            self.assertIn("owner_lost_detected", event_types)
+            self.assertIn("owner_lost_waiting_parent_observe", event_types)
+            self.assertNotIn("owner_lost_requeue_scheduled", event_types)
         finally:
             db.close()
 

@@ -351,9 +351,6 @@ class BinarySecurityStageItem(Base, JsonMixin):
     rerun_count = Column(Integer, nullable=False, default=0)
     downstream_service = Column(String(64), nullable=True)
     downstream_task_id = Column(String(128), nullable=True, index=True)
-    claim_owner_instance_id = Column(String(128), nullable=True, index=True)
-    claim_execution_token = Column(String(64), nullable=True, index=True)
-    claim_started_at = Column(DateTime, nullable=True)
     input_ref_json = Column(Text, nullable=True)
     output_ref_json = Column(Text, nullable=True)
     payload_json = Column(Text, nullable=True)
@@ -922,18 +919,6 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"UPDATE {stage_item_table} SET rerun_count = retry_count WHERE rerun_count = 0 AND retry_count > 0"
             )
-        if "claim_owner_instance_id" not in columns:
-            statements.append(
-                f"ALTER TABLE {stage_item_table} ADD COLUMN claim_owner_instance_id VARCHAR(128) NULL"
-            )
-        if "claim_execution_token" not in columns:
-            statements.append(
-                f"ALTER TABLE {stage_item_table} ADD COLUMN claim_execution_token VARCHAR(64) NULL"
-            )
-        if "claim_started_at" not in columns:
-            statements.append(
-                f"ALTER TABLE {stage_item_table} ADD COLUMN claim_started_at DATETIME NULL"
-            )
         result_json_type = str(column_defs.get("result_json", {}).get("type") or "").lower()
         if "result_json" in columns and "mediumtext" not in result_json_type:
             statements.append(
@@ -946,14 +931,6 @@ def _ensure_compat_columns(engine) -> None:
             index_statements.append(
                 f"CREATE INDEX ix_bssi_task_stage_identity_created ON {stage_item_table} "
                 "(task_id, stage_name, item_identity_key, created_at)"
-            )
-        if "ix_bssi_claim_owner_instance_id" not in indexes:
-            index_statements.append(
-                f"CREATE INDEX ix_bssi_claim_owner_instance_id ON {stage_item_table} (claim_owner_instance_id)"
-            )
-        if "ix_bssi_claim_execution_token" not in indexes:
-            index_statements.append(
-                f"CREATE INDEX ix_bssi_claim_execution_token ON {stage_item_table} (claim_execution_token)"
             )
         _execute_compat_statements(index_statements)
     archive_job_table = BinarySecurityArchiveJob.__tablename__

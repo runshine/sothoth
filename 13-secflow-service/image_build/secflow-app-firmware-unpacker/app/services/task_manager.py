@@ -1596,6 +1596,16 @@ def _update_task_progress_for_owner(
         db.close()
 
 
+def _is_parent_orchestrated_binary_security_task(task: Any) -> bool:
+    if task is None:
+        return False
+    if str(getattr(task, "task_origin_type", "") or "").strip() != "binary_security":
+        return False
+    parent_task_id = str(getattr(task, "parent_task_id", "") or "").strip()
+    parent_stage_item_id = str(getattr(task, "parent_stage_item_id", "") or "").strip()
+    return bool(parent_task_id and parent_stage_item_id)
+
+
 def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = False) -> None:
     from app.model import TaskStatus, UnpackTask, get_db_session
 
@@ -1618,25 +1628,33 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
             terminal_event = None
             terminal_summary = None
         elif owner_lost and task.status == TaskStatus.RUNNING.value:
-            task.takeover_count = int(task.takeover_count or 0) + 1
-            max_retries = max(0, int(get_max_retries() or 0))
-            budget_exhausted = max_retries >= 0 and int(task.takeover_count or 0) > max_retries
-            if budget_exhausted:
-                task.status = TaskStatus.FAILED.value
-                task.current_stage = "awaiting_takeover"
-                task.result_status = "failed"
-                task.error_message = "owner_lost_retry_exhausted"
-                task.result_message = f"Task failed: owner lost recovery exhausted after {task.takeover_count} attempts"
-                terminal_event = "task_failed"
-                terminal_summary = "任务因 owner 丢失恢复次数耗尽而失败"
-            else:
-                task.status = TaskStatus.AWAITING_TAKEOVER.value
-                task.current_stage = "awaiting_takeover"
+            if _is_parent_orchestrated_binary_security_task(task):
+                task.status = TaskStatus.RUNNING.value
                 task.result_status = None
                 task.result_message = None
                 task.error_message = None
                 terminal_event = None
                 terminal_summary = None
+            else:
+                task.takeover_count = int(task.takeover_count or 0) + 1
+                max_retries = max(0, int(get_max_retries() or 0))
+                budget_exhausted = max_retries >= 0 and int(task.takeover_count or 0) > max_retries
+                if budget_exhausted:
+                    task.status = TaskStatus.FAILED.value
+                    task.current_stage = "awaiting_takeover"
+                    task.result_status = "failed"
+                    task.error_message = "owner_lost_retry_exhausted"
+                    task.result_message = f"Task failed: owner lost recovery exhausted after {task.takeover_count} attempts"
+                    terminal_event = "task_failed"
+                    terminal_summary = "任务因 owner 丢失恢复次数耗尽而失败"
+                else:
+                    task.status = TaskStatus.AWAITING_TAKEOVER.value
+                    task.current_stage = "awaiting_takeover"
+                    task.result_status = None
+                    task.result_message = None
+                    task.error_message = None
+                    terminal_event = None
+                    terminal_summary = None
         elif task.status == TaskStatus.CANCELLING.value:
             task.status = TaskStatus.CANCELLED.value
             task.result_status = "cancelled"
@@ -1671,6 +1689,7 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
         task.last_progress_at = now_local()
         db.commit()
         if owner_lost:
+            parent_waiting_observe = _is_parent_orchestrated_binary_security_task(task) and task.status == TaskStatus.RUNNING.value
             if task.status == TaskStatus.AWAITING_TAKEOVER.value:
                 _mark_task_auto_recovered_pending(
                     task,
@@ -1689,7 +1708,11 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
                     "reason": reason,
                     "owner_id": previous_owner_id,
                     "max_retries": max(0, int(get_max_retries() or 0)),
-                    "recovery_action": "awaiting_takeover" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "terminalized",
+                    "recovery_action": (
+                        "waiting_parent_observe"
+                        if parent_waiting_observe
+                        else ("awaiting_takeover" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "terminalized")
+                    ),
                     "takeover_count": int(task.takeover_count or 0),
                 },
                 owner_id=previous_owner_id,
@@ -1712,8 +1735,16 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
             )
             _record_task_event_from_row(
                 task,
-                event_type="owner_lost_requeue_scheduled" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "owner_lost_retry_exhausted",
-                summary="任务 owner 丢失后已安排自动恢复" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "任务 owner 丢失自动恢复次数耗尽",
+                event_type=(
+                    "owner_lost_waiting_parent_observe"
+                    if parent_waiting_observe
+                    else ("owner_lost_requeue_scheduled" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "owner_lost_retry_exhausted")
+                ),
+                summary=(
+                    "任务 owner 丢失后等待父任务恢复观测"
+                    if parent_waiting_observe
+                    else ("任务 owner 丢失后已安排自动恢复" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "任务 owner 丢失自动恢复次数耗尽")
+                ),
                 stage_key=task.current_stage,
                 status=task.status,
                 detail={
@@ -1721,7 +1752,11 @@ def _finalize_orphaned_task(task_id: str, reason: str, *, owner_lost: bool = Fal
                     "owner_id": previous_owner_id,
                     "takeover_count": int(task.takeover_count or 0),
                     "max_retries": max(0, int(get_max_retries() or 0)),
-                    "recovery_action": "awaiting_takeover" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "terminal_failed",
+                    "recovery_action": (
+                        "waiting_parent_observe"
+                        if parent_waiting_observe
+                        else ("awaiting_takeover" if task.status == TaskStatus.AWAITING_TAKEOVER.value else "terminal_failed")
+                    ),
                 },
                 owner_id=previous_owner_id,
                 created_by="task_manager",

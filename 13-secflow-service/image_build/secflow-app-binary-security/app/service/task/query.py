@@ -915,7 +915,7 @@ class TaskQueryServiceMixin:
             "downstream_http_429_retry_attempted",
             "downstream_http_429_retry_recovered",
             "owned_execution_takeover_requeued",
-            "streaming_stage_item_requeued_after_downstream_missing",
+            "streaming_stage_item_observation_gap_detected",
         }
 
     def _same_timeline_compression_bucket(

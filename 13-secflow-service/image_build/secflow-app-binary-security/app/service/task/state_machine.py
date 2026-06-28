@@ -2111,6 +2111,8 @@ class TaskStateMachineMixin:
         normalized_stage = str(next_stage or "").strip()
         if not normalized_stage:
             return False
+        if normalized_stage == "dataflow_vuln_scan" and self._task_is_waiting_for_manual_confirmation(task):
+            return False
         if (
             normalized_stage == "dataflow_vuln_scan"
             and (
@@ -3561,14 +3563,15 @@ class TaskStateMachineMixin:
             if failed_stage_status == "downstream_missing":
                 return False
             if recoverable_owner_lost:
+                deferred_status = "running" if str(task.status or "").strip() in {"running", "dispatching"} else "pending"
                 _apply_retry_reopen_patch(
-                    status="pending",
-                    reason="owner lost 可恢复，任务回到待执行",
+                    status=deferred_status,
+                    reason="owner lost 可恢复，等待父任务恢复观测",
                     stage_name=failed_stage_run.stage_name or task.current_stage,
                     runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                     finished_at=None,
                     last_error=None,
-                    clear_runtime_owner=True,
+                    clear_runtime_owner=False,
                 )
                 self._clear_task_abnormal_reason_snapshot(db, task)
                 return True

@@ -465,8 +465,8 @@ class DownstreamTaskController:
                 db,
                 task,
                 item,
-                event_type="child_task_dispatch_attached",
-                message=f"复用已在运行的下游子任务: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                event_type="child_observation_observed",
+                message=f"已观测到下游子任务仍在运行: {item.downstream_service}:{item.downstream_task_id or '-'}",
                 payload=payload,
             )
             return
@@ -695,16 +695,7 @@ class DownstreamTaskController:
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
-        if db is not None:
-            self._record_downstream_item_disposition(
-                db,
-                task,
-                item,
-                event_type="child_task_retry_requested",
-                message=f"请求控制下游子任务: {item.downstream_service}:{item.downstream_task_id or '-'}",
-                payload={"operation": "retry_or_restart", "stage_name": stage_name},
-            )
-        if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and self.manager._has_retryable_downstream_task(item):
+        if self.manager._has_retryable_downstream_task(item):
             try:
                 payload = await self.fetch_child_payload(task, item, token or "")
             except NotFoundError:
@@ -723,7 +714,7 @@ class DownstreamTaskController:
                 payload = None
             if isinstance(payload, dict):
                 mapped_status = self.manager._map_downstream_status(str(payload.get("status") or ""))
-                if mapped_status in {"pending", "queued", "dispatching", "running"}:
+                if mapped_status in {"pending", "queued", "dispatching", "running", "cancelling"}:
                     control = {
                         "outcome": "already_running",
                         "payload": payload,
@@ -733,6 +724,15 @@ class DownstreamTaskController:
                     if db is not None:
                         self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
                     return control
+        if db is not None:
+            self._record_downstream_item_disposition(
+                db,
+                task,
+                item,
+                event_type="child_task_retry_requested",
+                message=f"请求控制下游子任务: {item.downstream_service}:{item.downstream_task_id or '-'}",
+                payload={"operation": "retry_or_restart", "stage_name": stage_name},
+            )
         try:
             payload = await self.invoke_retry_or_restart(stage_name=stage_name, task=task, item=item, token=token)
             control = {"outcome": "accepted", "payload": payload, "error_message": None, "http_status": 200}

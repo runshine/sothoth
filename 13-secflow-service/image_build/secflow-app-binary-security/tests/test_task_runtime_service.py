@@ -152,7 +152,6 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
 
         self.assertEqual(["si-entry"], claimed)
         self.assertEqual("dispatching", item.status)
-        self.assertEqual(self.manager.instance_id, item.claim_owner_instance_id)
 
     def test_run_b2s_item_success_keeps_entry_descriptor_contract_compatible(self):
         task = self._task(task_type=TASK_TYPE_BINARY_MODULE, name="b2s-task")
@@ -368,13 +367,11 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
             ):
                 result = asyncio.run(self.manager._run_system_analysis_item(task, stage_run, firmware, retrying=True))
 
-        self.assertEqual("success", result["status"])
-        self.assertEqual("success", item.status)
-        self.assertEqual("sa-child", item.downstream_task_id)
+        self.assertEqual("running", result["status"])
+        self.assertEqual("running", item.status)
+        self.assertEqual("sa-old", item.downstream_task_id)
         self.assertEqual("fw-1", result["item"]["firmware_key"])
-        self.assertEqual("sa-child", result["item"]["downstream"]["task_id"])
-        self.assertEqual({"message": "ok"}, result["item"]["system_analysis_result"]["summary"])
-        control_mock.assert_awaited_once()
+        control_mock.assert_not_awaited()
 
     def test_run_system_analysis_item_returns_archive_blocked_after_authoritative_success_payload(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="system-archive")
