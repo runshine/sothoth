@@ -2995,6 +2995,15 @@ class TaskOperationServiceMixin:
                     if reconcile_task is None:
                         return False
                     self._ensure_task_write_ownership(reconcile_task, db=reconcile_db, allow_dispatching=True)
+                    reconcile_mode = str(signal.get("reconcile_mode") or "").strip().lower()
+                    if reconcile_mode == "observe_only":
+                        stage_name = str(signal.get("stage_name") or reconcile_task.current_stage or "").strip()
+                        if stage_name:
+                            self._refresh_stage_from_authoritative_items(reconcile_db, reconcile_task, stage_name)
+                            self._reconcile_stage_domain_in_session(reconcile_db, reconcile_task, stage_name)
+                        await self._sync_streaming_task_tail_state(reconcile_task.id)
+                        reconcile_db.commit()
+                        return True
                     changed = await self._run_task_layer_reconcile_signal(
                         reconcile_db,
                         reconcile_task,

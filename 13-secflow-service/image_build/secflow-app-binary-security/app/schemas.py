@@ -491,6 +491,10 @@ class BinarySecurityStageItemResponse(BinarySecurityBaseModel):
     downstream_binding_message: Optional[str] = None
     downstream_cancel_phase: Optional[str] = None
     downstream_summary: Optional[dict[str, Any]] = None
+    failure_category: Optional[str] = None
+    failure_message: Optional[str] = None
+    downstream_business_status: Optional[str] = None
+    orchestrator_error: Optional[str] = None
     input_ref: dict[str, Any] = Field(default_factory=dict)
     output_ref: dict[str, Any] = Field(default_factory=dict)
     result: dict[str, Any] = Field(default_factory=dict)

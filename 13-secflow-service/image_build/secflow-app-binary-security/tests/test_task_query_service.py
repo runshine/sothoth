@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -147,6 +148,193 @@ class TaskQueryServiceTests(unittest.TestCase):
             self.assertTrue(response.grouped_by_index)
             self.assertEqual("m1", response.artifact_groups[0].module_key)
             self.assertEqual("out/a.c", response.artifact_groups[0].artifacts[0].relative_path)
+
+    def test_list_delete_queue_returns_cross_project_items_and_project_names(self):
+        queued = BinarySecurityTask(
+            id="task-delete-queued",
+            project_id="p1",
+            name="queued-task",
+            task_type="source",
+            status="delete_requested",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        queued.cleanup_snapshot_json = json.dumps(
+            {
+                "delete_queued": True,
+                "delete_queue_requested_at": "2026-06-28T12:00:00Z",
+            }
+        )
+        running = BinarySecurityTask(
+            id="task-delete-running",
+            project_id="p2",
+            name="running-task",
+            task_type="source",
+            status="deleting",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        running.cleanup_snapshot_json = json.dumps(
+            {
+                "delete_queued": True,
+                "delete_in_progress": True,
+                "delete_queue_requested_at": "2026-06-28T12:00:00Z",
+                "delete_started_at": "2026-06-28T12:05:00Z",
+            }
+        )
+        failed = BinarySecurityTask(
+            id="task-delete-failed",
+            project_id="p3",
+            name="failed-task",
+            task_type="source",
+            status="delete_failed",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            last_error="cleanup failed",
+        )
+        failed.cleanup_snapshot_json = json.dumps(
+            {
+                "delete_queued": True,
+                "delete_queue_requested_at": "2026-06-28T12:00:00Z",
+                "delete_last_error": "cleanup failed",
+            }
+        )
+        db = _AppendingModelAwareDb(tasks=[queued, running, failed], events=[])
+
+        with patch.object(
+            self.manager,
+            "_task_list_project_names",
+            return_value={"p1": "Project One", "p2": "Project Two", "p3": "Project Three"},
+        ) as names_mock:
+            response = self.manager.list_delete_queue(
+                db,
+                token="token-1",
+                page=1,
+                page_size=20,
+            )
+
+        self.assertEqual(3, response.total)
+        self.assertEqual({"queued_total": 1, "running_total": 1, "blocked_total": 0, "failed_total": 1}, response.stats)
+        self.assertEqual(["task-delete-queued", "task-delete-running", "task-delete-failed"], [item.id for item in response.items])
+        self.assertEqual("Project One", response.items[0].project_name)
+        self.assertEqual("queued", response.items[0].delete_status)
+        self.assertEqual("running", response.items[1].delete_status)
+        self.assertEqual("failed", response.items[2].delete_status)
+        names_mock.assert_called_once()
+
+    def test_list_delete_queue_filters_project_and_task_type(self):
+        source_task = BinarySecurityTask(
+            id="source-delete",
+            project_id="p1",
+            name="source-delete",
+            task_type="source",
+            status="delete_requested",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        source_task.cleanup_snapshot_json = json.dumps({"delete_queued": True})
+        kg_task = BinarySecurityTask(
+            id="kg-delete",
+            project_id="p1",
+            name="kg-delete",
+            task_type="source",
+            status="delete_requested",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        kg_task.policy_json = json.dumps({"pipeline_profile": "kg_source_vuln_scan"})
+        kg_task.cleanup_snapshot_json = json.dumps({"delete_queued": True})
+        other_project = BinarySecurityTask(
+            id="other-project-delete",
+            project_id="p2",
+            name="other-project-delete",
+            task_type="source",
+            status="delete_requested",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        other_project.cleanup_snapshot_json = json.dumps({"delete_queued": True})
+        db = _AppendingModelAwareDb(tasks=[source_task, kg_task, other_project], events=[])
+
+        response = self.manager.list_delete_queue(
+            db,
+            project_id="p1",
+            task_type="kg_source_vuln_scan_e2e",
+            page=1,
+            page_size=20,
+        )
+
+        self.assertEqual(1, response.total)
+        self.assertEqual("kg-delete", response.items[0].id)
+        self.assertEqual("kg_source_vuln_scan_e2e", response.items[0].task_type)
+
+    def test_list_delete_queue_project_name_lookup_failure_does_not_fail_response(self):
+        task = BinarySecurityTask(
+            id="task-delete-1",
+            project_id="p1",
+            name="delete-task",
+            task_type="source",
+            status="delete_failed",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        task.cleanup_snapshot_json = json.dumps(
+            {
+                "delete_queued": True,
+                "delete_queue_requested_at": "2026-06-28T12:00:00Z",
+            }
+        )
+        db = _AppendingModelAwareDb(tasks=[task], events=[])
+
+        with patch.object(self.manager, "_task_list_project_names", return_value={"p1": None}):
+            response = self.manager.list_delete_queue(
+                db,
+                token="token-1",
+                task_type="source_scan_e2e",
+                page=1,
+                page_size=20,
+            )
+
+        self.assertEqual(1, response.total)
+        self.assertEqual("task-delete-1", response.items[0].id)
+        self.assertEqual("failed", response.items[0].delete_status)
+        self.assertIsNone(response.items[0].project_name)
+
+    def test_list_delete_queue_sorts_by_updated_at(self):
+        older = BinarySecurityTask(
+            id="older-task",
+            project_id="p1",
+            name="older",
+            task_type="binary_module",
+            status="delete_requested",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            updated_at=datetime(2026, 6, 28, 12, 0, 0, tzinfo=timezone.utc),
+        )
+        older.cleanup_snapshot_json = json.dumps({"delete_queued": True})
+        newer = BinarySecurityTask(
+            id="newer-task",
+            project_id="p1",
+            name="newer",
+            task_type="binary_module",
+            status="delete_requested",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            updated_at=datetime(2026, 6, 28, 13, 0, 0, tzinfo=timezone.utc),
+        )
+        newer.cleanup_snapshot_json = json.dumps({"delete_queued": True})
+        db = _AppendingModelAwareDb(tasks=[older, newer], events=[])
+
+        response = self.manager.list_delete_queue(
+            db,
+            task_type="binary_module_e2e",
+            sort_by="updated_at",
+            sort_direction="asc",
+            page=1,
+            page_size=20,
+        )
+
+        self.assertEqual(["older-task", "newer-task"], [item.id for item in response.items])
 
 
 if __name__ == "__main__":

@@ -1678,7 +1678,11 @@ class TaskReadModelServiceMixin:
             except Exception:
                 abnormal_reason = None
         if abnormal_reason is None:
-            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+            abnormal_reason = (
+                self._task_success_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+                if str(getattr(task, "status", "") or "").strip() == "success"
+                else self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+            )
         (
             last_successful_sync_at,
             last_sync_attempt_at,
@@ -1797,7 +1801,11 @@ class TaskReadModelServiceMixin:
             except Exception:
                 abnormal_reason = None
         if abnormal_reason is None:
-            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+            abnormal_reason = (
+                self._task_success_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+                if str(getattr(task, "status", "") or "").strip() == "success"
+                else self._task_abnormal_reason(task, stage_summaries, stage_items, archive_jobs)
+            )
         return task_manager_module._TaskDetailContext(
             task=task,
             queue_info=self._build_queue_info(db, project_id=project_id),
@@ -1856,7 +1864,11 @@ class TaskReadModelServiceMixin:
                 except Exception:
                     abnormal_reason = None
             if abnormal_reason is None:
-                abnormal_reason = self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
+                abnormal_reason = (
+                    self._task_success_abnormal_reason(task, stage_summaries, items, archive_jobs)
+                    if str(getattr(task, "status", "") or "").strip() == "success"
+                    else self._task_abnormal_reason(task, stage_summaries, items, archive_jobs)
+                )
         else:
             stage_runs = detail_ctx.stage_runs
             items = detail_ctx.stage_items
@@ -1914,8 +1926,8 @@ class TaskReadModelServiceMixin:
         failure_snapshot = self._stage_failure_snapshot(task, active_stage_run)
         terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
         workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
-        workflow_terminalization_ready = self._workflow_ready_for_finalization(workflow_snapshots)
-        workflow_blocked_by_stage = self._workflow_blocked_on_stage(task, workflow_snapshots)
+        workflow_terminalization_ready = self._workflow_ready_for_finalization(db, task, workflow_snapshots)
+        workflow_blocked_by_stage = self._workflow_blocked_on_stage(db, task, workflow_snapshots)
         if self._task_status_is_terminal(task.status):
             workflow_terminalization_ready = True
             workflow_blocked_by_stage = None
@@ -4061,6 +4073,71 @@ class TaskReadModelServiceMixin:
             ),
         )
 
+    @staticmethod
+    def _is_stage_item_persistence_error_message(message: str | None) -> bool:
+        normalized = str(message or "").strip().lower()
+        if not normalized:
+            return False
+        if "data too long for column" in normalized:
+            return True
+        return any(
+            token in normalized
+            for token in (
+                "input_ref_json",
+                "output_ref_json",
+                "payload_json",
+                "result_json",
+                "orchestrator persistence",
+            )
+        )
+
+    def _stage_item_failure_projection(
+        self: TaskManager,
+        item,
+        *,
+        result: dict[str, Any],
+        sync_observation: dict[str, Any],
+        downstream_status: str | None,
+        latest_binding_mismatch: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        normalized_item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        downstream_business_status = self._normalize_downstream_status(
+            self._string_or_none(sync_observation.get("mapped_status"))
+            or self._string_or_none(result.get("downstream_status"))
+            or downstream_status
+        )
+        error_message = self._string_or_none(item.error_message)
+        sync_error_message = self._string_or_none(sync_observation.get("error_message"))
+        sync_error_type = self._string_or_none(sync_observation.get("error_type"))
+        failure_category = None
+        failure_message = None
+        orchestrator_error = None
+        if self._is_stage_item_persistence_error_message(error_message):
+            failure_category = "orchestrator_persistence_failed"
+            failure_message = "下游已成功，但编排器在本地持久化阶段结果时失败"
+            orchestrator_error = error_message
+        elif latest_binding_mismatch:
+            failure_category = "binding_mismatch"
+            failure_message = self._string_or_none(latest_binding_mismatch.get("message")) or "下游绑定已变化，当前 item 等待重新对齐"
+            orchestrator_error = sync_error_message or error_message
+        elif (
+            bool(result.get("archive_blocked"))
+            or str(result.get("status") or "").strip().lower() == "archive_blocked"
+            or str(sync_error_type or "").strip().lower() == "archive_blocked"
+        ):
+            failure_category = "archive_blocked"
+            failure_message = sync_error_message or error_message or "阶段产物归档失败，后续推进已被阻断"
+            orchestrator_error = error_message or sync_error_message
+        elif normalized_item_status in {"failed", "partial_success", "cancelled", "downstream_missing"}:
+            failure_category = "downstream"
+            failure_message = error_message or sync_error_message
+        return {
+            "failure_category": failure_category,
+            "failure_message": failure_message,
+            "downstream_business_status": downstream_business_status,
+            "orchestrator_error": orchestrator_error,
+        }
+
     def _stage_item_response(
         self: TaskManager,
         task,
@@ -4138,6 +4215,13 @@ class TaskReadModelServiceMixin:
         if binding_state != "created_pending_sync":
             binding_message = None
         latest_binding_mismatch = dict(result.get("latest_binding_mismatch") or {}) or None
+        failure_projection = self._stage_item_failure_projection(
+            item,
+            result=result,
+            sync_observation=sync_observation,
+            downstream_status=downstream_status,
+            latest_binding_mismatch=latest_binding_mismatch,
+        )
         archive_bound_downstream_task_id = None
         if archive_jobs:
             for job in reversed(archive_jobs):
@@ -4176,6 +4260,10 @@ class TaskReadModelServiceMixin:
             downstream_binding_message=binding_message or self._downstream_binding_status_message(item),
             downstream_cancel_phase=self._string_or_none(downstream_payload.get("cancel_phase")),
             downstream_summary=self._stage_item_downstream_summary(item, result=result),
+            failure_category=self._string_or_none(failure_projection.get("failure_category")),
+            failure_message=self._string_or_none(failure_projection.get("failure_message")),
+            downstream_business_status=self._string_or_none(failure_projection.get("downstream_business_status")),
+            orchestrator_error=self._string_or_none(failure_projection.get("orchestrator_error")),
             input_ref=item.input_ref,
             output_ref=output_ref,
             result=result,

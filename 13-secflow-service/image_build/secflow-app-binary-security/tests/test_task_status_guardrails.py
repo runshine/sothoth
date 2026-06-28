@@ -16,6 +16,7 @@ class TaskStatusGuardrailTests(unittest.TestCase):
         allowed_fragments = {
             "app/service/task/events.py",
             "app/service/task/operation.py:125:",
+            "app/service/task/operation.py:269:",
             "app/service/task/operation.py:3640:",
             "app/service/task/operation.py:4060:",
         }

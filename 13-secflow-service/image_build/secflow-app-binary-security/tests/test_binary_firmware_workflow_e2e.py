@@ -1229,7 +1229,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertTrue(any((row.get("entries") or []) == [] for row in entry_results))
         self.assertEqual([], self.manager._stage_items(db, task.id, "dataflow_vuln_scan"))
         self.assertEqual("running", task.status)
-        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual("entry_analysis", task.current_stage)
 
     def test_binary_firmware_workflow_e2e_entry_success_without_archive_does_not_start_dataflow(self):
         task = _binary_task(
@@ -4618,7 +4618,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertIn(task.status, {"running", "success"})
         self.assertEqual(task.status, detail.status)
 
-    def test_binary_firmware_workflow_e2e_dataflow_partial_success_archive_terminalizes_parent_failed(self):
+    def test_binary_firmware_workflow_e2e_dataflow_partial_success_archive_terminalizes_parent_success(self):
         task = _binary_task(
             summary={
                 "firmware_unpack_results": [{"firmware_key": "fw-1"}],
@@ -4773,14 +4773,16 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertTrue(first_signals)
         self.assertTrue(second_signals)
         self.assertEqual("archive_apply", str(second_signals[-1].get("reconcile_reason") or ""))
-        self.assertEqual("failed", task.status)
-        self.assertEqual("failed", detail.status)
+        self.assertEqual("success", task.status)
+        self.assertEqual("success", detail.status)
         self.assertEqual(
             "partial_success",
             next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
         )
         self.assertTrue((task.summary or {}).get("dataflow_results"))
         self.assertTrue(any(event.event_type == "task_layer_reconcile_completed" for event in db.events))
+        self.assertIsNotNone(detail.abnormal_reason)
+        self.assertEqual("dataflow_partial_success", detail.abnormal_reason.code)
 
     def test_binary_firmware_workflow_e2e_dataflow_partial_success_advancement_policy_terminalizes_parent_partial_success(self):
         task = _binary_task(
@@ -5082,7 +5084,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("partial_success", dataflow_summary.status)
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
 
-    def test_binary_firmware_workflow_e2e_dataflow_partial_success_currently_finalizes_failed(self):
+    def test_binary_firmware_workflow_e2e_dataflow_partial_success_with_downstream_missing_terminalizes_parent_success(self):
         task = _binary_task(summary={"entry_results": [{"module_key": "mod-a", "entries": [{"entry_key": "mod-a:entry-main", "module_key": "mod-a"}]}]})
         task.current_stage = "dataflow_vuln_scan"
         firmware_run = BinarySecurityStageRun(
@@ -5198,10 +5200,14 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.manager._rebuild_summary_results_from_stage_items(db, task, "dataflow_vuln_scan", "dataflow_results")
         self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("failed", task.status)
+        detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        self.assertEqual("success", task.status)
+        self.assertEqual("success", detail.status)
         self.assertEqual("dataflow_vuln_scan", task.current_stage)
         self.assertEqual([], (task.summary or {}).get("dataflow_results") or [])
         self.assertTrue(any(event.event_type == "task_layer_reconcile_completed" for event in db.events))
+        self.assertIsNotNone(detail.abnormal_reason)
+        self.assertEqual("dataflow_partial_success", detail.abnormal_reason.code)
 
     def test_binary_firmware_workflow_e2e_late_archive_apply_blocked_after_archive_failure(self):
         task = _binary_task()

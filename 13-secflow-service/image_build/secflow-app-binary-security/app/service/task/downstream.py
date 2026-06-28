@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import re
@@ -31,6 +32,56 @@ task_manager_module = _TaskManagerModuleProxy()
 class TaskDownstreamServiceMixin:
     CHILD_TRANSITION_IN_PLACE_RESTART = "in_place_restart"
     CHILD_TRANSITION_DESTRUCTIVE_REBUILD = "destructive_rebuild"
+
+    def _sanitize_stage_item_input(
+        self: TaskManager,
+        stage_name: str,
+        input_ref: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        normalized_stage = normalize_stage_name(stage_name)
+        payload = dict(input_ref or {}) if isinstance(input_ref, dict) else {}
+        if normalized_stage == "dataflow_vuln_scan":
+            return self._sanitize_dataflow_stage_item_input(payload)
+        return self._strip_stage_item_runtime_noise(payload)
+
+    def _strip_stage_item_runtime_noise(self: TaskManager, payload: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        sanitized = copy.deepcopy(payload)
+        for key in (
+            "llm_binding_snapshot",
+            "provider_runtime_summary",
+            "models_json",
+            "provider_config",
+            "provider_config_snapshot",
+            "runtime_snapshot",
+            "prompt_snapshot",
+            "downstream_payload",
+            "downstream_task_payload",
+            "full_downstream_payload",
+            "workspace_root",
+            "artifact_root",
+            "archive_root",
+        ):
+            sanitized.pop(key, None)
+        agent_task_key = sanitized.get("agent_task_key")
+        if isinstance(agent_task_key, dict):
+            lightweight_key = {
+                "id": agent_task_key.get("id") or agent_task_key.get("agent_task_key_id"),
+                "name": agent_task_key.get("name") or agent_task_key.get("agent_task_key_name"),
+                "prefix": agent_task_key.get("prefix") or agent_task_key.get("agent_task_key_prefix"),
+                "source": agent_task_key.get("source") or agent_task_key.get("agent_task_key_source"),
+            }
+            sanitized["agent_task_key"] = {key: value for key, value in lightweight_key.items() if value not in (None, "")}
+        for key in (
+            "agent_task_key_secret",
+            "root_task_key_secret",
+            "secret",
+            "token",
+            "api_key",
+        ):
+            sanitized.pop(key, None)
+        return sanitized
 
     # Downstream orchestration relies on shared task-manager constants/helpers.
     @staticmethod
@@ -184,10 +235,68 @@ class TaskDownstreamServiceMixin:
         return self._dataflow_entry_execution_fingerprint(input_ref)
 
     def _decorate_dataflow_entry_with_execution_fingerprint(self, entry: dict[str, Any]) -> dict[str, Any]:
-        normalized = dict(entry or {})
+        normalized = self._sanitize_dataflow_stage_item_input(entry)
         fingerprint = self._dataflow_entry_execution_fingerprint(normalized)
         normalized["execution_fingerprint"] = fingerprint
         return normalized
+
+    def _sanitize_dataflow_stage_item_input(self, entry: dict[str, Any] | None) -> dict[str, Any]:
+        if not isinstance(entry, dict):
+            return {}
+        normalized = self._strip_stage_item_runtime_noise(entry)
+        normalized["module_name"] = normalized.get("module_name") or normalized.get("entry_module_name")
+        normalized["source_dir"] = normalized.get("source_dir") or self._resolve_entry_source_dir(normalized)
+        normalized["module_input_path"] = normalized.get("module_input_path") or self._resolve_dfa_module_input_path(normalized)
+        normalized["source_root_path"] = normalized.get("source_root_path") or self._resolve_dfa_source_root_path(normalized)
+        normalized["source_file"] = self._compress_source_file_hint(
+            str(normalized.get("source_file") or normalized.get("definition_file") or normalized.get("file_name") or "")
+        )
+        normalized["dataflow_dir"] = normalized.get("dataflow_dir") or self._resolve_vuln_scan_dataflow_input_dir(normalized)
+        normalized["data_flow_root"] = normalized.get("data_flow_root") or self._resolve_vuln_scan_dataflow_input_dir(normalized)
+        allowed_fields = {
+            "entry_key",
+            "firmware_key",
+            "firmware_name",
+            "module_key",
+            "module_name",
+            "module_kind",
+            "function_name",
+            "raw_function_name",
+            "file_name",
+            "line_no",
+            "definition_file",
+            "definition_line",
+            "definition_kind",
+            "is_definition_found",
+            "tag",
+            "taint_params",
+            "signature_params",
+            "function_description",
+            "function_description_source",
+            "entry_reason",
+            "entry_reason_source",
+            "taint_details",
+            "entry_file",
+            "module_input_path",
+            "source_root_path",
+            "source_dir",
+            "source_file",
+            "dataflow_dir",
+            "data_flow_root",
+            "execution_epoch",
+            "upstream_item_id",
+            "triggered_by_stage",
+            "execution_fingerprint",
+        }
+        sanitized = {field: normalized.get(field) for field in allowed_fields if normalized.get(field) is not None}
+        sanitized["taint_params"] = self._normalize_dataflow_execution_list(normalized.get("taint_params"))
+        sanitized["signature_params"] = self._normalize_dataflow_execution_list(normalized.get("signature_params"))
+        taint_details = normalized.get("taint_details")
+        if isinstance(taint_details, list):
+            sanitized["taint_details"] = [dict(detail) for detail in taint_details if isinstance(detail, dict)]
+        else:
+            sanitized["taint_details"] = []
+        return sanitized
 
     def _update_stage_item_metadata_only(
         self,
@@ -198,7 +307,7 @@ class TaskDownstreamServiceMixin:
         output_ref: dict[str, Any] | None = None,
     ) -> BinarySecurityStageItem:
         item.item_name = item_name
-        item.input_ref = dict(input_ref or {})
+        item.input_ref = self._sanitize_dataflow_stage_item_input(input_ref)
         if output_ref is not None:
             item.output_ref = dict(output_ref or {})
         result = self._load_stage_item_result_payload(item)
@@ -330,7 +439,7 @@ class TaskDownstreamServiceMixin:
         if fingerprint:
             input_ref = dict(item.input_ref or {})
             input_ref["execution_fingerprint"] = fingerprint
-            item.input_ref = input_ref
+            item.input_ref = self._sanitize_stage_item_input(item.stage_name, input_ref)
             result = self._load_stage_item_result_payload(item)
             result["execution_fingerprint"] = fingerprint
             item.result = result
@@ -1057,6 +1166,8 @@ class TaskDownstreamServiceMixin:
                 existing_items_by_identity[identity_key] = existing_item
         processed_identities = set(existing_items_by_identity.keys())
 
+        preserved_success_identities: set[str] = set()
+
         def _should_preserve_existing_streaming_item(existing_item: BinarySecurityStageItem) -> bool:
             if not self._streaming_mode_enabled(task):
                 return False
@@ -1069,7 +1180,17 @@ class TaskDownstreamServiceMixin:
             if self._task_is_waiting_for_manual_confirmation(task):
                 return False
             normalized_status = str(existing_item.status or "").strip().lower()
-            if normalized_status not in {"failed", "cancelled", "downstream_missing", "pending", "queued", "dispatching", "running"}:
+            if normalized_status not in {
+                "failed",
+                "cancelled",
+                "downstream_missing",
+                "pending",
+                "queued",
+                "dispatching",
+                "running",
+                "success",
+                "partial_success",
+            }:
                 return False
             return True
 
@@ -1080,6 +1201,29 @@ class TaskDownstreamServiceMixin:
             previous_downstream_task_id = str(existing_item.downstream_task_id or "").strip() or None
             observed_at = task_manager_module._now()
             existing_result = self._load_stage_item_result_payload(existing_item)
+            if previous_status in {"success", "partial_success"}:
+                existing_item.stage_run_id = stage_run.id
+                existing_item.updated_at = observed_at
+                preserved_success_identities.add(identity_key)
+                self._record_event(
+                    db,
+                    task,
+                    "streaming_stage_item_success_preserved",
+                    "流式阶段已成功的 authoritative item 保持完成态，仅参与观测与聚合",
+                    level="info",
+                    stage_name=stage_run.stage_name,
+                    item=existing_item,
+                    payload={
+                        "before_status": previous_status,
+                        "after_status": previous_status,
+                        "downstream_task_id": previous_downstream_task_id,
+                        "task_runtime_phase": self._task_runtime_phase(task),
+                        "dispatcher_instance_id": task.dispatcher_instance_id,
+                        "task_execution_token": self._dispatch_token(task),
+                        "recovery_action": "observe_only",
+                    },
+                )
+                continue
             sync_observation = dict(existing_result.get("sync_observation") or {})
             sync_observation.update(
                 {
@@ -1126,9 +1270,16 @@ class TaskDownstreamServiceMixin:
                     "task_runtime_phase": self._task_runtime_phase(task),
                     "dispatcher_instance_id": task.dispatcher_instance_id,
                     "task_execution_token": self._dispatch_token(task),
-                    "recovery_action": "requeued_pending",
+                    "recovery_action": "observe_only",
                 },
             )
+
+        if preserved_success_identities:
+            executable_inputs = [
+                row[0]
+                for row in candidate_inputs
+                if row[5] not in preserved_success_identities
+            ]
 
         batch_size = min(100, max(25, int(task.policy.get("stage_item_seed_batch_size") or 100)))
         last_error: Exception | None = None
@@ -1187,7 +1338,7 @@ class TaskDownstreamServiceMixin:
                                 reset_started_at=True,
                                 reset_finished_at=True,
                             )
-                        item.input_ref = input_ref
+                        item.input_ref = self._sanitize_stage_item_input(stage_run.stage_name, input_ref)
                         item.output_ref = output_ref(input_item)
                     db.commit()
                 return executable_inputs

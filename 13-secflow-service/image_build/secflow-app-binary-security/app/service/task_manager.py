@@ -4883,6 +4883,7 @@ class TaskManager(
         expected_keys = {str(module.get("module_key") or "").strip() for module in expected if str(module.get("module_key") or "").strip()}
         materialized_keys = {str(module.get("module_key") or "").strip() for module in materialized if str(module.get("module_key") or "").strip()}
         missing = sorted(key for key in expected_keys if key not in materialized_keys)
+        legacy_materialized_only = not expected_keys and bool(materialized_keys)
         return {
             "expected_modules": expected,
             "materialized_modules": materialized,
@@ -4895,7 +4896,8 @@ class TaskManager(
                 [module for module in materialized if str(module.get("completion_state") or "").strip() in {"failed", "orchestration_failed", "cancelled"}]
             ),
             "missing_module_keys": missing,
-            "complete": bool(expected_keys) and len(expected_keys) == len(materialized_keys),
+            "complete": legacy_materialized_only or (bool(expected_keys) and len(expected_keys) == len(materialized_keys)),
+            "legacy_materialized_only": legacy_materialized_only,
         }
 
     def _entry_module_completion_gate(self, task: BinarySecurityTask, db: Session) -> bool:
@@ -6964,6 +6966,83 @@ class TaskManager(
             recommended_action="查看阶段时间线、下游任务和归档节点，确认是哪一层先出现异常。",
         )
 
+    def _task_success_abnormal_reason(
+        self,
+        task: BinarySecurityTask,
+        stage_summaries: list[BinarySecurityStageSummary],
+        items: list[BinarySecurityStageItem],
+        archive_jobs: list[BinarySecurityArchiveJob],
+    ) -> BinarySecurityAbnormalReason | None:
+        del archive_jobs
+        dataflow_summary = next(
+            (
+                summary
+                for summary in stage_summaries
+                if normalize_stage_name(summary.stage_name) == "dataflow_vuln_scan"
+            ),
+            None,
+        )
+        if dataflow_summary is None:
+            return None
+        dataflow_items = [
+            item
+            for item in items
+            if normalize_stage_name(item.stage_name) == "dataflow_vuln_scan"
+        ]
+        success_count = sum(
+            1
+            for item in dataflow_items
+            if (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()) in {"success", "partial_success"}
+        )
+        if success_count <= 0:
+            return None
+        abnormal_item_count = sum(
+            1
+            for item in dataflow_items
+            if (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
+            in {"failed", "partial_success", "downstream_missing", "cancelled"}
+        )
+        if str(dataflow_summary.status or "").strip() != "partial_success" and abnormal_item_count <= 0:
+            return None
+        latest_item_reason = next(
+            (
+                self._stage_item_abnormal_reason(item, task=task)
+                for item in reversed(dataflow_items)
+                if self._stage_item_abnormal_reason(item, task=task) is not None
+            ),
+            None,
+        )
+        evidence = [
+            self._abnormal_reason_evidence("stage_name", "阶段", "dataflow_vuln_scan"),
+            self._abnormal_reason_evidence("stage_status", "阶段状态", dataflow_summary.status),
+            self._abnormal_reason_evidence("success_items", "成功子任务数", success_count),
+            self._abnormal_reason_evidence("failed_items", "失败子任务数", dataflow_summary.failed_items),
+            self._abnormal_reason_evidence("downstream_missing_items", "缺失子任务数", dataflow_summary.downstream_missing_items),
+            self._abnormal_reason_evidence("last_error", "原始错误", dataflow_summary.last_error),
+        ]
+        if latest_item_reason is not None:
+            evidence.extend(
+                [
+                    self._abnormal_reason_evidence("latest_abnormal_item", "最近异常子任务", latest_item_reason.item_key),
+                    self._abnormal_reason_evidence("latest_abnormal_message", "最近异常原因", latest_item_reason.message),
+                ]
+            )
+        return self._build_abnormal_reason(
+            category="orchestration",
+            code="dataflow_partial_success",
+            title="数据流阶段部分成功",
+            message="数据流漏洞挖掘已成功产出部分结果，但仍存在失败子任务。",
+            source_layer="task",
+            status="partial_success",
+            service="binary-security",
+            stage_name="dataflow_vuln_scan",
+            first_seen_at=dataflow_summary.started_at,
+            last_seen_at=dataflow_summary.finished_at,
+            evidence=evidence,
+            recommended_action="任务已成功结束；如需补齐剩余结果，请查看失败子任务并按需重试失败项。",
+            terminal=False,
+        )
+
     def _abnormal_reason_history(self, db: Session, task: BinarySecurityTask) -> list[BinarySecurityAbnormalReasonEventSummary]:
         rows = (
             db.query(BinarySecurityEvent)
@@ -7766,11 +7845,46 @@ class TaskManager(
             item
             for item in self._stage_items(db, task.id, stage_name)
             if self._is_failed_retry_candidate_status(item.status)
+            and not self._stage_item_failure_requires_archive_retry_only(db, task, item)
             and (
                 str(item.downstream_task_id or "").strip()
                 or self._latest_observed_downstream_status(item) in RETRY_CHILD_ABNORMAL_STATUSES
             )
         ]
+
+    def _stage_item_failure_requires_archive_retry_only(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> bool:
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = dict(result.get("sync_observation") or {})
+        last_result = str(
+            sync_observation.get("last_result")
+            or result.get("last_sync_result")
+            or ""
+        ).strip()
+        if last_result == "downstream_archive_failed_manual_intervention":
+            return True
+        jobs = self._archive_jobs_for_stage_items(
+            db,
+            task.id,
+            str(item.stage_name or "").strip(),
+            [str(item.id or "").strip()],
+        )
+        for job in jobs:
+            if str(getattr(job, "archive_status", "") or "").strip() != "failed":
+                continue
+            supported, _reason = self._archive_job_retry_support(
+                db,
+                task,
+                job,
+                ignore_operation_lock=True,
+            )
+            if supported:
+                return True
+        return False
 
     def _has_retryable_failed_stage_items(self, db: Session, task: BinarySecurityTask) -> bool:
         for stage_name in self._stage_sequence_for_task(task):
@@ -7852,6 +7966,15 @@ class TaskManager(
         for upstream_stage in upstream_stages:
             run = runs_by_stage.get(upstream_stage)
             if not run or int(getattr(run, "retry_count", 0) or 0) <= 0:
+                continue
+            try:
+                stage_index = stage_sequence.index(stage_name)
+                upstream_index = stage_sequence.index(upstream_stage)
+            except ValueError:
+                continue
+            if stage_index <= upstream_index:
+                continue
+            if stage_index == upstream_index + 1 and earliest_target_created_at is None and stage_name not in runs_by_stage:
                 continue
             upstream_completed_at = self._comparable_datetime(
                 getattr(run, "finished_at", None) or getattr(run, "started_at", None)
@@ -8138,6 +8261,8 @@ class TaskManager(
             return "cancelled"
         if all(status == "downstream_missing" for status in statuses):
             return "downstream_missing"
+        if any(status == "partial_success" for status in statuses):
+            return "partial_success"
         if any(status in {"failed", "partial_success"} for status in statuses):
             return "failed"
         if any(status == "downstream_missing" for status in statuses):
@@ -8541,7 +8666,7 @@ class TaskManager(
                 item.rerun_count = int(item.rerun_count or 0) + 1
             if auto_retrying:
                 item.retry_count = int(item.retry_count or 0) + 1
-        item.input_ref = input_ref
+        item.input_ref = self._sanitize_stage_item_input(stage_name, input_ref)
         if output_ref is not None:
             item.output_ref = output_ref
         max_attempts = self._retryable_write_attempts()
@@ -8578,7 +8703,7 @@ class TaskManager(
                 if not keep_existing_active:
                     existing.started_at = self._stage_item_started_at(running_status)
                     self._ensure_stage_item_first_started_at(existing)
-                existing.input_ref = input_ref
+                existing.input_ref = self._sanitize_stage_item_input(stage_name, input_ref)
                 if output_ref is not None:
                     existing.output_ref = output_ref
                 if retrying:
@@ -10259,11 +10384,22 @@ class TaskManager(
         stage_name: str,
         summary_key: str,
     ) -> list[dict[str, Any]]:
+        allowed_statuses = {"success"}
+        include_partial_success_payloads = summary_key == "dataflow_results" and self._task_type(task) == TASK_TYPE_SOURCE
+        if include_partial_success_payloads:
+            allowed_statuses.add("partial_success")
         items = [
             item
             for item in self._stage_items(db, task.id, stage_name)
-            if item.status == "success"
+            if item.status in allowed_statuses
         ]
+        count_items = list(items)
+        if summary_key == "dataflow_results" and not include_partial_success_payloads:
+            count_items = [
+                item
+                for item in self._stage_items(db, task.id, stage_name)
+                if item.status in {"success", "partial_success"}
+            ]
         rebuilt = self._compact_stage_success_items(
             summary_key,
             [
@@ -10273,6 +10409,17 @@ class TaskManager(
                     **self._load_stage_item_result_payload(item),
                 }
                 for item in items
+            ],
+        )
+        counted_rebuilt = self._compact_stage_success_items(
+            summary_key,
+            [
+                {
+                    **dict(item.input_ref or {}),
+                    **dict(item.output_ref or {}),
+                    **self._load_stage_item_result_payload(item),
+                }
+                for item in count_items
             ],
         )
         if summary_key == "b2s_results" and self._task_type(task) == TASK_TYPE_BINARY_MODULE:
@@ -10321,12 +10468,12 @@ class TaskManager(
                     "items": self._compact_stage_success_items_for_db(summary_key, rebuilt),
                     "failed_items": failed_items[:DB_FAILURE_ITEM_LIMIT],
                     "cancelled_items": cancelled_items[:DB_FAILURE_ITEM_LIMIT],
-                    "success_count": len(rebuilt),
+                    "success_count": len(counted_rebuilt),
                     "failed_count": int((stage_run.counts or {}).get("failed_items") or 0),
                     "cancelled_count": int((stage_run.counts or {}).get("cancelled_items") or 0),
                     "running_count": int((stage_run.counts or {}).get("running_items") or 0),
                     "entry_count": self._entry_count_for_summary(summary_key, rebuilt),
-                    "vuln_result_count": len(rebuilt) if summary_key == "dataflow_results" else 0,
+                    "vuln_result_count": len(counted_rebuilt) if summary_key == "dataflow_results" else 0,
                     "status_synced": True,
                     "sync_status": stage_run.status,
                     **(stage_run.counts or {}),
@@ -10565,6 +10712,7 @@ class TaskManager(
                 or self._string_or_none(failure_snapshot.get("error"))
                 or self._string_or_none(getattr(stage_run, "last_error", None))
             )
+            is_streaming_tail = self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, stage_name)
             reason: str | None = None
             if stage_status in {"failed", "cancelled", "downstream_missing"} and self._is_archive_repair_sensitive_failure(
                 stage_name,
@@ -10572,9 +10720,18 @@ class TaskManager(
                 failure_message=failure_message,
             ):
                 reason = "failed_due_to_missing_repaired_inputs"
-            elif stage_status in {"pending", "queued", "running", "dispatching", "success", "partial_success"} and stage_items:
+            elif (
+                not is_streaming_tail
+                and stage_status in {"pending", "queued", "running", "dispatching", "success", "partial_success"}
+                and stage_items
+            ):
                 reason = "stale_descendant_items_present"
-            elif stage_status in {"pending", "queued", "running", "dispatching", "success", "partial_success"} and stage_run is not None and has_materialized_progress:
+            elif (
+                not is_streaming_tail
+                and stage_status in {"pending", "queued", "running", "dispatching", "success", "partial_success"}
+                and stage_run is not None
+                and has_materialized_progress
+            ):
                 reason = "stale_descendant_stage_run_present"
             if reason:
                 contaminated.append(
@@ -11445,7 +11602,7 @@ class TaskManager(
             lambda input_file, retrying=False, auto_retrying=False: self._run_firmware_item(
                 task, stage_run, input_file, token, retrying, auto_retrying
             ),
-            retries=int(task.policy.get("max_retries_per_item") or 0),
+            retries=self._max_retries_per_item(task),
             initial_retry=retry_existing,
         )
         status, summary = self._aggregate_stage_items(db, task, results, "firmware_unpack_results")
@@ -11486,7 +11643,7 @@ class TaskManager(
             lambda analysis_input, retrying=False, auto_retrying=False: self._run_system_analysis_item(
                 task, stage_run, analysis_input, retrying, auto_retrying
             ),
-            retries=int(task.policy.get("max_retries_per_item") or 0),
+            retries=self._max_retries_per_item(task),
             initial_retry=retry_existing,
         )
         status, aggregate_summary = self._aggregate_stage_items(db, task, results, "system_analysis_results")
@@ -11567,7 +11724,7 @@ class TaskManager(
             lambda module, retrying=False, auto_retrying=False: self._run_b2s_item(
                 task, stage_run, module, token, retrying, auto_retrying
             ),
-            retries=int(task.policy.get("max_retries_per_item") or 0),
+            retries=self._max_retries_per_item(task),
             initial_retry=retry_existing,
         )
         return self._aggregate_stage_items(db, task, results, "b2s_results")
@@ -11616,7 +11773,7 @@ class TaskManager(
             lambda module, retrying=False, auto_retrying=False: self._run_entry_item(
                 task, stage_run, module, token, retrying, auto_retrying
             ),
-            retries=int(task.policy.get("max_retries_per_item") or 0),
+            retries=self._max_retries_per_item(task),
             initial_retry=retry_existing,
         )
         status, summary = self._aggregate_stage_items(db, task, results, "entry_results")
@@ -12179,7 +12336,7 @@ class TaskManager(
             lambda entry, retrying=False, auto_retrying=False: self._run_dataflow_item(
                 task, stage_run, entry, token, retrying, auto_retrying
             ),
-            retries=int(task.policy.get("max_retries_per_item") or 0),
+            retries=self._max_retries_per_item(task),
             initial_retry=retry_existing,
         )
         return self._aggregate_stage_items(db, task, results, "dataflow_results")

@@ -2606,7 +2606,8 @@ class TaskRuntimeServiceMixin:
                 attempts = 0
                 result = await runner(item, initial_retry)
                 await self._ensure_task_execution_current_async(task)
-                while result.get("status") == "failed" and attempts < max(0, retries):
+                automatic_retries_allowed = max(0, int(retries))
+                while result.get("status") == "failed" and attempts < automatic_retries_allowed:
                     attempts += 1
                     await self._ensure_task_execution_current_async(task)
                     if supports_auto_retrying:
@@ -2664,6 +2665,7 @@ class TaskRuntimeServiceMixin:
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item, token)
+            created = None
             retry_strategy = None
             retry_strategy_status = None
             if retrying:
@@ -3627,6 +3629,7 @@ class TaskRuntimeServiceMixin:
             )
             session.commit()
             active_payload = await self._active_downstream_payload(task, item, token)
+            created = None
             retry_strategy = None
             retry_strategy_status = None
             if retrying:
@@ -3872,6 +3875,7 @@ class TaskRuntimeServiceMixin:
         _downstream_origin_payload = task_manager_module._downstream_origin_payload
         _entry_signature_params = task_manager_module._entry_signature_params
         _now = task_manager_module._now
+        RETRY_CHILD_STRATEGY_REUSE_SUCCESS = task_manager_module.RETRY_CHILD_STRATEGY_REUSE_SUCCESS
         RETRY_CHILD_STRATEGY_ADOPT_ACTIVE = task_manager_module.RETRY_CHILD_STRATEGY_ADOPT_ACTIVE
         RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL = (
             task_manager_module.RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
@@ -3923,6 +3927,8 @@ class TaskRuntimeServiceMixin:
                 self._store_retry_item_action(task, action_snapshot)
                 session.commit()
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    active_payload = None
+                elif retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
                     active_payload = None
             taint_params = [str(value).strip() for value in (entry.get("taint_params") or []) if str(value).strip()]
             if not taint_params:
@@ -4029,6 +4035,10 @@ class TaskRuntimeServiceMixin:
                             status = "downstream_missing"
                         else:
                             status = "failed"
+                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
+                    session.commit()
+                    payload = await self._downstream_fetch_item_payload(task, item, None)
+                    status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
                 elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
@@ -4318,6 +4328,7 @@ class TaskRuntimeServiceMixin:
         _downstream_origin_payload = task_manager_module._downstream_origin_payload
         _now = task_manager_module._now
         RETRY_CHILD_ABNORMAL_STATUSES = task_manager_module.RETRY_CHILD_ABNORMAL_STATUSES
+        RETRY_CHILD_STRATEGY_REUSE_SUCCESS = task_manager_module.RETRY_CHILD_STRATEGY_REUSE_SUCCESS
         RETRY_CHILD_STRATEGY_ADOPT_ACTIVE = task_manager_module.RETRY_CHILD_STRATEGY_ADOPT_ACTIVE
         RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL = (
             task_manager_module.RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL
@@ -4326,16 +4337,17 @@ class TaskRuntimeServiceMixin:
         session = get_session_factory()()
         try:
             dataflow_result = self._validate_dataflow_output_contract(dataflow_result)
+            stage_item_input = self._sanitize_dataflow_stage_item_input(dataflow_result)
             item = self._upsert_stage_item(
                 session,
                 task=task,
                 stage_run=stage_run,
                 stage_name=stage_run.stage_name,
-                item_key=dataflow_result["entry_key"],
-                item_name=dataflow_result["function_name"],
-                parent_key=dataflow_result["module_key"],
+                item_key=stage_item_input["entry_key"],
+                item_name=stage_item_input["function_name"],
+                parent_key=stage_item_input["module_key"],
                 downstream_service="dataflow_vuln_scan",
-                input_ref=dataflow_result,
+                input_ref=stage_item_input,
                 retrying=retrying,
                 auto_retrying=auto_retrying,
             )
@@ -4492,6 +4504,8 @@ class TaskRuntimeServiceMixin:
                             "item": result,
                             "error": payload.get("error") or payload.get("error_message"),
                         }
+                elif retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
+                    active_payload = None
             if active_payload is not None:
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "pending"
@@ -4506,6 +4520,12 @@ class TaskRuntimeServiceMixin:
                 )
                 created = None
             else:
+                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
+                    payload = await self._downstream_fetch_item_payload(task, item, token or "")
+                    status = self._status_from_downstream_payload(
+                        payload,
+                        success_statuses={"success", "succeeded", "completed"},
+                    )
                 if str(item.downstream_task_id or "").strip() and not retrying:
                     return self._defer_item_after_downstream_transport_error(
                         session,
@@ -4515,7 +4535,7 @@ class TaskRuntimeServiceMixin:
                         exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
                         response_item=dataflow_result,
                     )
-                else:
+                elif not (retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item)):
                     self._mark_downstream_binding_creating(item)
                     session.commit()
                     dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)

@@ -48,7 +48,13 @@ class TaskArchiveServiceMixin:
                 str(getattr(job, "archive_status", "") or "").strip() in {"pending", "running", "archived", "applying"}
                 for job in jobs
             )
-            if not has_pending_like_job:
+            has_retryable_failed_job = any(
+                str(getattr(job, "archive_status", "") or "").strip() == "failed"
+                and str((getattr(job, "payload", None) or {}).get("mapped_status") or "").strip().lower()
+                in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES
+                for job in jobs
+            )
+            if not has_pending_like_job and not has_retryable_failed_job:
                 continue
             supported, reason, _, _ = self._archive_full_retry_support(
                 db,

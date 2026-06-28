@@ -351,9 +351,9 @@ class BinarySecurityStageItem(Base, JsonMixin):
     rerun_count = Column(Integer, nullable=False, default=0)
     downstream_service = Column(String(64), nullable=True)
     downstream_task_id = Column(String(128), nullable=True, index=True)
-    input_ref_json = Column(Text, nullable=True)
-    output_ref_json = Column(Text, nullable=True)
-    payload_json = Column(Text, nullable=True)
+    input_ref_json = Column(MEDIUMTEXT, nullable=True)
+    output_ref_json = Column(MEDIUMTEXT, nullable=True)
+    payload_json = Column(MEDIUMTEXT, nullable=True)
     result_json = Column(MEDIUMTEXT, nullable=True)
     error_message = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -918,6 +918,21 @@ def _ensure_compat_columns(engine) -> None:
             )
             statements.append(
                 f"UPDATE {stage_item_table} SET rerun_count = retry_count WHERE rerun_count = 0 AND retry_count > 0"
+            )
+        input_ref_json_type = str(column_defs.get("input_ref_json", {}).get("type") or "").lower()
+        if "input_ref_json" in columns and "mediumtext" not in input_ref_json_type:
+            statements.append(
+                f"ALTER TABLE {stage_item_table} MODIFY COLUMN input_ref_json MEDIUMTEXT NULL"
+            )
+        output_ref_json_type = str(column_defs.get("output_ref_json", {}).get("type") or "").lower()
+        if "output_ref_json" in columns and "mediumtext" not in output_ref_json_type:
+            statements.append(
+                f"ALTER TABLE {stage_item_table} MODIFY COLUMN output_ref_json MEDIUMTEXT NULL"
+            )
+        payload_json_type = str(column_defs.get("payload_json", {}).get("type") or "").lower()
+        if "payload_json" in columns and "mediumtext" not in payload_json_type:
+            statements.append(
+                f"ALTER TABLE {stage_item_table} MODIFY COLUMN payload_json MEDIUMTEXT NULL"
             )
         result_json_type = str(column_defs.get("result_json", {}).get("type") or "").lower()
         if "result_json" in columns and "mediumtext" not in result_json_type:

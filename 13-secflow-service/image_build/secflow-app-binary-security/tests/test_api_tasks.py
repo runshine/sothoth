@@ -447,6 +447,7 @@ class _RouteManagerStub:
     def list_delete_queue(
         self,
         db,
+        token=None,
         project_id=None,
         task_type=None,
         delete_status=None,
@@ -457,7 +458,7 @@ class _RouteManagerStub:
         page_size=20,
     ):
         self.calls.append(
-            ("list_delete_queue", db, project_id, task_type, delete_status, search, sort_by, sort_direction, page, page_size)
+            ("list_delete_queue", db, token, project_id, task_type, delete_status, search, sort_by, sort_direction, page, page_size)
         )
         return BinarySecurityDeleteQueueResponse(
             total=1,
@@ -748,7 +749,7 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(20, payload["page_size"])
         self.assertEqual("queued", payload["items"][0]["delete_status"])
         self.assertEqual(
-            ("list_delete_queue", fake_db, None, "source_scan_e2e", None, None, "delete_requested_at", "desc", 1, 20),
+            ("list_delete_queue", fake_db, "token", None, "source_scan_e2e", None, None, "delete_requested_at", "desc", 1, 20),
             manager.calls[0],
         )
 

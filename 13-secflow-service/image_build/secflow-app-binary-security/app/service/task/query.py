@@ -22,6 +22,7 @@ from app.model import (
     normalize_stage_name,
 )
 from app.observability import observe_task_list_query, observe_task_list_query_stage
+from app.service.project import get_project_service
 from app.schemas import (
     BinarySecurityActionResponse,
     BinarySecurityArchiveJobPageResponse,
@@ -51,10 +52,50 @@ logger = logging.getLogger(__name__)
 
 
 class TaskQueryServiceMixin:
+    def _task_list_project_names(
+        self: TaskManager,
+        db: Session,
+        tasks: list[BinarySecurityTask],
+        *,
+        token: str | None = None,
+    ) -> dict[str, str | None]:
+        del db
+        project_ids = {
+            str(getattr(task, "project_id", "") or "").strip()
+            for task in (tasks or [])
+            if str(getattr(task, "project_id", "") or "").strip()
+        }
+        if not project_ids:
+            return {}
+        project_names: dict[str, str | None] = {project_id: None for project_id in project_ids}
+        if not token:
+            return project_names
+        project_service = get_project_service()
+        for project_id in sorted(project_ids):
+            try:
+                payload = project_service.get_project(token, project_id)
+            except Exception as exc:
+                logger.warning(
+                    "binary-security delete queue project name lookup failed: project_id=%s error_type=%s error=%s",
+                    project_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            project_name = str(
+                payload.get("name")
+                or payload.get("project_name")
+                or payload.get("display_name")
+                or ""
+            ).strip() or None
+            project_names[project_id] = project_name
+        return project_names
+
     def list_delete_queue(
         self: TaskManager,
         db: Session,
         *,
+        token: str | None = None,
         project_id: str | None = None,
         task_type: str | None = None,
         delete_status: str | None = None,
@@ -77,24 +118,6 @@ class TaskQueryServiceMixin:
         )
         if normalized_project_id:
             base_query = base_query.filter(BinarySecurityTask.project_id == normalized_project_id)
-        if normalized_task_type:
-            if normalized_task_type == "binary_firmware_e2e":
-                base_query = base_query.filter(
-                    or_(BinarySecurityTask.task_type == "binary", BinarySecurityTask.task_type.is_(None))
-                )
-            elif normalized_task_type == "source_scan_e2e":
-                base_query = base_query.filter(BinarySecurityTask.task_type == "source").filter(
-                    or_(
-                        BinarySecurityTask.policy_json.is_(None),
-                        ~BinarySecurityTask.policy_json.like('%"pipeline_profile": "kg_source_vuln_scan"%'),
-                    )
-                )
-            elif normalized_task_type == "kg_source_vuln_scan_e2e":
-                base_query = base_query.filter(BinarySecurityTask.task_type == "source").filter(
-                    BinarySecurityTask.policy_json.like('%"pipeline_profile": "kg_source_vuln_scan"%')
-                )
-            elif normalized_task_type == "binary_module_e2e":
-                base_query = base_query.filter(BinarySecurityTask.task_type == "binary_module")
         if normalized_search:
             base_query = base_query.filter(
                 or_(
@@ -120,7 +143,7 @@ class TaskQueryServiceMixin:
                 BinarySecurityTask.finished_at,
             )
         ).all()
-        project_names = self._task_list_project_names(db, tasks)
+        project_names = self._task_list_project_names(db, tasks, token=token)
 
         def parse_datetime(value: Any):
             text = str(value or "").strip()
@@ -134,7 +157,10 @@ class TaskQueryServiceMixin:
         def map_queue_task_type(task: BinarySecurityTask) -> str:
             task_kind = str(task.task_type or "binary").strip().lower() or "binary"
             if task_kind == "source":
-                policy = task_shared.json_dict(task.policy_json)
+                try:
+                    policy = json.loads(str(task.policy_json or "").strip() or "{}")
+                except Exception:
+                    policy = {}
                 if str(policy.get("pipeline_profile") or "").strip() == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
                     return "kg_source_vuln_scan_e2e"
                 return "source_scan_e2e"
@@ -148,6 +174,9 @@ class TaskQueryServiceMixin:
             delete_state = self._task_delete_queue_state(task)
             task_status = str(task.status or "").strip().lower()
             delete_error = str(delete_state.get("delete_last_error") or task.last_error or "").strip() or None
+            mapped_task_type = map_queue_task_type(task)
+            if normalized_task_type and normalized_task_type != mapped_task_type:
+                continue
             if delete_state.get("delete_in_progress"):
                 mapped_delete_status = "running"
             elif task_status in {"delete_failed", "force_delete_failed"} or delete_error:
@@ -158,15 +187,16 @@ class TaskQueryServiceMixin:
                 continue
             if normalized_delete_status and normalized_delete_status != mapped_delete_status:
                 continue
-            if mapped_delete_status in stats:
-                stats[mapped_delete_status] += 1
+            stats_key = f"{mapped_delete_status}_total"
+            if stats_key in stats:
+                stats[stats_key] += 1
             rows.append(
                 BinarySecurityDeleteQueueItem(
                     id=str(task.id),
                     project_id=str(task.project_id),
                     project_name=project_names.get(str(task.project_id)),
                     name=str(task.name or task.id),
-                    task_type=map_queue_task_type(task),
+                    task_type=mapped_task_type,
                     task_status=str(task.status or ""),
                     display_status=str(task.status or ""),
                     delete_status=mapped_delete_status,

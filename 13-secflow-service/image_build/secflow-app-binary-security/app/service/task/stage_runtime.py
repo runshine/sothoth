@@ -14,6 +14,103 @@ if TYPE_CHECKING:
 
 
 class TaskStageRuntimeMixin:
+    def _stage_has_authoritative_progress_facts(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> bool:
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_stage_name:
+            return False
+        resolved_stage_run = stage_run or self._latest_stage_run(db, task.id, normalized_stage_name)
+        if resolved_stage_run is not None:
+            resolved_status = str(getattr(resolved_stage_run, "status", "") or "").strip().lower()
+            if resolved_status in {
+                "running",
+                "dispatching",
+                "success",
+                "partial_success",
+                "failed",
+                "cancelled",
+                "downstream_missing",
+            }:
+                return True
+            if getattr(resolved_stage_run, "started_at", None) or getattr(resolved_stage_run, "finished_at", None):
+                return True
+        resolved_stage_items = stage_items if stage_items is not None else self._stage_items(db, task.id, normalized_stage_name)
+        if not resolved_stage_items:
+            return False
+        for item in resolved_stage_items:
+            item_status = str(getattr(item, "status", "") or "").strip().lower()
+            if item_status in {
+                "pending",
+                "queued",
+                "running",
+                "dispatching",
+                "success",
+                "partial_success",
+                "failed",
+                "cancelled",
+                "downstream_missing",
+            }:
+                return True
+            if (
+                getattr(item, "started_at", None)
+                or getattr(item, "finished_at", None)
+                or str(getattr(item, "downstream_task_id", "") or "").strip()
+            ):
+                return True
+        return False
+
+    def _advance_task_current_stage_from_authoritative_facts(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        stage_run: BinarySecurityStageRun | None = None,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> bool:
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_stage_name:
+            return False
+        sequence = self._stage_sequence_for_task(task)
+        if normalized_stage_name not in sequence:
+            return False
+        current_stage = str(getattr(task, "current_stage", "") or "").strip()
+        if current_stage == normalized_stage_name:
+            return False
+        if current_stage in sequence and sequence.index(current_stage) > sequence.index(normalized_stage_name):
+            return False
+        if not self._stage_has_authoritative_progress_facts(
+            db,
+            task,
+            normalized_stage_name,
+            stage_run=stage_run,
+            stage_items=stage_items,
+        ):
+            return False
+        previous_stage = current_stage or None
+        task.current_stage = normalized_stage_name
+        self._record_event(
+            db,
+            task,
+            "task_current_stage_advanced_from_authoritative_facts",
+            f"阶段权威事实已落库，父任务主阶段推进到: {normalized_stage_name}",
+            level="info",
+            stage_name=normalized_stage_name,
+            payload={
+                "previous_stage": previous_stage,
+                "current_stage": normalized_stage_name,
+                "advance_source": "authoritative_stage_refresh",
+            },
+        )
+        return True
+
     def _streaming_dataflow_materialized_item_keys(
         self: TaskManager,
         db: Session,
@@ -109,9 +206,13 @@ class TaskStageRuntimeMixin:
         task: BinarySecurityTask,
         stage_run: BinarySecurityStageRun,
     ) -> str:
-        if not self._streaming_mode_enabled(task) or not self._is_streaming_tail_stage(task, stage_run.stage_name):
-            return "pending"
         current = str(stage_run.status or "").strip()
+        if not self._streaming_mode_enabled(task) or not self._is_streaming_tail_stage(task, stage_run.stage_name):
+            if current == "success":
+                return current
+            if current in {"running", "dispatching"}:
+                return "running"
+            return "pending"
         if current == "success":
             return current
         if current in {"failed", "downstream_missing", "cancelled", "partial_success"}:
@@ -165,7 +266,16 @@ class TaskStageRuntimeMixin:
             self._refresh_streaming_tail_stage_state(db, task, stage_name)
         else:
             self._refresh_stage_run_from_items(db, task, stage_name)
-        return self._latest_stage_run(db, task.id, stage_name)
+        stage_run = self._latest_stage_run(db, task.id, stage_name)
+        stage_items = self._stage_items(db, task.id, stage_name)
+        self._advance_task_current_stage_from_authoritative_facts(
+            db,
+            task,
+            stage_name,
+            stage_run=stage_run,
+            stage_items=stage_items,
+        )
+        return stage_run
 
     def _refresh_stage_from_authoritative_items(
         self: TaskManager,
@@ -228,9 +338,27 @@ class TaskStageRuntimeMixin:
         handler = self._stage_handler(normalized_stage_name)
         if handler is not None and handler.manages_stage_refresh():
             handler.refresh_summary_from_items(self, db, task)
-            return self._latest_stage_run(db, task.id, normalized_stage_name)
+            stage_run = self._latest_stage_run(db, task.id, normalized_stage_name)
+            stage_items = self._stage_items(db, task.id, normalized_stage_name)
+            self._advance_task_current_stage_from_authoritative_facts(
+                db,
+                task,
+                normalized_stage_name,
+                stage_run=stage_run,
+                stage_items=stage_items,
+            )
+            return stage_run
         self._refresh_stage_run_from_items(db, task, normalized_stage_name)
-        return self._latest_stage_run(db, task.id, normalized_stage_name)
+        stage_run = self._latest_stage_run(db, task.id, normalized_stage_name)
+        stage_items = self._stage_items(db, task.id, normalized_stage_name)
+        self._advance_task_current_stage_from_authoritative_facts(
+            db,
+            task,
+            normalized_stage_name,
+            stage_run=stage_run,
+            stage_items=stage_items,
+        )
+        return stage_run
 
     def _reconcile_retry_affected_stages_in_session(
         self: TaskManager,

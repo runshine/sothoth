@@ -1076,15 +1076,15 @@ class TaskRuntimeStateServiceMixin:
         if override.get("tail_reconcile_poll_interval_seconds") is not None:
             base["tail_reconcile_poll_interval_seconds"] = int(override["tail_reconcile_poll_interval_seconds"])
         base["module_risk_levels"] = task_manager_module._normalize_module_risk_levels(base.get("module_risk_levels"))
+        # Child-task automatic retry is globally disabled. Explicit retry/reset operations
+        # remain available, but runtime execution ignores task-supplied retry counts.
+        base["max_retries_per_item"] = 0
+        base["automatic_child_retry_enabled"] = False
         return base
 
     def _max_retries_per_item(self: TaskManager, task: BinarySecurityTask) -> int:
-        effective = self._effective_runtime_policy(task)
-        value = effective.get("max_retries_per_item")
-        try:
-            return max(1, int(value if value is not None else 1))
-        except Exception:
-            return 1
+        del task
+        return 0
 
     def _runtime_policy_effect_scope(self: TaskManager, task: BinarySecurityTask) -> dict[str, str]:
         from app.service import task_manager as task_manager_module
@@ -1547,6 +1547,7 @@ class TaskRuntimeStateServiceMixin:
             reason=reconcile_reason,
             stage_name=signal_stage_name,
             extra={
+                "reconcile_mode": "observe_only" if reconcile_reason == "archive_apply" else "allow_execution",
                 "state_event_id": str(state_event_id or "").strip() or None,
                 "source_event_type": str(source_event_type or "").strip() or None,
                 "fact_applied": True,
@@ -1566,6 +1567,7 @@ class TaskRuntimeStateServiceMixin:
                 "reason": reconcile_reason,
                 "takeover_reason": reconcile_reason,
                 "takeover_action": "request_task_layer_reconcile",
+                "reconcile_mode": "observe_only" if reconcile_reason == "archive_apply" else "allow_execution",
                 "source_event_type": str(source_event_type or "").strip() or None,
                 "state_event_id": str(state_event_id or "").strip() or None,
                 "fact_applied": True,

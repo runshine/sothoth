@@ -3226,6 +3226,103 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("succeeded", action_rows["si-df-source-retry-failed-items-a"]["verification_status"])
         self.assertNotIn("si-df-source-retry-failed-items-b", action_rows)
 
+    def test_source_workflow_e2e_retry_failed_items_archive_only_failure_upgrades_to_archive_retry(self):
+        task = _source_task(
+            summary={
+                "input_dir": "/tmp/source-project",
+                "selected_modules": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "risk_level": "高",
+                        "source_dir": "/tmp/source-project/mod-a",
+                        "source_root": "/tmp/source-project",
+                        "source_root_path": "/tmp/source-project",
+                        "module_dir": "/tmp/source-project/mod-a",
+                        "files_list": "/tmp/source-project/mod-a/files.list",
+                        "files_list_path": "/tmp/source-project/mod-a/files.list",
+                        "task_type": TASK_TYPE_SOURCE,
+                        "firmware_key": "source_project",
+                        "firmware_name": "source_project",
+                    }
+                ],
+                "entry_results": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "entries": [{"entry_key": "mod-a:entry-1", "function_name": "fn_a", "module_key": "mod-a"}],
+                    }
+                ],
+            },
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        task.status = "failed"
+        task.current_stage = "entry_analysis"
+        task.finished_at = _now()
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-source-archive-only-retry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+            last_error="总任务产物归档失败",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-source-archive-only-retry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="source_project",
+            item_identity_key="mod-a::source_project",
+            status="failed",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-success-a",
+            error_message="总任务产物归档失败",
+        )
+        entry_item.result = {
+            "last_sync_result": "downstream_archive_failed_manual_intervention",
+            "sync_observation": {
+                "last_result": "downstream_archive_failed_manual_intervention",
+            },
+        }
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-entry-source-archive-only-retry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            item_id=entry_item.id,
+            item_key=entry_item.item_key,
+            archive_status="failed",
+            error_message="copy failed",
+        )
+        archive_job.payload = {
+            "mapped_status": "success",
+            "downstream_payload": {"task_id": "eat-success-a", "status": "success"},
+        }
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run],
+            stage_items=[entry_item],
+            archive_jobs=[archive_job],
+            events=[],
+        )
+
+        original_enqueue = self.manager._enqueue_task
+        try:
+            self.manager._enqueue_task = lambda *_args, **_kwargs: None
+            operation = self.manager.retry_failed_items(db, project_id=task.project_id, task_id=task.id)
+        finally:
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual("retry_archive_full", operation.operation_type)
+        self.assertEqual("entry_analysis", operation.target_stage)
+        self.assertEqual(operation.id, task.current_operation_id)
+        self.assertEqual("task_retry_failed_items_archive_full_accepted", getattr(db.added[-1], "event_type", ""))
+
     def test_source_workflow_e2e_rebuilds_missing_entry_authoritative_items_before_execution(self):
         module = {
             "module_key": "mod-a",
@@ -3847,7 +3944,7 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("partial_success", dataflow_summary.status)
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
 
-    def test_source_workflow_e2e_dataflow_partial_success_archive_terminalizes_parent_failed(self):
+    def test_source_workflow_e2e_dataflow_partial_success_archive_terminalizes_parent_success(self):
         task = _source_task(
             summary={
                 "input_dir": "/tmp/source-project",
@@ -3997,14 +4094,16 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertTrue(first_signals)
         self.assertTrue(second_signals)
         self.assertEqual("archive_apply", str(second_signals[-1].get("reconcile_reason") or ""))
-        self.assertEqual("failed", task.status)
-        self.assertEqual("failed", detail.status)
+        self.assertEqual("success", task.status)
+        self.assertEqual("success", detail.status)
         self.assertEqual(
             "partial_success",
             next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
         )
         self.assertTrue((task.summary or {}).get("dataflow_results"))
         self.assertTrue(any(event.event_type == "task_layer_reconcile_completed" for event in db.events))
+        self.assertIsNotNone(detail.abnormal_reason)
+        self.assertEqual("dataflow_partial_success", detail.abnormal_reason.code)
 
     def test_source_workflow_e2e_replaced_dataflow_child_ignores_stale_late_payload(self):
         task = _source_task(summary={"input_dir": "/tmp/source-project"})
@@ -6649,7 +6748,7 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertIn(task.status, {"running", "success"})
         self.assertEqual(task.status, detail.status)
 
-    def test_binary_module_workflow_e2e_dataflow_partial_success_archive_terminalizes_parent_failed(self):
+    def test_binary_module_workflow_e2e_dataflow_partial_success_archive_terminalizes_parent_success(self):
         task = _binary_module_task(
             summary={
                 "b2s_results": [self._binary_module_descriptor()],
@@ -6764,14 +6863,16 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertTrue(first_signals)
         self.assertTrue(second_signals)
         self.assertEqual("archive_apply", str(second_signals[-1].get("reconcile_reason") or ""))
-        self.assertEqual("failed", task.status)
-        self.assertEqual("failed", detail.status)
+        self.assertEqual("success", task.status)
+        self.assertEqual("success", detail.status)
         self.assertEqual(
             "partial_success",
             next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
         )
         self.assertTrue((task.summary or {}).get("dataflow_results"))
         self.assertTrue(any(event.event_type == "task_layer_reconcile_completed" for event in db.events))
+        self.assertIsNotNone(detail.abnormal_reason)
+        self.assertEqual("dataflow_partial_success", detail.abnormal_reason.code)
 
     def test_binary_module_workflow_e2e_entry_downstream_missing_recovers_on_next_owner_prepare(self):
         now = _now()

@@ -164,11 +164,18 @@ def list_delete_queue(
     sort_direction: str = Query("desc"),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=1000),
+    authorization: Optional[str] = Header(None),
     _: TokenUser = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    token = None
+    if authorization:
+        parts = authorization.split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1]
     return get_task_manager().list_delete_queue(
         db,
+        token=token,
         project_id=project_id,
         task_type=task_type,
         delete_status=delete_status,
