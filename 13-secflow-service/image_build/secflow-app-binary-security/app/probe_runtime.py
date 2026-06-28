@@ -62,7 +62,7 @@ class ProbeRuntime:
         startup_age = self._startup_age_seconds(started_at)
         healthy = pid_alive
         ready = pid_alive and not self._shutting_down
-        startup_ok = ready and startup_age is not None and startup_age >= self.startup_grace_seconds
+        startup_ok = ready and started_at is not None
         payload = {
             "service": self.service_name,
             "pid_file": self.pid_file,

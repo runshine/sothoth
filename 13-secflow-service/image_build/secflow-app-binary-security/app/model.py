@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
@@ -21,6 +22,7 @@ from app.time_utils import now_local
 
 
 Base = declarative_base()
+logger = logging.getLogger(__name__)
 
 TASK_TERMINAL_STATUSES = {"success", "partial_success", "failed", "cancelled", "cancel_failed", "delete_failed", "force_delete_failed"}
 ITEM_TERMINAL_STATUSES = {"success", "failed", "cancelled"}
@@ -703,17 +705,34 @@ def get_session_factory():
 
 
 def init_database() -> None:
+    started = time.perf_counter()
     engine = get_engine()
+    logger.info("binary-security init_database: begin engine=%s", engine.url.render_as_string(hide_password=True))
+    logger.info("binary-security init_database: running Base.metadata.create_all")
     Base.metadata.create_all(bind=engine)
+    logger.info("binary-security init_database: Base.metadata.create_all finished")
+    logger.info("binary-security init_database: running compatibility schema checks")
     _ensure_compat_columns(engine)
+    logger.info(
+        "binary-security init_database: complete duration_ms=%s",
+        int((time.perf_counter() - started) * 1000),
+    )
 
 
 def _ensure_compat_columns(engine) -> None:
     def _execute_compat_statements(statements: list[str]) -> None:
         if not statements:
             return
+        logger.info("binary-security init_database: applying compatibility statements count=%s", len(statements))
         with engine.begin() as conn:
-            for statement in statements:
+            for index, statement in enumerate(statements, start=1):
+                compact_statement = " ".join(str(statement).split())
+                logger.info(
+                    "binary-security init_database: executing compat statement %s/%s sql=%s",
+                    index,
+                    len(statements),
+                    compact_statement,
+                )
                 try:
                     conn.execute(text(statement))
                 except OperationalError as exc:
@@ -726,9 +745,15 @@ def _ensure_compat_columns(engine) -> None:
                     # MySQL duplicate column/index errors should be treated as
                     # idempotent during multi-pod startup migrations.
                     if int(errno or 0) in {1060, 1061}:
+                        logger.info(
+                            "binary-security init_database: compat statement duplicate-safe skipped errno=%s sql=%s",
+                            errno,
+                            compact_statement,
+                        )
                         continue
                     raise
 
+    logger.info("binary-security init_database: inspecting existing schema metadata")
     inspector = inspect(engine)
     task_table = BinarySecurityTask.__tablename__
     if inspector.has_table(task_table):

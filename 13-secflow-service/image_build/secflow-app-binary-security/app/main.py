@@ -112,7 +112,7 @@ def _external_probe_started_at_file() -> Path:
     return Path(os.environ.get("SECFLOW_MAIN_STARTED_AT_FILE", "/tmp/secflow-main.started_at"))
 
 
-def _mark_external_probe_startup_complete() -> None:
+def _mark_external_probe_startup_started() -> None:
     if not _external_probe_process_enabled():
         return
     _external_probe_started_at_file().write_text(f"{time.time()}\n", encoding="utf-8")
@@ -267,6 +267,12 @@ async def lifespan(_: FastAPI):
                 f"redis_url={cfg.queue.redis_url}"
             ),
         )
+        _mark_external_probe_startup_started()
+        logger.info(
+            "Binary Security startup step=%s status=ok detail=external_probe_startup_acknowledged started_at_file=%s",
+            startup_step,
+            _external_probe_started_at_file(),
+        )
 
         startup_step = "probe_server"
         if not _external_probe_process_enabled():
@@ -318,7 +324,6 @@ async def lifespan(_: FastAPI):
             await get_task_manager().start()
             _log_startup_step_done(startup_step)
         mark_startup_state(startup_ready=True, startup_error=None)
-        _mark_external_probe_startup_complete()
     except Exception as exc:
         mark_startup_state(startup_ready=False, startup_error=str(exc))
         logger.exception(

@@ -197,6 +197,12 @@ class MainRoleTests(unittest.TestCase):
 
         self.assertTrue(_has_step("load_config"))
         self.assertTrue(_has_step_done("load_config"))
+        self.assertTrue(any(
+            len(args) >= 3
+            and args[0] == "Binary Security startup step=%s status=ok detail=external_probe_startup_acknowledged started_at_file=%s"
+            and args[1] == "load_config"
+            for args in info_calls
+        ))
         self.assertTrue(_has_step("init_database"))
         self.assertTrue(_has_step_done("init_database"))
         self.assertTrue(_has_step("database_ping"))
@@ -240,7 +246,8 @@ class MainRoleTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     asyncio.run(_run())
 
-            self.assertFalse(os.path.exists(started_at_file))
+            self.assertTrue(os.path.exists(started_at_file))
+            self.assertTrue(float(open(started_at_file, "r", encoding="utf-8").read().strip()) > 0)
 
         self.assertTrue(logger_exception.called)
         args = logger_exception.call_args.args
