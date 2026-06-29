@@ -42783,7 +42783,7 @@ def _test_authoritative_archive_repairs_false_replacement_residual(self):
         "archive_root": "/archive/dvs-old",
         "artifact_root": "/archive/dvs-old",
         "archive_job_id": "aj-authoritative",
-        "archive_status": "superseded",
+        "archive_status": "success",
     }
     item.result = {
         "sync_observation": {
@@ -42807,7 +42807,7 @@ def _test_authoritative_archive_repairs_false_replacement_residual(self):
         item_key=item.item_key,
         downstream_service="dataflow_vuln_scan",
         downstream_task_id="dvs-old",
-        archive_status="superseded",
+        archive_status="success",
         archive_root="/archive/dvs-old",
     )
     archive_job.payload = {"bound_downstream_task_id": "dvs-old", "mapped_status": "success"}
@@ -42821,6 +42821,101 @@ def _test_authoritative_archive_repairs_false_replacement_residual(self):
     self.assertEqual("success", response.status)
     self.assertEqual("success", response.downstream_status)
     self.assertEqual("success", response.output_ref.get("archive_status"))
+
+
+def _test_authoritative_archive_reconcile_rearchives_superseded_archive_root(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-authoritative-archive-rearchive",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="si-authoritative-archive-rearchive",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-a",
+        item_name="entry-a",
+        status="success",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-old",
+    )
+    item.output_ref = {
+        "archive_root": "/archive/dvs-old",
+        "artifact_root": "/archive/dvs-old",
+        "archive_job_id": "aj-authoritative",
+        "archive_status": "superseded",
+    }
+    item.result = {
+        "downstream": {"task_id": "dvs-old", "status": "passed"},
+        "archive_root": "/archive/dvs-old",
+        "artifact_root": "/archive/dvs-old",
+    }
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-authoritative",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_id=item.id,
+        item_key=item.item_key,
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-old",
+        archive_status="superseded",
+        archive_root="/archive/dvs-old",
+        attempts=0,
+    )
+    archive_job.payload = {"bound_downstream_task_id": "dvs-old", "mapped_status": "success"}
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job], events=[])
+
+    original_delete = manager._delete_archive_roots_for_jobs
+    original_queue = manager._queue_downstream_archive_job
+
+    def _fake_delete(_task, jobs):
+        return [str(getattr(job, "archive_root", "") or "").strip() for job in jobs if str(getattr(job, "archive_root", "") or "").strip()]
+
+    def _fake_queue(_db, _task, _item, *, payload, mapped_status, before_status, extra_paths=None):
+        del payload, mapped_status, before_status, extra_paths
+        queued = BinarySecurityArchiveJob(
+            id="aj-reauthoritative",
+            task_id=_task.id,
+            project_id=_task.project_id,
+            stage_name=_item.stage_name,
+            item_id=_item.id,
+            item_key=_item.item_key,
+            downstream_service=_item.downstream_service,
+            downstream_task_id=_item.downstream_task_id,
+            archive_status="pending",
+            attempts=0,
+        )
+        queued.payload = {"bound_downstream_task_id": _item.downstream_task_id, "mapped_status": "success"}
+        db.archive_jobs.append(queued)
+        return queued
+
+    manager._delete_archive_roots_for_jobs = _fake_delete
+    manager._queue_downstream_archive_job = _fake_queue
+    try:
+        changed = manager._reconcile_authoritative_archive_item(db, task, item)
+    finally:
+        manager._delete_archive_roots_for_jobs = original_delete
+        manager._queue_downstream_archive_job = original_queue
+
+    event_types = [event.event_type for event in db.events]
+    self.assertTrue(changed)
+    self.assertEqual("pending", item.output_ref.get("archive_status"))
+    self.assertNotIn("archive_root", item.output_ref)
+    self.assertIn("authoritative_archive_roots_deleted_for_rearchive", event_types)
+    self.assertIn("authoritative_archive_reconcile_rearchive_started", event_types)
+    self.assertIn("authoritative_archive_reconcile_queued", event_types)
+    queued_job = next(job for job in db.archive_jobs if job.id == "aj-reauthoritative")
+    self.assertEqual(1, int(queued_job.attempts or 0))
 
 
 def _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal(self):

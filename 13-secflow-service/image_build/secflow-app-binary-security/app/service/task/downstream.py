@@ -2358,10 +2358,7 @@ class TaskDownstreamServiceMixin:
                 continue
             if str(getattr(job, "archive_status", "") or "").strip().lower() == "success":
                 return True
-        refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs)
-        archive_root = str(refs.get("archive_root") or refs.get("artifact_root") or "").strip()
-        archive_job_status = str(refs.get("archive_status") or "").strip().lower()
-        return bool(archive_root and archive_job_status in {"success", "superseded", "archived", "applying", ""})
+        return False
 
     def _item_has_active_authoritative_archive_job(
         self,
@@ -2458,6 +2455,70 @@ class TaskDownstreamServiceMixin:
         item.error_message = None
         self._clear_replacement_in_progress(item)
         return True
+
+    def _cleanup_authoritative_archive_roots_for_rearchive(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> list[str]:
+        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
+        if not authoritative_task_id:
+            return []
+        matching_jobs = [
+            job
+            for job in list(archive_jobs or [])
+            if self._archive_job_bound_downstream_task_id(job) == authoritative_task_id
+        ]
+        if not matching_jobs:
+            refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs)
+            archive_root = str(refs.get("archive_root") or refs.get("artifact_root") or "").strip()
+            if not archive_root:
+                return []
+            deleted_roots = self._delete_paths_from_workspace([archive_root])
+            if deleted_roots:
+                self._record_event(
+                    db,
+                    task,
+                    "authoritative_archive_roots_deleted_for_rearchive",
+                    "authoritative child 的旧归档目录已删除，准备重新归档",
+                    stage_name=item.stage_name,
+                    item=item,
+                    level="warning",
+                    payload={
+                        "downstream_task_id": authoritative_task_id,
+                        "deleted_archive_roots": deleted_roots,
+                        "repair_source": "archive_reconcile",
+                    },
+                )
+            return deleted_roots
+        deleted_roots = self._delete_archive_roots_for_jobs(task, matching_jobs)
+        if deleted_roots:
+            self._record_event(
+                db,
+                task,
+                "authoritative_archive_roots_deleted_for_rearchive",
+                "authoritative child 的旧归档目录已删除，准备重新归档",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "downstream_task_id": authoritative_task_id,
+                    "archive_job_ids": [job.id for job in matching_jobs],
+                    "deleted_archive_roots": deleted_roots,
+                    "repair_source": "archive_reconcile",
+                },
+            )
+        for job in matching_jobs:
+            job.archive_root = None
+            job.error_message = "authoritative archive root cleared before rearchive"
+            payload = dict(getattr(job, "payload", None) or {})
+            payload["rearchive_requested"] = True
+            payload["rearchive_requested_at"] = task_manager_module._now().isoformat()
+            job.payload = payload
+        return deleted_roots
 
     def _clear_replacement_in_progress(self, item: BinarySecurityStageItem) -> None:
         result = dict(item.result or {})

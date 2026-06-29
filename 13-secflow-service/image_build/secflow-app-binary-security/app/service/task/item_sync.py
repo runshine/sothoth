@@ -107,6 +107,46 @@ class TaskItemSyncServiceMixin:
                 },
             )
             return True
+        refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs)
+        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
+        archive_root = str(refs.get("archive_root") or refs.get("artifact_root") or "").strip()
+        if (
+            authoritative_task_id
+            and archive_root
+            and not self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs)
+            and not self._item_has_active_authoritative_archive_job(item, archive_jobs=archive_jobs)
+        ):
+            deleted_roots = self._cleanup_authoritative_archive_roots_for_rearchive(
+                db,
+                task,
+                item,
+                archive_jobs=archive_jobs,
+            )
+            output_ref = dict(item.output_ref or {})
+            for key in ("archive_root", "artifact_root", "archive_copy_stats", "archive_job_id"):
+                output_ref.pop(key, None)
+            output_ref["archive_status"] = "pending"
+            item.output_ref = output_ref
+            result = dict(item.result or {})
+            result.pop("archive_root", None)
+            result.pop("artifact_root", None)
+            result.pop("archive_copy_stats", None)
+            item.result = result
+            self._record_event(
+                db,
+                task,
+                "authoritative_archive_reconcile_rearchive_started",
+                "检测到 authoritative child 仅有 superseded/脏态归档，已删除旧归档并准备重新归档",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "repair_source": "archive_reconcile",
+                    "reason": "authoritative_archive_not_success",
+                    "downstream_task_id": authoritative_task_id,
+                    "deleted_archive_roots": deleted_roots,
+                },
+            )
         if not self._item_can_enqueue_authoritative_archive(item, archive_jobs=archive_jobs):
             return False
         payload = dict(self._load_stage_item_result_payload(item).get("downstream") or {})
@@ -122,6 +162,7 @@ class TaskItemSyncServiceMixin:
         )
         if job is None:
             return False
+        job.attempts = int(getattr(job, "attempts", 0) or 0) + 1
         self._record_event(
             db,
             task,
@@ -134,6 +175,7 @@ class TaskItemSyncServiceMixin:
                 "reason": "authoritative_archive_missing",
                 "downstream_task_id": self._item_authoritative_downstream_task_id(item),
                 "archive_job_id": job.id,
+                "archive_attempts": int(getattr(job, "attempts", 0) or 0),
             },
         )
         return True
