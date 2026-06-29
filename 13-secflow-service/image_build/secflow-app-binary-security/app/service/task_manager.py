@@ -53,6 +53,7 @@ from app.model import (
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityStateEvent,
+    BinarySecurityTaskStateLease,
     BinarySecurityCoordinatorLease,
     BinarySecurityTask,
     BinarySecurityTaskRuntimeLease,
@@ -2343,6 +2344,63 @@ class TaskManager(
     ) -> None:
         await asyncio.to_thread(self._write_task_metadata, task, path, status=status)
 
+    async def _enqueue_task_and_wait(
+        self,
+        task_id: str,
+        *,
+        context: str = "task_enqueue",
+        timeout_seconds: int = 10,
+        force_requeue: bool = False,
+    ) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+
+        async def _push() -> None:
+            queue = get_task_queue()
+            if force_requeue:
+                await queue.force_requeue_task(normalized_task_id, context=context)
+            else:
+                await queue.push_task(normalized_task_id, context=context)
+
+        try:
+            await asyncio.wait_for(_push(), timeout=max(1, int(timeout_seconds or 10)))
+        except Exception:
+            logger.warning(
+                "binary-security enqueue task synchronously failed: task_id=%s context=%s force_requeue=%s timeout_seconds=%s",
+                normalized_task_id,
+                context,
+                force_requeue,
+                timeout_seconds,
+                exc_info=True,
+            )
+            return False
+        logger.info(
+            "binary-security enqueue task synchronously succeeded: task_id=%s context=%s force_requeue=%s timeout_seconds=%s",
+            normalized_task_id,
+            context,
+            force_requeue,
+            timeout_seconds,
+        )
+        return True
+
+    def _enqueue_task_and_wait_sync(
+        self,
+        task_id: str,
+        *,
+        context: str = "task_enqueue",
+        timeout_seconds: int = 10,
+        force_requeue: bool = False,
+    ) -> bool:
+        return asyncio.run(
+            self._enqueue_task_and_wait(
+                task_id,
+                context=context,
+                timeout_seconds=timeout_seconds,
+                force_requeue=force_requeue,
+            )
+        )
+
     def _enqueue_task(self, task_id: str) -> None:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
@@ -2372,6 +2430,235 @@ class TaskManager(
                 logger.warning("failed to enqueue task", extra={"task_id": normalized_task_id}, exc_info=True)
 
         loop.create_task(_push())
+
+    def _initial_enqueue_wait_timeout_seconds(self) -> int:
+        configured = getattr(self.cfg.queue, "initial_enqueue_wait_timeout_seconds", None)
+        try:
+            return max(1, int(configured or 10))
+        except (TypeError, ValueError):
+            return 10
+
+    def _orphan_parent_reconcile_stale_seconds(self) -> int:
+        configured = getattr(self.cfg.scheduler, "orphan_parent_reconcile_stale_seconds", None)
+        try:
+            return max(30, int(configured or 300))
+        except (TypeError, ValueError):
+            return 300
+
+    def _orphan_parent_reconcile_batch_size(self) -> int:
+        configured = getattr(self.cfg.scheduler, "orphan_parent_reconcile_batch_size", None)
+        try:
+            return max(1, int(configured or 20))
+        except (TypeError, ValueError):
+            return 20
+
+    def _task_has_manual_or_retry_operation(self, db: Session, task: BinarySecurityTask) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        operations = (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.task_id == task.id)
+            .all()
+        )
+        return any(
+            str(getattr(operation, "status", "") or "").strip() in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES
+            for operation in operations
+        )
+
+    def _peek_orphan_parent_task_missing_initial_enqueue(
+        self,
+        db: Session,
+        *,
+        stale_after_seconds: int = 300,
+    ) -> BinarySecurityTask | None:
+        from app.service import task_manager as task_manager_module
+
+        cutoff = _now() - timedelta(seconds=max(1, int(stale_after_seconds or self._orphan_parent_reconcile_stale_seconds())))
+        rows = (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(
+                task_manager_module.BinarySecurityTask.status == "pending",
+                task_manager_module.BinarySecurityTask.runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                task_manager_module.BinarySecurityTask.current_stage.isnot(None),
+                task_manager_module.BinarySecurityTask.updated_at <= cutoff,
+            )
+            .order_by(
+                task_manager_module.BinarySecurityTask.updated_at.asc(),
+                task_manager_module.BinarySecurityTask.created_at.asc(),
+            )
+            .all()
+        )
+        for task in rows:
+            if str(getattr(task, "status", "") or "").strip() != "pending":
+                continue
+            if self._task_runtime_phase(task) != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                continue
+            if not str(getattr(task, "current_stage", "") or "").strip():
+                continue
+            if getattr(task, "updated_at", None) is None or getattr(task, "updated_at", None) > cutoff:
+                continue
+            if str(getattr(task, "dispatcher_instance_id", "") or "").strip():
+                continue
+            if getattr(task, "dispatch_started_at", None) is not None:
+                continue
+            if (
+                db.query(task_manager_module.BinarySecurityStageRun)
+                .filter(task_manager_module.BinarySecurityStageRun.task_id == task.id)
+                .first()
+                is not None
+            ):
+                continue
+            if (
+                db.query(task_manager_module.BinarySecurityStageItem)
+                .filter(task_manager_module.BinarySecurityStageItem.task_id == task.id)
+                .first()
+                is not None
+            ):
+                continue
+            if self._runtime_lease_for_task(db, task.id) is not None:
+                continue
+            state_lease = (
+                db.query(BinarySecurityTaskStateLease)
+                .filter(BinarySecurityTaskStateLease.task_id == task.id)
+                .first()
+            )
+            if state_lease is not None:
+                continue
+            state_event = (
+                db.query(BinarySecurityStateEvent)
+                .filter(BinarySecurityStateEvent.task_id == task.id)
+                .first()
+            )
+            if state_event is not None:
+                continue
+            if self._task_has_manual_or_retry_operation(db, task):
+                continue
+            return task
+        return None
+
+    async def _reconcile_orphan_parent_task_missing_initial_enqueue(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        actor: str,
+        stale_after_seconds: int = 300,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        latest = (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(task_manager_module.BinarySecurityTask.id == task.id)
+            .first()
+        )
+        if latest is None:
+            return False
+        candidate = self._peek_orphan_parent_task_missing_initial_enqueue(
+            db,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if candidate is None or str(getattr(candidate, "id", "") or "").strip() != str(getattr(latest, "id", "") or "").strip():
+            return False
+        now_value = _now()
+        stuck_seconds = max(0, int((now_value - (latest.updated_at or now_value)).total_seconds()))
+        requeued = await self._enqueue_task_and_wait(
+            latest.id,
+            context="orphan_parent_initial_enqueue_reconcile",
+            timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+            force_requeue=True,
+        )
+        if not requeued:
+            logger.warning(
+                "binary-security orphan parent task initial enqueue reconcile failed: task_id=%s actor=%s stale_after_seconds=%s",
+                latest.id,
+                actor,
+                stale_after_seconds,
+            )
+            return False
+        latest.updated_at = now_value
+        self._record_event(
+            db,
+            latest,
+            "task_initial_dispatch_reconciled",
+            "检测到孤儿父任务首次入队丢失，已重新加入调度队列",
+            level="warning",
+            stage_name=latest.current_stage,
+            payload={
+                "reason": "initial_enqueue_missing_after_task_creation",
+                "stale_after_seconds": max(1, int(stale_after_seconds or self._orphan_parent_reconcile_stale_seconds())),
+                "current_stage": str(getattr(latest, "current_stage", "") or "").strip() or None,
+                "runtime_phase": self._task_runtime_phase(latest),
+                "has_stage_run": False,
+                "has_stage_item": False,
+                "has_runtime_lease": False,
+                "has_state_lease": False,
+                "has_state_event": False,
+                "redis_requeue": True,
+                "stuck_seconds": stuck_seconds,
+                "actor": actor,
+            },
+        )
+        db.commit()
+        logger.info(
+            "binary-security orphan parent task initial enqueue reconciled: task_id=%s actor=%s stuck_seconds=%s",
+            latest.id,
+            actor,
+            stuck_seconds,
+        )
+        return True
+
+    async def reconcile_orphan_parent_tasks_missing_initial_enqueue(
+        self,
+        db: Session,
+        *,
+        batch_size: int,
+        actor: str,
+        stale_after_seconds: int = 300,
+    ) -> int:
+        repaired = 0
+        limit = max(1, int(batch_size or 1))
+        for _ in range(limit):
+            candidate = self._peek_orphan_parent_task_missing_initial_enqueue(
+                db,
+                stale_after_seconds=stale_after_seconds,
+            )
+            if candidate is None:
+                break
+            if not await self._reconcile_orphan_parent_task_missing_initial_enqueue(
+                db,
+                candidate,
+                actor=actor,
+                stale_after_seconds=stale_after_seconds,
+            ):
+                break
+            repaired += 1
+        return repaired
+
+    async def repair_orphan_parent_tasks_missing_initial_enqueue(
+        self,
+        *,
+        batch_size: int | None = None,
+        actor: str = "binary-security-orphan-parent-repair",
+        stale_after_seconds: int | None = None,
+    ) -> dict[str, int]:
+        from app.service import task_manager as task_manager_module
+
+        db = task_manager_module.get_session_factory()()
+        try:
+            requeued = await self.reconcile_orphan_parent_tasks_missing_initial_enqueue(
+                db,
+                batch_size=batch_size or self._orphan_parent_reconcile_batch_size(),
+                actor=actor,
+                stale_after_seconds=stale_after_seconds or self._orphan_parent_reconcile_stale_seconds(),
+            )
+            return {
+                "requeued": int(requeued),
+                "skipped": 0,
+                "failed": 0,
+            }
+        finally:
+            with suppress(Exception):
+                db.close()
 
     def _task_lease_ttl_seconds(self) -> int:
         configured = getattr(self.cfg.scheduler, "task_lease_ttl_seconds", None)
@@ -3275,7 +3562,29 @@ class TaskManager(
         self._record_event(db, task, "task_upload_completed", "输入文件上传完成", payload={"uploaded_files": len(actual_files)})
         self._record_event(db, task, "task_start_requested", "输入文件已就绪，任务已自动进入调度队列")
         db.commit()
-        self._enqueue_task(task.id)
+        enqueued = await self._enqueue_task_and_wait(
+            task.id,
+            context="task_create_initial_enqueue",
+            timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+        )
+        if not enqueued:
+            refreshed = self._task_or_404(db, project_id, task.id)
+            self._record_event(
+                db,
+                refreshed,
+                "task_initial_enqueue_failed",
+                "任务首次进入调度队列失败，等待后台补偿自动恢复",
+                level="warning",
+                stage_name=refreshed.current_stage,
+                payload={
+                    "reason": "initial_enqueue_failed_after_task_creation",
+                    "enqueue_context": "task_create_initial_enqueue",
+                    "timeout_seconds": self._initial_enqueue_wait_timeout_seconds(),
+                    "runtime_phase": self._task_runtime_phase(refreshed),
+                    "current_stage": str(getattr(refreshed, "current_stage", "") or "").strip() or None,
+                },
+            )
+            db.commit()
         return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def start_task(self, db: Session, *, project_id: str, task_id: str) -> BinarySecurityTaskDetailResponse:
@@ -3316,7 +3625,29 @@ class TaskManager(
         else:
             self._record_event(db, task, "source_tree_initialized", f"已初始化源码工程输入，共 {len(input_files)} 个文件")
         db.commit()
-        self._enqueue_task(task.id)
+        enqueued = self._enqueue_task_and_wait_sync(
+            task.id,
+            context="task_start_initial_enqueue",
+            timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+        )
+        if not enqueued:
+            refreshed = self._task_or_404(db, project_id, task.id)
+            self._record_event(
+                db,
+                refreshed,
+                "task_initial_enqueue_failed",
+                "任务首次进入调度队列失败，等待后台补偿自动恢复",
+                level="warning",
+                stage_name=refreshed.current_stage,
+                payload={
+                    "reason": "initial_enqueue_failed_after_manual_start",
+                    "enqueue_context": "task_start_initial_enqueue",
+                    "timeout_seconds": self._initial_enqueue_wait_timeout_seconds(),
+                    "runtime_phase": self._task_runtime_phase(refreshed),
+                    "current_stage": str(getattr(refreshed, "current_stage", "") or "").strip() or None,
+                },
+            )
+            db.commit()
         return self.get_task_detail(db, project_id=project_id, task_id=task_id)
 
     def get_task_abnormal_reason_history(
@@ -3362,6 +3693,7 @@ class TaskManager(
                     error_message=job.error_message,
                     abnormal_reason=self._archive_job_abnormal_reason(job),
                     attempts=job.attempts or 0,
+                    retry_attempt_count=max(0, int(job.attempts or 0)),
                     created_at=job.created_at,
                     started_at=job.started_at,
                     completed_at=job.completed_at,

@@ -20,6 +20,85 @@ if TYPE_CHECKING:
 
 
 class TaskArchiveServiceMixin:
+    _ARCHIVE_JOB_REUSABLE_STATUSES = frozenset({"pending", "running", "archived", "applying", "success", "ignored", "skipped"})
+
+    def _collapse_duplicate_archive_jobs_for_dedupe(
+        self: TaskManager,
+        db: Session,
+        task: Any,
+        item: Any,
+        *,
+        job_dedupe_key: str,
+    ):
+        from app.service import task_manager as task_manager_module
+
+        jobs = (
+            db.query(task_manager_module.BinarySecurityArchiveJob)
+            .filter(
+                task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
+                task_manager_module.BinarySecurityArchiveJob.stage_name == item.stage_name,
+                task_manager_module.BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
+            )
+            .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.desc())
+            .all()
+        )
+        if not jobs:
+            return None
+        canonical = next(
+            (
+                job
+                for job in jobs
+                if str(getattr(job, "archive_status", "") or "").strip().lower() in self._ARCHIVE_JOB_REUSABLE_STATUSES
+            ),
+            None,
+        )
+        if canonical is None:
+            canonical = next(
+                (
+                    job
+                    for job in jobs
+                    if str(getattr(job, "archive_status", "") or "").strip().lower() == "failed"
+                ),
+                jobs[0],
+            )
+        collapsed_job_ids: list[str] = []
+        now = task_manager_module._now()
+        for job in jobs:
+            if job is canonical:
+                continue
+            status = str(getattr(job, "archive_status", "") or "").strip().lower()
+            if status not in self._ARCHIVE_JOB_REUSABLE_STATUSES:
+                continue
+            payload = dict(getattr(job, "payload", None) or {})
+            payload["superseded"] = True
+            payload["superseded_reason"] = "duplicate_archive_job_dedupe_key"
+            payload["superseded_by_archive_job_id"] = canonical.id
+            job.payload = payload
+            job.archive_status = "superseded"
+            job.owner_id = None
+            job.completed_at = job.completed_at or now
+            job.updated_at = now
+            if not str(getattr(job, "error_message", "") or "").strip():
+                job.error_message = f"superseded by canonical archive job {canonical.id}"
+            collapsed_job_ids.append(str(getattr(job, "id", "") or ""))
+        if collapsed_job_ids:
+            self._record_event(
+                db,
+                task,
+                "archive_job_duplicate_dedupe_collapsed",
+                "归档重复 dedupe key 已收敛到单一 canonical job",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "job_dedupe_key": job_dedupe_key,
+                    "canonical_archive_job_id": canonical.id,
+                    "collapsed_archive_job_ids": collapsed_job_ids,
+                    "downstream_task_id": str(getattr(item, "downstream_task_id", "") or "").strip() or None,
+                },
+            )
+        return canonical
+
     def _archive_pending_full_retry_stage(
         self: TaskManager,
         db: Session,
@@ -744,44 +823,27 @@ class TaskArchiveServiceMixin:
                 locked = False
             if not locked:
                 time.sleep(0.05)
-            existing = (
-                db.query(task_manager_module.BinarySecurityArchiveJob)
-                .filter(
-                    task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
-                    task_manager_module.BinarySecurityArchiveJob.stage_name == item.stage_name,
-                    task_manager_module.BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
-                    task_manager_module.BinarySecurityArchiveJob.archive_status.in_(
-                        ["pending", "running", "archived", "applying", "success", "ignored", "skipped"]
-                    ),
-                )
-                .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.desc())
-                .first()
+            canonical = self._collapse_duplicate_archive_jobs_for_dedupe(
+                db,
+                task,
+                item,
+                job_dedupe_key=job_dedupe_key,
             )
-            if existing is not None:
+            canonical_status = str(getattr(canonical, "archive_status", "") or "").strip().lower() if canonical is not None else ""
+            if canonical is not None and canonical_status in self._ARCHIVE_JOB_REUSABLE_STATUSES:
                 try:
                     db.commit()
                 except Exception:
                     db.rollback()
                     raise
-                return existing
-            failed = (
-                db.query(task_manager_module.BinarySecurityArchiveJob)
-                .filter(
-                    task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
-                    task_manager_module.BinarySecurityArchiveJob.stage_name == item.stage_name,
-                    task_manager_module.BinarySecurityArchiveJob.job_dedupe_key == job_dedupe_key,
-                    task_manager_module.BinarySecurityArchiveJob.archive_status == "failed",
-                )
-                .order_by(task_manager_module.BinarySecurityArchiveJob.created_at.desc())
-                .first()
-            )
-            if failed is not None:
+                return canonical
+            if canonical is not None and canonical_status == "failed":
                 try:
                     db.commit()
                 except Exception:
                     db.rollback()
                     raise
-                return failed
+                return canonical
             job = task_manager_module.BinarySecurityArchiveJob(
                 id=f"aj_{uuid.uuid4().hex[:24]}",
                 task_id=task.id,
@@ -845,6 +907,19 @@ class TaskArchiveServiceMixin:
                 except Exception:
                     db.rollback()
                     raise
+            canonical = self._collapse_duplicate_archive_jobs_for_dedupe(
+                db,
+                task,
+                item,
+                job_dedupe_key=job_dedupe_key,
+            )
+            if canonical is not None:
+                try:
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    raise
+                return canonical
             return job
         finally:
             if locked:

@@ -557,6 +557,54 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
         self.assertIn("pending_task_reenqueued_by_reconcile", [row.event_type for row in db.events])
 
+    async def test_reconcile_work_queues_runs_orphan_parent_initial_enqueue_reconcile_first(self):
+        task = BinarySecurityTask(
+            id="task-orphan",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        calls: list[tuple[str, object]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                calls.append(("queue_positions", context))
+                del _queue_key
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                calls.append(("force_requeue_task", task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                calls.append(("push_task", task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                calls.append(("cleanup_dedupe_orphans", _queue_key))
+                return {}
+
+        async def _reconcile(*_args, **_kwargs):
+            calls.append(("orphan_reconcile", None))
+            return 1
+
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", side_effect=_reconcile),
+        ):
+            await self.manager._reconcile_work_queues(db)
+
+        self.assertEqual("orphan_reconcile", calls[0][0])
+        self.assertIn(("queue_positions", "queue_reconcile_snapshot"), calls)
+
     async def test_reconcile_work_queues_does_not_force_reenqueue_pending_task_already_in_redis(self):
         task = BinarySecurityTask(
             id="task-pending",

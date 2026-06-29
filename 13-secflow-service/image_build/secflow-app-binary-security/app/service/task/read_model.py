@@ -3911,6 +3911,8 @@ class TaskReadModelServiceMixin:
                 running_count=len([job for job in stage_jobs if job.archive_status == "running"]),
                 applying_count=len([job for job in stage_jobs if job.archive_status in {"archived", "applying"}]),
                 pending_count=len([job for job in stage_jobs if job.archive_status == "pending"]),
+                retry_attempt_total=sum(max(0, int(getattr(job, "attempts", 0) or 0)) for job in stage_jobs),
+                retried_job_count=sum(1 for job in stage_jobs if int(getattr(job, "attempts", 0) or 0) > 1),
                 first_created_at=first_created_at,
                 last_updated_at=last_updated_at,
                 duration_seconds=duration_seconds,
@@ -4209,6 +4211,7 @@ class TaskReadModelServiceMixin:
         first_started_at = self._stage_item_first_started_at(item)
         latest_started_at = item.started_at
         total_retry_count = int(item.retry_count or 0) + int(item.rerun_count or 0)
+        rebuild_rerun_count = int(result.get("rebuild_rerun_count") or 0)
         binding = self._downstream_binding_snapshot(item)
         binding_state = self._downstream_binding_state(item)
         binding_message = self._string_or_none(binding.get("message"))
@@ -4243,6 +4246,7 @@ class TaskReadModelServiceMixin:
             status=item.status,
             retry_count=int(item.retry_count or 0),
             rerun_count=int(item.rerun_count or 0),
+            rebuild_rerun_count=rebuild_rerun_count,
             auto_retry_count=int(item.retry_count or 0),
             total_retry_count=total_retry_count,
             downstream_service=item.downstream_service,

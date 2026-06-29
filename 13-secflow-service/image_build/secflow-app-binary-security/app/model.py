@@ -24,6 +24,10 @@ from app.time_utils import now_local
 Base = declarative_base()
 logger = logging.getLogger(__name__)
 
+
+def _mediumtext_type():
+    return MEDIUMTEXT().with_variant(Text(), "sqlite")
+
 TASK_TERMINAL_STATUSES = {"success", "partial_success", "failed", "cancelled", "cancel_failed", "delete_failed", "force_delete_failed"}
 ITEM_TERMINAL_STATUSES = {"success", "failed", "cancelled"}
 STAGE_SEQUENCE = [
@@ -147,9 +151,9 @@ class BinarySecurityTask(Base, JsonMixin):
     execution_mode = Column(String(32), nullable=True, index=True)
     target_stage_name = Column(String(64), nullable=True, index=True)
     current_operation_id = Column(String(48), nullable=True, index=True)
-    cleanup_snapshot_json = Column(MEDIUMTEXT, nullable=True)
+    cleanup_snapshot_json = Column(_mediumtext_type(), nullable=True)
     last_error = Column(Text, nullable=True)
-    latest_abnormal_reason_json = Column(MEDIUMTEXT, nullable=True)
+    latest_abnormal_reason_json = Column(_mediumtext_type(), nullable=True)
     runtime_phase = Column(String(32), nullable=False, default=TASK_RUNTIME_PHASE_OWNED_EXECUTION, index=True)
     tail_reconcile_state = Column(String(32), nullable=False, default="idle", index=True)
     operation_lock_owner = Column(String(128), nullable=True, index=True)
@@ -296,7 +300,7 @@ class BinarySecurityStageRun(Base, JsonMixin):
     input_snapshot_json = Column(Text, nullable=True)
     output_summary_json = Column(Text, nullable=True)
     counts_json = Column(Text, nullable=True)
-    downstream_refs_json = Column(MEDIUMTEXT, nullable=True)
+    downstream_refs_json = Column(_mediumtext_type(), nullable=True)
     last_error = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -353,10 +357,10 @@ class BinarySecurityStageItem(Base, JsonMixin):
     rerun_count = Column(Integer, nullable=False, default=0)
     downstream_service = Column(String(64), nullable=True)
     downstream_task_id = Column(String(128), nullable=True, index=True)
-    input_ref_json = Column(MEDIUMTEXT, nullable=True)
-    output_ref_json = Column(MEDIUMTEXT, nullable=True)
-    payload_json = Column(MEDIUMTEXT, nullable=True)
-    result_json = Column(MEDIUMTEXT, nullable=True)
+    input_ref_json = Column(_mediumtext_type(), nullable=True)
+    output_ref_json = Column(_mediumtext_type(), nullable=True)
+    payload_json = Column(_mediumtext_type(), nullable=True)
+    result_json = Column(_mediumtext_type(), nullable=True)
     error_message = Column(Text, nullable=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
@@ -409,7 +413,7 @@ class BinarySecurityEvent(Base, JsonMixin):
     level = Column(String(16), nullable=False, default="info")
     event_type = Column(String(64), nullable=False, index=True)
     message = Column(Text, nullable=False)
-    payload_json = Column(MEDIUMTEXT, nullable=True)
+    payload_json = Column(_mediumtext_type(), nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False, index=True)
 
     @property
@@ -452,7 +456,7 @@ class BinarySecuritySyncEvent(Base, JsonMixin):
     origin_pod_name = Column(String(255), nullable=True)
     origin_node_name = Column(String(255), nullable=True)
     origin_role = Column(String(64), nullable=True, index=True)
-    payload_json = Column(MEDIUMTEXT, nullable=True)
+    payload_json = Column(_mediumtext_type(), nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False, index=True)
 
     @property
@@ -508,14 +512,14 @@ class BinarySecurityTaskOperation(Base, JsonMixin):
     request_source = Column(String(32), nullable=True, index=True)
     status = Column(String(32), nullable=False, default="requested", index=True)
     operation_token = Column(String(64), nullable=False, index=True)
-    request_payload_json = Column(MEDIUMTEXT, nullable=True)
-    result_payload_json = Column(MEDIUMTEXT, nullable=True)
+    request_payload_json = Column(_mediumtext_type(), nullable=True)
+    result_payload_json = Column(_mediumtext_type(), nullable=True)
     error_code = Column(String(64), nullable=True, index=True)
     error_message = Column(Text, nullable=True)
     current_step = Column(String(64), nullable=True, index=True)
     step_attempts_json = Column(Text, nullable=True)
-    step_payload_json = Column(MEDIUMTEXT, nullable=True)
-    resume_cursor_json = Column(MEDIUMTEXT, nullable=True)
+    step_payload_json = Column(_mediumtext_type(), nullable=True)
+    resume_cursor_json = Column(_mediumtext_type(), nullable=True)
     superseded_by_operation_id = Column(String(48), nullable=True, index=True)
     created_at = Column(DateTime, default=now_local, nullable=False, index=True)
     updated_at = Column(DateTime, default=now_local, onupdate=now_local, nullable=False)

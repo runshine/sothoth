@@ -474,6 +474,7 @@ class BinarySecurityStageItemResponse(BinarySecurityBaseModel):
     status: str
     retry_count: int = 0
     rerun_count: int = 0
+    rebuild_rerun_count: int = 0
     auto_retry_count: int = 0
     total_retry_count: int = 0
     downstream_service: Optional[str] = None
@@ -537,6 +538,7 @@ class BinarySecurityArchiveJobResponse(BinarySecurityBaseModel):
     error_message: Optional[str] = None
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     attempts: int = 0
+    retry_attempt_count: int = 0
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -570,6 +572,8 @@ class BinarySecurityOverviewArchiveDetail(BinarySecurityBaseModel):
     running_count: int = 0
     applying_count: int = 0
     pending_count: int = 0
+    retry_attempt_total: int = 0
+    retried_job_count: int = 0
     first_created_at: Optional[datetime] = None
     last_updated_at: Optional[datetime] = None
     duration_seconds: Optional[float] = None

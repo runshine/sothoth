@@ -692,6 +692,7 @@ class ArchiveReclaimTests(unittest.TestCase):
         self.assertEqual("aj-ready", claimed)
         self.assertEqual("pending", delayed_job.archive_status)
         self.assertEqual("running", ready_job.archive_status)
+        self.assertEqual(1, int(ready_job.attempts or 0))
 
     def test_replace_active_child_binding_supersedes_old_archive_jobs(self):
         task = self._task()
@@ -745,6 +746,8 @@ class ArchiveReclaimTests(unittest.TestCase):
         self.assertEqual("child-new", item.downstream_task_id)
         self.assertEqual("superseded", archive_job.archive_status)
         self.assertTrue(bool((archive_job.payload or {}).get("superseded")))
+        self.assertEqual(1, int(item.rerun_count or 0))
+        self.assertEqual(1, int((item.result or {}).get("rebuild_rerun_count") or 0))
         event_types = [event.event_type for event in db.events]
         self.assertIn("superseded_archive_jobs_cancelled", event_types)
         self.assertIn("child_binding_replaced", event_types)
@@ -808,11 +811,38 @@ class ArchiveReclaimTests(unittest.TestCase):
             self.assertEqual("child-new", item.downstream_task_id)
             self.assertEqual("superseded", archive_job.archive_status)
             self.assertFalse(archive_root.exists())
+            self.assertEqual(1, int(item.rerun_count or 0))
+            self.assertEqual(1, int((item.result or {}).get("rebuild_rerun_count") or 0))
             event_types = [event.event_type for event in db.events]
             self.assertIn("superseded_archive_jobs_cancelled", event_types)
             self.assertIn("superseded_archive_roots_deleted", event_types)
             replace_event = next(event for event in db.events if event.event_type == "child_binding_replaced")
             self.assertEqual([str(archive_root)], list((replace_event.payload or {}).get("deleted_archive_roots") or []))
+            self.assertEqual(1, int((replace_event.payload or {}).get("rebuild_rerun_count") or 0))
+
+    def test_replace_active_child_binding_in_place_restart_does_not_increment_rebuild_rerun(self):
+        task = self._task()
+        item = self._item(status="running")
+        item.downstream_task_id = "child-old"
+        item.rerun_count = 3
+        item.result = {"rebuild_rerun_count": 2}
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[], events=[])
+
+        old_downstream_task_id = asyncio.run(
+            self.manager._replace_active_child_binding(
+                db,
+                task,
+                item,
+                new_downstream_task_id="child-old",
+                token="token",
+                reason="test_in_place_restart",
+                transition_type=self.manager.CHILD_TRANSITION_IN_PLACE_RESTART,
+            )
+        )
+
+        self.assertEqual("child-old", old_downstream_task_id)
+        self.assertEqual(3, int(item.rerun_count or 0))
+        self.assertEqual(2, int((item.result or {}).get("rebuild_rerun_count") or 0))
 
     def test_queue_downstream_archive_job_ignores_stale_child_payload(self):
         task = self._task()
@@ -1695,6 +1725,176 @@ class TaskManagerTests(unittest.TestCase):
             self.manager._enqueue_task("task-123")
 
         self.assertEqual([("task-123", "task_enqueue")], pushed)
+
+    def test_enqueue_task_and_wait_sync_uses_push_task(self):
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def push_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
+                pushed.append((task_id, context))
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            result = self.manager._enqueue_task_and_wait_sync("task-123", context="initial_enqueue", timeout_seconds=3)
+
+        self.assertTrue(result)
+        self.assertEqual([("task-123", "initial_enqueue")], pushed)
+
+    def test_peek_orphan_parent_task_missing_initial_enqueue_matches_only_orphan_parent(self):
+        stale_task = BinarySecurityTask(
+            id="task-orphan",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            updated_at=_now() - timedelta(seconds=301),
+        )
+        active_task = BinarySecurityTask(
+            id="task-active",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            updated_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[stale_task, active_task])
+
+        matched = self.manager._peek_orphan_parent_task_missing_initial_enqueue(db, stale_after_seconds=300)
+
+        self.assertIsNotNone(matched)
+        self.assertEqual("task-orphan", matched.id)
+
+    def test_peek_orphan_parent_task_missing_initial_enqueue_skips_task_with_stage_run(self):
+        task = BinarySecurityTask(
+            id="task-stage-run",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            updated_at=_now() - timedelta(seconds=301),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-1",
+            task_id="task-stage-run",
+            project_id="project-1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+        matched = self.manager._peek_orphan_parent_task_missing_initial_enqueue(db, stale_after_seconds=300)
+
+        self.assertIsNone(matched)
+
+    def test_reconcile_orphan_parent_task_missing_initial_enqueue_requeues_and_records_event(self):
+        task = BinarySecurityTask(
+            id="task-orphan",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            updated_at=_now() - timedelta(seconds=301),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+
+        async def _exercise():
+            with patch.object(self.manager, "_enqueue_task_and_wait", AsyncMock(return_value=True)) as enqueue_mock:
+                changed = await self.manager._reconcile_orphan_parent_task_missing_initial_enqueue(
+                    db,
+                    task,
+                    actor="test-reconciler",
+                    stale_after_seconds=300,
+                )
+            return changed, enqueue_mock
+
+        changed, enqueue_mock = asyncio.run(_exercise())
+
+        self.assertTrue(changed)
+        enqueue_mock.assert_awaited_once()
+        self.assertIn("task_initial_dispatch_reconciled", [row.event_type for row in db.events])
+
+    def test_reconcile_orphan_parent_task_missing_initial_enqueue_skips_when_recent(self):
+        task = BinarySecurityTask(
+            id="task-fresh",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            updated_at=_now() - timedelta(seconds=120),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+
+        async def _exercise():
+            with patch.object(self.manager, "_enqueue_task_and_wait", AsyncMock(return_value=True)) as enqueue_mock:
+                changed = await self.manager.reconcile_orphan_parent_tasks_missing_initial_enqueue(
+                    db,
+                    batch_size=10,
+                    actor="test-reconciler",
+                    stale_after_seconds=300,
+                )
+            return changed, enqueue_mock
+
+        changed, enqueue_mock = asyncio.run(_exercise())
+
+        self.assertEqual(0, changed)
+        enqueue_mock.assert_not_called()
+
+    def test_start_task_records_initial_enqueue_failed_when_sync_enqueue_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="task-start",
+                project_id="project-1",
+                name="task",
+                status="failed",
+                task_type=TASK_TYPE_SOURCE,
+                current_stage="system_analysis",
+                firmware_source="project_filesystem",
+                firmware_path="/tmp/fw.bin",
+                output_root="/tmp/out",
+                workspace_root=tmp,
+            )
+            task.summary = {"input_files": [{"filename": "a.c"}]}
+            db = _ModelAwareDb(tasks=[task], events=[])
+
+            with (
+                patch.object(self.manager, "_enqueue_task_and_wait_sync", return_value=False),
+                patch.object(self.manager, "get_task_detail", return_value={"task_id": task.id}),
+                patch.object(self.manager, "_write_task_metadata", return_value=None),
+            ):
+                result = self.manager.start_task(db, project_id="project-1", task_id="task-start")
+
+            self.assertEqual({"task_id": task.id}, result)
+            self.assertIn("task_initial_enqueue_failed", [row.event_type for row in db.events])
 
     def test_deduplicate_entry_keys_handles_long_duplicate_suffixes(self):
         long_signature = (
@@ -2724,7 +2924,7 @@ class TaskManagerTests(unittest.TestCase):
             "module_input_path": "/tmp/flow.md",
             "source_dir": "/tmp/source/module-1",
         }
-        existing_input["execution_fingerprint"] = self.manager._legacy_vuln_execution_fingerprint(existing_input)
+        existing_input["execution_fingerprint"] = self.manager._build_dataflow_vuln_item_execution_fingerprint(existing_input)
         existing = BinarySecurityStageItem(
             id="si-vuln",
             task_id="t1",
@@ -2804,7 +3004,7 @@ class TaskManagerTests(unittest.TestCase):
             "module_input_path": "/tmp/flow.md",
             "source_dir": "/tmp/source/module-1",
         }
-        existing_input["execution_fingerprint"] = self.manager._legacy_vuln_execution_fingerprint(existing_input)
+        existing_input["execution_fingerprint"] = self.manager._build_dataflow_vuln_item_execution_fingerprint(existing_input)
         existing = BinarySecurityStageItem(
             id="si-vuln",
             task_id="t1",
@@ -2845,7 +3045,7 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("success", existing.status)
         self.assertEqual("dvs_existing", existing.downstream_task_id)
 
-    def test_trigger_vuln_items_from_dataflow_result_signature_change_requeues_target_item(self):
+    def test_trigger_vuln_items_from_dataflow_result_false_signature_change_is_suppressed(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
             id="t1",
@@ -2904,7 +3104,10 @@ class TaskManagerTests(unittest.TestCase):
             stage_name="dataflow_vuln_scan",
             item_id="si-vuln",
             archive_status="success",
-            payload={"downstream_payload": {"task_id": "dvs_existing", "status": "passed"}},
+            payload={
+                "bound_downstream_task_id": "dvs_existing",
+                "downstream_payload": {"task_id": "dvs_existing", "status": "passed"},
+            },
         )
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -2928,9 +3131,173 @@ class TaskManagerTests(unittest.TestCase):
         )
 
         self.assertIs(seeded, existing)
+        self.assertEqual("success", seeded.status)
+        self.assertEqual("dvs_existing", seeded.downstream_task_id)
+        self.assertEqual("success", archive_job.archive_status)
+        self.assertTrue(any(event.event_type == "dataflow_execution_signature_change_suppressed" for event in db.events))
+        self.assertFalse(any(event.event_type == "legacy_vuln_execution_signature_changed" for event in db.events))
+        self.assertFalse(any(event.event_type == "stale_dataflow_item_requeued_after_signature_change" for event in db.events))
+        self.assertFalse(self.manager._replacement_in_progress_state(existing)["replacement_in_progress"])
+        self.assertEqual(0, int(seeded.rerun_count or 0))
+        self.assertEqual(0, int((seeded.result or {}).get("rebuild_rerun_count") or 0))
+
+    def test_restore_false_signature_change_rebuild_reverts_existing_replacement(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+        )
+        item = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="pending",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id=None,
+            input_ref={"execution_fingerprint": "fp-old"},
+            result={
+                "execution_fingerprint": "fp-old",
+                "sync_observation": {
+                    "replacement_in_progress": True,
+                    "binding_cleared": True,
+                    "verification_status": "pending",
+                    "old_downstream_task_id": "dvs_existing",
+                    "superseded_downstream_task_id": "dvs_existing",
+                },
+            },
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-vuln-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si-vuln",
+            archive_status="success",
+            payload={
+                "bound_downstream_task_id": "dvs_existing",
+                "downstream_payload": {"task_id": "dvs_existing", "status": "passed"},
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job], events=[])
+
+        restored = self.manager._restore_false_signature_change_rebuild(
+            db,
+            task,
+            item,
+            previous_fingerprint="fp-old",
+            current_fingerprint="fp-new",
+            changed_fields=[],
+            comparison_mode="legacy_compat",
+        )
+
+        self.assertTrue(restored)
+        self.assertEqual("success", item.status)
+        self.assertEqual("dvs_existing", item.downstream_task_id)
+        self.assertTrue(any(event.event_type == "stale_dataflow_rebuild_reverted" for event in db.events))
+        self.assertFalse(self.manager._replacement_in_progress_state(item)["replacement_in_progress"])
+
+    def test_trigger_vuln_items_from_dataflow_result_real_signature_change_requeues_target_item(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-df",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-df",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+        )
+        existing_input = {
+            "entry_key": "entry-1",
+            "module_key": "module-1",
+            "function_name": "handle_req",
+            "source_file": "lib.c",
+            "taint_params": ["ctx"],
+            "signature_params": ["sig_a"],
+        }
+        existing_input["execution_fingerprint"] = self.manager._build_dataflow_vuln_item_execution_fingerprint(existing_input)
+        existing = BinarySecurityStageItem(
+            id="si-vuln",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-vuln",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs_existing",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-vuln-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si-vuln",
+            archive_status="success",
+            payload={"bound_downstream_task_id": "dvs_existing", "downstream_payload": {"task_id": "dvs_existing", "status": "passed"}},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[existing], archive_jobs=[archive_job], runtime_leases=[lease], events=[])
+
+        seeded = self.manager._trigger_vuln_items_from_dataflow_result(
+            db,
+            task,
+            {
+                "entry_key": "entry-1",
+                "module_key": "module-1",
+                "function_name": "handle_req_changed",
+                "source_file": "lib.c",
+                "file_name": "lib.c",
+                "taint_params": ["ctx"],
+                "signature_params": ["sig_a"],
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertIs(seeded, existing)
         self.assertEqual("pending", seeded.status)
         self.assertIsNone(seeded.downstream_task_id)
-        self.assertEqual("success", archive_job.archive_status)
+        self.assertEqual("superseded", archive_job.archive_status)
+        self.assertEqual(1, int(seeded.rerun_count or 0))
+        self.assertEqual(1, int((seeded.result or {}).get("rebuild_rerun_count") or 0))
         self.assertTrue(any(event.event_type == "legacy_vuln_execution_signature_changed" for event in db.events))
 
     def test_reclaim_stale_streaming_stage_items_resets_dispatching_vuln_item(self):
@@ -5944,8 +6311,8 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual(1, response.total)
         summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
-        self.assertEqual("owner_lost_recoverable", summary_by_stage["system_analysis"].abnormal_reason.code)
-        self.assertEqual("下游 owner 丢失，等待自动恢复", summary_by_stage["system_analysis"].abnormal_reason.title)
+        self.assertEqual("owner_lost_retry_exhausted", summary_by_stage["system_analysis"].abnormal_reason.code)
+        self.assertEqual("下游 owner 丢失自动恢复失败", summary_by_stage["system_analysis"].abnormal_reason.title)
 
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(
@@ -7353,8 +7720,8 @@ class TaskManagerTests(unittest.TestCase):
         nodes = self.manager._build_stage_overview_nodes(db, task, summaries, [], [stage_item])
 
         business_node = next(node for node in nodes if node.node_type == "business" and node.stage_name == "system_analysis")
-        self.assertEqual("owner_lost_recoverable", business_node.abnormal_reason.code)
-        self.assertEqual("下游 owner 丢失，等待自动恢复", business_node.abnormal_reason.title)
+        self.assertEqual("owner_lost_retry_exhausted", business_node.abnormal_reason.code)
+        self.assertEqual("下游 owner 丢失自动恢复失败", business_node.abnormal_reason.title)
 
     def test_choose_module_binary_handles_relative_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -10991,7 +11358,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(2, detail.policy["stage_parallelism"]["firmware_unpack"])
         self.assertEqual(8, detail.policy["stage_parallelism"]["dataflow_vuln_scan"])
         self.assertEqual(4, detail.policy["stage_parallelism"]["system_analysis"])
-        self.assertEqual(3, detail.policy["max_retries_per_item"])
+        self.assertEqual(0, detail.policy["max_retries_per_item"])
         self.assertFalse(detail.policy["continue_on_item_failure"])
 
     def test_update_task_concurrency_rejects_stages_outside_source_flow(self):
@@ -11215,7 +11582,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
         self.assertEqual(8, detail.policy["max_stage_parallelism"])
-        self.assertEqual(5, detail.policy["max_retries_per_item"])
+        self.assertEqual(0, detail.policy["max_retries_per_item"])
         self.assertFalse(detail.policy["continue_on_item_failure"])
         self.assertFalse(detail.policy["partial_success_stage_advancement"]["binary_to_source"])
         self.assertTrue(detail.policy["partial_success_stage_advancement"]["entry_analysis"])
@@ -24957,12 +25324,14 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             status="failed",
             retry_count=1,
             rerun_count=11,
+            result={"rebuild_rerun_count": 4},
         )
 
         response = self.manager._stage_item_response(item)
 
         self.assertEqual(1, response.retry_count)
         self.assertEqual(11, response.rerun_count)
+        self.assertEqual(4, response.rebuild_rerun_count)
         self.assertEqual(1, response.auto_retry_count)
 
     def test_stage_item_response_exposes_system_analysis_downstream_summary(self):
@@ -26514,6 +26883,74 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertGreaterEqual(db.flush_calls, 2)
         self.assertGreaterEqual(db.commit_calls, 2)
         self.assertGreaterEqual(db.rollback_calls, 1)
+
+    def test_ensure_downstream_archive_job_collapses_duplicate_reusable_jobs_for_same_dedupe_key(self):
+        task = BinarySecurityTask(
+            id="task1",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="task1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="source_project-images",
+            item_name="images",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            status="success",
+        )
+        canonical = BinarySecurityArchiveJob(
+            id="aj-canonical",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si1",
+            item_key="source_project-images",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            job_dedupe_key="si1::eat_1",
+            archive_status="success",
+        )
+        duplicate = BinarySecurityArchiveJob(
+            id="aj-duplicate",
+            task_id="task1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_id="si1",
+            item_key="source_project-images",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            job_dedupe_key="si1::eat_1",
+            archive_status="pending",
+        )
+        db = _LockingDb(_FakeConnection(lock_result=True))
+        db.tasks.append(task)
+        db.stage_items.append(item)
+        db.archive_jobs.extend([canonical, duplicate])
+
+        refreshed = self.manager._ensure_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload={"task_id": "eat_1", "status": "passed"},
+            mapped_status="success",
+            before_status="success",
+        )
+
+        self.assertIs(canonical, refreshed)
+        self.assertEqual("success", canonical.archive_status)
+        self.assertEqual("superseded", duplicate.archive_status)
+        self.assertEqual("aj-canonical", duplicate.payload.get("superseded_by_archive_job_id"))
+        self.assertTrue(any(event.event_type == "archive_job_duplicate_dedupe_collapsed" for event in db.events))
 
     def test_collect_downstream_refs_dedupes_same_service_and_task_id(self):
         task = BinarySecurityTask(
@@ -32003,6 +32440,106 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("superseded", archive_job.archive_status)
         self.assertTrue(any(event.event_type == "dataflow_entry_execution_signature_changed" for event in fake_session.events))
         self.assertTrue(any(event.event_type == "stale_dataflow_item_requeued_after_signature_change" for event in fake_session.events))
+
+    def test_trigger_dataflow_items_from_entry_result_false_signature_change_is_suppressed(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="module-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="IPSEC",
+            item_name="IPSEC",
+            parent_key="module-input",
+            downstream_service="entry_analyse",
+            status="success",
+        )
+        existing_input = {
+            "entry_key": "entry-1",
+            "module_key": "IPSEC",
+            "function_name": "handle",
+            "data_flow_file": "/tmp/flow.md",
+            "module_input_path": "/tmp/flow.md",
+            "source_dir": "/tmp/source/module-1",
+        }
+        existing_input["execution_fingerprint"] = self.manager._legacy_vuln_execution_fingerprint(existing_input)
+        existing_item = BinarySecurityStageItem(
+            id="si-dfa",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-dfa",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle",
+            parent_key="IPSEC",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfvs-1",
+            status="success",
+            input_ref=existing_input,
+            result={"execution_fingerprint": existing_input["execution_fingerprint"]},
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_id="si-dfa",
+            archive_status="success",
+            payload={"bound_downstream_task_id": "dfvs-1", "downstream_payload": {"task_id": "dfvs-1", "status": "passed"}},
+        )
+        entry_result = {
+            "entries": [
+                {
+                    "entry_key": "entry-1",
+                    "module_key": "IPSEC",
+                    "function_name": "handle",
+                    "source_file": "",
+                    "file_name": "",
+                    "taint_params": [],
+                    "signature_params": [],
+                    "function_description": "refresh only",
+                }
+            ]
+        }
+        fake_session = _ModelAwareDb(stage_items=[existing_item], archive_jobs=[archive_job], events=[])
+
+        with (
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=True),
+            patch.object(self.manager, "_streaming_tail_stage_names", return_value=("dataflow_vuln_scan",)),
+            patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_find_stage_item", return_value=existing_item),
+        ):
+            items = self.manager._trigger_dataflow_items_from_entry_result(
+                fake_session,
+                task,
+                entry_result,
+                upstream_item=upstream_item,
+            )
+
+        self.assertEqual(1, len(items))
+        self.assertIs(existing_item, items[0])
+        self.assertEqual("success", existing_item.status)
+        self.assertEqual("dfvs-1", existing_item.downstream_task_id)
+        self.assertTrue(any(event.event_type == "dataflow_execution_signature_change_suppressed" for event in fake_session.events))
+        self.assertTrue(any(event.event_type == "stale_dataflow_rebuild_reverted" for event in fake_session.events))
+        self.assertFalse(any(event.event_type == "dataflow_entry_execution_signature_changed" for event in fake_session.events))
 
     def test_sanitize_dataflow_stage_item_input_drops_runtime_noise(self):
         payload = {
@@ -40119,7 +40656,7 @@ def _test_record_polled_child_sync_failure_marks_owned_execution_owner_lost(self
     self.assertEqual("owned_execution_owner_lost", events[0].event_type)
     self.assertIn("当前执行 owner 已丢失，等待 worker 重新接管", events[0].message)
     self.assertEqual("child_owner_lost_detected", events[1].event_type)
-    self.assertEqual("child_owner_lost_waiting_parent_observe", events[2].event_type)
+    self.assertEqual("child_owner_lost_retry_exhausted", events[2].event_type)
     self.assertEqual(1, int(item.retry_count or 0))
 
 
@@ -40160,7 +40697,7 @@ def _test_record_polled_child_sync_failure_marks_owned_execution_runtime_owner_c
     self.assertEqual(3, len(events))
     self.assertEqual("owned_execution_owner_lost", events[0].event_type)
     self.assertEqual("child_owner_lost_detected", events[1].event_type)
-    self.assertEqual("child_owner_lost_waiting_parent_observe", events[2].event_type)
+    self.assertEqual("child_owner_lost_retry_exhausted", events[2].event_type)
     self.assertEqual(1, int(item.retry_count or 0))
 
 

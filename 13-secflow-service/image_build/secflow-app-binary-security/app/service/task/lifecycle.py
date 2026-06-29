@@ -799,6 +799,7 @@ class TaskLifecycleServiceMixin:
                     continue
                 if not self._archive_job_ready_for_retry(job):
                     continue
+                job.attempts = int(job.attempts or 0) + 1
                 job.archive_status = "running"
                 job.owner_id = str(self.instance_id or "").strip() or None
                 now_value = task_shared._now()

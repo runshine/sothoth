@@ -667,6 +667,17 @@ class TaskRuntimeServiceMixin:
             elapsed = (now_value - self._last_queue_reconcile_at).total_seconds()
             if elapsed < interval_seconds:
                 return
+        orphan_reconciled = await self.reconcile_orphan_parent_tasks_missing_initial_enqueue(
+            db,
+            batch_size=self._orphan_parent_reconcile_batch_size(),
+            actor="binary-security-orphan-parent-reconciler",
+            stale_after_seconds=self._orphan_parent_reconcile_stale_seconds(),
+        )
+        if orphan_reconciled:
+            task_manager_module.logger.info(
+                "binary-security orphan parent initial enqueue reconcile repaired tasks: count=%s",
+                orphan_reconciled,
+            )
         queue = task_manager_module.get_task_queue()
         pending_positions = await queue.queue_positions(self.cfg.queue.task_queue_key, context="queue_reconcile_snapshot")
         seed_batch_size = max(1, int(getattr(self.cfg.queue, "seed_batch_size", 20) or 20))

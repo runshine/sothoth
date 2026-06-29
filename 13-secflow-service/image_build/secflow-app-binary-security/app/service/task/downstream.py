@@ -33,6 +33,38 @@ class TaskDownstreamServiceMixin:
     CHILD_TRANSITION_IN_PLACE_RESTART = "in_place_restart"
     CHILD_TRANSITION_DESTRUCTIVE_REBUILD = "destructive_rebuild"
 
+    def _increment_stage_item_rebuild_rerun_count(
+        self: TaskManager,
+        item: BinarySecurityStageItem,
+        *,
+        reason: str,
+    ) -> int:
+        item.rerun_count = int(item.rerun_count or 0) + 1
+        result = dict(item.result or {})
+        rebuild_rerun_count = int(result.get("rebuild_rerun_count") or 0) + 1
+        result["rebuild_rerun_count"] = rebuild_rerun_count
+        result["last_rebuild_reason"] = str(reason or "").strip() or None
+        item.result = result
+        return rebuild_rerun_count
+
+    def _maybe_count_child_binding_rebuild(
+        self: TaskManager,
+        item: BinarySecurityStageItem,
+        *,
+        old_downstream_task_id: str | None,
+        new_downstream_task_id: str | None,
+        transition_type: str | None,
+        reason: str,
+    ) -> int:
+        old_task_id = str(old_downstream_task_id or "").strip() or None
+        new_task_id = str(new_downstream_task_id or "").strip() or None
+        normalized_transition_type = str(transition_type or self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD).strip().lower()
+        if normalized_transition_type != self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD:
+            return int((item.result or {}).get("rebuild_rerun_count") or 0)
+        if not old_task_id or not new_task_id or old_task_id == new_task_id:
+            return int((item.result or {}).get("rebuild_rerun_count") or 0)
+        return self._increment_stage_item_rebuild_rerun_count(item, reason=reason)
+
     def _sanitize_stage_item_input(
         self: TaskManager,
         stage_name: str,
@@ -234,9 +266,13 @@ class TaskDownstreamServiceMixin:
             return None
         return self._dataflow_entry_execution_fingerprint(input_ref)
 
+    def _build_dataflow_vuln_item_execution_fingerprint(self, payload: dict[str, Any] | None) -> str:
+        normalized = self._sanitize_dataflow_stage_item_input(payload)
+        return self._dataflow_entry_execution_fingerprint(normalized)
+
     def _decorate_dataflow_entry_with_execution_fingerprint(self, entry: dict[str, Any]) -> dict[str, Any]:
         normalized = self._sanitize_dataflow_stage_item_input(entry)
-        fingerprint = self._dataflow_entry_execution_fingerprint(normalized)
+        fingerprint = self._build_dataflow_vuln_item_execution_fingerprint(normalized)
         normalized["execution_fingerprint"] = fingerprint
         return normalized
 
@@ -322,7 +358,12 @@ class TaskDownstreamServiceMixin:
         item: BinarySecurityStageItem,
     ) -> None:
         old_task_id = str(item.downstream_task_id or "").strip() or None
+        rebuild_rerun_count = 0
         if old_task_id:
+            rebuild_rerun_count = self._increment_stage_item_rebuild_rerun_count(
+                item,
+                reason="streaming_entry_execution_signature_changed",
+            )
             self._supersede_archive_jobs_for_downstream_task(
                 db,
                 task,
@@ -349,6 +390,7 @@ class TaskDownstreamServiceMixin:
                     "item_key": item.item_key,
                     "old_downstream_task_id": old_task_id,
                     "reason": "streaming_entry_execution_signature_changed",
+                    "rebuild_rerun_count": rebuild_rerun_count,
                 },
             )
         self._clear_item_downstream_runtime_state(item)
@@ -376,6 +418,141 @@ class TaskDownstreamServiceMixin:
         item.started_at = None
         item.error_message = None
 
+    def _should_suppress_dataflow_signature_rebuild(
+        self,
+        *,
+        previous_fingerprint: str | None,
+        current_fingerprint: str | None,
+        changed_fields: list[str] | None,
+    ) -> bool:
+        previous = str(previous_fingerprint or "").strip()
+        current = str(current_fingerprint or "").strip()
+        if not previous or not current or previous == current:
+            return False
+        return not list(changed_fields or [])
+
+    def _restore_false_signature_change_rebuild(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        previous_fingerprint: str | None,
+        current_fingerprint: str | None,
+        changed_fields: list[str] | None,
+        comparison_mode: str,
+    ) -> bool:
+        replacement_state = self._replacement_in_progress_state(item)
+        if not self._is_destructive_rebuild_transition(replacement_state):
+            return False
+        old_task_id = str(
+            replacement_state.get("old_downstream_task_id")
+            or dict(self._load_stage_item_result_payload(item).get("sync_observation") or {}).get("superseded_downstream_task_id")
+            or ""
+        ).strip()
+        if not old_task_id or str(item.downstream_task_id or "").strip():
+            return False
+        archive_jobs = self._archive_jobs_for_stage_items(db, item.task_id, item.stage_name, [item.id])
+        matching_job = next(
+            (
+                job for job in archive_jobs
+                if self._archive_job_bound_downstream_task_id(job) == old_task_id
+                and str(getattr(job, "archive_status", "") or "").strip().lower() == "success"
+            ),
+            None,
+        )
+        if matching_job is None:
+            return False
+        replacement_state_before = dict(replacement_state)
+        item.downstream_task_id = old_task_id
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = dict(result.get("sync_observation") or {})
+        sync_observation.pop("superseded_downstream_task_id", None)
+        sync_observation["downstream_status"] = "success"
+        sync_observation["mapped_status"] = "success"
+        sync_observation["status_raw"] = (
+            str((dict(getattr(matching_job, "payload", None) or {}).get("downstream_payload") or {}).get("status") or "").strip()
+            or "passed"
+        )
+        sync_observation["message"] = "误触发重建已回滚，继续沿用当前有效 child"
+        result["sync_observation"] = sync_observation
+        result["downstream_status"] = "success"
+        result["sync_status"] = "synced"
+        downstream_snapshot = dict(result.get("downstream") or {})
+        downstream_snapshot["task_id"] = old_task_id
+        downstream_snapshot["status"] = sync_observation["status_raw"]
+        result["downstream"] = downstream_snapshot
+        if previous_fingerprint:
+            result["execution_fingerprint"] = previous_fingerprint
+        item.result = result
+        self._clear_replacement_in_progress(item)
+        self._set_downstream_binding_snapshot(
+            item,
+            state="bound",
+            attempts=0,
+            first_attempt_at=None,
+            last_attempt_at=None,
+            next_retry_at=None,
+            last_error=None,
+            last_error_type=None,
+            recoverable=None,
+            message=None,
+        )
+        item.status = "success"
+        item.error_message = None
+        self._record_event(
+            db,
+            task,
+            "stale_dataflow_rebuild_reverted",
+            "误触发的 DFVS 定点重建已回滚，恢复沿用当前有效 child",
+            stage_name=item.stage_name,
+            item=item,
+            level="warning",
+            payload={
+                "item_id": item.id,
+                "item_key": item.item_key,
+                "downstream_task_id": old_task_id,
+                "old_execution_fingerprint": previous_fingerprint,
+                "new_execution_fingerprint": current_fingerprint,
+                "changed_fields": list(changed_fields or []),
+                "comparison_mode": comparison_mode,
+                "revert_reason": "false_signature_change_with_successful_existing_child",
+                "replacement_state_before": replacement_state_before,
+                "replacement_state_after": self._replacement_in_progress_state(item),
+            },
+        )
+        return True
+
+    def _record_dataflow_signature_change_suppressed(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        previous_fingerprint: str | None,
+        current_fingerprint: str | None,
+        changed_fields: list[str] | None,
+        comparison_mode: str,
+    ) -> None:
+        self._record_event(
+            db,
+            task,
+            "dataflow_execution_signature_change_suppressed",
+            "检测到空差异的 DFVS 契约变化，已抑制误重建",
+            stage_name=item.stage_name,
+            item=item,
+            level="warning",
+            payload={
+                "item_id": item.id,
+                "item_key": item.item_key,
+                "old_execution_fingerprint": previous_fingerprint,
+                "new_execution_fingerprint": current_fingerprint,
+                "changed_fields": list(changed_fields or []),
+                "comparison_mode": comparison_mode,
+                "suppressed_reason": "no_effective_field_change",
+            },
+        )
+
     def _prepare_entry_analysis_stage_item_for_signature_change(
         self,
         db: Session,
@@ -384,6 +561,10 @@ class TaskDownstreamServiceMixin:
     ) -> None:
         old_task_id = str(item.downstream_task_id or "").strip() or None
         if old_task_id:
+            self._increment_stage_item_rebuild_rerun_count(
+                item,
+                reason="streaming_entry_execution_signature_changed",
+            )
             self._supersede_archive_jobs_for_downstream_task(
                 db,
                 task,
@@ -918,30 +1099,71 @@ class TaskDownstreamServiceMixin:
                         output_ref=dict(existing.output_ref or {}),
                     )
                     changed_fields = self._dataflow_entry_execution_changed_fields(previous_entry, normalized_entry)
-                    self._record_event(
-                        db,
-                        task,
-                        "dataflow_entry_execution_signature_changed",
-                        f"入口刷新改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
-                        stage_name="dataflow_vuln_scan",
-                        item=item,
-                        level="warning",
-                        payload={
-                            "upstream_item_id": upstream_item.id,
-                            "entry_key": entry_key,
-                            "item_id": item.id,
-                            "old_execution_fingerprint": previous_fingerprint,
-                            "new_execution_fingerprint": current_fingerprint,
-                            "changed_fields": changed_fields,
-                        },
-                    )
-                    self._prepare_dataflow_stage_item_for_signature_change(
-                        db,
-                        task,
-                        item,
-                    )
-                    recreate_count += 1
-                    materialized_any_work = True
+                    if self._should_suppress_dataflow_signature_rebuild(
+                        previous_fingerprint=previous_fingerprint,
+                        current_fingerprint=current_fingerprint,
+                        changed_fields=changed_fields,
+                    ):
+                        self._record_dataflow_signature_change_suppressed(
+                            db,
+                            task,
+                            item,
+                            previous_fingerprint=previous_fingerprint,
+                            current_fingerprint=current_fingerprint,
+                            changed_fields=changed_fields,
+                            comparison_mode="streaming_entry_refresh",
+                        )
+                        if self._restore_false_signature_change_rebuild(
+                            db,
+                            task,
+                            item,
+                            previous_fingerprint=previous_fingerprint,
+                            current_fingerprint=current_fingerprint,
+                            changed_fields=changed_fields,
+                            comparison_mode="streaming_entry_refresh",
+                        ):
+                            metadata_only_count += 1
+                        else:
+                            self._record_event(
+                                db,
+                                task,
+                                "streaming_dataflow_item_metadata_refreshed",
+                                f"入口刷新未形成有效 DFVS 契约变化，已仅更新展示元数据: {entry_key}",
+                                stage_name="dataflow_vuln_scan",
+                                item=item,
+                                payload={
+                                    "upstream_item_id": upstream_item.id,
+                                    "entry_key": entry_key,
+                                    "refresh_mode": "suppressed_signature_change",
+                                    "execution_fingerprint": previous_fingerprint or current_fingerprint,
+                                },
+                            )
+                            metadata_only_count += 1
+                    else:
+                        self._record_event(
+                            db,
+                            task,
+                            "dataflow_entry_execution_signature_changed",
+                            f"入口刷新改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
+                            stage_name="dataflow_vuln_scan",
+                            item=item,
+                            level="warning",
+                            payload={
+                                "upstream_item_id": upstream_item.id,
+                                "entry_key": entry_key,
+                                "item_id": item.id,
+                                "old_execution_fingerprint": previous_fingerprint,
+                                "new_execution_fingerprint": current_fingerprint,
+                                "changed_fields": changed_fields,
+                            },
+                        )
+                        self._prepare_dataflow_stage_item_for_signature_change(
+                            db,
+                            task,
+                            item,
+                        )
+                        recreate_count += 1
+                        materialized_any_work = True
             created_items.append(item)
             if existing is not None:
                 refreshed_count += 1
@@ -996,7 +1218,7 @@ class TaskDownstreamServiceMixin:
             "upstream_item_id": upstream_item.id,
             "triggered_by_stage": upstream_item.stage_name,
         }
-        normalized_result["execution_fingerprint"] = self._legacy_vuln_execution_fingerprint(normalized_result)
+        normalized_result = self._decorate_dataflow_entry_with_execution_fingerprint(normalized_result)
         existing = self._find_stage_item(
             db,
             task_id=task.id,
@@ -1061,34 +1283,56 @@ class TaskDownstreamServiceMixin:
                     reason="streaming_vuln_item_materialization",
                     reopen_terminal=True,
                 )
+                previous_entry = dict(existing.input_ref or {})
                 item = self._update_stage_item_metadata_only(
                     existing,
                     item_name=str(dataflow_result.get("function_name") or "").strip() or None,
                     input_ref=normalized_result,
                     output_ref=dict(existing.output_ref or {}),
                 )
-                changed_fields = self._payload_changed_fields(
-                    self._legacy_vuln_execution_fingerprint_payload(existing.input_ref or {}),
-                    self._legacy_vuln_execution_fingerprint_payload(normalized_result),
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "legacy_vuln_execution_signature_changed",
-                    f"历史兼容路径改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
-                    stage_name="dataflow_vuln_scan",
-                    item=item,
-                    level="warning",
-                    payload={
-                        "upstream_item_id": upstream_item.id,
-                        "entry_key": entry_key,
-                        "item_id": item.id,
-                        "old_execution_fingerprint": previous_fingerprint,
-                        "new_execution_fingerprint": current_fingerprint,
-                        "changed_fields": changed_fields,
-                    },
-                )
-                self._prepare_dataflow_stage_item_for_signature_change(db, task, item)
+                changed_fields = self._dataflow_entry_execution_changed_fields(previous_entry, normalized_result)
+                if self._should_suppress_dataflow_signature_rebuild(
+                    previous_fingerprint=previous_fingerprint,
+                    current_fingerprint=current_fingerprint,
+                    changed_fields=changed_fields,
+                ):
+                    self._record_dataflow_signature_change_suppressed(
+                        db,
+                        task,
+                        item,
+                        previous_fingerprint=previous_fingerprint,
+                        current_fingerprint=current_fingerprint,
+                        changed_fields=changed_fields,
+                        comparison_mode="legacy_compat",
+                    )
+                    self._restore_false_signature_change_rebuild(
+                        db,
+                        task,
+                        item,
+                        previous_fingerprint=previous_fingerprint,
+                        current_fingerprint=current_fingerprint,
+                        changed_fields=changed_fields,
+                        comparison_mode="legacy_compat",
+                    )
+                else:
+                    self._record_event(
+                        db,
+                        task,
+                        "legacy_vuln_execution_signature_changed",
+                        f"历史兼容路径改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
+                        stage_name="dataflow_vuln_scan",
+                        item=item,
+                        level="warning",
+                        payload={
+                            "upstream_item_id": upstream_item.id,
+                            "entry_key": entry_key,
+                            "item_id": item.id,
+                            "old_execution_fingerprint": previous_fingerprint,
+                            "new_execution_fingerprint": current_fingerprint,
+                            "changed_fields": changed_fields,
+                        },
+                    )
+                    self._prepare_dataflow_stage_item_for_signature_change(db, task, item)
         self._record_event(
             db,
             task,
@@ -2283,6 +2527,14 @@ class TaskDownstreamServiceMixin:
             reason,
         )
 
+        rebuild_rerun_count = self._maybe_count_child_binding_rebuild(
+            item,
+            old_downstream_task_id=old_task_id,
+            new_downstream_task_id=new_task_id,
+            transition_type=normalized_transition_type,
+            reason=reason,
+        )
+
         self._mark_replacement_in_progress(
             item,
             old_downstream_task_id=old_task_id,
@@ -2360,6 +2612,8 @@ class TaskDownstreamServiceMixin:
                 "new_downstream_task_id": new_task_id,
                 "reason": reason,
                 "deleted_archive_roots": deleted_archive_roots,
+                "rebuild_rerun_count": rebuild_rerun_count,
+                "transition_type": normalized_transition_type,
             },
         )
         self._record_event(
