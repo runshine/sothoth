@@ -3153,6 +3153,9 @@ class TaskManager(
         has_active_operation = operation_status in TASK_OPERATION_ACTIVE_STATUSES
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if not dispatcher_instance_id:
+            task_status = str(getattr(task, "status", "") or "").strip().lower()
+            if task_status == "pending":
+                return False
             return not has_active_operation
         lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
         return bool(

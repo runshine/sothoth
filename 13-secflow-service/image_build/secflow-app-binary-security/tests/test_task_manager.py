@@ -10570,6 +10570,36 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(supported)
 
+    def test_task_row_owner_is_runtime_supported_rejects_pending_active_operation_without_owner(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="pending",
+            current_stage="system_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id=None,
+            lease_expires_at=None,
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_RETRY,
+            target_stage="system_analysis",
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+
+        supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+
+        self.assertFalse(supported)
+
     def test_task_row_owner_is_runtime_supported_accepts_active_cancel_finalize_with_runtime_lease(self):
         task = BinarySecurityTask(
             id="t1",
