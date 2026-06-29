@@ -42718,6 +42718,111 @@ def _test_finalize_gate_blocks_when_active_children_exist(self):
     self.assertTrue(decision.has_active_items)
 
 
+def _test_task_has_any_active_children_ignores_parent_runtime_lease_without_real_children(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-finalize-gate-parent-lease",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-dataflow-parent-lease",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="success",
+        finished_at=_now(),
+    )
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[dataflow_run], runtime_leases=[runtime_lease], events=[])
+
+    active = manager._task_has_any_active_children(db, task, stage_runs=[dataflow_run], stage_items=[])
+
+    self.assertFalse(active)
+
+
+def _test_authoritative_archive_repairs_false_replacement_residual(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-authoritative-archive-repair",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="si-authoritative-archive-repair",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-a",
+        item_name="entry-a",
+        status="success",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-old",
+    )
+    item.output_ref = {
+        "archive_root": "/archive/dvs-old",
+        "artifact_root": "/archive/dvs-old",
+        "archive_job_id": "aj-authoritative",
+        "archive_status": "superseded",
+    }
+    item.result = {
+        "sync_observation": {
+            "replacement_in_progress": True,
+            "binding_cleared": True,
+            "verification_status": "pending",
+            "old_downstream_task_id": "dvs-old",
+            "transition_type": "destructive_rebuild",
+            "downstream_status": "pending",
+        },
+        "downstream": {"task_id": "dvs-old", "status": "passed"},
+        "archive_root": "/archive/dvs-old",
+        "artifact_root": "/archive/dvs-old",
+    }
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-authoritative",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_id=item.id,
+        item_key=item.item_key,
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-old",
+        archive_status="superseded",
+        archive_root="/archive/dvs-old",
+    )
+    archive_job.payload = {"bound_downstream_task_id": "dvs-old", "mapped_status": "success"}
+
+    repaired = manager._repair_false_replacement_state_for_authoritative_success(item, archive_jobs=[archive_job])
+    response = manager._stage_item_response(task, item, archive_jobs=[archive_job])
+
+    self.assertTrue(repaired)
+    self.assertFalse(manager._replacement_in_progress_state(item)["replacement_in_progress"])
+    self.assertEqual("bound", response.downstream_binding_state)
+    self.assertEqual("success", response.status)
+    self.assertEqual("success", response.downstream_status)
+    self.assertEqual("success", response.output_ref.get("archive_status"))
+
+
 def _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -49522,6 +49627,8 @@ TaskManagerTests.test_should_skip_readless_reconcile_for_active_task_uses_runtim
 TaskManagerTests.test_should_preserve_task_dispatch_ownership_uses_runtime_lease_without_status_gate = _test_should_preserve_task_dispatch_ownership_uses_runtime_lease_without_status_gate
 TaskManagerTests.test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success = _test_finalize_gate_blocks_when_next_stage_not_materialized_after_system_analysis_success
 TaskManagerTests.test_finalize_gate_blocks_when_active_children_exist = _test_finalize_gate_blocks_when_active_children_exist
+TaskManagerTests.test_task_has_any_active_children_ignores_parent_runtime_lease_without_real_children = _test_task_has_any_active_children_ignores_parent_runtime_lease_without_real_children
+TaskManagerTests.test_authoritative_archive_repairs_false_replacement_residual = _test_authoritative_archive_repairs_false_replacement_residual
 TaskManagerTests.test_finalize_gate_allows_when_workflow_terminal_and_children_terminal = _test_finalize_gate_allows_when_workflow_terminal_and_children_terminal
 TaskManagerTests.test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure = _test_finalize_gate_blocked_active_path_does_not_restore_running_after_authoritative_cancelled_failure
 TaskManagerTests.test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized = _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_materialized

@@ -87,9 +87,6 @@ class TaskStateMachineMixin:
         )
         if any(str(getattr(job, "archive_status", "") or "").strip() in active_statuses for job in archive_jobs):
             return True
-        runtime_lease = self._runtime_lease_for_task(db, task.id)
-        if self._runtime_lease_is_active(runtime_lease):
-            return True
         if str(getattr(task, "status", "") or "").strip().lower() in active_statuses and (
             str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         ):

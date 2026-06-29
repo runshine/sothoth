@@ -4162,6 +4162,13 @@ class TaskReadModelServiceMixin:
         result = self._load_stage_item_result_payload(item)
         output_ref = dict(item.output_ref or {})
         resolved_archive_refs = self._resolved_stage_item_archive_refs(item, archive_jobs=archive_jobs)
+        self._repair_false_replacement_state_for_authoritative_success(
+            item,
+            archive_jobs=archive_jobs,
+        )
+        result = self._load_stage_item_result_payload(item)
+        output_ref = dict(item.output_ref or {})
+        resolved_archive_refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs) or resolved_archive_refs
         for key in ("artifact_root", "archive_root", "archive_copy_stats", "archive_job_id", "archive_status"):
             value = resolved_archive_refs.get(key)
             if value is None:
@@ -4173,6 +4180,13 @@ class TaskReadModelServiceMixin:
                 continue
             result.setdefault(key, value)
         downstream_status, sync_observation, repaired = self._effective_stage_item_downstream_status(item, result=result)
+        if self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+            replacement_state = self._replacement_in_progress_state(item)
+            if replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]:
+                downstream_status = "success"
+                sync_observation["downstream_status"] = "success"
+                sync_observation["mapped_status"] = "success"
+                repaired = True
         downstream_payload = dict(result.get("downstream") or {})
         last_synced_at = result.get("last_sync_success_at") or result.get("downstream_status_synced_at")
         last_attempt_at = result.get("last_sync_attempt_at") or sync_observation.get("last_attempt_at") or sync_observation.get("last_synced_at")
@@ -4215,6 +4229,9 @@ class TaskReadModelServiceMixin:
         binding = self._downstream_binding_snapshot(item)
         binding_state = self._downstream_binding_state(item)
         binding_message = self._string_or_none(binding.get("message"))
+        if self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+            binding_state = "bound"
+            binding_message = None
         if binding_state != "created_pending_sync":
             binding_message = None
         latest_binding_mismatch = dict(result.get("latest_binding_mismatch") or {}) or None
@@ -4237,13 +4254,14 @@ class TaskReadModelServiceMixin:
             last_success_at=parsed_last_synced_at if isinstance(parsed_last_synced_at, datetime) else None,
             last_error_at=parsed_last_error_at if isinstance(parsed_last_error_at, datetime) else None,
         )
+        authoritative_archive_success = self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs)
         return task_manager_module.BinarySecurityStageItemResponse(
             id=item.id,
             stage_name=item.stage_name,
             item_key=item.item_key,
             item_name=item.item_name,
             parent_key=item.parent_key,
-            status=item.status,
+            status="success" if authoritative_archive_success else item.status,
             retry_count=int(item.retry_count or 0),
             rerun_count=int(item.rerun_count or 0),
             rebuild_rerun_count=rebuild_rerun_count,
@@ -4253,15 +4271,15 @@ class TaskReadModelServiceMixin:
             downstream_task_id=item.downstream_task_id,
             archive_bound_downstream_task_id=archive_bound_downstream_task_id,
             latest_binding_mismatch=latest_binding_mismatch,
-            downstream_status=downstream_status,
-            downstream_binding_state=binding_state,
+            downstream_status="success" if authoritative_archive_success else downstream_status,
+            downstream_binding_state="bound" if authoritative_archive_success else binding_state,
             downstream_create_attempts=max(0, int(binding.get("attempts") or 0)),
             downstream_create_last_attempt_at=self._parse_comparable_datetime(binding.get("last_attempt_at")),
             downstream_create_next_retry_at=self._parse_comparable_datetime(binding.get("next_retry_at")),
             downstream_create_last_error=self._string_or_none(binding.get("last_error")),
             downstream_create_last_error_type=self._string_or_none(binding.get("last_error_type")),
             downstream_create_recoverable=self._bool_or_none(binding.get("recoverable")),
-            downstream_binding_message=binding_message or self._downstream_binding_status_message(item),
+            downstream_binding_message=None if authoritative_archive_success else (binding_message or self._downstream_binding_status_message(item)),
             downstream_cancel_phase=self._string_or_none(downstream_payload.get("cancel_phase")),
             downstream_summary=self._stage_item_downstream_summary(item, result=result),
             failure_category=self._string_or_none(failure_projection.get("failure_category")),

@@ -2304,6 +2304,161 @@ class TaskDownstreamServiceMixin:
             "transition_type": transition_type,
         }
 
+    def _item_authoritative_downstream_task_id(self, item: BinarySecurityStageItem) -> str | None:
+        current_task_id = str(getattr(item, "downstream_task_id", "") or "").strip()
+        return current_task_id or None
+
+    def _item_authoritative_archive_refs(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> dict[str, Any]:
+        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
+        resolved = self._resolved_stage_item_archive_refs(item, archive_jobs=archive_jobs)
+        archive_task_id = str(
+            resolved.get("bound_downstream_task_id")
+            or resolved.get("archive_bound_downstream_task_id")
+            or resolved.get("downstream_task_id")
+            or ""
+        ).strip()
+        if authoritative_task_id and archive_task_id and archive_task_id != authoritative_task_id:
+            return {}
+        if archive_jobs:
+            matching_job = next(
+                (
+                    job
+                    for job in reversed(list(archive_jobs))
+                    if self._archive_job_bound_downstream_task_id(job) == authoritative_task_id
+                ),
+                None,
+            )
+            if matching_job is not None:
+                resolved = {
+                    **resolved,
+                    "archive_job_id": resolved.get("archive_job_id") or getattr(matching_job, "id", None),
+                    "archive_status": resolved.get("archive_status") or getattr(matching_job, "archive_status", None),
+                    "bound_downstream_task_id": authoritative_task_id,
+                }
+        if authoritative_task_id and resolved.get("archive_root"):
+            resolved["bound_downstream_task_id"] = authoritative_task_id
+        return resolved
+
+    def _item_has_authoritative_archive_success(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> bool:
+        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
+        if not authoritative_task_id:
+            return False
+        for job in list(archive_jobs or []):
+            if self._archive_job_bound_downstream_task_id(job) != authoritative_task_id:
+                continue
+            if str(getattr(job, "archive_status", "") or "").strip().lower() == "success":
+                return True
+        refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs)
+        archive_root = str(refs.get("archive_root") or refs.get("artifact_root") or "").strip()
+        archive_job_status = str(refs.get("archive_status") or "").strip().lower()
+        return bool(archive_root and archive_job_status in {"success", "superseded", "archived", "applying", ""})
+
+    def _item_has_active_authoritative_archive_job(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> bool:
+        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
+        if not authoritative_task_id:
+            return False
+        active_statuses = {"pending", "queued", "running", "applying", "reconciling", "archived"}
+        return any(
+            self._archive_job_bound_downstream_task_id(job) == authoritative_task_id
+            and str(getattr(job, "archive_status", "") or "").strip().lower() in active_statuses
+            for job in list(archive_jobs or [])
+        )
+
+    def _item_can_enqueue_authoritative_archive(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> bool:
+        normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if normalized_status not in {"success", "partial_success"}:
+            return False
+        if not self._item_authoritative_downstream_task_id(item):
+            return False
+        if self._item_has_active_authoritative_archive_job(item, archive_jobs=archive_jobs):
+            return False
+        if self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+            return False
+        return True
+
+    def _repair_false_replacement_state_for_authoritative_success(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> bool:
+        replacement_state = self._replacement_in_progress_state(item)
+        if not (replacement_state["replacement_in_progress"] or replacement_state["binding_cleared"]):
+            return False
+        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
+        old_task_id = str(replacement_state.get("old_downstream_task_id") or "").strip() or None
+        if not authoritative_task_id or not old_task_id or authoritative_task_id != old_task_id:
+            return False
+        normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if normalized_status not in {"success", "partial_success"}:
+            return False
+        if not self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+            return False
+        resolved_refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs)
+        output_ref = dict(item.output_ref or {})
+        result = dict(item.result or {})
+        for key in ("artifact_root", "archive_root", "archive_copy_stats", "archive_job_id"):
+            if resolved_refs.get(key) is not None:
+                output_ref[key] = resolved_refs.get(key)
+        output_ref["archive_status"] = "success"
+        item.output_ref = output_ref
+        result["archive_root"] = output_ref.get("archive_root")
+        result["artifact_root"] = output_ref.get("artifact_root")
+        if output_ref.get("archive_copy_stats") is not None:
+            result["archive_copy_stats"] = output_ref.get("archive_copy_stats")
+        sync_observation = dict(result.get("sync_observation") or {})
+        sync_observation["downstream_status"] = "success"
+        sync_observation["mapped_status"] = "success"
+        sync_observation["verification_status"] = "succeeded"
+        sync_observation.pop("message", None)
+        result["sync_observation"] = sync_observation
+        result["downstream_status"] = "success"
+        result["sync_status"] = "synced"
+        downstream_payload = dict(result.get("downstream") or {})
+        if authoritative_task_id:
+            downstream_payload["task_id"] = authoritative_task_id
+        downstream_payload["status"] = downstream_payload.get("status") or "passed"
+        result["downstream"] = downstream_payload
+        item.result = result
+        self._set_downstream_binding_snapshot(
+            item,
+            state="bound",
+            attempts=0,
+            first_attempt_at=None,
+            last_attempt_at=None,
+            next_retry_at=None,
+            last_error=None,
+            last_error_type=None,
+            recoverable=None,
+            message=None,
+        )
+        item.downstream_status = "success"
+        item.downstream_mapped_status = "success"
+        item.sync_status = "synced"
+        item.error_message = None
+        self._clear_replacement_in_progress(item)
+        return True
+
     def _clear_replacement_in_progress(self, item: BinarySecurityStageItem) -> None:
         result = dict(item.result or {})
         sync_observation = dict(result.get("sync_observation") or {})

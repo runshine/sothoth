@@ -80,6 +80,64 @@ class TaskItemSyncServiceMixin:
             for item in candidates
         )
 
+    def _reconcile_authoritative_archive_item(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+    ) -> bool:
+        archive_jobs = self._stage_archive_jobs_by_item(db, task.id, item.stage_name).get(str(item.id or ""), [])
+        repaired = self._repair_false_replacement_state_for_authoritative_success(
+            item,
+            archive_jobs=archive_jobs,
+        )
+        if repaired:
+            self._record_event(
+                db,
+                task,
+                "false_replacement_state_repaired",
+                "authoritative child 已成功且归档已存在，已清理误残留的 replacement 状态",
+                stage_name=item.stage_name,
+                item=item,
+                payload={
+                    "repair_source": "archive_reconcile",
+                    "reason": "authoritative_archive_already_present",
+                    "downstream_task_id": self._item_authoritative_downstream_task_id(item),
+                    "archive_root": self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs).get("archive_root"),
+                },
+            )
+            return True
+        if not self._item_can_enqueue_authoritative_archive(item, archive_jobs=archive_jobs):
+            return False
+        payload = dict(self._load_stage_item_result_payload(item).get("downstream") or {})
+        if not payload:
+            payload = {"task_id": self._item_authoritative_downstream_task_id(item), "status": "passed"}
+        job = self._queue_downstream_archive_job(
+            db,
+            task,
+            item,
+            payload=payload,
+            mapped_status="success",
+            before_status=str(getattr(item, "status", "") or "").strip() or None,
+        )
+        if job is None:
+            return False
+        self._record_event(
+            db,
+            task,
+            "authoritative_archive_reconcile_queued",
+            "检测到 authoritative child 缺少归档，已补建归档任务",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "repair_source": "archive_reconcile",
+                "reason": "authoritative_archive_missing",
+                "downstream_task_id": self._item_authoritative_downstream_task_id(item),
+                "archive_job_id": job.id,
+            },
+        )
+        return True
+
     def _list_tasks_needing_downstream_sync(self: TaskManager, db: Session) -> list[dict[str, str]]:
         refs: list[dict[str, str]] = []
         seen: set[tuple[str, str]] = set()
@@ -2714,6 +2772,9 @@ class TaskItemSyncServiceMixin:
                 current_touched: set[str] = set()
                 for item in candidates:
                     if self._maybe_reconcile_stale_dataflow_stage_item(session, task, item):
+                        current_touched.add(normalize_stage_name(item.stage_name))
+                        continue
+                    if self._reconcile_authoritative_archive_item(session, task, item):
                         current_touched.add(normalize_stage_name(item.stage_name))
                         continue
                     if self._sync_stage_item_downstream_fact(session, task, item):
