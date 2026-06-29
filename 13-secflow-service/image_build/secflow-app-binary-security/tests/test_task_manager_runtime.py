@@ -566,6 +566,18 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("task-1", "dispatch_claim_not_acquired_reenqueue")], requeued)
         self.assertIn("dispatch_claim_reenqueued", [row.event_type for row in db.events])
 
+    def test_dispatch_task_by_id_logs_claim_blocked_reason_for_missing_task_row(self):
+        manager = TaskManager()
+        db = _ModelAwareDb(tasks=[], events=[])
+
+        with patch("app.service.task_manager.logger.info") as log_info:
+            claimed = manager._dispatch_task_by_id(db, "missing-task")
+
+        self.assertIsNone(claimed)
+        self.assertTrue(
+            any("binary-security dispatch claim blocked:" in str(call.args[0]) for call in log_info.call_args_list)
+        )
+
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

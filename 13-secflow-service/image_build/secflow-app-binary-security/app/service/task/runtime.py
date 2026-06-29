@@ -14,6 +14,31 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    def _log_dispatch_claim_blocked(
+        self: TaskManager,
+        task_id: str,
+        *,
+        reason: str,
+        task=None,
+        current_operation=None,
+        detail: str | None = None,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        task_manager_module.logger.info(
+            "binary-security dispatch claim blocked: task_id=%s reason=%s status=%s runtime_phase=%s "
+            "dispatcher_instance_id=%s current_operation_id=%s operation_type=%s operation_status=%s detail=%s",
+            str(task_id or "").strip() or None,
+            str(reason or "").strip() or "unknown",
+            str(getattr(task, "status", "") or "").strip() or None if task is not None else None,
+            str(self._task_runtime_phase(task)) if task is not None else None,
+            str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None if task is not None else None,
+            str(getattr(task, "current_operation_id", "") or "").strip() or None if task is not None else None,
+            str(getattr(current_operation, "operation_type", "") or "").strip() or None if current_operation is not None else None,
+            str(getattr(current_operation, "status", "") or "").strip().lower() or None if current_operation is not None else None,
+            str(detail or "").strip() or None,
+        )
+
     async def _requeue_unclaimed_dispatch_task(self: TaskManager, db: Session, task_id: str) -> None:
         from app.service import task_manager as task_manager_module
 
@@ -919,15 +944,27 @@ class TaskRuntimeServiceMixin:
         active_count = self._active_dispatch_count(db)
         local_active_count = self._local_active_runtime_count()
         if local_active_count >= int(getattr(service_config, "worker_task_concurrency", 40) or 40):
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="local_worker_task_concurrency_limit",
+                detail=f"local_active_count={local_active_count}",
+            )
             return None
         if active_count >= service_config.max_concurrent_tasks:
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="global_max_concurrent_tasks_limit",
+                detail=f"active_count={active_count}",
+            )
             return None
         task = db.query(task_manager_module.BinarySecurityTask).filter(
             task_manager_module.BinarySecurityTask.id == task_id
         ).first()
         if task is None:
+            self._log_dispatch_claim_blocked(task_id, reason="task_row_missing")
             return None
         if self._task_is_hidden_by_delete_queue(task):
+            self._log_dispatch_claim_blocked(task_id, reason="task_hidden_by_delete_queue", task=task)
             return None
         current_operation = None
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
@@ -965,6 +1002,12 @@ class TaskRuntimeServiceMixin:
                             wait_for_runner=False,
                         )
                     )
+                self._log_dispatch_claim_blocked(
+                    task_id,
+                    reason="owner_guarded_control_operation_waiting_local_control_wakeup",
+                    task=task,
+                    current_operation=current_operation,
+                )
                 return None
             if (not local_handle_present) or local_handle_done or local_handle_cancel_requested:
                 if asyncio.get_event_loop().is_running():
@@ -986,6 +1029,12 @@ class TaskRuntimeServiceMixin:
                     },
                 )
                 db.commit()
+                self._log_dispatch_claim_blocked(
+                    task_id,
+                    reason="owner_guarded_control_operation_restart_local_runtime",
+                    task=task,
+                    current_operation=current_operation,
+                )
                 return None
         if operation_requires_runtime_handle and self._release_unsupported_task_row_owner(
             db,
@@ -995,6 +1044,12 @@ class TaskRuntimeServiceMixin:
         ):
             db.commit()
             self._enqueue_task(task.id)
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="released_unsupported_owner_without_local_runtime",
+                task=task,
+                current_operation=current_operation,
+            )
             return None
         if owner_guarded_control_operation and not self._task_row_owner_is_runtime_supported(
             db,
@@ -1054,25 +1109,61 @@ class TaskRuntimeServiceMixin:
                 ):
                     db.commit()
                     self._enqueue_task(task.id)
+                    self._log_dispatch_claim_blocked(
+                        task_id,
+                        reason="released_unsupported_foreign_owner",
+                        task=task,
+                        current_operation=current_operation,
+                    )
                     return None
         if (
             current_status != "pending"
             and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
             and not owner_guarded_control_operation
         ):
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="non_pending_task_already_owned_by_supported_runtime",
+                task=task,
+                current_operation=current_operation,
+            )
             return None
         if has_active_operation and not operation_allows_runtime_resume:
             if (
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
                 and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
             ):
+                self._log_dispatch_claim_blocked(
+                    task_id,
+                    reason="active_operation_blocks_runtime_resume_but_same_owner_supported",
+                    task=task,
+                    current_operation=current_operation,
+                )
                 return None
             if current_status != "pending" and not has_active_operation:
+                self._log_dispatch_claim_blocked(
+                    task_id,
+                    reason="non_pending_status_without_runtime_resume",
+                    task=task,
+                    current_operation=current_operation,
+                )
                 return None
         current_status = str(getattr(task, "status", "") or "").strip().lower()
         if current_status != "pending" and not operation_allows_runtime_resume and not has_active_operation:
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="task_status_not_pending_without_resumable_operation",
+                task=task,
+                current_operation=current_operation,
+            )
             return None
         if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not operation_allows_runtime_resume and not has_active_operation:
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="task_terminal_status",
+                task=task,
+                current_operation=current_operation,
+            )
             return None
         lease_takeover_decision = self._can_take_over_parent_control_operation(
             db,
@@ -1101,6 +1192,12 @@ class TaskRuntimeServiceMixin:
                 reason="dispatch_claim_takeover_gate",
                 stage_name=task.current_stage,
             )
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="claim_takeover_gate_suppressed_active_lease",
+                task=task,
+                current_operation=current_operation,
+            )
             return None
         active_runtime_lease = self._runtime_lease_for_task(db, task_id)
         if self._runtime_lease_is_active(active_runtime_lease):
@@ -1126,6 +1223,12 @@ class TaskRuntimeServiceMixin:
                 decision=decision,
                 reason="dispatch_claim_blocked_by_active_runtime_lease",
                 stage_name=task.current_stage,
+            )
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="active_runtime_lease_present",
+                task=task,
+                current_operation=current_operation,
             )
             return None
         started_at = task_manager_module._now()
@@ -1156,6 +1259,12 @@ class TaskRuntimeServiceMixin:
         if updated:
             db.commit()
             return task_id
+        self._log_dispatch_claim_blocked(
+            task_id,
+            reason="claim_update_filter_rejected_row",
+            task=task,
+            current_operation=current_operation,
+        )
         return None
 
     def _claim_streaming_stage_items(self: TaskManager, db: Session) -> list[str]:
