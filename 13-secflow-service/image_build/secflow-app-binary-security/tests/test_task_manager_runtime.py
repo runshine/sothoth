@@ -566,6 +566,58 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("task-1", "dispatch_claim_not_acquired_reenqueue")], requeued)
         self.assertIn("dispatch_claim_reenqueued", [row.event_type for row in db.events])
 
+    async def test_requeue_unclaimed_dispatch_task_redirects_delete_hidden_task_to_delete_queue(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-delete-hidden",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            current_operation_id="op-delete",
+        )
+        task.cleanup_snapshot = {
+            "delete_queued": True,
+            "delete_operation_id": "op-delete",
+            "delete_mode": "delete",
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], state_events=[])
+        main_reenqueued: list[tuple[str, str | None]] = []
+        delete_reenqueued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def force_requeue_task(self, task_id, *, context=None):
+                main_reenqueued.append((task_id, context))
+
+            async def force_requeue_delete_task(self, task_id, *, context=None):
+                delete_reenqueued.append((task_id, context))
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await manager._requeue_unclaimed_dispatch_task(db, task.id)
+
+        self.assertEqual([], main_reenqueued)
+        self.assertEqual([("task-delete-hidden", "dispatch_claim_hidden_delete_reenqueue")], delete_reenqueued)
+        event = next(row for row in db.events if row.event_type == "dispatch_claim_reenqueued")
+        self.assertEqual(
+            "dispatch_claim_hidden_by_delete_queue_after_redis_pop",
+            dict(event.payload or {}).get("reason"),
+        )
+        self.assertEqual(
+            "dispatch_claim_hidden_delete_reenqueue",
+            dict(event.payload or {}).get("enqueue_context"),
+        )
+
     def test_dispatch_task_by_id_logs_claim_blocked_reason_for_missing_task_row(self):
         manager = TaskManager()
         db = _ModelAwareDb(tasks=[], events=[])

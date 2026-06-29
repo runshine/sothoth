@@ -45,34 +45,54 @@ class TaskRuntimeServiceMixin:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return
+        reenqueue_context = "dispatch_claim_not_acquired_reenqueue"
+        reenqueue_message = "任务已从 Redis 弹出但当前未能 claim，已重新放回调度队列"
+        reenqueue_reason = "dispatch_claim_not_acquired_after_redis_pop"
         task = (
             db.query(task_manager_module.BinarySecurityTask)
             .filter(task_manager_module.BinarySecurityTask.id == normalized_task_id)
             .first()
         )
         if task is not None:
+            active_delete_operation = self._active_delete_queue_operation(db, task)
+            if active_delete_operation is not None:
+                reenqueue_context = "dispatch_claim_hidden_delete_reenqueue"
+                reenqueue_message = "任务已从 Redis 主队列弹出，但当前处于 delete queue 隐藏态，已改为重新放回 delete queue"
+                reenqueue_reason = "dispatch_claim_hidden_by_delete_queue_after_redis_pop"
             self._record_event(
                 db,
                 task,
                 "dispatch_claim_reenqueued",
-                "任务已从 Redis 弹出但当前未能 claim，已重新放回调度队列",
+                reenqueue_message,
                 level="warning",
                 stage_name=task.current_stage,
                 payload={
                     "task_id": normalized_task_id,
-                    "reason": "dispatch_claim_not_acquired_after_redis_pop",
+                    "reason": reenqueue_reason,
                     "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
                     "runtime_phase": self._task_runtime_phase(task),
                     "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    "enqueue_context": reenqueue_context,
                 },
             )
             db.commit()
+        if task is not None and self._active_delete_queue_operation(db, task) is not None:
+            await task_manager_module.get_task_queue().force_requeue_delete_task(
+                normalized_task_id,
+                context=reenqueue_context,
+            )
+            task_manager_module.logger.warning(
+                "binary-security dispatch popped task from main queue but task is hidden by delete queue; task requeued to delete queue: task_id=%s",
+                normalized_task_id,
+            )
+            return
         await task_manager_module.get_task_queue().force_requeue_task(
             normalized_task_id,
-            context="dispatch_claim_not_acquired_reenqueue",
+            context=reenqueue_context,
         )
         task_manager_module.logger.warning(
-            "binary-security dispatch popped task but claim was not acquired; task requeued: task_id=%s",
+            "binary-security dispatch popped task but claim was not acquired; task requeued to main queue: task_id=%s",
             normalized_task_id,
         )
 
