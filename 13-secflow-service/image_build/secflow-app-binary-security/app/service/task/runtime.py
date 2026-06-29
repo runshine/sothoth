@@ -744,6 +744,8 @@ class TaskRuntimeServiceMixin:
             )
         queue = task_manager_module.get_task_queue()
         pending_positions = await queue.queue_positions(self.cfg.queue.task_queue_key, context="queue_reconcile_snapshot")
+        delete_queue_key = str(getattr(self.cfg.queue, "delete_queue_key", "") or "binary_security_delete_queue").strip()
+        delete_positions = await queue.queue_positions(delete_queue_key, context="delete_queue_reconcile_snapshot")
         seed_batch_size = max(1, int(getattr(self.cfg.queue, "seed_batch_size", 20) or 20))
         task_rows = (
             db.query(task_manager_module.BinarySecurityTask)
@@ -767,9 +769,87 @@ class TaskRuntimeServiceMixin:
                     {"pending_positions": pending_positions},
                     db=db,
                 )
+                active_delete_operation = self._active_delete_queue_operation(db, task)
                 if queue_state == "dispatching" and recoverable_reason == "pending_task_owned_by_active_runtime":
                     continue
                 if queue_state == "db_pending_not_enqueued":
+                    if active_delete_operation is not None:
+                        delete_position = delete_positions.get(normalized_task_id)
+                        task_manager_module.logger.warning(
+                            "binary-security pending task waiting for delete queue detected: task_id=%s task_status=%s "
+                            "delete_queue_position=%s dispatcher_instance_id=%s lease_expires_at=%s current_operation_id=%s",
+                            normalized_task_id,
+                            current_status,
+                            int(delete_position) if delete_position is not None else None,
+                            str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                            task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
+                            str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                        )
+                        self._record_event(
+                            db,
+                            task,
+                            "pending_task_waiting_for_delete_queue_detected",
+                            "检测到 pending 任务正在等待 delete queue 消费，已优先补偿 delete queue",
+                            level="warning",
+                            payload={
+                                "task_status": current_status,
+                                "queue_state": queue_state,
+                                "recoverable_reason": recoverable_reason,
+                                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                                "lease_expires_at": task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
+                                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                                "delete_operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                                "delete_queue_position": int(delete_position) if delete_position is not None else None,
+                                "enqueue_context": "delete_queue_reconcile",
+                            },
+                        )
+                        if delete_position is None:
+                            try:
+                                await queue.force_requeue_delete_task(
+                                    normalized_task_id,
+                                    context="delete_queue_reconcile_pending_delete_operation",
+                                )
+                                delete_positions[normalized_task_id] = len(delete_positions) + 1
+                                self._record_event(
+                                    db,
+                                    task,
+                                    "pending_task_reenqueued_by_delete_reconcile",
+                                    "pending 任务已由 delete queue reconcile 同步重新放回 Redis delete queue",
+                                    payload={
+                                        "task_status": current_status,
+                                        "queue_state": queue_state,
+                                        "recoverable_reason": recoverable_reason,
+                                        "enqueue_context": "delete_queue_reconcile",
+                                        "delete_operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                                    },
+                                )
+                            except Exception as exc:
+                                task_manager_module.logger.exception(
+                                    "binary-security pending task delete queue reenqueue failed: task_id=%s task_status=%s "
+                                    "queue_state=%s error_type=%s error=%s",
+                                    normalized_task_id,
+                                    current_status,
+                                    queue_state,
+                                    exc.__class__.__name__,
+                                    exc,
+                                )
+                                self._record_event(
+                                    db,
+                                    task,
+                                    "pending_task_delete_reenqueue_failed",
+                                    "pending 任务重新放回 Redis delete queue 失败，等待下一轮自愈重试",
+                                    level="warning",
+                                    payload={
+                                        "task_status": current_status,
+                                        "queue_state": queue_state,
+                                        "recoverable_reason": recoverable_reason,
+                                        "error_type": exc.__class__.__name__,
+                                        "error": str(exc),
+                                        "enqueue_context": "delete_queue_reconcile",
+                                        "delete_operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                                    },
+                                )
+                        continue
                     released = False
                     if (
                         str(getattr(task, "dispatcher_instance_id", "") or "").strip()
