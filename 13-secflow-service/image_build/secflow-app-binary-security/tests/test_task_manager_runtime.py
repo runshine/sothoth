@@ -512,6 +512,60 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(["called", "called"], reconcile_calls)
 
+    async def test_dispatch_loop_requeues_popped_task_when_claim_not_acquired(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        requeued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            def __init__(self):
+                self._popped = False
+
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
+                if not self._popped:
+                    self._popped = True
+                    return "task-1"
+                manager._running = False
+                return None
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                requeued.append((task_id, context))
+
+        async def _reconcile(_db):
+            return None
+
+        async def _observe(_db):
+            return None
+
+        manager._dispatch_task_by_id = lambda _db, _task_id: None
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+        ):
+            await manager._dispatch_loop()
+
+        self.assertEqual([("task-1", "dispatch_claim_not_acquired_reenqueue")], requeued)
+        self.assertIn("dispatch_claim_reenqueued", [row.event_type for row in db.events])
+
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

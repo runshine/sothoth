@@ -14,6 +14,43 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    async def _requeue_unclaimed_dispatch_task(self: TaskManager, db: Session, task_id: str) -> None:
+        from app.service import task_manager as task_manager_module
+
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return
+        task = (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(task_manager_module.BinarySecurityTask.id == normalized_task_id)
+            .first()
+        )
+        if task is not None:
+            self._record_event(
+                db,
+                task,
+                "dispatch_claim_reenqueued",
+                "任务已从 Redis 弹出但当前未能 claim，已重新放回调度队列",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "task_id": normalized_task_id,
+                    "reason": "dispatch_claim_not_acquired_after_redis_pop",
+                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                },
+            )
+            db.commit()
+        await task_manager_module.get_task_queue().force_requeue_task(
+            normalized_task_id,
+            context="dispatch_claim_not_acquired_reenqueue",
+        )
+        task_manager_module.logger.warning(
+            "binary-security dispatch popped task but claim was not acquired; task requeued: task_id=%s",
+            normalized_task_id,
+        )
+
     async def _delete_dispatch_loop(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module
 
@@ -625,6 +662,8 @@ class TaskRuntimeServiceMixin:
                                     handle.done() if handle is not None else None,
                                     getattr(handle, "cancel_requested", None) if handle is not None else None,
                                 )
+                        else:
+                            await self._requeue_unclaimed_dispatch_task(db, task_id)
                     await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
                     self._mark_loop_heartbeat("task_dispatch")
