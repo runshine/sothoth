@@ -964,8 +964,29 @@ class TaskRuntimeServiceMixin:
             self._log_dispatch_claim_blocked(task_id, reason="task_row_missing")
             return None
         if self._task_is_hidden_by_delete_queue(task):
-            self._log_dispatch_claim_blocked(task_id, reason="task_hidden_by_delete_queue", task=task)
-            return None
+            active_delete_operation = self._active_delete_queue_operation(db, task)
+            if active_delete_operation is not None:
+                self._log_dispatch_claim_blocked(
+                    task_id,
+                    reason="task_hidden_by_delete_queue",
+                    task=task,
+                    current_operation=active_delete_operation,
+                )
+                return None
+            cleared = self._clear_stale_delete_queue_hidden_state(
+                db,
+                task,
+                reason="delete_queue_snapshot_without_active_delete_operation",
+            )
+            if cleared:
+                task_manager_module.logger.warning(
+                    "binary-security cleared stale delete queue hidden state before dispatch claim: "
+                    "task_id=%s status=%s dispatcher_instance_id=%s current_operation_id=%s",
+                    task_id,
+                    str(getattr(task, "status", "") or "").strip() or None,
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                )
         current_operation = None
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
         if current_operation_id:

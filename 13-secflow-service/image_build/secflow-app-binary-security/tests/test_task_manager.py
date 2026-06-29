@@ -39576,6 +39576,91 @@ def _test_dispatch_task_by_id_suppresses_foreign_owner_delete_operation_without_
     self.assertIn("delete_takeover_suppressed_active_lease", event_types)
 
 
+def _test_dispatch_task_by_id_clears_stale_delete_queue_hidden_state_for_pending_task(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-stale-delete-hidden",
+        project_id="p1",
+        name="source",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id=None,
+        current_operation_id="op-retry",
+        lease_expires_at=None,
+    )
+    task.cleanup_snapshot = {
+        "delete_queued": True,
+        "delete_in_progress": True,
+        "delete_operation_id": "op-delete-stale",
+        "delete_mode": "delete",
+    }
+    operation = BinarySecurityTaskOperation(
+        id="op-retry",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type="retry",
+        status="queued",
+        current_step=None,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertEqual(task.id, claimed)
+    self.assertFalse(task.cleanup_snapshot.get("delete_queued"))
+    self.assertFalse(task.cleanup_snapshot.get("delete_in_progress"))
+    self.assertEqual("local-worker", task.dispatcher_instance_id)
+    self.assertTrue(any(event.event_type == "stale_delete_queue_hidden_state_cleared" for event in db.events))
+
+
+def _test_dispatch_task_by_id_keeps_hidden_when_active_delete_queue_operation_exists(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-active-delete-hidden",
+        project_id="p1",
+        name="source",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id=None,
+        current_operation_id="op-delete-active",
+        lease_expires_at=None,
+    )
+    task.cleanup_snapshot = {
+        "delete_queued": True,
+        "delete_in_progress": False,
+        "delete_operation_id": "op-delete-active",
+        "delete_mode": "delete",
+    }
+    operation = BinarySecurityTaskOperation(
+        id="op-delete-active",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_DELETE,
+        status="queued",
+        current_step=None,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertIsNone(claimed)
+    self.assertTrue(task.cleanup_snapshot.get("delete_queued"))
+    self.assertEqual("op-delete-active", task.current_operation_id)
+    self.assertFalse(any(event.event_type == "stale_delete_queue_hidden_state_cleared" for event in db.events))
+
+
 def _test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -46501,6 +46586,8 @@ TaskManagerTests.test_dispatch_task_by_id_claims_queued_cancel_operation_without
 TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _test_refresh_task_status_after_sync_clears_fake_local_owner
 TaskManagerTests.test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry = _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry
 TaskManagerTests.test_dispatch_task_by_id_suppresses_foreign_owner_delete_operation_without_expired_runtime_lease = _test_dispatch_task_by_id_suppresses_foreign_owner_delete_operation_without_expired_runtime_lease
+TaskManagerTests.test_dispatch_task_by_id_clears_stale_delete_queue_hidden_state_for_pending_task = _test_dispatch_task_by_id_clears_stale_delete_queue_hidden_state_for_pending_task
+TaskManagerTests.test_dispatch_task_by_id_keeps_hidden_when_active_delete_queue_operation_exists = _test_dispatch_task_by_id_keeps_hidden_when_active_delete_queue_operation_exists
 TaskManagerTests.test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease = _test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease
 TaskManagerTests.test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches = _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches
 TaskManagerTests.test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel = _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel

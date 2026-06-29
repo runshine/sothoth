@@ -68,6 +68,75 @@ class TaskControlServiceMixin:
         delete_state = self._task_delete_queue_state(task)
         return bool(delete_state["delete_queued"] or delete_state["delete_in_progress"])
 
+    def _active_delete_queue_operation(self: TaskManager, db: Session, task):
+        from app.service import task_manager as task_manager_module
+
+        task_id = str(getattr(task, "id", "") or "").strip()
+        if not task_id:
+            return None
+        delete_state = self._task_delete_queue_state(task)
+        delete_operation_id = str(delete_state.get("delete_operation_id") or "").strip() or None
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
+        candidate_ids: list[str] = []
+        if delete_operation_id:
+            candidate_ids.append(delete_operation_id)
+        if current_operation_id and current_operation_id not in candidate_ids:
+            candidate_ids.append(current_operation_id)
+        for operation_id in candidate_ids:
+            operation = (
+                db.query(task_manager_module.BinarySecurityTaskOperation)
+                .filter(task_manager_module.BinarySecurityTaskOperation.id == operation_id)
+                .first()
+            )
+            if operation is None:
+                continue
+            if str(getattr(operation, "task_id", "") or "").strip() != task_id:
+                continue
+            if str(getattr(operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_DELETE:
+                continue
+            status = str(getattr(operation, "status", "") or "").strip().lower()
+            if status in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+                continue
+            return operation
+        return None
+
+    def _clear_stale_delete_queue_hidden_state(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        reason: str,
+    ) -> bool:
+        snapshot = self._task_delete_snapshot_state(task)
+        if not snapshot:
+            return False
+        changed = False
+        if snapshot.get("delete_queued"):
+            snapshot["delete_queued"] = False
+            changed = True
+        if snapshot.get("delete_in_progress"):
+            snapshot["delete_in_progress"] = False
+            changed = True
+        if not changed:
+            return False
+        snapshot["delete_last_error"] = None
+        task.cleanup_snapshot = snapshot
+        self._record_event(
+            db,
+            task,
+            "stale_delete_queue_hidden_state_cleared",
+            "检测到陈旧删除隐藏态，已恢复任务可调度状态",
+            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+            level="warning",
+            payload={
+                "reason": str(reason or "").strip() or "stale_delete_queue_hidden_state",
+                "delete_operation_id": str(snapshot.get("delete_operation_id") or "").strip() or None,
+                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                "delete_mode": str(snapshot.get("delete_mode") or "").strip() or None,
+            },
+        )
+        return True
+
     def _mark_task_delete_queued(
         self: TaskManager,
         task,
