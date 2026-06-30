@@ -257,8 +257,8 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     selected_risk_levels: list[str] = Field(default_factory=list)
     module_selection_mode: str = "auto"
     entry_selection_mode: str = "auto"
-    entry_auto_selection_strategy: str = "all"
-    entry_auto_selection_top_n: int = 0
+    entry_auto_selection_strategy: str = "top_n_per_module_by_confidence"
+    entry_auto_selection_top_n: int = 20
     candidate_entry_count: int = 0
     selected_entry_count: int = 0
     entry_count: int = 0
@@ -953,8 +953,8 @@ class BinarySecurityEntrySelectionResponse(BinarySecurityBaseModel):
     task_id: str
     status: str
     selection_mode: str = "auto"
-    auto_selection_strategy: str = "all"
-    auto_selection_top_n: int = 0
+    auto_selection_strategy: str = "top_n_per_module_by_confidence"
+    auto_selection_top_n: int = 20
     requires_confirmation: bool = False
     candidate_entries: list[dict[str, Any]] = Field(default_factory=list)
     selected_entry_keys: list[str] = Field(default_factory=list)

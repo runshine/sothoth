@@ -486,6 +486,7 @@ ENTRY_SELECTION_MODE_AUTO = "auto"
 ENTRY_SELECTION_MODE_MANUAL_CONFIRM = "manual_confirm"
 ENTRY_AUTO_SELECTION_STRATEGY_ALL = "all"
 ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE = "top_n_per_module_by_confidence"
+DEFAULT_ENTRY_AUTO_SELECTION_TOP_N = 20
 ALLOWED_MODULE_RISK_LEVELS = ("高", "中", "低")
 STAGE_SUMMARY_RESULT_KEYS = {
     "firmware_unpack": ["firmware_unpack_results"],
@@ -5002,22 +5003,22 @@ class TaskManager(
     def _entry_auto_selection_strategy(self, task: BinarySecurityTask) -> str:
         if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
             return ENTRY_AUTO_SELECTION_STRATEGY_ALL
-        strategy = str((task.policy or {}).get("entry_auto_selection_strategy") or ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
+        strategy = str((task.policy or {}).get("entry_auto_selection_strategy") or ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE).strip()
         if strategy not in {
             ENTRY_AUTO_SELECTION_STRATEGY_ALL,
             ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE,
         }:
-            return ENTRY_AUTO_SELECTION_STRATEGY_ALL
+            return ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE
         return strategy
 
     def _entry_auto_selection_top_n(self, task: BinarySecurityTask) -> int:
         if self._entry_auto_selection_strategy(task) != ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
             return 0
         try:
-            value = int((task.policy or {}).get("entry_auto_selection_top_n") or 0)
+            value = int((task.policy or {}).get("entry_auto_selection_top_n") or DEFAULT_ENTRY_AUTO_SELECTION_TOP_N)
         except (TypeError, ValueError):
-            return 0
-        return max(0, value)
+            return DEFAULT_ENTRY_AUTO_SELECTION_TOP_N
+        return max(1, value)
 
     def _module_risk_levels(self, task: BinarySecurityTask) -> list[str]:
         return _normalize_module_risk_levels((task.policy or {}).get("module_risk_levels"))
