@@ -3763,7 +3763,10 @@ class TaskOperationServiceMixin:
         from app.service import task_manager as task_manager_module
 
         resume_step = self._operation_resume_step(operation)
-        if operation.operation_type == task_manager_module.TASK_ACTION_CANCEL:
+        if operation.operation_type in {
+            task_manager_module.TASK_ACTION_CANCEL,
+            task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+        }:
             return await self._run_cancel_operation_steps(db, task, operation, resume_step)
         if operation.operation_type in {
             task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
@@ -4466,11 +4469,12 @@ class TaskOperationServiceMixin:
             return result
 
         async def _mark_task_cancelling() -> dict[str, Any]:
+            is_finish_success = operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
             self._set_task_status(
                 db,
                 task,
                 task_manager_module.TASK_STATUS_CANCELLING,
-                reason="取消操作已开始，任务进入取消中",
+                reason="成功结束操作已开始，任务进入收口中" if is_finish_success else "取消操作已开始，任务进入取消中",
                 source="task_operation",
                 stage_name=operation.target_stage,
             )
@@ -4481,8 +4485,8 @@ class TaskOperationServiceMixin:
                 db,
                 task,
                 operation,
-                "task_cancelling",
-                "取消操作已开始，任务进入取消中",
+                "task_finish_success_started" if is_finish_success else "task_cancelling",
+                "成功结束操作已开始，任务进入收口中" if is_finish_success else "取消操作已开始，任务进入取消中",
                 stage_name=operation.target_stage,
             )
             return {"task_status": task.status}
@@ -4495,8 +4499,14 @@ class TaskOperationServiceMixin:
                     db,
                     task,
                     operation,
-                    "cancel_target_collected",
-                    f"取消目标已纳入收敛检查: {self._cancel_target_display(target)}",
+                    "finish_success_target_collected"
+                    if operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
+                    else "cancel_target_collected",
+                    (
+                        f"成功结束目标已纳入收敛检查: {self._cancel_target_display(target)}"
+                        if operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
+                        else f"取消目标已纳入收敛检查: {self._cancel_target_display(target)}"
+                    ),
                     stage_name=str(target.get("stage_name") or operation.target_stage or "").strip() or None,
                     payload=dict(target),
                 )
@@ -4742,18 +4752,20 @@ class TaskOperationServiceMixin:
                 for target in list(self._operation_result_data(operation).get("ignored_blocking_targets") or [])
                 if isinstance(target, dict)
             ]
+            is_finish_success = operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
             finalized = self._finalize_control_operation_terminal(
                 db,
                 task,
                 operation,
                 step_name=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
-                step_message="取消操作已收口为已取消",
-                task_status="cancelled",
-                task_reason="取消操作已确认完成并原子收口",
-                lease_reason="cancel_operation_confirmed_cleanup",
-                task_event_type="task_cancel_succeeded",
-                task_event_message="任务取消已完成",
+                step_message="成功结束操作已收口为成功" if is_finish_success else "取消操作已收口为已取消",
+                task_status="success" if is_finish_success else "cancelled",
+                task_reason="成功结束操作已确认完成并原子收口" if is_finish_success else "取消操作已确认完成并原子收口",
+                lease_reason="finish_success_operation_confirmed_cleanup" if is_finish_success else "cancel_operation_confirmed_cleanup",
+                task_event_type="task_finish_success_applied" if is_finish_success else "task_cancel_succeeded",
+                task_event_message="开发者成功结束已完成，主任务已收口为成功" if is_finish_success else "任务取消已完成",
                 task_event_payload={
+                    "developer_mode": is_finish_success,
                     "cancel_state": cancel_state,
                     "force_cancelled_after_verify_retries": bool(
                         self._operation_result_data(operation).get("force_cancelled_after_verify_retries")
@@ -4768,7 +4780,7 @@ class TaskOperationServiceMixin:
             await self._write_task_metadata_async(
                 task,
                 task_manager_module.Path(task.workspace_root) / "input" / "task-metadata.json",
-                status="cancelled",
+                status="success" if is_finish_success else "cancelled",
             )
             return finalized
 
@@ -4805,31 +4817,41 @@ class TaskOperationServiceMixin:
         try:
             await _run_step(
                 task_manager_module.TASK_OPERATION_STEP_MARK_TASK_CANCELLING,
-                message="取消操作已进入任务状态切换",
+                message="成功结束操作已进入任务状态切换"
+                if operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
+                else "取消操作已进入任务状态切换",
                 next_step=task_manager_module.TASK_OPERATION_STEP_COLLECT_CANCEL_TARGETS,
                 fn=_mark_task_cancelling,
             )
             await _run_step(
                 task_manager_module.TASK_OPERATION_STEP_COLLECT_CANCEL_TARGETS,
-                message="取消操作已收集需要收敛的目标",
+                message="成功结束操作已收集需要收敛的目标"
+                if operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
+                else "取消操作已收集需要收敛的目标",
                 next_step=task_manager_module.TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
                 fn=_collect_targets,
             )
             await _run_step(
                 task_manager_module.TASK_OPERATION_STEP_CANCEL_LOCAL_EXECUTION,
-                message="取消操作已停止本地执行链",
+                message="成功结束操作已停止本地执行链"
+                if operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
+                else "取消操作已停止本地执行链",
                 next_step=task_manager_module.TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
                 fn=_cancel_local,
             )
             await _run_step(
                 task_manager_module.TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
-                message="取消操作已向下游发出取消请求",
+                message="成功结束操作已向下游发出取消请求"
+                if operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
+                else "取消操作已向下游发出取消请求",
                 next_step=task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
                 fn=_cancel_downstream_targets,
             )
             verify_outcome = await _run_step(
                 task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
-                message="取消操作已完成下游收敛核验",
+                message="成功结束操作已完成下游收敛核验"
+                if operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS
+                else "取消操作已完成下游收敛核验",
                 next_step=task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED,
                 fn=_verify_quiesced,
             )

@@ -622,6 +622,9 @@ class TaskControlServiceMixin:
             "stage_options": {},
             "module_selection_mode": "auto",
             "module_risk_levels": ["高"],
+            "entry_selection_mode": "auto",
+            "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+            "entry_auto_selection_top_n": 20,
         }
         defaults["partial_success_stage_advancement"] = {
             stage_name: True for stage_name in stage_names if stage_name in {"binary_to_source", "entry_analysis", "dataflow_vuln_scan"}
@@ -1347,6 +1350,95 @@ class TaskControlServiceMixin:
             action="cancel",
             status="accepted",
             message="任务取消已受理，后台正在停止执行并清理下游任务",
+            task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
+        )
+
+    async def finish_task_as_success(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        requested_by: str | None = None,
+    ) -> BinarySecurityActionResponse:
+        from app.service import task_manager as task_manager_module
+
+        task = self._task_or_404(db, project_id, task_id)
+        self._reject_if_delete_queued(task, action="finish_success")
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None and str(active_operation.operation_type or "").strip() == task_manager_module.TASK_ACTION_FINISH_SUCCESS:
+            task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_FINISH_SUCCESS, "already_queued")
+            return BinarySecurityActionResponse(
+                task_id=task_id,
+                operation_id=active_operation.id,
+                accepted=True,
+                action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                status="accepted",
+                message="成功结束已受理，后台正在停止下游并收口主任务",
+                task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
+            )
+        if str(task.status or "").strip().lower() in {"success", "partial_success"}:
+            task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_FINISH_SUCCESS, "already_success")
+            return BinarySecurityActionResponse(
+                task_id=task_id,
+                accepted=True,
+                action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                status="accepted",
+                message="任务已经处于成功终态",
+                task_status_after_accept=str(task.status or "").strip() or "success",
+            )
+        normalized_requested_by = str(requested_by or getattr(task, "created_by", None) or "").strip() or None
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            target_stage=task.current_stage,
+            requested_by=normalized_requested_by,
+            request_payload={"current_stage": task.current_stage, "developer_mode": True},
+            accepted_event_type="task_finish_success_accepted",
+            accepted_message="成功结束已受理，后台正在停止下游并收口主任务",
+        )
+        self._set_task_status(
+            db,
+            task,
+            task_manager_module.TASK_STATUS_CANCELLING,
+            reason="收到开发者成功结束请求",
+            source="task_control",
+            stage_name=task.current_stage,
+        )
+        task.finished_at = None
+        task.last_error = None
+        task.current_operation_id = operation.id
+        db.commit()
+        wakeup_requested = await self._request_local_worker_control_wakeup(
+            task.id,
+            task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            operation_id=operation.id,
+            wait_for_runner=False,
+        )
+        if wakeup_requested:
+            self._record_event(
+                db,
+                task,
+                "local_owner_control_wakeup_requested",
+                "已通知当前 owner 原地处理成功结束控制操作",
+                stage_name=task.current_stage,
+                payload={
+                    "operation_id": operation.id,
+                    "operation_type": task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                },
+            )
+            db.commit()
+        self._enqueue_task(task.id)
+        task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_FINISH_SUCCESS, "accepted")
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id=operation.id,
+            accepted=True,
+            action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            status="accepted",
+            message="成功结束已受理，后台正在停止下游并将主任务标记为成功",
             task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
         )
 

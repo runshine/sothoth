@@ -360,95 +360,23 @@ class TaskQueryServiceMixin:
             stage_durations["page_items"] = time.perf_counter() - stage_started
 
             stage_started = time.perf_counter()
-            queue_info = self._load_task_list_cached_value(
-                cache_group="queue_info",
-                project_id=normalized_project_id or "__all__",
-                task_type=normalized_task_type,
-                pipeline_profile=normalized_pipeline_profile,
-                ttl_seconds=3.0,
-                loader=lambda: self._build_queue_info(db, project_id=normalized_project_id),
-                fallback={"running_count": 0, "queued_count": 0, "pending_positions": {}, "last_reconcile_at": None},
-            )
-            observe_task_list_query_stage(
-                stage="queue_info",
-                task_type=metrics_task_type,
-                duration_seconds=time.perf_counter() - stage_started,
-            )
-            stage_durations["queue_info"] = time.perf_counter() - stage_started
-
-            stage_started = time.perf_counter()
-            service_config = self._load_service_config(db)
-            observe_task_list_query_stage(
-                stage="service_config",
-                task_type=metrics_task_type,
-                duration_seconds=time.perf_counter() - stage_started,
-            )
-            stage_durations["service_config"] = time.perf_counter() - stage_started
-
-            stage_started = time.perf_counter()
-            project_stats = (
-                self._load_task_list_cached_value(
-                    cache_group="project_stats",
-                    project_id=normalized_project_id,
-                    task_type=normalized_task_type,
-                    pipeline_profile=normalized_pipeline_profile,
-                    ttl_seconds=5.0,
-                    loader=lambda: self._build_project_stats_sql(
-                        db,
-                        project_id=normalized_project_id,
-                        task_type=normalized_task_type,
-                        pipeline_profile=normalized_pipeline_profile,
-                    ),
-                    fallback=BinarySecurityProjectStats(total=0),
-                )
-                if normalized_project_id
-                else BinarySecurityProjectStats(total=0)
-            )
-            observe_task_list_query_stage(
-                stage="project_stats",
-                task_type=metrics_task_type,
-                duration_seconds=time.perf_counter() - stage_started,
-            )
-            stage_durations["project_stats"] = time.perf_counter() - stage_started
-
-            stage_started = time.perf_counter()
-            project_stage_aggregates = (
-                self._load_task_list_cached_value(
-                    cache_group="project_stage_aggregates",
-                    project_id=normalized_project_id,
-                    task_type=normalized_task_type,
-                    pipeline_profile=normalized_pipeline_profile,
-                    ttl_seconds=5.0,
-                    loader=lambda: self._build_project_stage_aggregates_sql(
-                        db,
-                        project_id=normalized_project_id,
-                        task_type=normalized_task_type,
-                        pipeline_profile=normalized_pipeline_profile,
-                    ),
-                    fallback=[],
-                )
-                if normalized_project_id
-                else []
-            )
-            observe_task_list_query_stage(
-                stage="project_stage_aggregates",
-                task_type=metrics_task_type,
-                duration_seconds=time.perf_counter() - stage_started,
-            )
-            stage_durations["project_stage_aggregates"] = time.perf_counter() - stage_started
-
-            stage_started = time.perf_counter()
             stage_runs_by_task, stage_items_by_task = self._task_list_stage_state_by_task(db, tasks)
-            active_operations_by_task, cancel_operations_by_task = self._task_list_operation_maps(db, tasks)
+            active_operations_by_task, _cancel_operations_by_task = self._task_list_operation_maps(db, tasks)
+            observe_task_list_query_stage(
+                stage="prefetch_page_runtime",
+                task_type=metrics_task_type,
+                duration_seconds=time.perf_counter() - stage_started,
+            )
+            stage_durations["prefetch_page_runtime"] = time.perf_counter() - stage_started
+
+            stage_started = time.perf_counter()
             items = [
                 self._task_list_response(
                     db,
                     task,
-                    queue_info=queue_info,
                     stage_runs=stage_runs_by_task.get(str(task.id), []),
                     stage_items=stage_items_by_task.get(str(task.id), []),
                     active_operation=active_operations_by_task.get(str(task.id)),
-                    cancel_operation=cancel_operations_by_task.get(str(task.id)),
                 )
                 for task in tasks
             ]
@@ -474,12 +402,6 @@ class TaskQueryServiceMixin:
                 page_size=page_size,
                 total_pages=max(1, (total + page_size - 1) // page_size),
                 scope="current" if normalized_project_id else "all",
-                running_count=queue_info["running_count"],
-                queued_count=queue_info["queued_count"],
-                max_concurrent_tasks=service_config.max_concurrent_tasks,
-                project_stats=project_stats,
-                project_stage_aggregates=project_stage_aggregates,
-                queue_runtime={"last_reconcile_at": queue_info.get("last_reconcile_at")},
                 items=items,
             )
         except Exception:

@@ -576,6 +576,22 @@ async def cancel_task(
     return await get_task_manager().cancel_task(db, project_id=project_id, task_id=task_id)
 
 
+@router.post("/projects/{project_id}/tasks/{task_id}/finish-success", response_model=BinarySecurityActionResponse)
+async def finish_success_task(
+    project_id: str,
+    task_id: str,
+    user: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    requested_by = user.username or user.user_id or "unknown"
+    return await get_task_manager().finish_task_as_success(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        requested_by=requested_by,
+    )
+
+
 @router.delete("/projects/{project_id}/tasks/{task_id}", response_model=BinarySecurityActionResponse)
 async def delete_task(
     project_id: str,

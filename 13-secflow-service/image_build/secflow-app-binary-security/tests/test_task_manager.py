@@ -29615,6 +29615,9 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         payload = BinarySecurityTaskPolicyConfigPayload()
         self.assertEqual("mixed_streaming", payload.pipeline_mode)
         self.assertEqual(5, payload.max_stage_parallelism)
+        self.assertEqual("auto", payload.entry_selection_mode)
+        self.assertEqual("top_n_per_module_by_confidence", payload.entry_auto_selection_strategy)
+        self.assertEqual(20, payload.entry_auto_selection_top_n)
         self.assertEqual(
             {
                 "binary_to_source": True,
@@ -29774,6 +29777,9 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         row.config = {
             "pipeline_mode": "barrier",
             "max_stage_parallelism": 7,
+            "entry_selection_mode": "auto",
+            "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+            "entry_auto_selection_top_n": 15,
             "stage_parallelism": {
                 "system_analysis": 7,
                 "entry_analysis": 6,
@@ -29793,6 +29799,15 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual(7, policy["max_stage_parallelism"])
         self.assertEqual(6, policy["stage_parallelism"]["entry_analysis"])
         self.assertFalse(policy["continue_on_item_failure"])
+        self.assertEqual("top_n_per_module_by_confidence", policy["entry_auto_selection_strategy"])
+        self.assertEqual(15, policy["entry_auto_selection_top_n"])
+
+    def test_merge_policy_defaults_source_entry_auto_selection(self):
+        policy = self.manager._project_config_defaults(task_type=TASK_TYPE_SOURCE)
+
+        self.assertEqual("auto", policy["entry_selection_mode"])
+        self.assertEqual("top_n_per_module_by_confidence", policy["entry_auto_selection_strategy"])
+        self.assertEqual(20, policy["entry_auto_selection_top_n"])
 
     def test_claim_pending_tasks_reclaims_expired_lease(self):
         task = BinarySecurityTask(
@@ -49980,6 +49995,7 @@ def _test_control_operation_runtime_lease_coverage_matches_supported_operation_s
         task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
         task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
         task_manager_module.TASK_ACTION_CANCEL,
+        task_manager_module.TASK_ACTION_FINISH_SUCCESS,
         task_manager_module.TASK_ACTION_DELETE,
         "force_reset_to_pending",
     }

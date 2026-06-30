@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, load_only
 
 from app.exception import NotFoundError, ValidationError
 from app.model import BinarySecurityTaskStateLease, normalize_stage_name
+from app.schemas import BinarySecurityTaskListItemResponse
 
 from . import shared as task_shared
 
@@ -1938,7 +1939,10 @@ class TaskReadModelServiceMixin:
         delete_state = self._task_delete_queue_state(task)
         if (
             active_operation is not None
-            and str(active_operation.operation_type or "").strip() != task_manager_module.TASK_ACTION_CANCEL
+            and str(active_operation.operation_type or "").strip() not in {
+                task_manager_module.TASK_ACTION_CANCEL,
+                task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            }
         ):
             cancel_operation = None
         else:
@@ -3329,19 +3333,12 @@ class TaskReadModelServiceMixin:
         self: TaskManager,
         db: Session,
         task,
-        *,
-        queue_info: dict[str, Any] | None = None,
         stage_runs=None,
         stage_items=None,
         active_operation=None,
-        cancel_operation=None,
     ):
         from app.service import task_manager as task_manager_module
 
-        metrics = task.metrics or {}
-        queue_info = queue_info or {"pending_positions": {}}
-        queue_position = queue_info.get("pending_positions", {}).get(task.id)
-        queue_state, recoverable_reason = self._task_queue_state(task, queue_info, db=db)
         stage_sequence = self._stage_sequence_for_task(task)
         stage_summaries = self._build_task_list_stage_summaries(
             db,
@@ -3356,147 +3353,67 @@ class TaskReadModelServiceMixin:
                 abnormal_reason = task_manager_module.BinarySecurityAbnormalReason(**task.latest_abnormal_reason)
             except Exception:
                 abnormal_reason = None
-        tail_summary = self._tail_stage_work_summary(db, task)
-        lease_owner, lease_expires_at, lease_source, reconcile_pod_uid_unused, reconcile_boot_id_unused, reconcile_generation_unused = self._task_runtime_lease_view(db, task)
-        del reconcile_pod_uid_unused, reconcile_boot_id_unused, reconcile_generation_unused
-        runtime_phase = self._task_runtime_phase(task)
-        task_control_mode = self._task_control_mode(task)
-        base_policy = self._task_base_policy(task)
-        runtime_override = self._task_runtime_override(task)
-        effective_runtime_policy = self._effective_runtime_policy(task)
-        (
-            last_successful_sync_at,
-            last_sync_attempt_at,
-            last_sync_error_at,
-            last_sync_error_type,
-            last_sync_error_message,
-            active_sync_error_item_count,
-            never_synced_item_count,
-            stale_synced_item_count,
-        ) = self._task_sync_status_view(stage_items)
+        if abnormal_reason is None and stage_runs is not None and stage_items is not None:
+            abnormal_reason = self._task_abnormal_reason(task, stage_summaries, list(stage_items or []), [])
         manual_operation_state = self._build_task_list_manual_operation_state(
             db,
             task,
             stage_summaries=stage_summaries,
             active_operation=active_operation,
         )
-        kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
-        failure_snapshot = self._stage_failure_snapshot(
-            task,
-            next(
-                (
-                    run
-                    for run in stage_runs or []
-                    if str(run.stage_name or "").strip() == str(task.current_stage or "").strip()
-                ),
-                None,
-            ),
-        )
-        terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
-        delete_state = self._task_delete_queue_state(task)
-        return task_manager_module.BinarySecurityTaskResponse(
+        last_successful_sync_at = None
+        last_sync_attempt_at = None
+        last_sync_error_at = None
+        last_sync_error_type = None
+        last_sync_error_message = None
+        task_lease_owner_instance_id = None
+        task_lease_expires_at = None
+        task_lease_source = None
+        if stage_items is not None:
+            (
+                last_successful_sync_at,
+                last_sync_attempt_at,
+                last_sync_error_at,
+                last_sync_error_type,
+                last_sync_error_message,
+                _active_sync_error_item_count,
+                _never_synced_item_count,
+                _stale_synced_item_count,
+            ) = self._task_sync_status_view(list(stage_items or []))
+        lease_owner, lease_expires_at, lease_source, *_ = self._task_runtime_lease_view(db, task)
+        task_lease_owner_instance_id = lease_owner
+        task_lease_expires_at = lease_expires_at
+        task_lease_source = lease_source
+        return BinarySecurityTaskListItemResponse(
             id=task.id,
             project_id=task.project_id,
+            project_name=str(getattr(task, "project_id", "") or "").strip() or None,
+            pipeline_profile=self._pipeline_profile(task),
             task_type=self._task_type(task),
             name=task.name,
             schedule_user_task_id=_schedule_user_task_id_value(task),
             status=task.status,
-            runtime_phase=runtime_phase,
-            task_control_mode=task_control_mode,
-            current_operation_id=task.current_operation_id,
-            delete_queued=bool(delete_state.get("delete_queued")),
-            delete_in_progress=bool(delete_state.get("delete_in_progress")),
-            delete_mode=self._string_or_none(delete_state.get("delete_mode")),
-            delete_operation_id=self._string_or_none(delete_state.get("delete_operation_id")),
-            delete_requested_at=self._string_or_none(delete_state.get("delete_requested_at")),
-            delete_last_error=self._string_or_none(delete_state.get("delete_last_error")),
-            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
             last_error=task.last_error,
-            terminal_failure=terminal_failure,
-            requeue_suppressed=terminal_failure,
-            failure_code=self._string_or_none(failure_snapshot.get("failure_code")) if terminal_failure else None,
-            failure_category=self._string_or_none(failure_snapshot.get("failure_category")) if terminal_failure else None,
-            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")) if terminal_failure else None,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
-            is_queued=queue_state == "queued",
-            queue_position=queue_position,
-            queue_state=queue_state,
-            recoverable_reason=recoverable_reason,
-            last_reconcile_at=queue_info.get("last_reconcile_at"),
-            dispatcher_instance_id=task.dispatcher_instance_id,
-            task_lease_owner_instance_id=lease_owner,
-            task_lease_expires_at=lease_expires_at,
-            task_lease_source=lease_source,
-            tail_control_mode=str(tail_summary.get("tail_control_mode") or "idle"),
-            tail_has_runnable_unbound_items=bool(tail_summary.get("has_runnable_unbound_items")),
-            tail_unbound_runnable_item_count=int(tail_summary.get("unbound_runnable_item_count", 0) or 0),
-            tail_bound_active_item_count=int(tail_summary.get("bound_active_item_count", 0) or 0),
-            tail_has_downstream_refs=bool(tail_summary.get("has_downstream_refs")),
-            tail_takeover_required=bool(tail_summary.get("takeover_required")),
-            tail_takeover_reason=self._string_or_none(tail_summary.get("takeover_reason")),
-            tail_reconcile_state=self._tail_reconcile_state(task),
-            runtime_override_version=int(getattr(task, "runtime_override_version", 0) or 0),
-            runtime_override_updated_at=getattr(task, "runtime_override_updated_at", None),
-            runtime_override_updated_by=getattr(task, "runtime_override_updated_by", None),
-            runtime_policy_effect_scope=self._runtime_policy_effect_scope(task),
-            base_policy=base_policy,
-            runtime_override=runtime_override,
-            effective_runtime_policy=effective_runtime_policy,
-            last_successful_downstream_sync_at=last_successful_sync_at,
-            last_sync_attempt_at=last_sync_attempt_at,
-            last_sync_error_at=last_sync_error_at,
-            last_sync_error_type=last_sync_error_type,
-            last_sync_error_message=last_sync_error_message,
-            active_sync_error_item_count=active_sync_error_item_count,
-            never_synced_item_count=never_synced_item_count,
-            stale_synced_item_count=stale_synced_item_count,
             created_by=task.created_by,
             created_at=task.created_at,
             updated_at=task.updated_at,
             started_at=task.started_at,
             finished_at=task.finished_at,
-            high_risk_module_count=int(metrics.get("high_risk_module_count", 0)),
-            medium_risk_module_count=int(metrics.get("medium_risk_module_count", 0)),
-            low_risk_module_count=int(metrics.get("low_risk_module_count", 0)),
-            candidate_module_count=int(metrics.get("candidate_module_count", 0)),
-            selected_module_count=int(metrics.get("selected_module_count", 0)),
-            selected_risk_levels=task_shared._normalize_module_risk_levels(effective_runtime_policy.get("module_risk_levels")),
-            module_selection_mode=self._module_selection_mode(task),
-            entry_selection_mode=self._entry_selection_mode(task),
-            candidate_entry_count=len(self._entry_candidates(task)),
-            selected_entry_count=len(self._effective_entry_inputs(task)) if self._entry_selection_mode(task) == task_shared.ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task)),
-            entry_count=int(metrics.get("entry_count", 0)),
-            knowledge_graph_raw_entry_count=int(metrics.get("knowledge_graph_raw_entry_count", 0)),
-            knowledge_graph_selected_entry_count=int(metrics.get("knowledge_graph_selected_entry_count", 0)),
-            knowledge_graph_filtered_out_count=int(metrics.get("knowledge_graph_filtered_out_count", 0)),
-            knowledge_graph_graph_status=self._string_or_none(kg_state.get("graph_status")),
-            knowledge_graph_identification_state=self._string_or_none(kg_state.get("identification_state")),
-            knowledge_graph_attack_status=self._string_or_none(kg_state.get("attack_status")),
-            knowledge_graph_analysis_total=int(kg_state.get("knowledge_graph_analysis_total") or 0),
-            knowledge_graph_analysis_identified=int(kg_state.get("knowledge_graph_analysis_identified") or 0),
-            knowledge_graph_analysis_pending=int(kg_state.get("knowledge_graph_analysis_pending") or 0),
-            knowledge_graph_analysis_confirmed=int(kg_state.get("knowledge_graph_analysis_confirmed") or 0),
-            knowledge_graph_analysis_rejected=int(kg_state.get("knowledge_graph_analysis_rejected") or 0),
-            vuln_result_count=int(metrics.get("vuln_result_count", 0)),
-            firmware_item_count=int(metrics.get("firmware_item_count", 0)),
-            unpacked_firmware_count=int(metrics.get("unpacked_firmware_count", 0)),
-            failed_firmware_count=int(metrics.get("failed_firmware_count", 0)),
-            task_retry_supported=False,
-            task_retry_reason=None,
-            task_continue_supported=False,
-            task_continue_reason=None,
-            task_retry_failed_items_supported=False,
-            task_retry_failed_items_reason=None,
             abnormal_reason_title=abnormal_reason.title if abnormal_reason else None,
             abnormal_reason_code=abnormal_reason.code if abnormal_reason else None,
-            abnormal_reason_category=abnormal_reason.category if abnormal_reason else None,
-            abnormal_reason=abnormal_reason,
             stage_summaries=stage_summaries,
             manual_operation_state=manual_operation_state,
-            cancel_state=self._cancel_state_from_operation(task, cancel_operation),
-            cleanup_state=self._build_cleanup_state(task),
+            task_lease_owner_instance_id=task_lease_owner_instance_id,
+            task_lease_expires_at=task_lease_expires_at,
+            task_lease_source=task_lease_source,
+            last_successful_downstream_sync_at=last_successful_sync_at,
+            last_sync_attempt_at=last_sync_attempt_at,
+            last_sync_error_at=last_sync_error_at,
+            last_sync_error_type=last_sync_error_type,
+            last_sync_error_message=last_sync_error_message,
         )
 
     def _task_list_operation_maps(self: TaskManager, db: Session, tasks) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -3524,8 +3441,14 @@ class TaskReadModelServiceMixin:
             operation_type = str(getattr(operation, "operation_type", "") or "").strip()
             if task_id not in active_operations_by_task and status_value in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES:
                 active_operations_by_task[task_id] = operation
-            if task_id not in cancel_operations_by_task and operation_type == task_manager_module.TASK_ACTION_CANCEL:
-                if task_id in active_operations_by_task and str(active_operations_by_task[task_id].operation_type or "").strip() != task_manager_module.TASK_ACTION_CANCEL:
+            if task_id not in cancel_operations_by_task and operation_type in {
+                task_manager_module.TASK_ACTION_CANCEL,
+                task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            }:
+                if task_id in active_operations_by_task and str(active_operations_by_task[task_id].operation_type or "").strip() not in {
+                    task_manager_module.TASK_ACTION_CANCEL,
+                    task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                }:
                     continue
                 cancel_operations_by_task[task_id] = operation
         return active_operations_by_task, cancel_operations_by_task

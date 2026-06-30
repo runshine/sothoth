@@ -373,6 +373,7 @@ TASK_ACTION_RETRY_STAGE_FULL = "retry_stage_full"
 TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS = "retry_archive_failed_items"
 TASK_ACTION_RETRY_ARCHIVE_FULL = "retry_archive_full"
 TASK_ACTION_CANCEL = "cancel"
+TASK_ACTION_FINISH_SUCCESS = "finish_success"
 TASK_ACTION_DELETE = "delete"
 TASK_PENDING_ACTIONS = {
     TASK_ACTION_CONTINUE,
@@ -392,6 +393,7 @@ TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
     TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FULL,
     TASK_ACTION_CANCEL,
+    TASK_ACTION_FINISH_SUCCESS,
     TASK_ACTION_DELETE,
     "force_reset_to_pending",
 }
@@ -5653,11 +5655,11 @@ class TaskManager(
         entry_selection_snapshot = dict(summary.get("entry_selection") or {}) if isinstance(summary.get("entry_selection"), dict) else {}
         if self._pipeline_profile(task) != PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
             auto_candidates, auto_snapshot = self._select_auto_entries_per_module(task, modules, db)
-            entry_selection_snapshot = {
-                **entry_selection_snapshot,
-                **auto_snapshot,
-            }
             if self._entry_selection_mode(task) != ENTRY_SELECTION_MODE_MANUAL_CONFIRM:
+                entry_selection_snapshot = {
+                    **entry_selection_snapshot,
+                    **auto_snapshot,
+                }
                 entry_selection_snapshot.pop("selected_entry_keys", None)
                 entry_selection_snapshot.pop("selected_entries", None)
                 entry_selection_snapshot.pop("confirmed_at", None)
@@ -5673,7 +5675,10 @@ class TaskManager(
                     if str(entry.get("entry_key") or "").strip()
                 ]
         summary["entry_results"] = modules
-        summary["entry_selection"] = entry_selection_snapshot
+        if entry_selection_snapshot:
+            summary["entry_selection"] = entry_selection_snapshot
+        else:
+            summary.pop("entry_selection", None)
         task.summary = summary
         metrics = dict(task.metrics or {})
         metrics.update(self._entry_selection_metrics(task, db))
