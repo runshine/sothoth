@@ -14,6 +14,25 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    def _set_dispatch_claim_decision(
+        self: TaskManager,
+        *,
+        task_id: str,
+        claimed_task_id: str | None,
+        blocked_reason: str | None,
+        should_requeue: bool,
+    ) -> None:
+        self._last_dispatch_claim_decision = {
+            "task_id": str(task_id or "").strip() or None,
+            "claimed_task_id": str(claimed_task_id or "").strip() or None,
+            "blocked_reason": str(blocked_reason or "").strip() or None,
+            "should_requeue": bool(should_requeue),
+        }
+
+    def _dispatch_claim_decision(self: TaskManager) -> dict[str, object] | None:
+        decision = getattr(self, "_last_dispatch_claim_decision", None)
+        return dict(decision or {}) if decision else None
+
     def _log_dispatch_claim_blocked(
         self: TaskManager,
         task_id: str,
@@ -37,6 +56,60 @@ class TaskRuntimeServiceMixin:
             str(getattr(current_operation, "operation_type", "") or "").strip() or None if current_operation is not None else None,
             str(getattr(current_operation, "status", "") or "").strip().lower() or None if current_operation is not None else None,
             str(detail or "").strip() or None,
+        )
+
+    async def _drop_unclaimed_dispatch_task_after_pop(
+        self: TaskManager,
+        db: Session,
+        task_id: str,
+        *,
+        reason: str | None,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        normalized_task_id = str(task_id or "").strip()
+        normalized_reason = str(reason or "").strip() or "dispatch_claim_not_acquired_drop"
+        if not normalized_task_id:
+            return
+        task = (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(task_manager_module.BinarySecurityTask.id == normalized_task_id)
+            .first()
+        )
+        if task is not None:
+            self._record_event(
+                db,
+                task,
+                "dispatch_claim_dropped_after_pop",
+                "任务已从 Redis 弹出，但当前无需重新入队，已直接丢弃本次调度消费",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "task_id": normalized_task_id,
+                    "reason": normalized_reason,
+                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    "requeue_after_pop": False,
+                },
+            )
+            db.commit()
+            task_manager_module.logger.warning(
+                "binary-security dispatch popped task but claim was not acquired; task dropped after pop: "
+                "task_id=%s reason=%s status=%s runtime_phase=%s dispatcher_instance_id=%s",
+                normalized_task_id,
+                normalized_reason,
+                str(getattr(task, "status", "") or "").strip() or None,
+                self._task_runtime_phase(task),
+                str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+            )
+            return
+        task_manager_module.logger.warning(
+            "binary-security dispatch popped task but task row is missing; task dropped after pop: "
+            "task_id=%s reason=%s",
+            normalized_task_id,
+            normalized_reason,
         )
 
     async def _requeue_unclaimed_dispatch_task(self: TaskManager, db: Session, task_id: str) -> None:
@@ -660,6 +733,7 @@ class TaskRuntimeServiceMixin:
                         )
                         if task_id:
                             claimed_id = self._dispatch_task_by_id(db, task_id)
+                            decision = self._dispatch_claim_decision() or {}
                             if claimed_id:
                                 task = (
                                     db.query(task_manager_module.BinarySecurityTask)
@@ -715,7 +789,14 @@ class TaskRuntimeServiceMixin:
                                         getattr(handle, "cancel_requested", None) if handle is not None else None,
                                     )
                             else:
-                                await self._requeue_unclaimed_dispatch_task(db, task_id)
+                                if bool(decision.get("should_requeue", True)):
+                                    await self._requeue_unclaimed_dispatch_task(db, task_id)
+                                else:
+                                    await self._drop_unclaimed_dispatch_task_after_pop(
+                                        db,
+                                        task_id,
+                                        reason=str(decision.get("blocked_reason", "") or "").strip() or None,
+                                    )
                     await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
                     self._mark_loop_heartbeat("task_dispatch")
@@ -1046,6 +1127,12 @@ class TaskRuntimeServiceMixin:
     def _dispatch_task_by_id(self: TaskManager, db: Session, task_id: str) -> str | None:
         from app.service import task_manager as task_manager_module
 
+        self._set_dispatch_claim_decision(
+            task_id=task_id,
+            claimed_task_id=None,
+            blocked_reason=None,
+            should_requeue=True,
+        )
         self._run_parent_reclaim_pass(db)
         service_config = self._load_service_config(db)
         active_count = self._active_dispatch_count(db)
@@ -1056,6 +1143,12 @@ class TaskRuntimeServiceMixin:
                 reason="local_worker_task_concurrency_limit",
                 detail=f"local_active_count={local_active_count}",
             )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="local_worker_task_concurrency_limit",
+                should_requeue=True,
+            )
             return None
         if active_count >= service_config.max_concurrent_tasks:
             self._log_dispatch_claim_blocked(
@@ -1063,12 +1156,24 @@ class TaskRuntimeServiceMixin:
                 reason="global_max_concurrent_tasks_limit",
                 detail=f"active_count={active_count}",
             )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="global_max_concurrent_tasks_limit",
+                should_requeue=True,
+            )
             return None
         task = db.query(task_manager_module.BinarySecurityTask).filter(
             task_manager_module.BinarySecurityTask.id == task_id
         ).first()
         if task is None:
             self._log_dispatch_claim_blocked(task_id, reason="task_row_missing")
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="task_row_missing",
+                should_requeue=False,
+            )
             return None
         if self._task_is_hidden_by_delete_queue(task):
             active_delete_operation = self._active_delete_queue_operation(db, task)
@@ -1255,6 +1360,12 @@ class TaskRuntimeServiceMixin:
                 task=task,
                 current_operation=current_operation,
             )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="non_pending_task_already_owned_by_supported_runtime",
+                should_requeue=False,
+            )
             return None
         if has_active_operation and not operation_allows_runtime_resume:
             if (
@@ -1386,6 +1497,12 @@ class TaskRuntimeServiceMixin:
         )
         if updated:
             db.commit()
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=task_id,
+                blocked_reason=None,
+                should_requeue=False,
+            )
             return task_id
         self._log_dispatch_claim_blocked(
             task_id,

@@ -566,6 +566,71 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("task-1", "dispatch_claim_not_acquired_reenqueue")], requeued)
         self.assertIn("dispatch_claim_reenqueued", [row.event_type for row in db.events])
 
+    async def test_dispatch_loop_drops_popped_task_when_claim_decision_says_no_requeue(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        requeued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            def __init__(self):
+                self._popped = False
+
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
+                if not self._popped:
+                    self._popped = True
+                    return "task-1"
+                manager._running = False
+                return None
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                requeued.append((task_id, context))
+
+        async def _reconcile(_db):
+            return None
+
+        async def _observe(_db):
+            return None
+
+        def _dispatch_task_by_id(_db, _task_id):
+            manager._set_dispatch_claim_decision(
+                task_id="task-1",
+                claimed_task_id=None,
+                blocked_reason="non_pending_task_already_owned_by_supported_runtime",
+                should_requeue=False,
+            )
+            return None
+
+        manager._dispatch_task_by_id = _dispatch_task_by_id
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id="worker-a",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+        ):
+            await manager._dispatch_loop()
+
+        self.assertEqual([], requeued)
+        self.assertIn("dispatch_claim_dropped_after_pop", [row.event_type for row in db.events])
+
     async def test_dispatch_loop_skips_pop_when_local_worker_concurrency_is_full(self):
         manager = TaskManager()
         manager._running = True
@@ -679,6 +744,46 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(claimed)
         self.assertTrue(
             any("binary-security dispatch claim blocked:" in str(call.args[0]) for call in log_info.call_args_list)
+        )
+        self.assertEqual(
+            {
+                "task_id": "missing-task",
+                "claimed_task_id": None,
+                "blocked_reason": "task_row_missing",
+                "should_requeue": False,
+            },
+            manager._dispatch_claim_decision(),
+        )
+
+    def test_dispatch_task_by_id_marks_running_owned_task_as_drop_after_pop(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-running",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id="worker-a",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: True
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": None,
+                "blocked_reason": "non_pending_task_already_owned_by_supported_runtime",
+                "should_requeue": False,
+            },
+            manager._dispatch_claim_decision(),
         )
 
 

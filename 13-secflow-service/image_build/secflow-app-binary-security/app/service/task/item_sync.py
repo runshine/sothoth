@@ -1073,10 +1073,29 @@ class TaskItemSyncServiceMixin:
                 session.commit()
                 return
             before_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower() or None
-            should_apply = (
-                before_status in {"running", "queued"}
-                or (before_status == "dispatching" and mapped_status not in {"pending", "queued"})
-            )
+            should_apply = False
+            if self._payload_matches_current_child(item, payload):
+                replacement_state = self._replacement_in_progress_state(item)
+                authoritative_apply = self._should_apply_authoritative_downstream_state(
+                    item,
+                    payload=payload,
+                    mapped_status=mapped_status,
+                    apply_state=True,
+                    replacement_state=replacement_state,
+                )
+                if authoritative_apply:
+                    should_apply = mapped_status not in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES
+                    if should_apply and mapped_status in {"pending", "queued", "dispatching", "running"}:
+                        should_apply = self._should_apply_downstream_intermediate_status(
+                            item,
+                            mapped_status=mapped_status,
+                            payload=payload,
+                        )
+                if not should_apply:
+                    should_apply = (
+                        before_status in {"running", "queued"}
+                        or (before_status == "dispatching" and mapped_status not in {"pending", "queued"})
+                    )
             if should_apply:
                 self._apply_downstream_status_inline(
                     item,
