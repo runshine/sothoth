@@ -647,68 +647,75 @@ class TaskRuntimeServiceMixin:
             try:
                 with task_manager_module.observe_scheduler_loop("task_dispatch"):
                     self._mark_loop_heartbeat("task_dispatch")
-                    task_id = await task_manager_module.get_task_queue().pop_task(
-                        self.cfg.queue.block_timeout_seconds,
-                        context="task_dispatch_pop",
+                    service_config = self._load_service_config(db)
+                    local_active_count = self._local_active_runtime_count()
+                    local_slots = max(
+                        0,
+                        int(getattr(service_config, "worker_task_concurrency", 40) or 40) - local_active_count,
                     )
-                    if task_id:
-                        claimed_id = self._dispatch_task_by_id(db, task_id)
-                        if claimed_id:
-                            task = (
-                                db.query(task_manager_module.BinarySecurityTask)
-                                .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
-                                .first()
-                            )
-                            task_manager_module.logger.info(
-                                "binary-security dispatch claimed task and is attempting runtime start: "
-                                "task_id=%s queue_task_id=%s status=%s runtime_phase=%s dispatcher_instance_id=%s "
-                                "current_operation_id=%s lease_expires_at=%s",
-                                claimed_id,
-                                task_id,
-                                str(getattr(task, "status", "") or "").strip() if task is not None else "",
-                                str(self._task_runtime_phase(task)) if task is not None else "",
-                                str(getattr(task, "dispatcher_instance_id", "") or "").strip() if task is not None else "",
-                                str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else "",
-                                task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None))
-                                if task is not None
-                                else None,
-                            )
-                            started = await self._start_task_runtime(claimed_id)
-                            if started:
-                                task_manager_module.logger.info(
-                                    "binary-security dispatch successfully handed task to local runtime: "
-                                    "task_id=%s queue_task_id=%s local_handle_present=%s",
-                                    claimed_id,
-                                    task_id,
-                                    self._runtime_handle(claimed_id) is not None,
-                                )
-                            else:
+                    if local_slots > 0:
+                        task_id = await task_manager_module.get_task_queue().pop_task(
+                            self.cfg.queue.block_timeout_seconds,
+                            context="task_dispatch_pop",
+                        )
+                        if task_id:
+                            claimed_id = self._dispatch_task_by_id(db, task_id)
+                            if claimed_id:
                                 task = (
                                     db.query(task_manager_module.BinarySecurityTask)
                                     .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
                                     .first()
                                 )
-                                current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else ""
-                                current_status = str(getattr(task, "status", "") or "").strip() if task is not None else ""
-                                dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() if task is not None else ""
-                                runtime_phase = str(self._task_runtime_phase(task)) if task is not None else ""
-                                handle = self._runtime_handle(claimed_id)
-                                task_manager_module.logger.warning(
-                                    "binary-security dispatch claimed task but runtime start returned false: task_id=%s queue_task_id=%s "
-                                    "status=%s runtime_phase=%s dispatcher_instance_id=%s current_operation_id=%s "
-                                    "local_handle_present=%s local_handle_done=%s local_handle_cancel_requested=%s",
+                                task_manager_module.logger.info(
+                                    "binary-security dispatch claimed task and is attempting runtime start: "
+                                    "task_id=%s queue_task_id=%s status=%s runtime_phase=%s dispatcher_instance_id=%s "
+                                    "current_operation_id=%s lease_expires_at=%s",
                                     claimed_id,
                                     task_id,
-                                    current_status,
-                                    runtime_phase,
-                                    dispatcher_instance_id,
-                                    current_operation_id,
-                                    handle is not None,
-                                    handle.done() if handle is not None else None,
-                                    getattr(handle, "cancel_requested", None) if handle is not None else None,
+                                    str(getattr(task, "status", "") or "").strip() if task is not None else "",
+                                    str(self._task_runtime_phase(task)) if task is not None else "",
+                                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() if task is not None else "",
+                                    str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else "",
+                                    task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None))
+                                    if task is not None
+                                    else None,
                                 )
-                        else:
-                            await self._requeue_unclaimed_dispatch_task(db, task_id)
+                                started = await self._start_task_runtime(claimed_id)
+                                if started:
+                                    task_manager_module.logger.info(
+                                        "binary-security dispatch successfully handed task to local runtime: "
+                                        "task_id=%s queue_task_id=%s local_handle_present=%s",
+                                        claimed_id,
+                                        task_id,
+                                        self._runtime_handle(claimed_id) is not None,
+                                    )
+                                else:
+                                    task = (
+                                        db.query(task_manager_module.BinarySecurityTask)
+                                        .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
+                                        .first()
+                                    )
+                                    current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else ""
+                                    current_status = str(getattr(task, "status", "") or "").strip() if task is not None else ""
+                                    dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() if task is not None else ""
+                                    runtime_phase = str(self._task_runtime_phase(task)) if task is not None else ""
+                                    handle = self._runtime_handle(claimed_id)
+                                    task_manager_module.logger.warning(
+                                        "binary-security dispatch claimed task but runtime start returned false: task_id=%s queue_task_id=%s "
+                                        "status=%s runtime_phase=%s dispatcher_instance_id=%s current_operation_id=%s "
+                                        "local_handle_present=%s local_handle_done=%s local_handle_cancel_requested=%s",
+                                        claimed_id,
+                                        task_id,
+                                        current_status,
+                                        runtime_phase,
+                                        dispatcher_instance_id,
+                                        current_operation_id,
+                                        handle is not None,
+                                        handle.done() if handle is not None else None,
+                                        getattr(handle, "cancel_requested", None) if handle is not None else None,
+                                    )
+                            else:
+                                await self._requeue_unclaimed_dispatch_task(db, task_id)
                     await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
                     self._mark_loop_heartbeat("task_dispatch")

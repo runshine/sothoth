@@ -566,6 +566,57 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("task-1", "dispatch_claim_not_acquired_reenqueue")], requeued)
         self.assertIn("dispatch_claim_reenqueued", [row.event_type for row in db.events])
 
+    async def test_dispatch_loop_skips_pop_when_local_worker_concurrency_is_full(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        reconcile_calls: list[str] = []
+        pop_calls: list[str | None] = []
+
+        class _Queue:
+            async def pop_task(self, _timeout_seconds, context=None):
+                pop_calls.append(context)
+                manager._running = False
+                return "task-1"
+
+        class _Handle:
+            def done(self):
+                return False
+
+        async def _reconcile(_db):
+            reconcile_calls.append("called")
+            manager._running = False
+
+        async def _observe(_db):
+            return None
+
+        manager._workers = {
+            "task-a": _Handle(),
+            "task-b": _Handle(),
+        }
+        manager._load_service_config = lambda _db: SimpleNamespace(
+            worker_task_concurrency=2,
+            max_concurrent_tasks=40,
+            dispatch_timeout_seconds=60,
+            lease_timeout_seconds=90,
+        )
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        class _Db:
+            def close(self):
+                return None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: _Db()),
+        ):
+            await manager._dispatch_loop()
+
+        self.assertEqual([], pop_calls)
+        self.assertEqual(["called"], reconcile_calls)
+
     async def test_requeue_unclaimed_dispatch_task_redirects_delete_hidden_task_to_delete_queue(self):
         manager = TaskManager()
         task = BinarySecurityTask(
