@@ -484,6 +484,8 @@ MODULE_SELECTION_MODE_AUTO = "auto"
 MODULE_SELECTION_MODE_MANUAL_CONFIRM = "manual_confirm"
 ENTRY_SELECTION_MODE_AUTO = "auto"
 ENTRY_SELECTION_MODE_MANUAL_CONFIRM = "manual_confirm"
+ENTRY_AUTO_SELECTION_STRATEGY_ALL = "all"
+ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE = "top_n_per_module_by_confidence"
 ALLOWED_MODULE_RISK_LEVELS = ("高", "中", "低")
 STAGE_SUMMARY_RESULT_KEYS = {
     "firmware_unpack": ["firmware_unpack_results"],
@@ -4997,6 +4999,26 @@ class TaskManager(
             return ENTRY_SELECTION_MODE_AUTO
         return mode
 
+    def _entry_auto_selection_strategy(self, task: BinarySecurityTask) -> str:
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return ENTRY_AUTO_SELECTION_STRATEGY_ALL
+        strategy = str((task.policy or {}).get("entry_auto_selection_strategy") or ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
+        if strategy not in {
+            ENTRY_AUTO_SELECTION_STRATEGY_ALL,
+            ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE,
+        }:
+            return ENTRY_AUTO_SELECTION_STRATEGY_ALL
+        return strategy
+
+    def _entry_auto_selection_top_n(self, task: BinarySecurityTask) -> int:
+        if self._entry_auto_selection_strategy(task) != ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
+            return 0
+        try:
+            value = int((task.policy or {}).get("entry_auto_selection_top_n") or 0)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, value)
+
     def _module_risk_levels(self, task: BinarySecurityTask) -> list[str]:
         return _normalize_module_risk_levels((task.policy or {}).get("module_risk_levels"))
 
@@ -5260,6 +5282,125 @@ class TaskManager(
                 )
         return entries
 
+    def _entry_modules_for_selection(self, task: BinarySecurityTask, db: Session | None = None) -> list[dict[str, Any]]:
+        return [dict(module) for module in self._entry_result_success_modules(task, db)]
+
+    def _rank_entry_confidence(self, entry: dict[str, Any]) -> float:
+        try:
+            raw = entry.get("entry_confidence")
+            if raw is None:
+                return 0.0
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _normalize_module_selection_entries(
+        self,
+        task: BinarySecurityTask,
+        modules: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for module in modules:
+            if not isinstance(module, dict):
+                continue
+            module_key = str(module.get("module_key") or "").strip()
+            module_name = str(module.get("module_name") or "").strip()
+            module_kind = str(module.get("module_kind") or "").strip()
+            execution_epoch = int(module.get("execution_epoch") or self._entry_result_execution_epoch(task))
+            for entry in list(module.get("entries") or []):
+                if not isinstance(entry, dict):
+                    continue
+                entries.append(
+                    {
+                        **dict(entry),
+                        "module_key": str(entry.get("module_key") or "").strip() or module_key,
+                        "module_name": str(entry.get("module_name") or "").strip() or module_name,
+                        "module_kind": str(entry.get("module_kind") or "").strip() or module_kind,
+                        "execution_epoch": int(entry.get("execution_epoch") or execution_epoch),
+                    }
+                )
+        return _deduplicate_entry_keys(entries)
+
+    def _select_auto_entries_per_module(
+        self,
+        task: BinarySecurityTask,
+        modules_or_entries: list[dict[str, Any]],
+        db: Session | None = None,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        del db
+        strategy = self._entry_auto_selection_strategy(task)
+        top_n = self._entry_auto_selection_top_n(task)
+        modules = [
+            self._normalize_entry_result_module(task, dict(item))
+            for item in modules_or_entries
+            if isinstance(item, dict)
+        ]
+        raw_entries = self._normalize_module_selection_entries(task, modules)
+        if strategy == ENTRY_AUTO_SELECTION_STRATEGY_ALL:
+            return raw_entries, {
+                "auto_selection_strategy": strategy,
+                "auto_selection_top_n": 0,
+                "selection_source": "auto_policy",
+                "candidate_entries": raw_entries,
+                "candidate_entries_by_module": [
+                    {
+                        "module_key": str(module.get("module_key") or "").strip(),
+                        "module_name": str(module.get("module_name") or "").strip(),
+                        "raw_entry_count": len([entry for entry in list(module.get("entries") or []) if isinstance(entry, dict)]),
+                        "selected_entry_count": len([entry for entry in list(module.get("entries") or []) if isinstance(entry, dict)]),
+                        "truncated": False,
+                    }
+                    for module in modules
+                ],
+                "truncated_module_count": 0,
+            }
+        selected: list[dict[str, Any]] = []
+        candidate_entries_by_module: list[dict[str, Any]] = []
+        truncated_module_count = 0
+        for module in modules:
+            module_entries = [
+                {
+                    **dict(entry),
+                    "module_key": str(entry.get("module_key") or "").strip() or str(module.get("module_key") or "").strip(),
+                    "module_name": str(entry.get("module_name") or "").strip() or str(module.get("module_name") or "").strip(),
+                    "module_kind": str(entry.get("module_kind") or "").strip() or str(module.get("module_kind") or "").strip(),
+                    "execution_epoch": int(entry.get("execution_epoch") or module.get("execution_epoch") or self._entry_result_execution_epoch(task)),
+                }
+                for entry in list(module.get("entries") or [])
+                if isinstance(entry, dict)
+            ]
+            module_entries = _deduplicate_entry_keys(module_entries)
+            sorted_entries = sorted(
+                module_entries,
+                key=lambda entry: (
+                    -self._rank_entry_confidence(entry),
+                    str(entry.get("entry_key") or "").strip(),
+                    str(entry.get("function_name") or "").strip(),
+                ),
+            )
+            chosen_entries = sorted_entries[:top_n]
+            if len(sorted_entries) > len(chosen_entries):
+                truncated_module_count += 1
+            selected.extend(chosen_entries)
+            candidate_entries_by_module.append(
+                {
+                    "module_key": str(module.get("module_key") or "").strip(),
+                    "module_name": str(module.get("module_name") or "").strip(),
+                    "raw_entry_count": len(sorted_entries),
+                    "selected_entry_count": len(chosen_entries),
+                    "truncated": len(sorted_entries) > len(chosen_entries),
+                }
+            )
+        selected = _deduplicate_entry_keys(selected)
+        return selected, {
+            "auto_selection_strategy": strategy,
+            "auto_selection_top_n": top_n,
+            "selection_source": "auto_policy",
+            "candidate_entries": selected,
+            "candidate_entries_by_module": candidate_entries_by_module,
+            "truncated_module_count": truncated_module_count,
+        }
+
     def _clear_entry_result_state(self, task: BinarySecurityTask) -> None:
         summary = dict(task.summary or {})
         summary["entry_results"] = []
@@ -5322,7 +5463,11 @@ class TaskManager(
                 task,
                 [dict(item) for item in candidate_entries if isinstance(item, dict)],
             )
-        return self._entry_module_flow_inputs(task, db)
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return self._entry_module_flow_inputs(task, db)
+        modules = self._entry_modules_for_selection(task, db)
+        selected_entries, _snapshot = self._select_auto_entries_per_module(task, modules, db)
+        return selected_entries
 
     def _selected_entry_keys(self, task: BinarySecurityTask) -> list[str]:
         snapshot = self._entry_selection_snapshot(task)
@@ -5395,9 +5540,10 @@ class TaskManager(
 
     def _entry_selection_metrics(self, task: BinarySecurityTask, db: Session | None = None) -> dict[str, int]:
         module_state = self._entry_module_completion_state(task, None)
+        candidate_count = len(self._entry_candidates(task, db))
         return {
-            "candidate_entry_count": len(self._entry_candidates(task, db)),
-            "selected_entry_count": len(self._effective_entry_inputs(task, db)) if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_MANUAL_CONFIRM else len(self._entry_candidates(task, db)),
+            "candidate_entry_count": candidate_count,
+            "selected_entry_count": len(self._effective_entry_inputs(task, db)) if self._entry_selection_mode(task) == ENTRY_SELECTION_MODE_MANUAL_CONFIRM else candidate_count,
             "expected_entry_module_count": int(module_state.get("expected_module_count") or 0),
             "materialized_entry_module_count": int(module_state.get("materialized_module_count") or 0),
             "successful_entry_module_count": int(module_state.get("successful_module_count") or 0),
@@ -5502,7 +5648,32 @@ class TaskManager(
                 continue
             seen.add(module_key)
             modules.append(self._entry_module_result_from_stage_item(task, item))
-        task.summary = {**(task.summary or {}), "entry_results": modules}
+        summary = dict(task.summary or {})
+        entry_selection_snapshot = dict(summary.get("entry_selection") or {}) if isinstance(summary.get("entry_selection"), dict) else {}
+        if self._pipeline_profile(task) != PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            auto_candidates, auto_snapshot = self._select_auto_entries_per_module(task, modules, db)
+            entry_selection_snapshot = {
+                **entry_selection_snapshot,
+                **auto_snapshot,
+            }
+            if self._entry_selection_mode(task) != ENTRY_SELECTION_MODE_MANUAL_CONFIRM:
+                entry_selection_snapshot.pop("selected_entry_keys", None)
+                entry_selection_snapshot.pop("selected_entries", None)
+                entry_selection_snapshot.pop("confirmed_at", None)
+                entry_selection_snapshot.pop("status", None)
+                entry_selection_snapshot["mode"] = ENTRY_SELECTION_MODE_AUTO
+                entry_selection_snapshot["selected_entries"] = self._mark_selected_entries(
+                    auto_candidates,
+                    selected_by=ENTRY_SELECTION_MODE_AUTO,
+                )
+                entry_selection_snapshot["selected_entry_keys"] = [
+                    str(entry.get("entry_key") or "").strip()
+                    for entry in auto_candidates
+                    if str(entry.get("entry_key") or "").strip()
+                ]
+        summary["entry_results"] = modules
+        summary["entry_selection"] = entry_selection_snapshot
+        task.summary = summary
         metrics = dict(task.metrics or {})
         metrics.update(self._entry_selection_metrics(task, db))
         metrics["entry_count"] = sum(int(module.get("entry_count") or 0) for module in modules)

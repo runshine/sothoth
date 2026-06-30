@@ -47,6 +47,8 @@ class TaskPolicyOverrides(BinarySecurityBaseModel):
     module_selection_mode: Optional[str] = None
     module_risk_levels: Optional[list[str]] = None
     entry_selection_mode: Optional[str] = None
+    entry_auto_selection_strategy: Optional[str] = None
+    entry_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
     knowledge_graph_upload_id: Optional[str] = None
     knowledge_graph_db_name: Optional[str] = None
     knowledge_graph_include_excluded: Optional[bool] = None
@@ -103,6 +105,9 @@ class BinarySecurityTaskPolicyUpdatePayload(BinarySecurityBaseModel):
     stage_parallelism: dict[str, int] = Field(default_factory=dict)
     module_selection_mode: Optional[str] = None
     module_risk_levels: Optional[list[str]] = None
+    entry_selection_mode: Optional[str] = None
+    entry_auto_selection_strategy: Optional[str] = None
+    entry_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
 
 
 class BinarySecurityTaskPrepareResponse(BinarySecurityBaseModel):
@@ -252,6 +257,8 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     selected_risk_levels: list[str] = Field(default_factory=list)
     module_selection_mode: str = "auto"
     entry_selection_mode: str = "auto"
+    entry_auto_selection_strategy: str = "all"
+    entry_auto_selection_top_n: int = 0
     candidate_entry_count: int = 0
     selected_entry_count: int = 0
     entry_count: int = 0
@@ -946,6 +953,8 @@ class BinarySecurityEntrySelectionResponse(BinarySecurityBaseModel):
     task_id: str
     status: str
     selection_mode: str = "auto"
+    auto_selection_strategy: str = "all"
+    auto_selection_top_n: int = 0
     requires_confirmation: bool = False
     candidate_entries: list[dict[str, Any]] = Field(default_factory=list)
     selected_entry_keys: list[str] = Field(default_factory=list)

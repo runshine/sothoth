@@ -680,7 +680,15 @@ class TaskControlServiceMixin:
             policy["stage_parallelism"] = merged_parallelism
             if merged_parallelism:
                 policy["max_stage_parallelism"] = max(int(value) for value in merged_parallelism.values())
-        for key in ("max_stage_parallelism", "max_retries_per_item", "continue_on_item_failure", "module_selection_mode", "entry_selection_mode"):
+        for key in (
+            "max_stage_parallelism",
+            "max_retries_per_item",
+            "continue_on_item_failure",
+            "module_selection_mode",
+            "entry_selection_mode",
+            "entry_auto_selection_strategy",
+            "entry_auto_selection_top_n",
+        ):
             if override_payload.get(key) is not None:
                 policy[key] = override_payload.get(key)
         if override_payload.get("module_risk_levels") is not None:
@@ -702,6 +710,8 @@ class TaskControlServiceMixin:
             policy["knowledge_graph_include_excluded"] = None if include_excluded is None else bool(include_excluded)
         if policy.get("pipeline_profile") == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
             policy["entry_selection_mode"] = "auto"
+            policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+            policy["entry_auto_selection_top_n"] = 0
         return policy
 
     def save_task_policy_config(
@@ -827,6 +837,12 @@ class TaskControlServiceMixin:
             updated["module_selection_mode"] = str(payload.module_selection_mode or "").strip() or "auto"
         if payload.module_risk_levels is not None:
             updated["module_risk_levels"] = task_manager_module._normalize_module_risk_levels(list(payload.module_risk_levels or []))
+        if payload.entry_selection_mode is not None:
+            updated["entry_selection_mode"] = str(payload.entry_selection_mode or "").strip() or "auto"
+        if payload.entry_auto_selection_strategy is not None:
+            updated["entry_auto_selection_strategy"] = str(payload.entry_auto_selection_strategy or "").strip() or task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+        if payload.entry_auto_selection_top_n is not None:
+            updated["entry_auto_selection_top_n"] = int(payload.entry_auto_selection_top_n)
         stage_options = dict(updated.get("stage_options") or {})
         for stage_name, option in dict(payload.stage_options or {}).items():
             normalized_stage = str(stage_name or "").strip()
@@ -858,6 +874,20 @@ class TaskControlServiceMixin:
         if stage_parallelism:
             updated["stage_parallelism"] = stage_parallelism
             updated["max_stage_parallelism"] = max(int(value) for value in stage_parallelism.values())
+        if str(updated.get("entry_selection_mode") or "auto").strip() != task_manager_module.ENTRY_SELECTION_MODE_AUTO:
+            updated["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+            updated["entry_auto_selection_top_n"] = 0
+        elif self._pipeline_profile(task) == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            updated["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+            updated["entry_auto_selection_top_n"] = 0
+        else:
+            strategy = str(updated.get("entry_auto_selection_strategy") or task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
+            top_n = int(updated.get("entry_auto_selection_top_n") or 0)
+            if strategy == task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE and top_n <= 0:
+                raise ValidationError("按模块置信度 Top N 模式要求 entry_auto_selection_top_n >= 1")
+            if strategy != task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
+                updated["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+                updated["entry_auto_selection_top_n"] = 0
         return updated
 
     def update_task_policy(
@@ -1102,6 +1132,20 @@ class TaskControlServiceMixin:
         policy_overrides["task_type"] = task_type
         policy_overrides["pipeline_profile"] = pipeline_profile
         policy = self._merge_policy(db, project_id, policy_overrides, payload.stage_options)
+        if str(policy.get("entry_selection_mode") or "auto").strip() != task_manager_module.ENTRY_SELECTION_MODE_AUTO:
+            policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+            policy["entry_auto_selection_top_n"] = 0
+        elif pipeline_profile == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+            policy["entry_auto_selection_top_n"] = 0
+        else:
+            strategy = str(policy.get("entry_auto_selection_strategy") or task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
+            top_n = int(policy.get("entry_auto_selection_top_n") or 0)
+            if strategy == task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE and top_n <= 0:
+                raise ValidationError("按模块置信度 Top N 模式要求 entry_auto_selection_top_n >= 1")
+            if strategy != task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
+                policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+                policy["entry_auto_selection_top_n"] = 0
 
         input_kind = (
             path_input["input_kind"]

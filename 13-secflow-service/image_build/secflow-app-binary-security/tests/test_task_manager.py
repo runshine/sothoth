@@ -5008,6 +5008,173 @@ class TaskManagerTests(unittest.TestCase):
         self.assertEqual("t1", response.task_id)
         self.assertEqual(["e1"], response.selected_entry_keys)
 
+    def test_entry_candidates_top_n_by_confidence_selects_per_module(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy={
+                "entry_selection_mode": "auto",
+                "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+                "entry_auto_selection_top_n": 2,
+            },
+            summary={
+                "entry_results": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "module-a",
+                        "completion_state": "success",
+                        "completion_ready": True,
+                        "execution_epoch": 0,
+                        "entries": [
+                            {"entry_key": "a-2", "function_name": "func2", "entry_confidence": 0.7},
+                            {"entry_key": "a-1", "function_name": "func1", "entry_confidence": 0.9},
+                            {"entry_key": "a-3", "function_name": "func3", "entry_confidence": 0.1},
+                        ],
+                    },
+                    {
+                        "module_key": "mod-b",
+                        "module_name": "module-b",
+                        "completion_state": "success",
+                        "completion_ready": True,
+                        "execution_epoch": 0,
+                        "entries": [
+                            {"entry_key": "b-2", "function_name": "func2", "entry_confidence": 0.2},
+                            {"entry_key": "b-1", "function_name": "func1", "entry_confidence": 0.8},
+                            {"entry_key": "b-3", "function_name": "func3", "entry_confidence": None},
+                        ],
+                    },
+                ],
+            },
+        )
+        candidates = self.manager._entry_candidates(task)
+        self.assertEqual(["a-1", "a-2", "b-1", "b-2"], [entry["entry_key"] for entry in candidates])
+
+    def test_get_task_detail_exposes_entry_auto_selection_policy(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy={
+                "entry_selection_mode": "auto",
+                "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+                "entry_auto_selection_top_n": 3,
+            },
+            metrics={"entry_count": 6, "candidate_entry_count": 3, "selected_entry_count": 3},
+            summary={
+                "entry_results": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "module-a",
+                        "completion_state": "success",
+                        "completion_ready": True,
+                        "execution_epoch": 0,
+                        "entries": [
+                            {"entry_key": "a-1", "function_name": "func1", "entry_confidence": 0.9},
+                        ],
+                    }
+                ],
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
+        detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+        self.assertEqual("top_n_per_module_by_confidence", detail.entry_auto_selection_strategy)
+        self.assertEqual(3, detail.entry_auto_selection_top_n)
+
+    def test_manual_confirm_effective_entry_inputs_do_not_use_auto_top_n(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="pending_entry_confirmation",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy={
+                "entry_selection_mode": "manual_confirm",
+                "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+                "entry_auto_selection_top_n": 1,
+            },
+            summary={
+                "entry_results": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "module-a",
+                        "completion_state": "success",
+                        "completion_ready": True,
+                        "execution_epoch": 0,
+                        "entries": [
+                            {"entry_key": "a-1", "function_name": "func1", "entry_confidence": 0.9},
+                            {"entry_key": "a-2", "function_name": "func2", "entry_confidence": 0.7},
+                        ],
+                    }
+                ],
+                "entry_selection": {
+                    "status": "confirmed",
+                    "selected_entry_keys": ["a-2"],
+                    "selected_entries": [{"entry_key": "a-2", "function_name": "func2"}],
+                },
+            },
+        )
+        effective_entries = self.manager._effective_entry_inputs(task)
+        self.assertEqual(["a-2"], [entry["entry_key"] for entry in effective_entries])
+
+    def test_kg_source_entry_candidates_ignore_auto_top_n_strategy(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="knowledge_graph_entry_fetch",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy={
+                "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+                "entry_selection_mode": "auto",
+                "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+                "entry_auto_selection_top_n": 1,
+            },
+            summary={
+                "entry_results": [
+                    {
+                        "module_key": "knowledge-graph-source-project",
+                        "module_name": "source-project",
+                        "completion_state": "success",
+                        "completion_ready": True,
+                        "execution_epoch": 0,
+                        "entries": [
+                            {"entry_key": "kg-1", "function_name": "func1", "entry_confidence": 0.9},
+                            {"entry_key": "kg-2", "function_name": "func2", "entry_confidence": 0.1},
+                        ],
+                    }
+                ],
+            },
+        )
+        candidates = self.manager._entry_candidates(task)
+        self.assertEqual(["kg-1", "kg-2"], [entry["entry_key"] for entry in candidates])
+        self.assertEqual("all", self.manager._entry_auto_selection_strategy(task))
+        self.assertEqual(0, self.manager._entry_auto_selection_top_n(task))
+
     def test_get_task_stage_items_page_stays_readonly(self):
         task = BinarySecurityTask(
             id="t1",

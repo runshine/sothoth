@@ -1617,6 +1617,8 @@ class TaskReadModelServiceMixin:
             task_id=task.id,
             status=task.status,
             selection_mode=self._entry_selection_mode(task),
+            auto_selection_strategy=self._entry_auto_selection_strategy(task),
+            auto_selection_top_n=self._entry_auto_selection_top_n(task),
             requires_confirmation=task.status == task_manager_module.TASK_STATUS_PENDING_ENTRY_CONFIRMATION,
             candidate_entries=candidate_entries,
             selected_entry_keys=selected_keys,
@@ -2017,6 +2019,8 @@ class TaskReadModelServiceMixin:
             ),
             module_selection_mode=self._module_selection_mode(task),
             entry_selection_mode=self._entry_selection_mode(task),
+            entry_auto_selection_strategy=self._entry_auto_selection_strategy(task),
+            entry_auto_selection_top_n=self._entry_auto_selection_top_n(task),
             candidate_entry_count=len(self._entry_candidates(task)),
             selected_entry_count=len(self._effective_entry_inputs(task))
             if self._entry_selection_mode(task) == task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM
