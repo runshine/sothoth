@@ -786,6 +786,37 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._dispatch_claim_decision(),
         )
 
+    def test_dispatch_task_by_id_marks_running_unsupported_nonresumable_task_as_drop_after_pop(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-running-no-resume",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id="worker-a",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": None,
+                "blocked_reason": "task_status_not_pending_without_resumable_operation",
+                "should_requeue": False,
+            },
+            manager._dispatch_claim_decision(),
+        )
+
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

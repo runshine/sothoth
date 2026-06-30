@@ -1209,6 +1209,12 @@ class TaskRuntimeServiceMixin:
                     task=task,
                     current_operation=active_delete_operation,
                 )
+                self._set_dispatch_claim_decision(
+                    task_id=task_id,
+                    claimed_task_id=None,
+                    blocked_reason="task_hidden_by_delete_queue",
+                    should_requeue=True,
+                )
                 return None
             cleared = self._clear_stale_delete_queue_hidden_state(
                 db,
@@ -1266,6 +1272,12 @@ class TaskRuntimeServiceMixin:
                     task=task,
                     current_operation=current_operation,
                 )
+                self._set_dispatch_claim_decision(
+                    task_id=task_id,
+                    claimed_task_id=None,
+                    blocked_reason="owner_guarded_control_operation_waiting_local_control_wakeup",
+                    should_requeue=False,
+                )
                 return None
             if (not local_handle_present) or local_handle_done or local_handle_cancel_requested:
                 if asyncio.get_event_loop().is_running():
@@ -1292,6 +1304,12 @@ class TaskRuntimeServiceMixin:
                     reason="owner_guarded_control_operation_restart_local_runtime",
                     task=task,
                     current_operation=current_operation,
+                )
+                self._set_dispatch_claim_decision(
+                    task_id=task_id,
+                    claimed_task_id=None,
+                    blocked_reason="owner_guarded_control_operation_restart_local_runtime",
+                    should_requeue=False,
                 )
                 return None
         if operation_requires_runtime_handle and self._release_unsupported_task_row_owner(
@@ -1403,6 +1421,12 @@ class TaskRuntimeServiceMixin:
                     task=task,
                     current_operation=current_operation,
                 )
+                self._set_dispatch_claim_decision(
+                    task_id=task_id,
+                    claimed_task_id=None,
+                    blocked_reason="active_operation_blocks_runtime_resume_but_same_owner_supported",
+                    should_requeue=False,
+                )
                 return None
             if current_status != "pending" and not has_active_operation:
                 self._log_dispatch_claim_blocked(
@@ -1410,6 +1434,12 @@ class TaskRuntimeServiceMixin:
                     reason="non_pending_status_without_runtime_resume",
                     task=task,
                     current_operation=current_operation,
+                )
+                self._set_dispatch_claim_decision(
+                    task_id=task_id,
+                    claimed_task_id=None,
+                    blocked_reason="non_pending_status_without_runtime_resume",
+                    should_requeue=False,
                 )
                 return None
         current_status = str(getattr(task, "status", "") or "").strip().lower()
@@ -1420,6 +1450,12 @@ class TaskRuntimeServiceMixin:
                 task=task,
                 current_operation=current_operation,
             )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="task_status_not_pending_without_resumable_operation",
+                should_requeue=False,
+            )
             return None
         if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not operation_allows_runtime_resume and not has_active_operation:
             self._log_dispatch_claim_blocked(
@@ -1427,6 +1463,12 @@ class TaskRuntimeServiceMixin:
                 reason="task_terminal_status",
                 task=task,
                 current_operation=current_operation,
+            )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="task_terminal_status",
+                should_requeue=False,
             )
             return None
         lease_takeover_decision = self._can_take_over_parent_control_operation(
@@ -1462,6 +1504,12 @@ class TaskRuntimeServiceMixin:
                 task=task,
                 current_operation=current_operation,
             )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="claim_takeover_gate_suppressed_active_lease",
+                should_requeue=False,
+            )
             return None
         active_runtime_lease = self._runtime_lease_for_task(db, task_id)
         if self._runtime_lease_is_active(active_runtime_lease):
@@ -1493,6 +1541,12 @@ class TaskRuntimeServiceMixin:
                 reason="active_runtime_lease_present",
                 task=task,
                 current_operation=current_operation,
+            )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="active_runtime_lease_present",
+                should_requeue=False,
             )
             return None
         started_at = task_manager_module._now()
