@@ -83,6 +83,3 @@
 	path = 13-secflow-service/image_build/secflow-app-vuln-verify-v2
 	url = https://github.com/GaiaSecHW/secflow-app-vuln-verify-v2.git
 	branch = main
-[submodule "13-secflow-service/image_build/secflow-app-dataflow-analyse"]
-	path = 13-secflow-service/image_build/secflow-app-dataflow-analyse
-	url = https://github.com/ict-bin/data_flow_analyse
