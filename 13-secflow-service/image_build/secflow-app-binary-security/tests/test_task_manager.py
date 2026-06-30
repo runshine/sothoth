@@ -39071,6 +39071,178 @@ def _test_sync_downstream_status_recovers_failed_entry_item_from_current_child_r
     self.assertIn("downstream_intermediate_state_recovered", [event.event_type for event in db.events])
 
 
+def _test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled(self):
+    task = BinarySecurityTask(
+        id="s-df-auto-no-recover",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-df-auto-no-recover",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-df-auto-no-recover",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        parent_key="module-1",
+        status="failed",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-live-1",
+        error_message="script_validation_failed",
+        result={
+            "sync_observation": {
+                "sync_status": "observation_gap_detected",
+                "last_result": "observation_gap_detected",
+                "downstream_status": "running",
+                "mapped_status": "running",
+            }
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    original_write = self.manager._write_task_metadata_async
+    original_enqueue = self.manager._enqueue_task
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "task_id": "dvs-live-1",
+            "status": "running",
+            "parent_task_id": _task.id,
+            "parent_stage_item_id": _item.id,
+            "parent_stage_item_key": _item.item_key,
+        }
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    self.manager._fetch_downstream_task_payload = _fetch
+    self.manager._write_task_metadata_async = _noop_write
+    self.manager._enqueue_task = lambda *_args, **_kwargs: None
+    try:
+        resp = asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                stage_name="dataflow_vuln_scan",
+                item_id=item.id,
+                apply_state=False,
+                force=False,
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+        self.manager._write_task_metadata_async = original_write
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertEqual(0, resp.synced_downstream_count)
+    self.assertEqual("failed", item.status)
+    self.assertNotEqual(True, item.result.get("sync_observation", {}).get("state_applied"))
+
+
+def _test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled(self):
+    task = BinarySecurityTask(
+        id="s-df-manual-recover",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/tmp",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-df-manual-recover",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-df-manual-recover",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        parent_key="module-1",
+        status="failed",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-live-2",
+        error_message="script_validation_failed",
+        result={
+            "sync_observation": {
+                "sync_status": "observation_gap_detected",
+                "last_result": "observation_gap_detected",
+                "downstream_status": "running",
+                "mapped_status": "running",
+            }
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    original_fetch = self.manager._fetch_downstream_task_payload
+    original_write = self.manager._write_task_metadata_async
+    original_enqueue = self.manager._enqueue_task
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "task_id": "dvs-live-2",
+            "status": "running",
+            "parent_task_id": _task.id,
+            "parent_stage_item_id": _item.id,
+            "parent_stage_item_key": _item.item_key,
+        }
+
+    async def _noop_write(*_args, **_kwargs):
+        return None
+
+    self.manager._fetch_downstream_task_payload = _fetch
+    self.manager._write_task_metadata_async = _noop_write
+    self.manager._enqueue_task = lambda *_args, **_kwargs: None
+    try:
+        resp = asyncio.run(
+            self.manager.sync_downstream_status(
+                db,
+                project_id="p1",
+                task_id=task.id,
+                stage_name="dataflow_vuln_scan",
+                item_id=item.id,
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        self.manager._fetch_downstream_task_payload = original_fetch
+        self.manager._write_task_metadata_async = original_write
+        self.manager._enqueue_task = original_enqueue
+
+    self.assertEqual(1, resp.synced_downstream_count)
+    self.assertEqual("running", item.status)
+    self.assertEqual("synced", item.result.get("sync_status"))
+    self.assertEqual("running", item.result.get("downstream_status"))
+    self.assertIn("downstream_intermediate_state_applied", [event.event_type for event in db.events])
+
+
 def _test_effective_stage_item_downstream_status_allows_recoverable_running_display(self):
     item = BinarySecurityStageItem(
         id="si-display-recover",
@@ -49927,6 +50099,8 @@ TaskManagerTests.test_operation_verify_retry_bindings_skips_duplicate_control_fo
 TaskManagerTests.test_run_current_task_operation_cancel_terminal_finalize_is_atomic = _test_run_current_task_operation_cancel_terminal_finalize_is_atomic
 TaskManagerTests.test_run_current_task_operation_returns_after_atomic_terminal_finalize_without_post_tail_ownership_check = _test_run_current_task_operation_returns_after_atomic_terminal_finalize_without_post_tail_ownership_check
 TaskManagerTests.test_run_current_task_operation_preserves_cancel_binding_when_terminal_finalize_stales_before_commit = _test_run_current_task_operation_preserves_cancel_binding_when_terminal_finalize_stales_before_commit
+TaskManagerTests.test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled = _test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled
+TaskManagerTests.test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled = _test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled
 
 
 if __name__ == "__main__":
