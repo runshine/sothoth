@@ -24931,7 +24931,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, summary["pending_count"])
         self.assertEqual(0, summary["success_count"])
 
-    def test_refresh_system_analysis_stage_from_synced_items_keeps_success_when_no_candidate_modules(self):
+    def test_refresh_system_analysis_stage_from_synced_items_marks_business_failure_when_no_candidate_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             output_root = workspace / "output"
@@ -24986,12 +24986,13 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
             self.manager._refresh_system_analysis_stage_from_synced_items(db, task)
 
-            self.assertEqual("success", stage_run.status)
-            self.assertIsNone(stage_run.last_error)
-            self.assertIsNone(task.last_error)
-            self.assertNotIn("failure_code", task.summary)
-            self.assertNotIn("failure_category", task.summary)
-            self.assertNotIn("failure_code", stage_run.output_summary)
+            self.assertEqual("failed", stage_run.status)
+            self.assertEqual("no_candidate_modules", stage_run.output_summary.get("failure_code"))
+            self.assertEqual("business", stage_run.output_summary.get("failure_category"))
+            self.assertEqual("系统分析已完成，但未发现匹配所选风险等级的风险模块", stage_run.last_error)
+            self.assertEqual("系统分析已完成，但未发现匹配所选风险等级的风险模块", task.last_error)
+            self.assertEqual("no_candidate_modules", task.summary.get("failure_code"))
+            self.assertEqual("business", task.summary.get("failure_category"))
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertIn("system_analysis_no_candidate_modules", event_types)
             self.assertTrue(
