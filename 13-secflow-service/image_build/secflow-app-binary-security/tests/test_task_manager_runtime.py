@@ -1,6 +1,6 @@
 import asyncio
 import unittest
-from datetime import timedelta
+from datetime import timedelta, datetime
 from contextlib import suppress
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -631,6 +631,73 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], requeued)
         self.assertIn("dispatch_claim_dropped_after_pop", [row.event_type for row in db.events])
 
+    async def test_dispatch_loop_starts_cooldown_when_claim_decision_requests_handoff_delay(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        requeued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            def __init__(self):
+                self._popped = False
+
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
+                if not self._popped:
+                    self._popped = True
+                    return "task-1"
+                manager._running = False
+                return None
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                requeued.append((task_id, context))
+
+        async def _reconcile(_db):
+            return None
+
+        async def _observe(_db):
+            return None
+
+        def _dispatch_task_by_id(_db, _task_id):
+            manager._set_dispatch_claim_decision(
+                task_id="task-1",
+                claimed_task_id=None,
+                blocked_reason="task_runtime_owner_handoff_cooldown",
+                should_requeue=False,
+                cooldown_seconds=15,
+            )
+            return None
+
+        manager._dispatch_task_by_id = _dispatch_task_by_id
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id="worker-old",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+        ):
+            await manager._dispatch_loop()
+
+        self.assertEqual([], requeued)
+        self.assertIn("dispatch_claim_requeue_cooldown_started", [row.event_type for row in db.events])
+        self.assertIn("dispatch_claim_cooldown", task.summary)
+
     async def test_dispatch_loop_skips_pop_when_local_worker_concurrency_is_full(self):
         manager = TaskManager()
         manager._running = True
@@ -751,6 +818,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 "claimed_task_id": None,
                 "blocked_reason": "task_row_missing",
                 "should_requeue": False,
+                "cooldown_seconds": None,
             },
             manager._dispatch_claim_decision(),
         )
@@ -782,6 +850,45 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 "claimed_task_id": None,
                 "blocked_reason": "non_pending_task_already_owned_by_supported_runtime",
                 "should_requeue": False,
+                "cooldown_seconds": None,
+            },
+            manager._dispatch_claim_decision(),
+        )
+
+    def test_dispatch_task_by_id_marks_runtime_owner_handoff_for_cooldown(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-handoff",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id="worker-old",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=1,
+            owner_instance_id="worker-new",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(seconds=300),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": None,
+                "blocked_reason": "task_runtime_owner_handoff_cooldown",
+                "should_requeue": False,
+                "cooldown_seconds": 15,
             },
             manager._dispatch_claim_decision(),
         )
@@ -964,6 +1071,55 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("task-pending", "queue_reconcile_pending_reenqueue")], reenqueued)
         self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
         self.assertIn("pending_task_reenqueued_by_reconcile", [row.event_type for row in db.events])
+
+    async def test_reconcile_work_queues_skips_task_during_dispatch_claim_cooldown(self):
+        task = BinarySecurityTask(
+            id="task-cooldown",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            summary_json={},
+        )
+        task.summary = {
+            "dispatch_claim_cooldown": {
+                "reason": "task_runtime_owner_handoff_cooldown",
+                "cooldown_seconds": 15,
+                "cooldown_started_at": datetime.utcnow().isoformat(),
+                "cooldown_until": (_now() + timedelta(seconds=30)).isoformat(),
+                "count": 1,
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
+
+        self.assertEqual([], pushed)
+        self.assertIn("dispatch_claim_cooldown", task.summary)
 
     async def test_reconcile_work_queues_runs_orphan_parent_initial_enqueue_reconcile_first(self):
         task = BinarySecurityTask(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+from datetime import timedelta
 from contextlib import suppress
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,64 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    def _dispatch_claim_handoff_cooldown_seconds(self: TaskManager) -> int:
+        configured = getattr(self.cfg.queue, "dispatch_claim_handoff_cooldown_seconds", None)
+        try:
+            return max(1, int(configured or 15))
+        except (TypeError, ValueError):
+            return 15
+
+    def _dispatch_claim_cooldown_snapshot(self: TaskManager, task) -> dict[str, object]:
+        summary = dict(getattr(task, "summary", None) or {})
+        raw = summary.get("dispatch_claim_cooldown")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _dispatch_claim_cooldown_active(self: TaskManager, task) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        cooldown = self._dispatch_claim_cooldown_snapshot(task)
+        until = task_manager_module._parse_iso_datetime(cooldown.get("cooldown_until"))
+        if until is None:
+            return False
+        return until > task_manager_module._now()
+
+    def _set_dispatch_claim_cooldown(
+        self: TaskManager,
+        task,
+        *,
+        reason: str,
+        cooldown_seconds: int,
+    ) -> dict[str, object]:
+        from app.service import task_manager as task_manager_module
+
+        now_value = task_manager_module._now()
+        until = now_value + timedelta(seconds=max(1, int(cooldown_seconds or 1)))
+        summary = dict(getattr(task, "summary", None) or {})
+        existing = summary.get("dispatch_claim_cooldown")
+        previous_count = 0
+        if isinstance(existing, dict):
+            try:
+                previous_count = max(0, int(existing.get("count") or 0))
+            except (TypeError, ValueError):
+                previous_count = 0
+        snapshot = {
+            "reason": str(reason or "").strip() or None,
+            "cooldown_seconds": max(1, int(cooldown_seconds or 1)),
+            "cooldown_started_at": task_manager_module._isoformat_or_none(now_value),
+            "cooldown_until": task_manager_module._isoformat_or_none(until),
+            "count": previous_count + 1,
+        }
+        summary["dispatch_claim_cooldown"] = snapshot
+        task.summary = summary
+        return snapshot
+
+    def _clear_dispatch_claim_cooldown(self: TaskManager, task) -> None:
+        summary = dict(getattr(task, "summary", None) or {})
+        if "dispatch_claim_cooldown" not in summary:
+            return
+        summary.pop("dispatch_claim_cooldown", None)
+        task.summary = summary
+
     def _set_dispatch_claim_decision(
         self: TaskManager,
         *,
@@ -21,17 +80,33 @@ class TaskRuntimeServiceMixin:
         claimed_task_id: str | None,
         blocked_reason: str | None,
         should_requeue: bool,
+        cooldown_seconds: int | None = None,
     ) -> None:
         self._last_dispatch_claim_decision = {
             "task_id": str(task_id or "").strip() or None,
             "claimed_task_id": str(claimed_task_id or "").strip() or None,
             "blocked_reason": str(blocked_reason or "").strip() or None,
             "should_requeue": bool(should_requeue),
+            "cooldown_seconds": None if cooldown_seconds is None else max(1, int(cooldown_seconds)),
         }
 
     def _dispatch_claim_decision(self: TaskManager) -> dict[str, object] | None:
         decision = getattr(self, "_last_dispatch_claim_decision", None)
         return dict(decision or {}) if decision else None
+
+    def _task_is_runtime_owner_handoff_pending(self: TaskManager, db: Session, task) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if task is None:
+            return False
+        if str(self._task_runtime_phase(task) or "").strip() != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return False
+        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
+        if not self._runtime_lease_is_active(lease):
+            return False
+        lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip()
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+        return bool(lease_owner and dispatcher_instance_id and lease_owner != dispatcher_instance_id)
 
     def _log_dispatch_claim_blocked(
         self: TaskManager,
@@ -110,6 +185,70 @@ class TaskRuntimeServiceMixin:
             "task_id=%s reason=%s",
             normalized_task_id,
             normalized_reason,
+        )
+
+    async def _cooldown_unclaimed_dispatch_task_after_pop(
+        self: TaskManager,
+        db: Session,
+        task_id: str,
+        *,
+        reason: str | None,
+        cooldown_seconds: int,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        normalized_task_id = str(task_id or "").strip()
+        normalized_reason = str(reason or "").strip() or "dispatch_claim_handoff_cooldown"
+        if not normalized_task_id:
+            return
+        task = (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(task_manager_module.BinarySecurityTask.id == normalized_task_id)
+            .first()
+        )
+        if task is None:
+            task_manager_module.logger.warning(
+                "binary-security dispatch popped task but cooldown target task row is missing; task dropped after pop: "
+                "task_id=%s reason=%s cooldown_seconds=%s",
+                normalized_task_id,
+                normalized_reason,
+                int(cooldown_seconds or 0),
+            )
+            return
+        snapshot = self._set_dispatch_claim_cooldown(
+            task,
+            reason=normalized_reason,
+            cooldown_seconds=cooldown_seconds,
+        )
+        self._record_event(
+            db,
+            task,
+            "dispatch_claim_requeue_cooldown_started",
+            f"任务已从 Redis 弹出，但当前处于 owner 切换冷却期，将在 {int(cooldown_seconds or 0)}s 后再重试调度",
+            level="warning",
+            stage_name=task.current_stage,
+            payload={
+                "task_id": normalized_task_id,
+                "reason": normalized_reason,
+                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                "runtime_phase": self._task_runtime_phase(task),
+                "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                "cooldown_seconds": int(cooldown_seconds or 0),
+                "cooldown_until": snapshot.get("cooldown_until"),
+                "requeue_after_pop": False,
+            },
+        )
+        db.commit()
+        task_manager_module.logger.warning(
+            "binary-security dispatch popped task but claim was not acquired; task cooldown started after pop: "
+            "task_id=%s reason=%s cooldown_seconds=%s status=%s runtime_phase=%s dispatcher_instance_id=%s",
+            normalized_task_id,
+            normalized_reason,
+            int(cooldown_seconds or 0),
+            str(getattr(task, "status", "") or "").strip() or None,
+            self._task_runtime_phase(task),
+            str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
         )
 
     async def _requeue_unclaimed_dispatch_task(self: TaskManager, db: Session, task_id: str) -> None:
@@ -816,6 +955,13 @@ class TaskRuntimeServiceMixin:
                             else:
                                 if bool(decision.get("should_requeue", True)):
                                     await self._requeue_unclaimed_dispatch_task(db, task_id)
+                                elif decision.get("cooldown_seconds"):
+                                    await self._cooldown_unclaimed_dispatch_task_after_pop(
+                                        db,
+                                        task_id,
+                                        reason=str(decision.get("blocked_reason", "") or "").strip() or None,
+                                        cooldown_seconds=int(decision.get("cooldown_seconds") or 0),
+                                    )
                                 else:
                                     await self._drop_unclaimed_dispatch_task_after_pop(
                                         db,
@@ -896,6 +1042,9 @@ class TaskRuntimeServiceMixin:
             normalized_task_id = str(getattr(task, "id", "") or "").strip()
             if not normalized_task_id:
                 continue
+            if self._dispatch_claim_cooldown_active(task):
+                continue
+            self._clear_dispatch_claim_cooldown(task)
             if current_status == "pending":
                 queue_state, recoverable_reason = self._task_queue_state(
                     task,
@@ -1429,6 +1578,21 @@ class TaskRuntimeServiceMixin:
                 )
                 return None
             if current_status != "pending" and not has_active_operation:
+                if self._task_is_runtime_owner_handoff_pending(db, task):
+                    self._log_dispatch_claim_blocked(
+                        task_id,
+                        reason="task_runtime_owner_handoff_cooldown",
+                        task=task,
+                        current_operation=current_operation,
+                    )
+                    self._set_dispatch_claim_decision(
+                        task_id=task_id,
+                        claimed_task_id=None,
+                        blocked_reason="task_runtime_owner_handoff_cooldown",
+                        should_requeue=False,
+                        cooldown_seconds=self._dispatch_claim_handoff_cooldown_seconds(),
+                    )
+                    return None
                 self._log_dispatch_claim_blocked(
                     task_id,
                     reason="non_pending_status_without_runtime_resume",
@@ -1444,6 +1608,21 @@ class TaskRuntimeServiceMixin:
                 return None
         current_status = str(getattr(task, "status", "") or "").strip().lower()
         if current_status != "pending" and not operation_allows_runtime_resume and not has_active_operation:
+            if self._task_is_runtime_owner_handoff_pending(db, task):
+                self._log_dispatch_claim_blocked(
+                    task_id,
+                    reason="task_runtime_owner_handoff_cooldown",
+                    task=task,
+                    current_operation=current_operation,
+                )
+                self._set_dispatch_claim_decision(
+                    task_id=task_id,
+                    claimed_task_id=None,
+                    blocked_reason="task_runtime_owner_handoff_cooldown",
+                    should_requeue=False,
+                    cooldown_seconds=self._dispatch_claim_handoff_cooldown_seconds(),
+                )
+                return None
             self._log_dispatch_claim_blocked(
                 task_id,
                 reason="task_status_not_pending_without_resumable_operation",

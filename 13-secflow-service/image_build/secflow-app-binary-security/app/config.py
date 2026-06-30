@@ -152,6 +152,7 @@ class QueueConfig(BaseModel):
     task_sync_queue_prefix: str = "bs:task_sync_queue"
     block_timeout_seconds: int = 5
     reconcile_interval_seconds: int = 30
+    dispatch_claim_handoff_cooldown_seconds: int = 15
     seed_batch_size: int = 20
     startup_ready_timeout_seconds: int = 60
     startup_retry_interval_seconds: int = 2
