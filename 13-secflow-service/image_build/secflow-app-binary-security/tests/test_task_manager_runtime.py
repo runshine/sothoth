@@ -791,6 +791,109 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.manager = TaskManager()
 
+    async def test_consume_delete_queue_task_defers_when_parent_lease_still_active(self):
+        task = BinarySecurityTask(
+            id="task-delete-active-lease",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+            current_operation_id="op-delete",
+        )
+        task.cleanup_snapshot = {
+            "delete_queued": True,
+            "delete_operation_id": "op-delete",
+            "delete_mode": "delete",
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], state_events=[])
+        requeued: list[str] = []
+        prepared: list[str] = []
+
+        self.manager._force_requeue_delete_task = lambda task_id: requeued.append(task_id)
+
+        async def _prepare(_db, _task):
+            prepared.append(_task.id)
+            return None
+
+        self.manager._prepare_delete_task = _prepare
+
+        await self.manager._consume_delete_queue_task(db, task.id)
+
+        self.assertEqual([task.id], requeued)
+        self.assertEqual([], prepared)
+        self.assertIn(
+            "task_delete_queue_consumption_deferred_for_active_lease",
+            [row.event_type for row in db.events],
+        )
+
+    async def test_consume_delete_queue_task_reclaims_expired_owner_before_processing(self):
+        task = BinarySecurityTask(
+            id="task-delete-expired-lease",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-a",
+            lease_expires_at=_now() - timedelta(minutes=5),
+            current_operation_id="op-delete",
+        )
+        task.cleanup_snapshot = {
+            "delete_queued": True,
+            "delete_operation_id": "op-delete",
+            "delete_mode": "delete",
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], state_events=[])
+        released: list[str] = []
+        prepared: list[str] = []
+
+        def _release(_db, release_task, *, active_operation=None, reason):
+            del _db, active_operation
+            released.append(reason)
+            release_task.dispatcher_instance_id = None
+            release_task.lease_expires_at = None
+            return True
+
+        async def _prepare(_db, _task):
+            prepared.append(_task.id)
+            return None
+
+        self.manager.instance_id = "worker-b"
+        self.manager._release_unsupported_task_row_owner = _release
+        self.manager._prepare_delete_task = _prepare
+
+        await self.manager._consume_delete_queue_task(db, task.id)
+
+        self.assertEqual(["delete_queue_consumption_takeover_gate"], released)
+        self.assertEqual([task.id], prepared)
+        started_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_started")
+        self.assertTrue(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
+        self.assertEqual("worker-b", task.dispatcher_instance_id)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+
     async def test_reconcile_work_queues_force_reenqueues_pending_task_missing_from_redis(self):
         task = BinarySecurityTask(
             id="task-pending",

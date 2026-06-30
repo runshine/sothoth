@@ -217,9 +217,33 @@ class TaskRuntimeServiceMixin:
         force_delete = bool(dict(active_operation.request_payload or {}).get("force_delete"))
         if not self._task_is_hidden_by_delete_queue(task):
             self._mark_task_delete_queued(task, operation_id=active_operation.id, force_delete=force_delete)
-        if self._runtime_lease_is_active(self._runtime_lease_for_task(db, task.id)):
+        delete_takeover_decision = self._can_take_over_parent_control_operation(
+            db,
+            task,
+            reason="delete_queue_consumption_takeover_gate",
+        )
+        if not delete_takeover_decision.allowed:
+            self._record_parent_runtime_lease_decision(
+                db,
+                task,
+                event_type="task_delete_queue_consumption_deferred_for_active_lease",
+                message="删除队列消费检测到父任务 lease 仍有效，当前暂不接管删除",
+                decision=delete_takeover_decision,
+                reason="delete_queue_consumption_takeover_gate",
+                stage_name=task.current_stage,
+                level="info",
+            )
             self._force_requeue_delete_task(task.id)
+            db.commit()
             return
+        released_owner = self._release_unsupported_task_row_owner(
+            db,
+            task,
+            active_operation=active_operation,
+            reason="delete_queue_consumption_takeover_gate",
+        )
+        if released_owner:
+            db.flush()
         started_at = task_manager_module._now()
         task.dispatcher_instance_id = self.instance_id
         task.dispatch_started_at = started_at
@@ -244,6 +268,7 @@ class TaskRuntimeServiceMixin:
                 "runtime_phase": self._task_runtime_phase(task),
                 "delete_queued": True,
                 "delete_in_progress": True,
+                "owner_released_before_delete_consume": bool(released_owner),
             },
         )
         db.commit()
