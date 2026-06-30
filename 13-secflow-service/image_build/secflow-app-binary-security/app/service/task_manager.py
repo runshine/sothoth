@@ -728,6 +728,7 @@ class TaskManager(
         self._non_owner_claim_log_state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._non_owner_claim_log_lock = threading.Lock()
         self._non_owner_claim_event_state: dict[tuple[str, str, str, str], datetime] = {}
+        self._last_dispatch_claim_decision: dict[str, Any] | None = None
         self._stage_registry = get_binary_security_stage_registry()
 
     def __getattr__(self, item: str):
