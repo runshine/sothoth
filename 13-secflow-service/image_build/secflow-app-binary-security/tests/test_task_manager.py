@@ -41545,6 +41545,48 @@ def _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied
     self.assertFalse(bool(sync_rows[0].state_applied))
 
 
+def _test_refresh_polled_child_sync_snapshot_applies_pending_dfvs_item_to_running(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-8b",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="si-8b",
+        task_id="task-8b",
+        project_id="p1",
+        stage_run_id="sr-8b",
+        stage_name="dataflow_vuln_scan",
+        item_key="source_project-xml_parser-htmlReadIO-5813",
+        status="pending",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-8b",
+        result={},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+
+    with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
+        manager._refresh_polled_child_sync_snapshot(
+            task_id="task-8b",
+            item_id="si-8b",
+            payload={"task_id": "dvs-8b", "status": "running"},
+        )
+
+    self.assertEqual("running", item.status)
+    observation = dict((item.result or {}).get("sync_observation") or {})
+    self.assertTrue(observation.get("state_applied"))
+    self.assertEqual("running", observation.get("mapped_status"))
+    self.assertEqual("synced", (item.result or {}).get("sync_status"))
+
+
 def _test_record_polled_child_sync_failure_records_transport_sync_event(self):
     task = BinarySecurityTask(
         id="task-polled-sync-failure",
@@ -46558,6 +46600,7 @@ TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_faile
 TaskManagerTests.test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails = _test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails
 TaskManagerTests.test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending = _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending
 TaskManagerTests.test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied = _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied
+TaskManagerTests.test_refresh_polled_child_sync_snapshot_applies_pending_dfvs_item_to_running = _test_refresh_polled_child_sync_snapshot_applies_pending_dfvs_item_to_running
 TaskManagerTests.test_sync_downstream_status_rewinds_running_entry_item_to_pending = _test_sync_downstream_status_rewinds_running_entry_item_to_pending
 TaskManagerTests.test_sync_downstream_status_keeps_dispatching_pending_for_entry_item = _test_sync_downstream_status_keeps_dispatching_pending_for_entry_item
 TaskManagerTests.test_task_list_response_exposes_runtime_lease_and_sync_view = _test_task_list_response_exposes_runtime_lease_and_sync_view
