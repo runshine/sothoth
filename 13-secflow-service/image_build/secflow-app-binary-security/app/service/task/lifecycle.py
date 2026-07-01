@@ -115,7 +115,7 @@ class TaskLifecycleServiceMixin:
                 task_id = str(getattr(task, "id", "") or "").strip()
                 if not task_id:
                     continue
-                if status in {"pending", "dispatching", "running"}:
+                if status == "pending":
                     task_count += 1
                     task_ids.append(task_id)
             for operation in db.query(task_manager_module.BinarySecurityTaskOperation).all():

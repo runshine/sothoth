@@ -306,6 +306,58 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager._state_event_inbox_loop_task)
         self.assertIsNone(manager._state_event_inbox_metrics_loop_task)
 
+    async def test_seed_work_queues_only_enqueues_pending_tasks(self):
+        manager = TaskManager()
+        workspace_root = self._workspace_root("seed-pending-only")
+        pushed: list[tuple[str, str | None]] = []
+
+        pending_task = BinarySecurityTask(
+            id="task-pending",
+            project_id="project-1",
+            name="pending",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=workspace_root,
+        )
+        dispatching_task = BinarySecurityTask(
+            id="task-dispatching",
+            project_id="project-1",
+            name="dispatching",
+            status="dispatching",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=workspace_root,
+        )
+        running_task = BinarySecurityTask(
+            id="task-running",
+            project_id="project-1",
+            name="running",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=workspace_root,
+        )
+        db = _ModelAwareDb(tasks=[pending_task, dispatching_task, running_task], operations=[], events=[], state_events=[])
+
+        class _Queue:
+            async def push_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+        ):
+            await manager._seed_work_queues()
+
+        self.assertEqual([("task-pending", "startup_seed")], pushed)
+
     async def test_start_task_runtime_creates_runner_and_heartbeat_handle(self):
         manager = TaskManager()
         started: list[str] = []
@@ -1254,6 +1306,52 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], pushed)
         self.assertIn("dispatch_claim_cooldown", task.summary)
+
+    async def test_reconcile_work_queues_does_not_reenqueue_active_nonpending_task_to_shared_dispatch(self):
+        task = BinarySecurityTask(
+            id="task-running-stale-owner",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("reconcile-active-nonpending"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-stale",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
+            patch.object(self.manager, "_queue_reconcile_task_rows", return_value=[task]),
+            patch.object(self.manager, "_queue_reconcile_operation_rows", return_value=[]),
+        ):
+            await self.manager._reconcile_work_queues_once(db)
+
+        self.assertEqual([], pushed)
+        self.assertIn("active_nonpending_task_reenqueue_skipped", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_runs_orphan_parent_initial_enqueue_reconcile_first(self):
         task = BinarySecurityTask(

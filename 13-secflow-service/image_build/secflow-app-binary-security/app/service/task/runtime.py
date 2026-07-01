@@ -1366,7 +1366,29 @@ class TaskRuntimeServiceMixin:
                 continue
             if self._task_row_owner_is_runtime_supported(db, task):
                 continue
-            await queue.push_task(normalized_task_id)
+            task_manager_module.logger.info(
+                "binary-security queue reconcile skipped shared-dispatch reenqueue for active non-pending task: "
+                "task_id=%s task_status=%s runtime_phase=%s dispatcher_instance_id=%s",
+                normalized_task_id,
+                str(getattr(task, "status", "") or "").strip() or None,
+                self._task_runtime_phase(task),
+                str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+            )
+            self._record_event(
+                db,
+                task,
+                "active_nonpending_task_reenqueue_skipped",
+                "活跃非 pending 任务不再通过 queue reconcile 重新注入共享调度队列",
+                level="info",
+                stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    "enqueue_context": "queue_reconcile",
+                    "reason": "active_nonpending_tasks_must_not_use_shared_dispatch_reenqueue",
+                },
+            )
         operation_rows = self._queue_reconcile_operation_rows(db, seed_batch_size=seed_batch_size)
         for (operation_task_id,) in operation_rows:
             normalized_task_id = str(operation_task_id or "").strip()
