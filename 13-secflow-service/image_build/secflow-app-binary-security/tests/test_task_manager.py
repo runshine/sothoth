@@ -32172,6 +32172,65 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("a", task.summary["input_files"][0]["firmware_key"])
         self.assertGreaterEqual(db.commits, 1)
 
+    def test_run_firmware_item_non_retry_adopts_authoritative_active_child_without_create(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="fw-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="firmware_unpack",
+            item_key="fw-1",
+            item_name="a.bin",
+            parent_key="fw-1",
+            downstream_service="firmware_unpacker",
+            downstream_task_id="fu-live",
+            status="pending",
+            output_ref={},
+        )
+        input_file = {"firmware_key": "fw-1", "filename": "a.bin", "path": "/tmp/a.bin"}
+        fake_session = _AppendingModelAwareDb(stage_items=[item], events=[])
+
+        async def fake_poll(*args, **kwargs):
+            del args, kwargs
+            return "success", {"task_id": "fu-live", "status": "success"}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_active_downstream_payload", return_value={"task_id": "fu-live", "status": "running"}),
+            patch.object(
+                self.manager,
+                "_downstream_create_task",
+                new=AsyncMock(side_effect=AssertionError("should not create duplicate firmware child")),
+            ),
+            patch.object(self.manager, "_poll_until_terminal", side_effect=fake_poll),
+            patch.object(self.manager, "_queue_archive_and_wait", return_value=(Path("/tmp"), None)),
+            patch.object(self.manager, "_compact_result_for_storage", side_effect=lambda stage_name, result: result),
+        ):
+            result = asyncio.run(self.manager._run_firmware_item(task, stage_run, input_file, token="tok", retrying=False))
+
+        self.assertEqual("success", result["status"])
+        self.assertEqual("fu-live", item.downstream_task_id)
+        self.assertEqual("success", item.status)
+        adopted_events = [event for event in fake_session.events if event.event_type == "downstream_child_adopted"]
+        self.assertTrue(adopted_events)
+        self.assertEqual("authoritative_child_already_active", adopted_events[-1].payload.get("reason"))
+
     def test_run_vuln_item_reuses_duplicate_downstream_task_before_create(self):
         task = BinarySecurityTask(
             id="t1",
@@ -38548,6 +38607,66 @@ def _test_archive_apply_remains_owner_inbox_observe_only(self):
 
 
 TaskManagerTests.test_archive_apply_remains_owner_inbox_observe_only = _test_archive_apply_remains_owner_inbox_observe_only
+
+
+def _test_observe_only_reconcile_skips_tail_sync_for_non_tail_stage(self):
+    task = BinarySecurityTask(
+        id="task-non-tail-observe-only",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    task.summary = {
+        "runtime_workset": {
+            "pending_task_layer_reconcile": {
+                "source_event_type": "archive_job_copied",
+                "state_event_id": "sev-non-tail-observe-only",
+                "reconcile_reason": "archive_apply",
+                "stage_name": "firmware_unpack",
+                "reconcile_mode": "observe_only",
+                "fact_applied": True,
+            }
+        }
+    }
+    stage_run = BinarySecurityStageRun(
+        id="sr-non-tail-observe-only",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="success",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
+
+    from app.service import task_manager as task_manager_module
+
+    original_factory = task_manager_module.get_session_factory
+    original_sync_tail = self.manager._sync_streaming_task_tail_state
+    sync_tail_calls: list[str] = []
+
+    async def _capture_sync_tail(task_id: str):
+        sync_tail_calls.append(task_id)
+
+    task_manager_module.get_session_factory = lambda: (lambda: db)
+    self.manager._sync_streaming_task_tail_state = _capture_sync_tail
+    try:
+        changed = asyncio.run(self.manager._run_task_runtime_signals(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        self.manager._sync_streaming_task_tail_state = original_sync_tail
+
+        self.assertFalse(changed)
+        self.assertEqual([], sync_tail_calls)
+
+
+TaskManagerTests.test_observe_only_reconcile_skips_tail_sync_for_non_tail_stage = _test_observe_only_reconcile_skips_tail_sync_for_non_tail_stage
 
 
 def _test_finalize_deferred_keeps_running_during_owned_stage_handoff(self):

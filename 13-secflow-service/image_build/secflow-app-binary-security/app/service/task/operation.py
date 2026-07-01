@@ -3003,7 +3003,8 @@ class TaskOperationServiceMixin:
                         if stage_name:
                             self._refresh_stage_from_authoritative_items(reconcile_db, reconcile_task, stage_name)
                             self._reconcile_stage_domain_in_session(reconcile_db, reconcile_task, stage_name)
-                        await self._sync_streaming_task_tail_state(reconcile_task.id)
+                        if stage_name and self._is_streaming_tail_stage(reconcile_task, stage_name):
+                            await self._sync_streaming_task_tail_state(reconcile_task.id)
                         reconcile_db.commit()
                         return True
                     changed = await self._run_task_layer_reconcile_signal(

@@ -3736,17 +3736,63 @@ class TaskRuntimeServiceMixin:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
-                    created = await self._downstream_create_task(
-                        session,
-                        task,
-                        item,
-                        service="firmware_unpacker",
-                        token=token,
-                        payload={
-                            "firmware_path": str(input_path),
-                            "origin": _downstream_origin_payload(task, item),
-                        },
-                    )
+                    current_child_payload = await self._active_downstream_payload(task, item, token)
+                    if current_child_payload is not None and str(item.downstream_task_id or "").strip():
+                        current_child_status = self._map_downstream_status(str(current_child_payload.get("status") or "")) or "running"
+                        item.status = current_child_status
+                        item.started_at = item.started_at or _now()
+                        self._merge_stage_item_result_fields(
+                            task,
+                            item,
+                            stage_name=stage_run.stage_name,
+                            updates={"project_id": task.project_id},
+                        )
+                        self._commit_stage_item_active_state(session, task, stage_run)
+                        self._record_downstream_item_disposition(
+                            session,
+                            task,
+                            item,
+                            event_type="downstream_child_adopted",
+                            message="已接管当前仍在运行中的 authoritative 下游子任务",
+                            payload={
+                                "stage_name": item.stage_name,
+                                "item_id": item.id,
+                                "item_key": item.item_key,
+                                "downstream_task_id": item.downstream_task_id,
+                                "adopted_status": current_child_status,
+                                "reason": "authoritative_child_already_active",
+                            },
+                        )
+                        session.commit()
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                            success_statuses={"success"},
+                            failure_statuses={"failed", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                        created = None
+                    elif str(item.downstream_task_id or "").strip() and not retrying:
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="firmware_unpack_observe",
+                            exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
+                            response_item=input_file,
+                        )
+                    else:
+                        created = await self._downstream_create_task(
+                            session,
+                            task,
+                            item,
+                            service="firmware_unpacker",
+                            token=token,
+                            payload={
+                                "firmware_path": str(input_path),
+                                "origin": _downstream_origin_payload(task, item),
+                            },
+                        )
             if created is not None:
                 item.status = "running"
                 old_downstream_task_id = await self._replace_active_child_binding(
