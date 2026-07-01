@@ -327,7 +327,38 @@ class TaskRuntimeStateServiceMixin:
         *,
         reason: str,
     ) -> LeaseClearDecision:
-        return self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
+        decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
+        active_operation = self._task_active_operation(db, task)
+        active_operation_type = str(getattr(active_operation, "operation_type", "") or "").strip() or None
+        task_status = str(getattr(task, "status", "") or "").strip().lower() or None
+        runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        if (
+            not decision.allowed
+            and str(reason or "").strip() == "delete_queue_consumption_takeover_gate"
+            and active_operation_type == "delete"
+            and decision.reason_code == "runtime_lease_missing_nonterminal"
+            and decision.lease_state == "missing"
+            and not dispatcher_instance_id
+            and runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION
+            and task_status in {"pending", "dispatching", "running", "cancelling"}
+        ):
+            return LeaseClearDecision(
+                allowed=True,
+                reason_code="delete_orphan_owned_execution_takeover",
+                lease_state=decision.lease_state,
+                owner_matches_current_instance=decision.owner_matches_current_instance,
+                task_terminal=decision.task_terminal,
+                task_status=decision.task_status,
+                runtime_phase=decision.runtime_phase,
+                active_operation_type=decision.active_operation_type,
+                active_operation_status=decision.active_operation_status,
+                runtime_lease_owner=decision.runtime_lease_owner,
+                runtime_lease_expires_at=decision.runtime_lease_expires_at,
+                row_lease_expires_at=decision.row_lease_expires_at,
+                dispatcher_instance_id=decision.dispatcher_instance_id,
+            )
+        return decision
 
     def _can_owner_release_parent_runtime_for_retry_requeue(
         self: TaskManager,
