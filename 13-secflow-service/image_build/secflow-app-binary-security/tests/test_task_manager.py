@@ -38423,6 +38423,133 @@ def _test_run_task_layer_reconcile_signal_archive_apply_uses_owner_stage_termina
 TaskManagerTests.test_run_task_layer_reconcile_signal_archive_apply_uses_owner_stage_terminal_apply = _test_run_task_layer_reconcile_signal_archive_apply_uses_owner_stage_terminal_apply
 
 
+def _test_missing_stage_terminal_recovery_prefers_owner_inbox_with_allow_execution(self):
+    task = BinarySecurityTask(
+        id="task-missing-stage-terminal",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now()
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+
+    decision = self.manager._task_layer_reconcile_delivery_decision(
+        db,
+        task,
+        source_event_type="stage_worker_terminal_observed",
+        reconcile_reason="missing_stage_terminal_recovery",
+    )
+
+    self.assertEqual("owner_inbox", decision.delivery_channel)
+    self.assertFalse(decision.observe_only)
+
+
+TaskManagerTests.test_missing_stage_terminal_recovery_prefers_owner_inbox_with_allow_execution = _test_missing_stage_terminal_recovery_prefers_owner_inbox_with_allow_execution
+
+
+def _test_missing_stage_terminal_recovery_request_uses_allow_execution_signal(self):
+    task = BinarySecurityTask(
+        id="task-missing-stage-terminal-request",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now()
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+
+    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+    enqueued: list[tuple[str, str, str]] = []
+
+    def _capture_enqueue(owner_instance_id: str, task_id: str, *, context: str = "owner_signal_enqueue"):
+        enqueued.append((owner_instance_id, task_id, context))
+
+    self.manager._enqueue_owner_signal = _capture_enqueue
+    try:
+        self.manager._request_task_layer_reconcile(
+            db,
+            task,
+            stage_name="firmware_unpack",
+            source_event_type="stage_worker_terminal_observed",
+            state_event_id="sev-terminal-missing",
+            reconcile_reason="missing_stage_terminal_recovery",
+            message="missing terminal recovery",
+        )
+    finally:
+        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    pending_reconcile = dict(self.manager._task_runtime_workset(task).get("pending_task_layer_reconcile") or {})
+    self.assertEqual("allow_execution", pending_reconcile.get("reconcile_mode"))
+    self.assertEqual("missing_stage_terminal_recovery", pending_reconcile.get("reconcile_reason"))
+    self.assertEqual("stage_worker_terminal_observed", pending_reconcile.get("source_event_type"))
+    self.assertEqual([("worker-a", task.id, "owner_reconcile_signal_enqueue")], enqueued)
+
+
+TaskManagerTests.test_missing_stage_terminal_recovery_request_uses_allow_execution_signal = _test_missing_stage_terminal_recovery_request_uses_allow_execution_signal
+
+
+def _test_archive_apply_remains_owner_inbox_observe_only(self):
+    task = BinarySecurityTask(
+        id="task-archive-observe-only",
+        project_id="p1",
+        name="n",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-a",
+    )
+    task.dispatch_started_at = _now()
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+
+    decision = self.manager._task_layer_reconcile_delivery_decision(
+        db,
+        task,
+        source_event_type="archive_job_copied",
+        reconcile_reason="archive_apply",
+    )
+
+    self.assertEqual("owner_inbox", decision.delivery_channel)
+    self.assertTrue(decision.observe_only)
+
+
+TaskManagerTests.test_archive_apply_remains_owner_inbox_observe_only = _test_archive_apply_remains_owner_inbox_observe_only
+
+
 def _test_finalize_deferred_keeps_running_during_owned_stage_handoff(self):
     task = BinarySecurityTask(
         id="task-stage-handoff",

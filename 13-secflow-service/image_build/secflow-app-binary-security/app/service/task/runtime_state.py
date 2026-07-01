@@ -57,6 +57,23 @@ class TaskRuntimeStateServiceMixin:
     _STATE_TRANSITION_GUARD_TTL_SECONDS = 30
     _MAIN_STATE_UNSET = object()
 
+    def _task_layer_reconcile_requires_execution(
+        self: TaskManager,
+        *,
+        source_event_type: str | None,
+        reconcile_reason: str | None,
+    ) -> bool:
+        normalized_source = str(source_event_type or "").strip()
+        normalized_reason = str(reconcile_reason or "").strip()
+        if normalized_reason == "missing_stage_terminal_recovery":
+            return True
+        return normalized_source in {
+            "stage_worker_terminal_observed",
+            "downstream_terminal_observed",
+            "task_execution_failed",
+            "archive_job_copy_failed",
+        }
+
     def _parent_task_state_snapshot(self: TaskManager, task) -> dict[str, Any]:
         return {
             "status": str(getattr(task, "status", "") or "").strip() or None,
@@ -1720,6 +1737,31 @@ class TaskRuntimeStateServiceMixin:
                 context="owner_reconcile_signal_enqueue",
             )
             return
+        if delivery_decision.delivery_channel == "owner_inbox" and target_owner_instance_id:
+            self._record_event(
+                db,
+                task,
+                "owner_reconcile_signal_enqueued",
+                "已向当前 owner worker 投递可执行的任务层收口信号",
+                level="info",
+                stage_name=signal_stage_name,
+                payload={
+                    "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                    "target_owner_instance_id": target_owner_instance_id,
+                    "local_instance_id": str(self.instance_id or "").strip() or None,
+                    "signal_channel": delivery_decision.delivery_channel,
+                    "reconcile_reason": reconcile_reason,
+                    "decision_reason": delivery_decision.decision_reason,
+                    "source_event_type": str(source_event_type or "").strip() or None,
+                    "reconcile_mode": "allow_execution",
+                },
+            )
+            self._enqueue_owner_signal(
+                target_owner_instance_id,
+                task.id,
+                context="owner_reconcile_signal_enqueue",
+            )
+            return
         self._enqueue_task(task.id)
 
     def _task_layer_reconcile_delivery_decision(
@@ -1730,8 +1772,6 @@ class TaskRuntimeStateServiceMixin:
         source_event_type: str,
         reconcile_reason: str,
     ) -> TaskLayerReconcileDeliveryDecision:
-        del reconcile_reason
-
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
         task_status = str(getattr(task, "status", "") or "").strip().lower() or None
         runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
@@ -1757,12 +1797,16 @@ class TaskRuntimeStateServiceMixin:
                 )
             )
         )
+        observe_only = not self._task_layer_reconcile_requires_execution(
+            source_event_type=source_event_type_normalized,
+            reconcile_reason=reconcile_reason,
+        )
 
         target_owner_instance_id = runtime_lease_owner or dispatcher_instance_id
         if runtime_lease_owner:
             return TaskLayerReconcileDeliveryDecision(
                 delivery_channel="owner_inbox",
-                observe_only=True,
+                observe_only=observe_only,
                 decision_reason="active_runtime_lease_owner_present",
                 target_owner_instance_id=target_owner_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
@@ -1773,7 +1817,7 @@ class TaskRuntimeStateServiceMixin:
         if dispatcher_instance_id and task_status not in TASK_TERMINAL_STATUSES:
             return TaskLayerReconcileDeliveryDecision(
                 delivery_channel="owner_inbox",
-                observe_only=True,
+                observe_only=observe_only,
                 decision_reason="dispatcher_owner_present",
                 target_owner_instance_id=target_owner_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
@@ -1789,7 +1833,7 @@ class TaskRuntimeStateServiceMixin:
         ):
             return TaskLayerReconcileDeliveryDecision(
                 delivery_channel="owner_inbox",
-                observe_only=True,
+                observe_only=observe_only,
                 decision_reason="owned_execution_non_pending_reconcile_owner_preferred",
                 target_owner_instance_id=target_owner_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
@@ -1800,7 +1844,7 @@ class TaskRuntimeStateServiceMixin:
         if owner_local_reconcile_event and runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION and task_status != "pending":
             return TaskLayerReconcileDeliveryDecision(
                 delivery_channel="owner_inbox",
-                observe_only=True,
+                observe_only=observe_only,
                 decision_reason="owned_execution_reconcile_without_row_owner_prefers_owner_channel",
                 target_owner_instance_id=target_owner_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
