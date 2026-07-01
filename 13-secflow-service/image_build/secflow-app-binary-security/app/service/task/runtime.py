@@ -152,6 +152,69 @@ class TaskRuntimeServiceMixin:
             .first()
         )
         if task is not None:
+            dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+            local_instance_id = str(self.instance_id or "").strip() or None
+            if (
+                normalized_reason == "non_pending_task_already_owned_by_supported_runtime"
+                and dispatcher_instance_id
+                and local_instance_id
+                and dispatcher_instance_id != local_instance_id
+            ):
+                self._record_event(
+                    db,
+                    task,
+                    "dispatch_claim_ignored_foreign_owner_signal",
+                    "共享调度队列消费到 foreign-owner 唤醒信号，已按 owner 定向语义忽略",
+                    level="info",
+                    stage_name=task.current_stage,
+                    payload={
+                        "task_id": normalized_task_id,
+                        "reason": normalized_reason,
+                        "dispatcher_instance_id": dispatcher_instance_id,
+                        "target_owner_instance_id": dispatcher_instance_id,
+                        "local_instance_id": local_instance_id,
+                        "runtime_phase": self._task_runtime_phase(task),
+                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                        "signal_channel": "shared_dispatch",
+                        "forwarded_from_shared_dispatch": False,
+                    },
+                )
+                self._enqueue_owner_signal(
+                    dispatcher_instance_id,
+                    normalized_task_id,
+                    context="shared_dispatch_foreign_owner_forward",
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "owner_reconcile_signal_forwarded_to_owner_inbox",
+                    "共享调度队列上的 foreign-owner 唤醒信号已转投当前 owner inbox",
+                    level="info",
+                    stage_name=task.current_stage,
+                    payload={
+                        "task_id": normalized_task_id,
+                        "reason": normalized_reason,
+                        "dispatcher_instance_id": dispatcher_instance_id,
+                        "target_owner_instance_id": dispatcher_instance_id,
+                        "local_instance_id": local_instance_id,
+                        "runtime_phase": self._task_runtime_phase(task),
+                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                        "signal_channel": "owner_inbox",
+                        "forwarded_from_shared_dispatch": True,
+                    },
+                )
+                db.commit()
+                task_manager_module.logger.info(
+                    "binary-security dispatch popped foreign-owner signal and forwarded to owner inbox: task_id=%s "
+                    "reason=%s current_owner=%s local_instance_id=%s status=%s runtime_phase=%s",
+                    normalized_task_id,
+                    normalized_reason,
+                    dispatcher_instance_id,
+                    local_instance_id,
+                    str(getattr(task, "status", "") or "").strip() or None,
+                    self._task_runtime_phase(task),
+                )
+                return
             self._record_event(
                 db,
                 task,
@@ -891,10 +954,30 @@ class TaskRuntimeServiceMixin:
                         int(getattr(service_config, "worker_task_concurrency", 40) or 40) - local_active_count,
                     )
                     if local_slots > 0:
-                        task_id = await task_manager_module.get_task_queue().pop_task(
+                        queue = task_manager_module.get_task_queue()
+                        task_id = await queue.pop_task(
                             self.cfg.queue.block_timeout_seconds,
                             context="task_dispatch_pop",
                         )
+                        recovered_recently = False
+                        blocking_client_recently_recovered = getattr(
+                            queue,
+                            "blocking_client_recently_recovered",
+                            None,
+                        )
+                        if callable(blocking_client_recently_recovered):
+                            recovered_recently = bool(
+                                blocking_client_recently_recovered(
+                                    channel="task_dispatch_pop",
+                                    within_seconds=max(5.0, float(self.cfg.queue.block_timeout_seconds or 5)),
+                                )
+                            )
+                        if task_id is None and recovered_recently:
+                            task_manager_module.logger.info(
+                                "binary-security dispatch pop recovered and resuming: local_active_count=%s local_slots=%s",
+                                local_active_count,
+                                local_slots,
+                            )
                         if task_id:
                             claimed_id = self._dispatch_task_by_id(db, task_id)
                             decision = self._dispatch_claim_decision() or {}
@@ -968,6 +1051,14 @@ class TaskRuntimeServiceMixin:
                                         task_id,
                                         reason=str(decision.get("blocked_reason", "") or "").strip() or None,
                                     )
+                    else:
+                        task_manager_module.logger.info(
+                            "binary-security task dispatch pop skipped because no local slots: "
+                            "local_active_count=%s worker_task_concurrency=%s local_slots=%s",
+                            local_active_count,
+                            int(getattr(service_config, "worker_task_concurrency", 40) or 40),
+                            local_slots,
+                        )
                     await self._reconcile_work_queues(db)
                     await self._observe_runtime_metrics(db)
                     self._mark_loop_heartbeat("task_dispatch")
@@ -1001,15 +1092,55 @@ class TaskRuntimeServiceMixin:
             active += 1
         return active
 
+    def _should_run_queue_reconcile(self: TaskManager, now_value: datetime) -> bool:
+        interval_seconds = max(5, int(getattr(self.cfg.queue, "reconcile_interval_seconds", 30) or 30))
+        if self._last_queue_reconcile_at is None:
+            return True
+        elapsed = (now_value - self._last_queue_reconcile_at).total_seconds()
+        return elapsed >= interval_seconds
+
     async def _reconcile_work_queues(self: TaskManager, db: Session) -> None:
         from app.service import task_manager as task_manager_module
 
         now_value = task_manager_module._now()
-        interval_seconds = max(5, int(getattr(self.cfg.queue, "reconcile_interval_seconds", 30) or 30))
-        if self._last_queue_reconcile_at is not None:
-            elapsed = (now_value - self._last_queue_reconcile_at).total_seconds()
-            if elapsed < interval_seconds:
-                return
+        if not self._should_run_queue_reconcile(now_value):
+            return
+        await self._reconcile_work_queues_once(db, now_value=now_value)
+
+    def _queue_reconcile_task_rows(self: TaskManager, db: Session, *, seed_batch_size: int) -> list[Any]:
+        from app.service import task_manager as task_manager_module
+
+        return (
+            db.query(task_manager_module.BinarySecurityTask)
+            .filter(task_manager_module.BinarySecurityTask.status.in_(["pending", "dispatching", "running"]))
+            .order_by(
+                task_manager_module.BinarySecurityTask.updated_at.asc(),
+                task_manager_module.BinarySecurityTask.created_at.asc(),
+                task_manager_module.BinarySecurityTask.id.asc(),
+            )
+            .limit(seed_batch_size)
+            .all()
+        )
+
+    def _queue_reconcile_operation_rows(self: TaskManager, db: Session, *, seed_batch_size: int) -> list[tuple[Any, ...]]:
+        from app.service import task_manager as task_manager_module
+
+        return (
+            db.query(task_manager_module.BinarySecurityTaskOperation.task_id)
+            .filter(task_manager_module.BinarySecurityTaskOperation.status.in_(["pending", "queued", "running", "accepted"]))
+            .order_by(
+                task_manager_module.BinarySecurityTaskOperation.updated_at.asc(),
+                task_manager_module.BinarySecurityTaskOperation.created_at.asc(),
+                task_manager_module.BinarySecurityTaskOperation.task_id.asc(),
+            )
+            .limit(seed_batch_size)
+            .all()
+        )
+
+    async def _reconcile_work_queues_once(self: TaskManager, db: Session, *, now_value: datetime | None = None) -> None:
+        from app.service import task_manager as task_manager_module
+
+        now_value = now_value or task_manager_module._now()
         orphan_reconciled = await self.reconcile_orphan_parent_tasks_missing_initial_enqueue(
             db,
             batch_size=self._orphan_parent_reconcile_batch_size(),
@@ -1026,17 +1157,7 @@ class TaskRuntimeServiceMixin:
         delete_queue_key = str(getattr(self.cfg.queue, "delete_queue_key", "") or "binary_security_delete_queue").strip()
         delete_positions = await queue.queue_positions(delete_queue_key, context="delete_queue_reconcile_snapshot")
         seed_batch_size = max(1, int(getattr(self.cfg.queue, "seed_batch_size", 20) or 20))
-        task_rows = (
-            db.query(task_manager_module.BinarySecurityTask)
-            .filter(task_manager_module.BinarySecurityTask.status.in_(["pending", "dispatching", "running"]))
-            .order_by(
-                task_manager_module.BinarySecurityTask.updated_at.asc(),
-                task_manager_module.BinarySecurityTask.created_at.asc(),
-                task_manager_module.BinarySecurityTask.id.asc(),
-            )
-            .limit(seed_batch_size)
-            .all()
-        )
+        task_rows = self._queue_reconcile_task_rows(db, seed_batch_size=seed_batch_size)
         for task in task_rows:
             current_status = str(getattr(task, "status", "") or "").strip().lower()
             normalized_task_id = str(getattr(task, "id", "") or "").strip()
@@ -1218,17 +1339,7 @@ class TaskRuntimeServiceMixin:
             if self._task_row_owner_is_runtime_supported(db, task):
                 continue
             await queue.push_task(normalized_task_id)
-        operation_rows = (
-            db.query(task_manager_module.BinarySecurityTaskOperation.task_id)
-            .filter(task_manager_module.BinarySecurityTaskOperation.status.in_(["pending", "queued", "running", "accepted"]))
-            .order_by(
-                task_manager_module.BinarySecurityTaskOperation.updated_at.asc(),
-                task_manager_module.BinarySecurityTaskOperation.created_at.asc(),
-                task_manager_module.BinarySecurityTaskOperation.task_id.asc(),
-            )
-            .limit(seed_batch_size)
-            .all()
-        )
+        operation_rows = self._queue_reconcile_operation_rows(db, seed_batch_size=seed_batch_size)
         for (operation_task_id,) in operation_rows:
             normalized_task_id = str(operation_task_id or "").strip()
             if normalized_task_id:

@@ -4115,20 +4115,35 @@ class TaskReadModelServiceMixin:
                 sync_observation["mapped_status"] = "success"
                 repaired = True
         downstream_payload = dict(result.get("downstream") or {})
-        last_synced_at = result.get("last_sync_success_at") or result.get("downstream_status_synced_at")
-        last_attempt_at = result.get("last_sync_attempt_at") or sync_observation.get("last_attempt_at") or sync_observation.get("last_synced_at")
-        last_error_at = result.get("last_sync_error_at") or sync_observation.get("last_error_at")
+        has_real_downstream_task = bool(str(item.downstream_task_id or "").strip())
+        last_synced_at = (
+            result.get("last_sync_success_at") or result.get("downstream_status_synced_at")
+            if has_real_downstream_task
+            else None
+        )
+        last_attempt_at = (
+            result.get("last_sync_attempt_at") or sync_observation.get("last_attempt_at") or sync_observation.get("last_synced_at")
+            if has_real_downstream_task
+            else None
+        )
+        last_error_at = (
+            result.get("last_sync_error_at") or sync_observation.get("last_error_at")
+            if has_real_downstream_task
+            else None
+        )
         raw_sync_status = result.get("sync_status")
         sync_status = str(raw_sync_status).strip().lower() if raw_sync_status is not None else None
         if sync_status == "transport_error" and (downstream_status or last_synced_at):
             sync_status = "synced"
         if not sync_status:
-            if item.downstream_task_id and (downstream_status or last_synced_at):
+            if has_real_downstream_task and (downstream_status or last_synced_at):
                 sync_status = "synced" if last_synced_at else "pending"
                 if downstream_status and not last_synced_at:
                     sync_status = "synced"
             else:
                 sync_status = "not_applicable"
+        if not has_real_downstream_task:
+            sync_status = "not_applicable"
         if repaired and sync_status in {None, "", "pending"}:
             sync_status = "synced"
         parsed_last_synced_at = last_synced_at
@@ -4175,11 +4190,15 @@ class TaskReadModelServiceMixin:
                 archive_bound_downstream_task_id = self._archive_job_bound_downstream_task_id(job) or archive_bound_downstream_task_id
                 if archive_bound_downstream_task_id:
                     break
-        freshness_state = self._stage_item_sync_freshness_state(
-            item,
-            last_attempt_at=parsed_last_attempt_at if isinstance(parsed_last_attempt_at, datetime) else None,
-            last_success_at=parsed_last_synced_at if isinstance(parsed_last_synced_at, datetime) else None,
-            last_error_at=parsed_last_error_at if isinstance(parsed_last_error_at, datetime) else None,
+        freshness_state = (
+            self._stage_item_sync_freshness_state(
+                item,
+                last_attempt_at=parsed_last_attempt_at if isinstance(parsed_last_attempt_at, datetime) else None,
+                last_success_at=parsed_last_synced_at if isinstance(parsed_last_synced_at, datetime) else None,
+                last_error_at=parsed_last_error_at if isinstance(parsed_last_error_at, datetime) else None,
+            )
+            if has_real_downstream_task
+            else "not_applicable"
         )
         authoritative_archive_success = self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs)
         return task_manager_module.BinarySecurityStageItemResponse(

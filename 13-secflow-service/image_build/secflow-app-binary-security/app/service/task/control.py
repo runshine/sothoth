@@ -47,6 +47,32 @@ class TaskControlServiceMixin:
             state_event_id=None,
             applied_by="owner_direct",
         )
+        target_owner_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        if target_owner_instance_id:
+            mode = str(payload.get("mode") or "policy").strip() or "policy"
+            self._record_event(
+                db,
+                task,
+                "owner_reconcile_signal_enqueued",
+                "已向当前 owner worker 投递策略收口唤醒信号",
+                level="info",
+                stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                    "target_owner_instance_id": target_owner_instance_id,
+                    "local_instance_id": str(self.instance_id or "").strip() or None,
+                    "signal_channel": "owner_inbox",
+                    "reconcile_reason": "manual_policy_update_requested",
+                    "source_event_type": "manual_policy_update_requested",
+                    "policy_update_mode": mode,
+                },
+            )
+            self._enqueue_owner_signal(
+                target_owner_instance_id,
+                task.id,
+                context="manual_policy_owner_signal_enqueue",
+            )
+            return
         self._enqueue_task(task.id)
 
     def _task_delete_snapshot_state(self: TaskManager, task) -> dict[str, Any]:

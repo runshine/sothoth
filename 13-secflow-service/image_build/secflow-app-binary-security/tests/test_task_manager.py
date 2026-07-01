@@ -558,16 +558,31 @@ class ArchiveReclaimTests(unittest.TestCase):
             runtime_leases=[runtime_lease],
             events=[],
         )
-        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
-            reclaimed = self.manager._reclaim_stale_archive_jobs()
+        queued: list[str] = []
+        owner_signals: list[tuple[str, str]] = []
+        original_enqueue = self.manager._enqueue_task
+        original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+        try:
+            self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+            self.manager._enqueue_owner_signal = (
+                lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+            )
+            with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+                reclaimed = self.manager._reclaim_stale_archive_jobs()
+        finally:
+            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_owner_signal = original_enqueue_owner_signal
         self.assertEqual(reclaimed, 1)
         self.assertEqual("failed", job.archive_status)
         self.assertIn("delegated to task owner repair", str(job.error_message))
         workset = dict((task.summary or {}).get("runtime_workset") or {})
         self.assertEqual("dataflow_vuln_scan", workset["pending_archive_rebuild"]["stage_name"])
         self.assertEqual("failed_items", workset["pending_archive_rebuild"]["rebuild_mode"])
+        self.assertEqual([], queued)
+        self.assertEqual([("worker-owner", task.id)], owner_signals)
         event_types = [event.event_type for event in db.events]
         self.assertIn("downstream_archive_rebuild_deferred_to_owner", event_types)
+        self.assertIn("owner_reconcile_signal_enqueued", event_types)
 
     def test_stop_cleanup_requeues_owned_running_archive_jobs(self):
         task = self._task()
@@ -34047,6 +34062,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             workspace_root="/tmp/ws",
             status="cancelled",
             current_stage="firmware_unpack",
+            dispatcher_instance_id="worker-owner",
         )
         task.cleanup_snapshot = {
             "cleanup_partial_failed": True,
@@ -34058,6 +34074,8 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             ],
         }
         db = _AppendingModelAwareDb(tasks=[task], events=[])
+        queued: list[str] = []
+        owner_signals: list[tuple[str, str]] = []
 
         async def _run():
             with (
@@ -34078,7 +34096,17 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                         }
                     ],
                 )
-                await self.manager._reconcile_deferred_cleanup_task_ref({"project_id": "p1", "task_id": "t-reconcile-cleanup-pending"}, "token")
+                original_enqueue = self.manager._enqueue_task
+                original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+                try:
+                    self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+                    self.manager._enqueue_owner_signal = (
+                        lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+                    )
+                    await self.manager._reconcile_deferred_cleanup_task_ref({"project_id": "p1", "task_id": "t-reconcile-cleanup-pending"}, "token")
+                finally:
+                    self.manager._enqueue_task = original_enqueue
+                    self.manager._enqueue_owner_signal = original_enqueue_owner_signal
 
         asyncio.run(_run())
 
@@ -34086,8 +34114,11 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
         self.assertEqual("partial_failed", task.cleanup_snapshot.get("deferred_cleanup_status"))
         self.assertEqual(1, len(task.cleanup_snapshot.get("deferred_downstream_refs") or []))
+        self.assertEqual([], queued)
+        self.assertEqual([("worker-owner", task.id)], owner_signals)
         event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
         self.assertIn("task_delete_cleanup_retry_deferred", event_types)
+        self.assertIn("owner_reconcile_signal_enqueued", event_types)
 
     def test_delete_downstream_refs_force_delete_ignores_unverified_failure(self):
         task = BinarySecurityTask(
@@ -36642,6 +36673,184 @@ def _test_archive_apply_uses_explicit_task_layer_reconcile(self):
     event_types = [event.event_type for event in db.events]
     self.assertNotIn("task_finalize_deferred_for_incomplete_stage", event_types)
     self.assertNotIn("main_state_write_blocked", event_types)
+
+
+def _test_request_task_layer_reconcile_archive_apply_uses_owner_inbox(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-owner",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    queued_tasks = []
+    owner_signals = []
+
+    original_enqueue_task = self.manager._enqueue_task
+    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+    self.manager._enqueue_task = lambda task_id: queued_tasks.append(task_id)
+    self.manager._enqueue_owner_signal = (
+        lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+    )
+    try:
+        self.manager._request_task_layer_reconcile(
+            db,
+            task,
+            stage_name="firmware_unpack",
+            source_event_type="archive_job_copied",
+            state_event_id=None,
+            reconcile_reason="archive_apply",
+            message="归档事实已更新，已通知当前 owner worker 收口任务层决策",
+        )
+    finally:
+        self.manager._enqueue_task = original_enqueue_task
+        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertEqual([], queued_tasks)
+    self.assertEqual([("worker-owner", "t1")], owner_signals)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("owned_execution_owner_reconcile_requested", event_types)
+    self.assertIn("owner_reconcile_signal_enqueued", event_types)
+
+
+def _test_request_task_layer_reconcile_non_archive_owner_signal_uses_owner_inbox(self):
+    task = BinarySecurityTask(
+        id="t2",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-owner",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    queued_tasks = []
+    owner_signals = []
+
+    original_enqueue_task = self.manager._enqueue_task
+    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+    self.manager._enqueue_task = lambda task_id: queued_tasks.append(task_id)
+    self.manager._enqueue_owner_signal = (
+        lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+    )
+    try:
+        self.manager._request_task_layer_reconcile(
+            db,
+            task,
+            stage_name="entry_analysis",
+            source_event_type="stage_worker_terminal_observed",
+            state_event_id="sev1",
+            reconcile_reason="stage_worker_terminal_observed",
+            message="阶段终态事实已落库，等待 owner worker 统一收口任务主状态",
+        )
+    finally:
+        self.manager._enqueue_task = original_enqueue_task
+        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertEqual([], queued_tasks)
+    self.assertEqual([("worker-owner", "t2")], owner_signals)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("owned_execution_owner_reconcile_requested", event_types)
+    self.assertIn("owner_reconcile_signal_enqueued", event_types)
+
+
+def _test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch(self):
+    task = BinarySecurityTask(
+        id="t3",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id=None,
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    queued_tasks = []
+    owner_signals = []
+
+    original_enqueue_task = self.manager._enqueue_task
+    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+    self.manager._enqueue_task = lambda task_id: queued_tasks.append(task_id)
+    self.manager._enqueue_owner_signal = (
+        lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+    )
+    try:
+        self.manager._request_task_layer_reconcile(
+            db,
+            task,
+            stage_name="entry_analysis",
+            source_event_type="stage_worker_terminal_observed",
+            state_event_id="sev2",
+            reconcile_reason="stage_worker_terminal_observed",
+            message="阶段终态事实已落库，等待 owner worker 统一收口任务主状态",
+        )
+    finally:
+        self.manager._enqueue_task = original_enqueue_task
+        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertEqual(["t3"], queued_tasks)
+    self.assertEqual([], owner_signals)
+    payload = dict(db.events[0].payload or {})
+    self.assertEqual("shared_dispatch", payload.get("signal_channel"))
+
+
+def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-owner",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    self.manager.instance_id = "worker-local"
+    forwarded = []
+
+    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+    self.manager._enqueue_owner_signal = (
+        lambda owner_instance_id, task_id, **_kwargs: forwarded.append((owner_instance_id, task_id))
+    )
+    try:
+        asyncio.run(
+            self.manager._drop_unclaimed_dispatch_task_after_pop(
+                db,
+                "t1",
+                reason="non_pending_task_already_owned_by_supported_runtime",
+            )
+        )
+    finally:
+        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertEqual([("worker-owner", "t1")], forwarded)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
+    self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
+    self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
 
 
 def _test_prepare_retry_failed_items_reconciles_affected_stages_in_session(self):
@@ -46931,6 +47140,47 @@ TaskManagerTests.test_start_worker_role_does_not_spawn_state_event_inbox_loops =
 TaskManagerTests.test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running = _test_sync_downstream_status_recovers_failed_entry_item_from_current_child_running
 TaskManagerTests.test_effective_stage_item_downstream_status_allows_recoverable_running_display = _test_effective_stage_item_downstream_status_allows_recoverable_running_display
 TaskManagerTests.test_tail_control_plane_stale_error_does_not_pollute_sync_error = _test_tail_control_plane_stale_error_does_not_pollute_sync_error
+
+
+def _test_stage_item_response_hides_sync_timestamps_without_real_downstream_task(self):
+    manager = TaskManager()
+    item = BinarySecurityStageItem(
+        id="si-no-downstream",
+        task_id="t1",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="queued",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id=None,
+        result={
+            "last_sync_attempt_at": _now().isoformat(),
+            "last_sync_success_at": _now().isoformat(),
+            "last_sync_error_at": _now().isoformat(),
+            "sync_status": "synced",
+            "sync_observation": {
+                "last_attempt_at": _now().isoformat(),
+                "last_success_at": _now().isoformat(),
+                "last_error_at": _now().isoformat(),
+                "downstream_status": "running",
+                "mapped_status": "running",
+            },
+        },
+    )
+
+    response = manager._stage_item_response(
+        BinarySecurityTask(id="t1", project_id="p1", status="running", current_stage="dataflow_vuln_scan"),
+        item,
+    )
+
+    self.assertIsNone(response.last_sync_attempt_at)
+    self.assertIsNone(response.last_sync_success_at)
+    self.assertIsNone(response.last_sync_error_at)
+    self.assertEqual("not_applicable", response.sync_status)
+    self.assertEqual("not_applicable", response.sync_freshness_state)
+
+
+TaskManagerTests.test_stage_item_response_hides_sync_timestamps_without_real_downstream_task = _test_stage_item_response_hides_sync_timestamps_without_real_downstream_task
 TaskManagerTests.test_sync_observation_recovery_clears_lingering_sync_error_state = _test_sync_observation_recovery_clears_lingering_sync_error_state
 TaskManagerTests.test_task_sync_status_view_excludes_no_child_business_failures_from_sync_errors = _test_task_sync_status_view_excludes_no_child_business_failures_from_sync_errors
 TaskManagerTests.test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy = _test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy
@@ -49656,6 +49906,307 @@ def _test_enqueue_task_sync_request_merges_same_dedupe_key(self):
     self.assertEqual([task.id, task.id], queued)
 
 
+def _test_enqueue_task_sync_request_uses_owner_inbox_when_owner_present(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-owner",
+        project_id="p1",
+        name="sync",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-owner",
+    )
+    fake_queue = _FakeTaskSyncQueue()
+    queued: list[str] = []
+    owner_signals: list[tuple[str, str]] = []
+    original_enqueue = manager._enqueue_task
+    original_enqueue_owner_signal = manager._enqueue_owner_signal
+    original_get_queue = task_manager_module.get_task_queue
+    try:
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        manager._enqueue_owner_signal = (
+            lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+        )
+        task_manager_module.get_task_queue = lambda: fake_queue
+        asyncio.run(
+            manager._enqueue_task_sync_request(
+                task,
+                sync_kind="downstream_status",
+                source="test",
+                reason="owner-sync",
+                stage_name="entry_analysis",
+                item_ids=["i1"],
+            )
+        )
+    finally:
+        manager._enqueue_task = original_enqueue
+        manager._enqueue_owner_signal = original_enqueue_owner_signal
+        task_manager_module.get_task_queue = original_get_queue
+
+    self.assertEqual([], queued)
+    self.assertEqual([("worker-owner", task.id)], owner_signals)
+
+
+def _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-owner"
+    fake_handle = SimpleNamespace(
+        done=lambda: False,
+        lease_established=True,
+        owner_active=True,
+        cancel_requested=False,
+        active_commit_succeeded=True,
+        release_requested=False,
+        takeover_observed=False,
+    )
+    task = BinarySecurityTask(
+        id="task-control-owner",
+        project_id="p1",
+        name="control",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-owner",
+        current_operation_id="op-1",
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-1",
+        task_id=task.id,
+        project_id="p1",
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        status="running",
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-owner",
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(minutes=1),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    original_runtime_handle = manager._runtime_handle
+    original_cancel = manager._request_local_worker_cancel
+    original_enqueue_task = manager._enqueue_task
+    original_enqueue_owner_signal = manager._enqueue_owner_signal
+    queued: list[str] = []
+    owner_signals: list[tuple[str, str]] = []
+
+    async def _fake_cancel(*_args, **_kwargs):
+        return True
+
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        manager._runtime_handle = lambda task_id: fake_handle if task_id == task.id else None
+        manager._request_local_worker_cancel = _fake_cancel
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        manager._enqueue_owner_signal = (
+            lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+        )
+        result = asyncio.run(manager._handoff_active_serial_control_operation_from_runtime(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._runtime_handle = original_runtime_handle
+        manager._request_local_worker_cancel = original_cancel
+        manager._enqueue_task = original_enqueue_task
+        manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertTrue(result)
+    self.assertEqual([], queued)
+    self.assertEqual([("worker-owner", task.id)], owner_signals)
+    self.assertTrue(any(event.event_type == "runtime_yielded_for_serial_control_operation" for event in db.events))
+
+
+def _test_reconcile_deferred_cleanup_task_ref_uses_owner_inbox_when_owner_present(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="t-reconcile-cleanup-pending",
+        project_id="p1",
+        name="task",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/tmp/in",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+        status="cancelled",
+        current_stage="firmware_unpack",
+        dispatcher_instance_id="worker-owner",
+    )
+    task.cleanup_snapshot = {
+        "cleanup_partial_failed": True,
+        "deleted_downstream_count": 0,
+        "deferred_cleanup_attempts": 1,
+        "deferred_cleanup_status": "partial_failed",
+        "deferred_downstream_refs": [
+            {"service": "firmware_unpacker", "task_id": "fw-1", "stage_name": "firmware_unpack", "deferred": True}
+        ],
+    }
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    queued: list[str] = []
+    owner_signals: list[tuple[str, str]] = []
+
+    async def _run():
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(manager, "_delete_downstream_refs", AsyncMock(return_value=0)),
+        ):
+            setattr(
+                manager,
+                "_last_downstream_cleanup_results",
+                [
+                    {
+                        "service": "firmware_unpacker",
+                        "task_id": "fw-1",
+                        "stage_name": "firmware_unpack",
+                        "delete_status": "failed",
+                        "deferred": True,
+                        "error": "still busy",
+                    }
+                ],
+            )
+            original_enqueue = manager._enqueue_task
+            original_enqueue_owner_signal = manager._enqueue_owner_signal
+            try:
+                manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+                manager._enqueue_owner_signal = (
+                    lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+                )
+                await manager._reconcile_deferred_cleanup_task_ref({"project_id": "p1", "task_id": task.id}, "token")
+            finally:
+                manager._enqueue_task = original_enqueue
+                manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    asyncio.run(_run())
+
+    self.assertEqual([], queued)
+    self.assertEqual([("worker-owner", task.id)], owner_signals)
+    event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
+    self.assertIn("task_delete_cleanup_retry_deferred", event_types)
+    self.assertIn("owner_reconcile_signal_enqueued", event_types)
+
+
+def _test_update_task_runtime_policy_uses_owner_inbox_when_owner_present(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="t-runtime-policy-owner",
+        project_id="p1",
+        name="binary",
+        status="running",
+        task_type=TASK_TYPE_BINARY_MODULE,
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase="tail_reconciliation",
+        dispatcher_instance_id="worker-owner",
+    )
+    task.policy = {
+        "max_stage_parallelism": 4,
+        "max_retries_per_item": 2,
+        "continue_on_item_failure": True,
+        "stage_parallelism": {"binary_to_source": 4, "entry_analysis": 4, "dataflow_vuln_scan": 4},
+    }
+    db = _ModelAwareDb(tasks=[task])
+    queued: list[str] = []
+    owner_signals: list[tuple[str, str]] = []
+    original_enqueue = manager._enqueue_task
+    original_enqueue_owner_signal = manager._enqueue_owner_signal
+    try:
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        manager._enqueue_owner_signal = (
+            lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+        )
+        manager.update_task_runtime_policy(
+            db,
+            project_id="p1",
+            task_id="t-runtime-policy-owner",
+            payload=BinarySecurityTaskRuntimePolicyUpdatePayload(
+                expected_version=0,
+                stage_parallelism={"entry_analysis": 2},
+                updated_by="tester",
+            ),
+        )
+    finally:
+        manager._enqueue_task = original_enqueue
+        manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertEqual([], queued)
+    self.assertEqual([("worker-owner", task.id)], owner_signals)
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("task_runtime_policy_updated", event_types)
+    self.assertIn("owner_reconcile_signal_enqueued", event_types)
+
+
+def _test_update_task_policy_falls_back_to_shared_dispatch_without_owner(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="t-policy-shared",
+        project_id="p1",
+        name="binary",
+        status="failed",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="project_filesystem",
+        firmware_path="/fw",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.policy = {
+        "max_stage_parallelism": 4,
+        "max_retries_per_item": 2,
+        "continue_on_item_failure": True,
+        "partial_success_stage_advancement": {"binary_to_source": True, "entry_analysis": True, "dataflow_vuln_scan": True},
+        "stage_parallelism": {
+            "firmware_unpack": 4,
+            "system_analysis": 4,
+            "binary_to_source": 4,
+            "entry_analysis": 4,
+            "dataflow_vuln_scan": 4,
+        },
+        "stage_options": {"binary_to_source": {"enabled": True}},
+        "module_selection_mode": "auto",
+        "module_risk_levels": ["高"],
+    }
+    db = _ModelAwareDb(tasks=[task])
+    queued: list[str] = []
+    owner_signals: list[tuple[str, str]] = []
+    original_enqueue = manager._enqueue_task
+    original_enqueue_owner_signal = manager._enqueue_owner_signal
+    try:
+        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
+        manager._enqueue_owner_signal = (
+            lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
+        )
+        manager.update_task_policy(
+            db,
+            project_id="p1",
+            task_id="t-policy-shared",
+            payload=BinarySecurityTaskPolicyUpdatePayload(
+                stage_options={"binary_to_source": {"enabled": False}},
+                max_retries_per_item=5,
+            ),
+        )
+    finally:
+        manager._enqueue_task = original_enqueue
+        manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertEqual([task.id], queued)
+    self.assertEqual([], owner_signals)
+    event_types = [getattr(event, "event_type", "") for event in db.added]
+    self.assertIn("task_policy_updated", event_types)
+    self.assertNotIn("owner_reconcile_signal_enqueued", event_types)
+
+
 def _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync(self):
     manager = TaskManager()
     manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -50269,6 +50820,10 @@ TaskManagerTests.test_ensure_stage_run_records_timeline_event_when_created = _te
 TaskManagerTests.test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage = _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
+TaskManagerTests.test_enqueue_task_sync_request_uses_owner_inbox_when_owner_present = _test_enqueue_task_sync_request_uses_owner_inbox_when_owner_present
+TaskManagerTests.test_reconcile_deferred_cleanup_task_ref_uses_owner_inbox_when_owner_present = _test_reconcile_deferred_cleanup_task_ref_uses_owner_inbox_when_owner_present
+TaskManagerTests.test_update_task_runtime_policy_uses_owner_inbox_when_owner_present = _test_update_task_runtime_policy_uses_owner_inbox_when_owner_present
+TaskManagerTests.test_update_task_policy_falls_back_to_shared_dispatch_without_owner = _test_update_task_policy_falls_back_to_shared_dispatch_without_owner
 TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync
 TaskManagerTests.test_drain_task_sync_queue_consumes_and_acks_entry = _test_drain_task_sync_queue_consumes_and_acks_entry
 TaskManagerTests.test_drain_task_sync_queue_retries_failed_entry = _test_drain_task_sync_queue_retries_failed_entry
@@ -50285,6 +50840,11 @@ TaskManagerTests.test_run_current_task_operation_returns_after_atomic_terminal_f
 TaskManagerTests.test_run_current_task_operation_preserves_cancel_binding_when_terminal_finalize_stales_before_commit = _test_run_current_task_operation_preserves_cancel_binding_when_terminal_finalize_stales_before_commit
 TaskManagerTests.test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled = _test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled
 TaskManagerTests.test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled = _test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled
+TaskManagerTests.test_request_task_layer_reconcile_archive_apply_uses_owner_inbox = _test_request_task_layer_reconcile_archive_apply_uses_owner_inbox
+TaskManagerTests.test_request_task_layer_reconcile_non_archive_owner_signal_uses_owner_inbox = _test_request_task_layer_reconcile_non_archive_owner_signal_uses_owner_inbox
+TaskManagerTests.test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch = _test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch
+TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal = _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal
+TaskManagerTests.test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox = _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox
 
 
 if __name__ == "__main__":

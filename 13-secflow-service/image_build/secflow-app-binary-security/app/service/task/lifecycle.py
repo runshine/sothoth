@@ -436,8 +436,32 @@ class TaskLifecycleServiceMixin:
                     "legacy_recovery": True,
                 },
             )
+            target_owner_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+            if target_owner_instance_id:
+                self._record_event(
+                    db,
+                    task,
+                    "owner_reconcile_signal_enqueued",
+                    "已向当前 owner worker 投递删除清理恢复信号",
+                    level="info",
+                    payload={
+                        "task_id": task.id,
+                        "target_owner_instance_id": target_owner_instance_id,
+                        "local_instance_id": str(self.instance_id or "").strip() or None,
+                        "signal_channel": "owner_inbox",
+                        "reconcile_reason": "legacy_delete_cleanup_retry_requested",
+                        "source_event_type": "task_delete_cleanup_retry_deferred",
+                    },
+                )
             db.commit()
-            self._enqueue_task(task.id)
+            if target_owner_instance_id:
+                self._enqueue_owner_signal(
+                    target_owner_instance_id,
+                    task.id,
+                    context="cleanup_retry_owner_signal_enqueue",
+                )
+            else:
+                self._enqueue_task(task.id)
         finally:
             db.close()
 
@@ -1150,6 +1174,33 @@ class TaskLifecycleServiceMixin:
                             "source": "lease_auditor_signal",
                         },
                     )
+                    target_owner_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+                    if target_owner_instance_id:
+                        self._record_event(
+                            db,
+                            task,
+                            "owner_reconcile_signal_enqueued",
+                            "已向当前 owner worker 投递归档重建恢复信号",
+                            level="info",
+                            stage_name=job.stage_name,
+                            payload={
+                                "task_id": task.id,
+                                "target_owner_instance_id": target_owner_instance_id,
+                                "local_instance_id": str(self.instance_id or "").strip() or None,
+                                "signal_channel": "owner_inbox",
+                                "reconcile_reason": "stale_running_archive_job",
+                                "source_event_type": "downstream_archive_rebuild_deferred_to_owner",
+                                "archive_job_id": job.id,
+                            },
+                        )
+                    if target_owner_instance_id:
+                        self._enqueue_owner_signal(
+                            target_owner_instance_id,
+                            task.id,
+                            context="archive_rebuild_owner_signal_enqueue",
+                        )
+                    else:
+                        self._enqueue_task(task.id)
                     reclaimed += 1
                     continue
                 if attempts > max_attempts:

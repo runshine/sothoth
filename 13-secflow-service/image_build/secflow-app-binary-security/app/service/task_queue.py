@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -25,38 +26,46 @@ DEFAULT_QUEUE_CONTEXT = "unspecified"
 class TaskQueue:
     def __init__(self) -> None:
         self.config = get_config().queue
-        self._clients_by_loop_id: dict[asyncio.AbstractEventLoop, Redis] = {}
+        self._command_clients_by_loop_id: dict[asyncio.AbstractEventLoop, Redis] = {}
+        self._blocking_clients_by_key: dict[tuple[object, ...], Redis] = {}
+        self._last_blocking_rebuild_succeeded_at: dict[tuple[object, ...], float] = {}
 
     def _current_loop(self) -> asyncio.AbstractEventLoop:
         return asyncio.get_running_loop()
 
-    def _forget_client(self, client: Redis, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
+    def _forget_command_client(self, client: Redis, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
         if loop is not None:
-            current = self._clients_by_loop_id.get(loop)
+            current = self._command_clients_by_loop_id.get(loop)
             if current is client:
-                self._clients_by_loop_id.pop(loop, None)
+                self._command_clients_by_loop_id.pop(loop, None)
             return
-        stale_loops = [cached_loop for cached_loop, cached in self._clients_by_loop_id.items() if cached is client]
+        stale_loops = [cached_loop for cached_loop, cached in self._command_clients_by_loop_id.items() if cached is client]
         for cached_loop in stale_loops:
-            self._clients_by_loop_id.pop(cached_loop, None)
+            self._command_clients_by_loop_id.pop(cached_loop, None)
+
+    def _forget_blocking_client(self, client: Redis, *, key: tuple[object, ...] | None = None) -> None:
+        if key is not None:
+            current = self._blocking_clients_by_key.get(key)
+            if current is client:
+                self._blocking_clients_by_key.pop(key, None)
+                self._last_blocking_rebuild_succeeded_at.pop(key, None)
+            return
+        stale_keys = [cached_key for cached_key, cached in self._blocking_clients_by_key.items() if cached is client]
+        for cached_key in stale_keys:
+            self._blocking_clients_by_key.pop(cached_key, None)
+            self._last_blocking_rebuild_succeeded_at.pop(cached_key, None)
 
     def _new_client(self, *, context: str = DEFAULT_QUEUE_CONTEXT) -> Redis:
-        loop = self._current_loop()
-        existing = self._clients_by_loop_id.get(loop)
-        if existing is not None:
-            return existing
         logger.info(
-            "binary-security task queue creating redis client: context=%s loop_id=%s redis_url=%s task_queue_key=%s "
-            "socket_connect_timeout=%s socket_timeout=%s active_loop_client_count=%s",
+            "binary-security task queue creating redis client: context=%s redis_url=%s task_queue_key=%s "
+            "socket_connect_timeout=%s socket_timeout=%s",
             str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
-            id(loop),
             str(self.config.redis_url or "").strip() or None,
             str(self.config.task_queue_key or "").strip() or None,
             REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
             REDIS_SOCKET_TIMEOUT_SECONDS,
-            len(self._clients_by_loop_id),
         )
-        client = Redis.from_url(
+        return Redis.from_url(
             self.config.redis_url,
             decode_responses=True,
             socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
@@ -64,11 +73,122 @@ class TaskQueue:
             health_check_interval=30,
             socket_keepalive=True,
         )
-        self._clients_by_loop_id[loop] = client
+
+    def _get_command_client(self, *, context: str = DEFAULT_QUEUE_CONTEXT) -> Redis:
+        loop = self._current_loop()
+        existing = self._command_clients_by_loop_id.get(loop)
+        if existing is not None:
+            return existing
+        logger.info(
+            "binary-security task queue creating command redis client: context=%s loop_id=%s active_loop_client_count=%s",
+            str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            id(loop),
+            len(self._command_clients_by_loop_id),
+        )
+        client = self._new_client(context=context)
+        self._command_clients_by_loop_id[loop] = client
         return client
 
+    def _blocking_client_key(self, *, channel: str, extra: str | None = None) -> tuple[object, ...]:
+        loop = self._current_loop()
+        normalized_channel = str(channel or "").strip() or "blocking"
+        normalized_extra = str(extra or "").strip() or None
+        return ("blocking", id(loop), normalized_channel, normalized_extra)
+
+    async def _get_blocking_client(self, *, channel: str, context: str = DEFAULT_QUEUE_CONTEXT, extra: str | None = None) -> Redis:
+        key = self._blocking_client_key(channel=channel, extra=extra)
+        existing = self._blocking_clients_by_key.get(key)
+        if existing is not None:
+            return existing
+        client = await self._rebuild_blocking_client_forever(key=key, channel=channel, context=context, extra=extra)
+        return client
+
+    async def _close_command_client(self, client: Redis) -> None:
+        loop = None
+        try:
+            loop = self._current_loop()
+        except RuntimeError:
+            loop = None
+        try:
+            await client.aclose()
+        except Exception:
+            logger.debug("failed closing redis client", exc_info=True)
+        finally:
+            self._forget_command_client(client, loop=loop)
+
+    async def _close_blocking_client(self, key: tuple[object, ...], client: Redis) -> None:
+        try:
+            await client.aclose()
+        except Exception:
+            logger.debug("failed closing blocking redis client", exc_info=True)
+        finally:
+            self._forget_blocking_client(client, key=key)
+
+    async def _rebuild_blocking_client_forever(
+        self,
+        *,
+        key: tuple[object, ...],
+        channel: str,
+        context: str,
+        extra: str | None = None,
+    ) -> Redis:
+        attempt = 0
+        started_at = time.monotonic()
+        while True:
+            attempt += 1
+            logger.warning(
+                "binary-security blocking redis client rebuild started: channel=%s context=%s extra=%s attempt=%s",
+                str(channel or "").strip() or None,
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(extra or "").strip() or None,
+                attempt,
+            )
+            client = self._new_client(context=context)
+            try:
+                await client.ping()
+            except Exception as exc:
+                logger.warning(
+                    "binary-security blocking redis client rebuild retrying: channel=%s context=%s extra=%s "
+                    "attempt=%s error_type=%s error=%s",
+                    str(channel or "").strip() or None,
+                    str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                    str(extra or "").strip() or None,
+                    attempt,
+                    exc.__class__.__name__,
+                    exc,
+                )
+                with contextlib.suppress(Exception):
+                    await client.aclose()
+                await asyncio.sleep(1)
+                continue
+            self._blocking_clients_by_key[key] = client
+            self._last_blocking_rebuild_succeeded_at[key] = time.monotonic()
+            logger.info(
+                "binary-security blocking redis client rebuild succeeded: channel=%s context=%s extra=%s "
+                "attempt=%s elapsed_seconds=%.2f",
+                str(channel or "").strip() or None,
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(extra or "").strip() or None,
+                attempt,
+                max(0.0, time.monotonic() - started_at),
+            )
+            return client
+
+    def blocking_client_recently_recovered(
+        self,
+        *,
+        channel: str,
+        extra: str | None = None,
+        within_seconds: float = 5.0,
+    ) -> bool:
+        key = self._blocking_client_key(channel=channel, extra=extra)
+        recovered_at = self._last_blocking_rebuild_succeeded_at.get(key)
+        if recovered_at is None:
+            return False
+        return (time.monotonic() - recovered_at) <= max(0.1, float(within_seconds))
+
     async def ping(self, *, context: str = "startup_warmup") -> None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         try:
             await client.ping()
         except Exception as exc:
@@ -125,7 +245,7 @@ class TaskQueue:
         )
 
     async def push_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         try:
             await self._push_unique(client, self.config.task_queue_key, str(task_id))
         except Exception as exc:
@@ -141,7 +261,7 @@ class TaskQueue:
             raise
 
     async def push_delete_task(self, task_id: str, *, context: str = "task_delete_enqueue") -> None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         queue_key = str(getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue").strip()
         try:
             await self._push_unique(client, queue_key, str(task_id))
@@ -158,7 +278,7 @@ class TaskQueue:
             raise
 
     async def force_requeue_task(self, task_id: str, *, context: str = "task_enqueue") -> None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         try:
             await self._force_requeue(client, self.config.task_queue_key, str(task_id))
         except Exception as exc:
@@ -173,8 +293,96 @@ class TaskQueue:
             )
             raise
 
+    def _owner_signal_queue_key(self, owner_instance_id: str) -> str:
+        normalized_owner = str(owner_instance_id or "").strip()
+        if not normalized_owner:
+            raise ValueError("owner_instance_id is required")
+        return f"{str(self.config.task_queue_key or '').strip()}:owner-inbox:{normalized_owner}"
+
+    async def push_owner_signal(
+        self,
+        owner_instance_id: str,
+        task_id: str,
+        *,
+        context: str = "owner_signal_enqueue",
+    ) -> None:
+        client = self._get_command_client(context=context)
+        queue_key = self._owner_signal_queue_key(owner_instance_id)
+        try:
+            await self._push_unique(client, queue_key, str(task_id))
+        except Exception as exc:
+            logger.exception(
+                "binary-security owner signal queue push failed: context=%s owner_instance_id=%s task_id=%s "
+                "redis_url=%s queue_key=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(owner_instance_id or "").strip() or None,
+                str(task_id or "").strip() or None,
+                str(self.config.redis_url or "").strip() or None,
+                queue_key or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+
+    async def pop_owner_signal(
+        self,
+        owner_instance_id: str,
+        timeout_seconds: int | None = None,
+        *,
+        context: str = "owner_signal_pop",
+    ) -> Optional[str]:
+        key = self._blocking_client_key(channel="owner_signal_pop", extra=owner_instance_id)
+        client = await self._get_blocking_client(channel="owner_signal_pop", context=context, extra=owner_instance_id)
+        queue_key = self._owner_signal_queue_key(owner_instance_id)
+        try:
+            result = await client.blpop(
+                queue_key,
+                timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
+            )
+        except RedisTimeoutError as exc:
+            logger.debug(
+                "binary-security owner signal queue pop timeout: context=%s owner_instance_id=%s redis_url=%s queue_key=%s "
+                "error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(owner_instance_id or "").strip() or None,
+                str(self.config.redis_url or "").strip() or None,
+                queue_key or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            return None
+        except (RedisConnectionError, OSError) as exc:
+            logger.warning(
+                "binary-security owner signal queue pop failed: context=%s owner_instance_id=%s redis_url=%s queue_key=%s "
+                "error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(owner_instance_id or "").strip() or None,
+                str(self.config.redis_url or "").strip() or None,
+                queue_key or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            logger.warning(
+                "binary-security blocking redis client connection lost detected: channel=%s context=%s extra=%s "
+                "error_type=%s error=%s",
+                "owner_signal_pop",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                str(owner_instance_id or "").strip() or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            await self._close_blocking_client(key, client)
+            await self._rebuild_blocking_client_forever(
+                key=key,
+                channel="owner_signal_pop",
+                context=context,
+                extra=owner_instance_id,
+            )
+            return None
+        return await self._consume_result(client, queue_key, result)
+
     async def force_requeue_delete_task(self, task_id: str, *, context: str = "task_delete_enqueue") -> None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         queue_key = str(getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue").strip()
         try:
             await self._force_requeue(client, queue_key, str(task_id))
@@ -191,7 +399,8 @@ class TaskQueue:
             raise
 
     async def pop_task(self, timeout_seconds: int | None = None, *, context: str = "task_dispatch_pop") -> Optional[str]:
-        client = self._new_client(context=context)
+        key = self._blocking_client_key(channel="task_dispatch_pop")
+        client = await self._get_blocking_client(channel="task_dispatch_pop", context=context)
         try:
             result = await client.blpop(
                 self.config.task_queue_key,
@@ -206,7 +415,6 @@ class TaskQueue:
                 exc.__class__.__name__,
                 exc,
             )
-            await self._close_client(client)
             return None
         except (RedisConnectionError, OSError) as exc:
             logger.warning(
@@ -217,12 +425,27 @@ class TaskQueue:
                 exc.__class__.__name__,
                 exc,
             )
-            await self._close_client(client)
+            logger.warning(
+                "binary-security blocking redis client connection lost detected: channel=%s context=%s extra=%s "
+                "error_type=%s error=%s",
+                "task_dispatch_pop",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                None,
+                exc.__class__.__name__,
+                exc,
+            )
+            await self._close_blocking_client(key, client)
+            await self._rebuild_blocking_client_forever(
+                key=key,
+                channel="task_dispatch_pop",
+                context=context,
+            )
             return None
         return await self._consume_result(client, self.config.task_queue_key, result)
 
     async def pop_delete_task(self, timeout_seconds: int | None = None, *, context: str = "task_delete_dispatch_pop") -> Optional[str]:
-        client = self._new_client(context=context)
+        key = self._blocking_client_key(channel="task_delete_dispatch_pop")
+        client = await self._get_blocking_client(channel="task_delete_dispatch_pop", context=context)
         queue_key = str(getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue").strip()
         try:
             result = await client.blpop(
@@ -238,7 +461,6 @@ class TaskQueue:
                 exc.__class__.__name__,
                 exc,
             )
-            await self._close_client(client)
             return None
         except (RedisConnectionError, OSError) as exc:
             logger.warning(
@@ -249,22 +471,23 @@ class TaskQueue:
                 exc.__class__.__name__,
                 exc,
             )
-            await self._close_client(client)
+            logger.warning(
+                "binary-security blocking redis client connection lost detected: channel=%s context=%s extra=%s "
+                "error_type=%s error=%s",
+                "task_delete_dispatch_pop",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                None,
+                exc.__class__.__name__,
+                exc,
+            )
+            await self._close_blocking_client(key, client)
+            await self._rebuild_blocking_client_forever(
+                key=key,
+                channel="task_delete_dispatch_pop",
+                context=context,
+            )
             return None
         return await self._consume_result(client, queue_key, result)
-
-    async def _close_client(self, client: Redis) -> None:
-        loop = None
-        try:
-            loop = self._current_loop()
-        except RuntimeError:
-            loop = None
-        try:
-            await client.aclose()
-        except Exception:
-            logger.debug("failed closing redis client", exc_info=True)
-        finally:
-            self._forget_client(client, loop=loop)
 
     async def _push_unique(self, client: Redis, queue_key: str, task_id: str) -> None:
         value = str(task_id or "").strip()
@@ -325,12 +548,12 @@ class TaskQueue:
         return task_id
 
     async def queue_stats(self, queue_key: str, *, context: str = "queue_snapshot") -> dict[str, float | int]:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         try:
             length = int(await client.llen(queue_key) or 0)
             oldest = await client.zrange(f"{queue_key}:enqueued_at", 0, 0, withscores=True)
         except (RedisTimeoutError, RedisConnectionError, OSError):
-            await self._close_client(client)
+            await self._close_command_client(client)
             return {
                 "length": 0,
                 "oldest_age_seconds": 0.0,
@@ -348,11 +571,11 @@ class TaskQueue:
         }
 
     async def queue_positions(self, queue_key: str, *, context: str = "queue_snapshot") -> dict[str, int]:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         try:
             task_ids = [str(value or "").strip() for value in list(await client.lrange(queue_key, 0, -1) or [])]
         except (RedisTimeoutError, RedisConnectionError, OSError):
-            await self._close_client(client)
+            await self._close_command_client(client)
             return {}
         positions: dict[str, int] = {}
         for index, task_id in enumerate(task_ids, start=1):
@@ -372,7 +595,7 @@ class TaskQueue:
         }
 
     async def dedupe_orphans(self, queue_key: str) -> dict[str, Any]:
-        client = self._new_client(context="queue_snapshot")
+        client = self._get_command_client(context="queue_snapshot")
         try:
             members = sorted(list(await client.smembers(f"{queue_key}:dedupe") or []))
             orphaned: list[str] = []
@@ -393,7 +616,7 @@ class TaskQueue:
                 "missing_timestamp_ids": missing_timestamps,
             }
         except (RedisTimeoutError, RedisConnectionError, OSError):
-            await self._close_client(client)
+            await self._close_command_client(client)
             return {
                 "dedupe_count": 0,
                 "orphan_count": 0,
@@ -403,7 +626,7 @@ class TaskQueue:
             }
 
     async def cleanup_dedupe_orphans(self, queue_key: str) -> dict[str, Any]:
-        client = self._new_client()
+        client = self._get_command_client()
         try:
             snapshot = await self.dedupe_orphans(queue_key)
             orphan_ids = list(snapshot.get("orphan_ids") or [])
@@ -420,7 +643,7 @@ class TaskQueue:
                 "removed_orphan_ids": removed_ids,
             }
         except (RedisTimeoutError, RedisConnectionError, OSError):
-            await self._close_client(client)
+            await self._close_command_client(client)
             return {
                 "dedupe_count": 0,
                 "orphan_count": 0,
@@ -432,8 +655,10 @@ class TaskQueue:
             }
 
     async def close(self) -> None:
-        clients = list(dict.fromkeys(self._clients_by_loop_id.values()))
-        self._clients_by_loop_id.clear()
+        clients = list(dict.fromkeys(self._command_clients_by_loop_id.values()))
+        clients.extend(list(dict.fromkeys(self._blocking_clients_by_key.values())))
+        self._command_clients_by_loop_id.clear()
+        self._blocking_clients_by_key.clear()
         for client in clients:
             try:
                 await client.aclose()
@@ -461,7 +686,7 @@ class TaskQueue:
         dedupe_key: str,
         context: str = "task_sync_enqueue",
     ) -> dict[str, Any]:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         normalized_task_id = str(task_id or "").strip()
         normalized_dedupe_key = str(dedupe_key or "").strip()
         if not normalized_task_id or not normalized_dedupe_key:
@@ -505,7 +730,7 @@ class TaskQueue:
         now_epoch: float | None = None,
         context: str = "task_sync_pop",
     ) -> dict[str, Any] | None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return None
@@ -536,7 +761,7 @@ class TaskQueue:
         dedupe_key: str | None = None,
         context: str = "task_sync_ack",
     ) -> None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         normalized_task_id = str(task_id or "").strip()
         normalized_queue_item_id = str(queue_item_id or "").strip()
         if not normalized_task_id or not normalized_queue_item_id:
@@ -565,7 +790,7 @@ class TaskQueue:
         *,
         context: str = "task_sync_retry",
     ) -> dict[str, Any]:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         normalized_task_id = str(task_id or "").strip()
         normalized_entry = self._normalize_task_sync_entry(entry)
         queue_item_id = str(normalized_entry.get("queue_item_id") or "").strip()
@@ -592,7 +817,7 @@ class TaskQueue:
         *,
         context: str = "task_sync_list",
     ) -> list[dict[str, Any]]:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return []
@@ -618,7 +843,7 @@ class TaskQueue:
         ttl_seconds: int = 30,
         context: str = "task_sync_repair_lock",
     ) -> bool:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         normalized_task_id = str(task_id or "").strip()
         normalized_owner_token = str(owner_token or "").strip()
         if not normalized_task_id or not normalized_owner_token:
@@ -637,7 +862,7 @@ class TaskQueue:
         *,
         context: str = "task_sync_repair_unlock",
     ) -> None:
-        client = self._new_client(context=context)
+        client = self._get_command_client(context=context)
         normalized_task_id = str(task_id or "").strip()
         normalized_owner_token = str(owner_token or "").strip()
         if not normalized_task_id or not normalized_owner_token:

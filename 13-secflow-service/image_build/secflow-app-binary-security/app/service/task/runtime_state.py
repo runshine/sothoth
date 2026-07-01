@@ -1540,6 +1540,11 @@ class TaskRuntimeStateServiceMixin:
         event_payload: dict[str, Any] | None = None,
     ) -> None:
         signal_stage_name = str(stage_name or task.current_stage or "").strip() or None
+        target_owner_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        observe_only = bool(target_owner_instance_id)
+        effective_event_type = str(event_type or "").strip() or "owned_execution_takeover_requeued"
+        if observe_only and effective_event_type == "owned_execution_takeover_requeued":
+            effective_event_type = "owned_execution_owner_reconcile_requested"
         self._merge_task_runtime_signal(
             task,
             "pending_task_layer_reconcile",
@@ -1547,7 +1552,7 @@ class TaskRuntimeStateServiceMixin:
             reason=reconcile_reason,
             stage_name=signal_stage_name,
             extra={
-                "reconcile_mode": "observe_only" if reconcile_reason == "archive_apply" else "allow_execution",
+                "reconcile_mode": "observe_only" if observe_only else "allow_execution",
                 "state_event_id": str(state_event_id or "").strip() or None,
                 "source_event_type": str(source_event_type or "").strip() or None,
                 "fact_applied": True,
@@ -1558,7 +1563,7 @@ class TaskRuntimeStateServiceMixin:
         self._record_event(
             db,
             task,
-            event_type,
+            effective_event_type,
             message,
             level=event_level,
             stage_name=signal_stage_name,
@@ -1566,15 +1571,40 @@ class TaskRuntimeStateServiceMixin:
                 "next_stage": signal_stage_name,
                 "reason": reconcile_reason,
                 "takeover_reason": reconcile_reason,
-                "takeover_action": "request_task_layer_reconcile",
-                "reconcile_mode": "observe_only" if reconcile_reason == "archive_apply" else "allow_execution",
+                "takeover_action": "request_task_layer_reconcile" if not observe_only else "notify_owner_reconcile",
+                "reconcile_mode": "observe_only" if observe_only else "allow_execution",
                 "source_event_type": str(source_event_type or "").strip() or None,
                 "state_event_id": str(state_event_id or "").strip() or None,
                 "fact_applied": True,
                 "reconcile_reason": reconcile_reason,
+                "signal_channel": "owner_inbox" if observe_only else "shared_dispatch",
+                "target_owner_instance_id": target_owner_instance_id,
                 **dict(event_payload or {}),
             },
         )
+        if observe_only:
+            self._record_event(
+                db,
+                task,
+                "owner_reconcile_signal_enqueued",
+                "已向当前 owner worker 投递任务层收口唤醒信号",
+                level="info",
+                stage_name=signal_stage_name,
+                payload={
+                    "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                    "target_owner_instance_id": target_owner_instance_id,
+                    "local_instance_id": str(self.instance_id or "").strip() or None,
+                    "signal_channel": "owner_inbox",
+                    "reconcile_reason": reconcile_reason,
+                    "source_event_type": str(source_event_type or "").strip() or None,
+                },
+            )
+            self._enqueue_owner_signal(
+                target_owner_instance_id,
+                task.id,
+                context="owner_reconcile_signal_enqueue",
+            )
+            return
         self._enqueue_task(task.id)
 
     def _reconcile_lease_view(
