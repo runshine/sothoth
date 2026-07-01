@@ -37260,7 +37260,12 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal(s
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         dispatcher_instance_id="worker-owner",
     )
-    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id="t1",
+        owner_instance_id="worker-owner",
+        lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
     self.manager.instance_id = "worker-local"
     forwarded = []
 
@@ -37301,7 +37306,12 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal_f
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         dispatcher_instance_id="worker-owner",
     )
-    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id="t1",
+        owner_instance_id="worker-owner",
+        lease_expires_at=_now() + timedelta(minutes=5),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
     self.manager.instance_id = "worker-local"
     forwarded = []
 
@@ -37325,6 +37335,50 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal_f
     self.assertIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
     self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
     self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
+
+
+def _test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="dispatching",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-dead-owner",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[], runtime_leases=[])
+    self.manager.instance_id = "worker-local"
+    forwarded = []
+
+    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+    original_supported = self.manager._task_row_owner_is_runtime_supported
+    self.manager._enqueue_owner_signal = (
+        lambda owner_instance_id, task_id, **_kwargs: forwarded.append((owner_instance_id, task_id))
+    )
+    self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+    try:
+        asyncio.run(
+            self.manager._drop_unclaimed_dispatch_task_after_pop(
+                db,
+                "t1",
+                reason="task_status_not_pending_without_resumable_operation",
+            )
+        )
+    finally:
+        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
+        self.manager._task_row_owner_is_runtime_supported = original_supported
+
+    self.assertEqual([], forwarded)
+    event_types = [event.event_type for event in db.events]
+    self.assertNotIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
+    self.assertNotIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
+    self.assertIn("dispatch_claim_dropped_after_pop", event_types)
 
 
 def _test_prepare_retry_failed_items_reconciles_affected_stages_in_session(self):
@@ -51318,6 +51372,7 @@ TaskManagerTests.test_request_task_layer_reconcile_archive_apply_uses_owner_inbo
 TaskManagerTests.test_request_task_layer_reconcile_non_archive_owner_signal_uses_owner_inbox = _test_request_task_layer_reconcile_non_archive_owner_signal_uses_owner_inbox
 TaskManagerTests.test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch = _test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch
 TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal = _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal
+TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support = _test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support
 TaskManagerTests.test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox = _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox
 
 

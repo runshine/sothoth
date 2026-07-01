@@ -156,6 +156,7 @@ class TaskRuntimeServiceMixin:
             local_instance_id = str(self.instance_id or "").strip() or None
             runtime_phase = self._task_runtime_phase(task)
             task_status = str(getattr(task, "status", "") or "").strip() or None
+            owner_runtime_supported = self._task_row_owner_is_runtime_supported(db, task)
             should_forward_owner_signal = (
                 normalized_reason in {
                     "non_pending_task_already_owned_by_supported_runtime",
@@ -167,6 +168,7 @@ class TaskRuntimeServiceMixin:
                 and dispatcher_instance_id != local_instance_id
                 and str(runtime_phase or "").strip() == "owned_execution"
                 and str(task_status or "").strip().lower() not in {"pending", "success", "failed", "cancelled"}
+                and owner_runtime_supported
             )
             if should_forward_owner_signal:
                 self._record_event(
@@ -1392,8 +1394,41 @@ class TaskRuntimeServiceMixin:
         operation_rows = self._queue_reconcile_operation_rows(db, seed_batch_size=seed_batch_size)
         for (operation_task_id,) in operation_rows:
             normalized_task_id = str(operation_task_id or "").strip()
-            if normalized_task_id:
-                await queue.push_task(normalized_task_id)
+            if not normalized_task_id:
+                continue
+            task = (
+                db.query(task_manager_module.BinarySecurityTask)
+                .filter(task_manager_module.BinarySecurityTask.id == normalized_task_id)
+                .first()
+            )
+            if task is None:
+                continue
+            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            if not current_operation_id:
+                task_manager_module.logger.info(
+                    "binary-security queue reconcile skipped shared-dispatch wakeup for task with stale active operation row: "
+                    "task_id=%s task_status=%s dispatcher_instance_id=%s",
+                    normalized_task_id,
+                    str(getattr(task, "status", "") or "").strip() or None,
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "active_operation_shared_dispatch_reenqueue_skipped",
+                    "检测到历史活跃 operation 行但任务已无 current_operation_id，不再注入共享调度队列",
+                    level="info",
+                    stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                    payload={
+                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                        "runtime_phase": self._task_runtime_phase(task),
+                        "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                        "enqueue_context": "queue_reconcile_operation",
+                        "reason": "stale_active_operation_row_without_task_binding",
+                    },
+                )
+                continue
+            await queue.push_task(normalized_task_id)
         await queue.cleanup_dedupe_orphans(self.cfg.queue.task_queue_key)
         self._last_queue_reconcile_at = now_value
 

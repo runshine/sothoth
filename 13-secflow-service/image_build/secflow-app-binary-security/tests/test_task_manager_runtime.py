@@ -704,7 +704,12 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-a",
         )
-        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id="task-1",
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[], runtime_leases=[lease])
 
         with (
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
@@ -772,7 +777,12 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-a",
         )
-        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id="task-1",
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[], runtime_leases=[lease])
 
         with (
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
@@ -1352,6 +1362,53 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], pushed)
         self.assertIn("active_nonpending_task_reenqueue_skipped", [row.event_type for row in db.events])
+
+    async def test_reconcile_work_queues_skips_stale_operation_row_without_current_operation_binding(self):
+        task = BinarySecurityTask(
+            id="task-stale-operation-row",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("reconcile-stale-op-row"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-stale",
+            current_operation_id=None,
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
+            patch.object(self.manager, "_queue_reconcile_task_rows", return_value=[]),
+            patch.object(self.manager, "_queue_reconcile_operation_rows", return_value=[("task-stale-operation-row",)]),
+        ):
+            await self.manager._reconcile_work_queues_once(db)
+
+        self.assertEqual([], pushed)
+        self.assertIn("active_operation_shared_dispatch_reenqueue_skipped", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_runs_orphan_parent_initial_enqueue_reconcile_first(self):
         task = BinarySecurityTask(
