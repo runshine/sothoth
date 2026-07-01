@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import nullcontext
 import json
 import os
 import pymysql
@@ -11,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -45547,6 +45548,39 @@ def _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_mai
     self.assertNotIn("main_state_write_blocked", event_types)
 
 
+def _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty(self):
+    manager = TaskManager()
+    manager._running = True
+    manager.instance_id = "worker-test"
+
+    class _Queue:
+        blocking_client_recently_recovered = None
+
+        async def pop_task(self, timeout, context=None):
+            manager._running = False
+            return None
+
+    db = _AppendingModelAwareDb()
+    session_factory = Mock(return_value=db)
+
+    async def _noop_async(*args, **kwargs):
+        return None
+
+    with (
+        patch.object(task_manager_module, "get_session_factory", return_value=session_factory),
+        patch.object(task_manager_module, "get_task_queue", return_value=_Queue()),
+        patch.object(task_manager_module, "observe_scheduler_loop", return_value=nullcontext()),
+        patch.object(manager, "_run_parent_reclaim_pass", return_value=(False, False, True, False, False, False, False, False)) as reclaim_pass,
+        patch.object(manager, "_load_service_config", return_value=SimpleNamespace(worker_task_concurrency=50)),
+        patch.object(manager, "_local_active_runtime_count", return_value=0),
+        patch.object(manager, "_reconcile_work_queues", new=AsyncMock(side_effect=_noop_async)),
+        patch.object(manager, "_observe_runtime_metrics", new=AsyncMock(side_effect=_noop_async)),
+    ):
+        asyncio.run(manager._dispatch_loop())
+
+    reclaim_pass.assert_called_once_with(db)
+
+
 def _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window(self):
     manager = TaskManager()
     manager.instance_id = "worker-live"
@@ -51442,6 +51476,7 @@ TaskManagerTests.test_request_task_layer_reconcile_without_owner_falls_back_to_s
 TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal = _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal
 TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support = _test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support
 TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state = _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state
+TaskManagerTests.test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty = _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty
 TaskManagerTests.test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox = _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox
 
 

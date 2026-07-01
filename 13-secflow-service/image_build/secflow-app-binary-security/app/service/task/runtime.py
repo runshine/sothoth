@@ -977,6 +977,7 @@ class TaskRuntimeServiceMixin:
             try:
                 with task_manager_module.observe_scheduler_loop("task_dispatch"):
                     self._mark_loop_heartbeat("task_dispatch")
+                    self._run_parent_reclaim_pass(db)
                     service_config = self._load_service_config(db)
                     local_active_count = self._local_active_runtime_count()
                     local_slots = max(
