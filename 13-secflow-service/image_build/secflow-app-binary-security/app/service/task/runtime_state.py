@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy.orm import Session
 
 from app.model import (
+    BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityTaskOperation,
     BinarySecurityTaskRuntimeLease,
@@ -457,6 +458,7 @@ class TaskRuntimeStateServiceMixin:
         task,
         *,
         source: str,
+        allow_reclaim_write: bool = False,
     ) -> bool:
         normalized_source = str(source or "").strip().lower()
         guarded_sources = {
@@ -471,7 +473,40 @@ class TaskRuntimeStateServiceMixin:
         }
         if normalized_source not in guarded_sources:
             return True
+        if allow_reclaim_write and self._stale_reclaim_write_allowed(db, task, source=source):
+            return True
         return self._task_runtime_owner_matches_current_instance(db, task) or self._task_runtime_transition_guard_owned_by_current_instance(task)
+
+    def _stale_reclaim_write_allowed(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        source: str,
+    ) -> bool:
+        normalized_source = str(source or "").strip().lower()
+        if normalized_source not in {"runtime_worker", "runtime_reclaim", "task_manager"}:
+            return False
+        if task is None:
+            return False
+        if self._task_runtime_owner_matches_current_instance(db, task):
+            return True
+        if self._task_runtime_transition_guard_owned_by_current_instance(task):
+            return True
+        if self._task_runtime_transition_guard_active(task):
+            return False
+        if self._task_has_active_cancel_operation(db, task):
+            return False
+        if self._task_active_operation(db, task) is not None:
+            return False
+        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+        stage_items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
+        if self._task_has_any_active_children(db, task, stage_runs=stage_runs, stage_items=stage_items):
+            return False
+        lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        if self._runtime_lease_is_active(lease):
+            return False
+        return True
 
     def _infer_running_to_pending_reason_category(
         self: TaskManager,
@@ -558,11 +593,12 @@ class TaskRuntimeStateServiceMixin:
         status_level: str = "info",
         status_payload: dict[str, Any] | None = None,
         record_blocked_event: bool = True,
+        allow_reclaim_write: bool = False,
         downgrade_reason_category: str | None = None,
         preserve_running_event_type: str | None = None,
         preserve_running_message: str | None = None,
     ) -> bool:
-        if not self._task_main_state_write_allowed(db, task, source=source):
+        if not self._task_main_state_write_allowed(db, task, source=source, allow_reclaim_write=allow_reclaim_write):
             if record_blocked_event:
                 self._record_main_state_write_blocked(
                     db,
@@ -782,6 +818,7 @@ class TaskRuntimeStateServiceMixin:
             last_error=self._MAIN_STATE_UNSET if last_error is None else last_error,
             clear_runtime_owner=True,
             record_blocked_event=record_blocked_event,
+            allow_reclaim_write=True,
         )
 
     def _apply_active_owned_execution_main_state(
@@ -838,6 +875,7 @@ class TaskRuntimeStateServiceMixin:
             last_error=self._MAIN_STATE_UNSET if last_error is None else last_error,
             clear_runtime_owner=True,
             record_blocked_event=record_blocked_event,
+            allow_reclaim_write=True,
         )
 
     def _record_main_state_write_blocked(

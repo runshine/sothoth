@@ -1882,6 +1882,7 @@ class TaskStateMachineMixin:
         finished_at: Any = None,
         last_error: Any = None,
         source: str = "state_machine",
+        allow_reclaim_write: bool = False,
     ) -> bool:
         return self._apply_task_main_state_update(
             db,
@@ -1894,6 +1895,7 @@ class TaskStateMachineMixin:
             finished_at=finished_at,
             last_error=self._MAIN_STATE_UNSET if last_error is None else last_error,
             clear_runtime_owner=True,
+            allow_reclaim_write=allow_reclaim_write,
         )
 
     def _next_stage_candidate(

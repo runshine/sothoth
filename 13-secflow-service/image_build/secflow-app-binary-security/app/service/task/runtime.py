@@ -2299,7 +2299,7 @@ class TaskRuntimeServiceMixin:
             dispatcher_instance_id = str(task.dispatcher_instance_id or "").strip() or None
             dispatch_started_at = task.dispatch_started_at
             task_lease_expires_at = task.lease_expires_at
-            self._apply_lease_loss_requeue_state(
+            reclaimed_to_pending = self._apply_lease_loss_requeue_state(
                 db,
                 task,
                 reason="调度超时，任务回收并重新进入队列",
@@ -2307,27 +2307,49 @@ class TaskRuntimeServiceMixin:
                 stage_name=task.current_stage,
                 last_error=None,
                 source="runtime_worker",
+                allow_reclaim_write=True,
             )
-            task_manager_module.observe_dispatch_reclaim("dispatch_timeout")
-            self._record_event(
-                db,
-                task,
-                "dispatch_reclaimed",
-                "调度超时，任务已回收并重新进入队列",
-                level="warning",
-                stage_name=task.current_stage,
-                payload={
-                    "dispatcher_instance_id": dispatcher_instance_id,
-                    "dispatch_started_at": task_manager_module._isoformat_or_none(dispatch_started_at),
-                    "task_lease_expires_at": task_manager_module._isoformat_or_none(task_lease_expires_at),
-                    "runtime_lease_owner": runtime_lease_owner,
-                    "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
-                    "active_stage_name": active_stage_name or task.current_stage,
-                    "active_item_count": active_item_count,
-                    "reclaim_reason": "dispatch_timeout",
-                    "has_downstream_refs": has_downstream_refs,
-                },
-            )
+            if reclaimed_to_pending:
+                task_manager_module.observe_dispatch_reclaim("dispatch_timeout")
+                self._record_event(
+                    db,
+                    task,
+                    "dispatch_reclaimed",
+                    "调度超时，任务已回收并重新进入队列",
+                    level="warning",
+                    stage_name=task.current_stage,
+                    payload={
+                        "dispatcher_instance_id": dispatcher_instance_id,
+                        "dispatch_started_at": task_manager_module._isoformat_or_none(dispatch_started_at),
+                        "task_lease_expires_at": task_manager_module._isoformat_or_none(task_lease_expires_at),
+                        "runtime_lease_owner": runtime_lease_owner,
+                        "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
+                        "active_stage_name": active_stage_name or task.current_stage,
+                        "active_item_count": active_item_count,
+                        "reclaim_reason": "dispatch_timeout",
+                        "has_downstream_refs": has_downstream_refs,
+                    },
+                )
+            else:
+                self._record_event(
+                    db,
+                    task,
+                    "dispatch_reclaim_blocked",
+                    "调度超时后尝试回收任务，但主状态写入被阻断",
+                    level="warning",
+                    stage_name=task.current_stage,
+                    payload={
+                        "dispatcher_instance_id": dispatcher_instance_id,
+                        "dispatch_started_at": task_manager_module._isoformat_or_none(dispatch_started_at),
+                        "task_lease_expires_at": task_manager_module._isoformat_or_none(task_lease_expires_at),
+                        "runtime_lease_owner": runtime_lease_owner,
+                        "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
+                        "active_stage_name": active_stage_name or task.current_stage,
+                        "active_item_count": active_item_count,
+                        "reclaim_reason": "dispatch_timeout",
+                        "has_downstream_refs": has_downstream_refs,
+                    },
+                )
             reclaimed = True
         if reclaimed:
             db.flush()

@@ -24356,6 +24356,33 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(self.manager._task_main_state_write_allowed(db, task, source="state_machine"))
 
+    def test_task_main_state_write_allowed_permits_runtime_reclaim_without_live_owner_or_children(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="task",
+            status="dispatching",
+            current_stage="firmware_unpack",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="other-instance",
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.dispatch_started_at = _now() - timedelta(minutes=10)
+        task.lease_expires_at = _now() - timedelta(minutes=5)
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], stage_items=[], operations=[])
+
+        self.assertTrue(
+            self.manager._task_main_state_write_allowed(
+                db,
+                task,
+                source="runtime_worker",
+                allow_reclaim_write=True,
+            )
+        )
+
     def test_decide_owned_execution_requeue_skips_when_authoritative_failure_should_finalize(self):
         task = BinarySecurityTask(
             id="t1",
@@ -45479,6 +45506,47 @@ def _test_reclaim_stale_dispatching_releases_owner_lost_active_tail(self):
     self.assertEqual("dispatching_runtime_lease_missing_with_active_tail", (takeover_event.payload or {}).get("takeover_reason"))
 
 
+def _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-new"
+    task = BinarySecurityTask(
+        id="task-dispatching-stale-non-owner",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="firmware_unpack",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-dead",
+        dispatch_started_at=_now() - timedelta(minutes=10),
+        lease_expires_at=_now() - timedelta(minutes=5),
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], events=[], runtime_leases=[])
+
+    with (
+        patch.object(manager, "_runtime_lease_context", return_value=(None, None, _now() - timedelta(minutes=5))),
+        patch.object(manager, "_runtime_lease_is_active", return_value=False),
+        patch.object(manager, "_streaming_tail_active_context", return_value=(None, 0, False)),
+        patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=False),
+    ):
+        reclaimed = manager._reclaim_stale_dispatching_locked(db)
+
+    self.assertTrue(reclaimed)
+    self.assertEqual("pending", task.status)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatch_started_at)
+    self.assertIsNone(task.lease_expires_at)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("dispatch_reclaimed", event_types)
+    self.assertNotIn("dispatch_reclaim_blocked", event_types)
+    self.assertNotIn("main_state_write_blocked", event_types)
+
+
 def _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window(self):
     manager = TaskManager()
     manager.instance_id = "worker-live"
@@ -51373,6 +51441,7 @@ TaskManagerTests.test_request_task_layer_reconcile_non_archive_owner_signal_uses
 TaskManagerTests.test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch = _test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch
 TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal = _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal
 TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support = _test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support
+TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state = _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state
 TaskManagerTests.test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox = _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox
 
 
