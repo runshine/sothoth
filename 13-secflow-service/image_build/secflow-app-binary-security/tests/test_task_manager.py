@@ -1730,6 +1730,45 @@ class TaskManagerTests(unittest.TestCase):
 
             self.assertFalse((Path(tmp) / "input" / "task-metadata.json").exists())
 
+    def test_write_task_metadata_is_skipped_when_db_marks_delete_in_progress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stale_task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+                cleanup_snapshot={},
+            )
+            authoritative_task = BinarySecurityTask(
+                id="t1",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+                cleanup_snapshot={"delete_in_progress": True},
+            )
+            original_get_session_factory = task_manager_module.get_session_factory
+            try:
+                task_manager_module.get_session_factory = lambda: (lambda: _ModelAwareDb(tasks=[authoritative_task]))
+                self.manager._write_task_metadata(
+                    stale_task,
+                    Path(tmp) / "input" / "task-metadata.json",
+                    status="pending",
+                )
+            finally:
+                task_manager_module.get_session_factory = original_get_session_factory
+
+            self.assertFalse((Path(tmp) / "input" / "task-metadata.json").exists())
+
     def test_enqueue_task_without_running_loop_uses_asyncio_run(self):
         pushed: list[tuple[str, str | None]] = []
 

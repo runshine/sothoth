@@ -2208,7 +2208,28 @@ class TaskManager(
     ) -> bool:
         if task is None:
             return True
-        if not self._is_task_delete_in_progress(task):
+        delete_in_progress = self._is_task_delete_in_progress(task)
+        if not delete_in_progress:
+            task_id = str(getattr(task, "id", "") or "").strip()
+            project_id = str(getattr(task, "project_id", "") or "").strip()
+            if task_id and project_id:
+                session = get_session_factory()()
+                try:
+                    current_task = (
+                        session.query(BinarySecurityTask)
+                        .filter(
+                            BinarySecurityTask.id == task_id,
+                            BinarySecurityTask.project_id == project_id,
+                        )
+                        .first()
+                    )
+                    if current_task is not None:
+                        cleanup_snapshot = getattr(current_task, "cleanup_snapshot", None)
+                        if isinstance(cleanup_snapshot, dict) and bool(cleanup_snapshot.get("delete_in_progress")):
+                            delete_in_progress = True
+                finally:
+                    session.close()
+        if not delete_in_progress:
             return True
         logger.info(
             "binary-security workspace write skipped during delete: task_id=%s purpose=%s path=%s",
