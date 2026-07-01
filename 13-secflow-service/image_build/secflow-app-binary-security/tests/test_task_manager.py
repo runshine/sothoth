@@ -37312,11 +37312,11 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal(s
     finally:
         self.manager._enqueue_owner_signal = original_enqueue_owner_signal
 
-    self.assertEqual([("worker-owner", "t1")], forwarded)
+    self.assertEqual([], forwarded)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
-    self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
-    self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
+    self.assertNotIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
+    self.assertNotIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
+    self.assertIn("dispatch_claim_dropped_after_pop", event_types)
 
 
 def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal_for_dispatching_nonresumable_reason(self):
@@ -37358,11 +37358,11 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal_f
     finally:
         self.manager._enqueue_owner_signal = original_enqueue_owner_signal
 
-    self.assertEqual([("worker-owner", "t1")], forwarded)
+    self.assertEqual([], forwarded)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
-    self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
-    self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
+    self.assertNotIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
+    self.assertNotIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
+    self.assertIn("dispatch_claim_dropped_after_pop", event_types)
 
 
 def _test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support(self):
@@ -37407,6 +37407,90 @@ def _test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_
     self.assertNotIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
     self.assertNotIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
     self.assertIn("dispatch_claim_dropped_after_pop", event_types)
+
+
+def _test_write_task_heartbeat_refreshes_runtime_lease_and_task_row_mirror(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-heartbeat-mirror",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id=None,
+        dispatch_started_at=None,
+        lease_expires_at=now_value - timedelta(minutes=5),
+    )
+    db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+    wrote = manager._write_task_heartbeat(db, task.id, now_value=now_value, source="unit_test")
+
+    self.assertTrue(wrote)
+    self.assertEqual("worker-a", task.dispatcher_instance_id)
+    self.assertEqual(now_value, task.dispatch_started_at)
+    self.assertIsNotNone(task.lease_expires_at)
+    self.assertGreater(task.lease_expires_at, now_value)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+    lease = db.runtime_leases[0]
+    self.assertEqual("worker-a", lease.owner_instance_id)
+    self.assertEqual(lease.lease_expires_at, task.lease_expires_at)
+
+
+def _test_queue_reconcile_skips_pending_not_enqueued_when_runtime_lease_is_active(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-pending-active-lease",
+        project_id="p1",
+        name="demo",
+        status="pending",
+        current_stage="entry_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        dispatcher_instance_id="worker-a",
+    )
+    now_value = _now()
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        runtime_leases=[
+            BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                owner_instance_id="worker-a",
+                lease_expires_at=now_value + timedelta(minutes=5),
+                heartbeat_at=now_value,
+            )
+        ],
+        events=[],
+    )
+
+    class _Queue:
+        async def queue_positions(self, *_args, **_kwargs):
+            return {}
+
+        async def cleanup_dedupe_orphans(self, *_args, **_kwargs):
+            return {}
+
+    original_get_queue = task_manager_module.get_task_queue
+    try:
+        task_manager_module.get_task_queue = lambda: _Queue()
+        asyncio.run(manager._reconcile_work_queues_once(db, now_value=now_value))
+    finally:
+        task_manager_module.get_task_queue = original_get_queue
+
+    event_types = [event.event_type for event in db.events]
+    self.assertNotIn("pending_task_not_enqueued_detected", event_types)
 
 
 def _test_prepare_retry_failed_items_reconciles_affected_stages_in_session(self):
@@ -51475,6 +51559,8 @@ TaskManagerTests.test_request_task_layer_reconcile_non_archive_owner_signal_uses
 TaskManagerTests.test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch = _test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispatch
 TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal = _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal
 TaskManagerTests.test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support = _test_drop_unclaimed_dispatch_task_after_pop_does_not_forward_stale_foreign_owner_signal_without_runtime_support
+TaskManagerTests.test_write_task_heartbeat_refreshes_runtime_lease_and_task_row_mirror = _test_write_task_heartbeat_refreshes_runtime_lease_and_task_row_mirror
+TaskManagerTests.test_queue_reconcile_skips_pending_not_enqueued_when_runtime_lease_is_active = _test_queue_reconcile_skips_pending_not_enqueued_when_runtime_lease_is_active
 TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state = _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state
 TaskManagerTests.test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty = _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty
 TaskManagerTests.test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox = _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox

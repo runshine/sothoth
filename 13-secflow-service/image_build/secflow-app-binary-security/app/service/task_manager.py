@@ -3442,7 +3442,13 @@ class TaskManager(
                 generation=self._owner_generation,
                 owner_started_at=self.owner_started_at,
             )
-            task.lease_expires_at = self._next_runtime_lease_expiry(now_value=now_value)
+            runtime_lease = self._runtime_lease_for_task(session, task_id)
+            runtime_lease_expires_at = getattr(runtime_lease, "lease_expires_at", None) if runtime_lease is not None else None
+            task.dispatcher_instance_id = str(self.instance_id or "").strip() or None
+            task.dispatch_started_at = task.dispatch_started_at or now_value
+            task.lease_expires_at = runtime_lease_expires_at or self._next_runtime_lease_expiry(now_value=now_value)
+            if str(getattr(task, "runtime_phase", "") or "").strip() != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+                task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
             task.tail_reconcile_state = "idle"
             task.updated_at = now_value
             session.commit()

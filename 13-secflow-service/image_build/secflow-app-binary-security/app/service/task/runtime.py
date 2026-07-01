@@ -157,6 +157,14 @@ class TaskRuntimeServiceMixin:
             runtime_phase = self._task_runtime_phase(task)
             task_status = str(getattr(task, "status", "") or "").strip() or None
             owner_runtime_supported = self._task_row_owner_is_runtime_supported(db, task)
+            runtime_lease = self._runtime_lease_for_task(db, normalized_task_id)
+            runtime_lease_active = bool(self._runtime_lease_is_active(runtime_lease))
+            runtime_lease_owner = (
+                str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() or None
+                if runtime_lease is not None
+                else None
+            )
+            local_handle_alive = bool(self._has_local_task_execution_owner(normalized_task_id))
             should_forward_owner_signal = (
                 normalized_reason in {
                     "non_pending_task_already_owned_by_supported_runtime",
@@ -169,6 +177,7 @@ class TaskRuntimeServiceMixin:
                 and str(runtime_phase or "").strip() == "owned_execution"
                 and str(task_status or "").strip().lower() not in {"pending", "success", "failed", "cancelled"}
                 and owner_runtime_supported
+                and not runtime_lease_active
             )
             if should_forward_owner_signal:
                 self._record_event(
@@ -186,6 +195,9 @@ class TaskRuntimeServiceMixin:
                         "local_instance_id": local_instance_id,
                         "runtime_phase": runtime_phase,
                         "task_status": task_status,
+                        "runtime_lease_active": runtime_lease_active,
+                        "runtime_lease_owner": runtime_lease_owner,
+                        "local_handle_alive": local_handle_alive,
                         "signal_channel": "shared_dispatch",
                         "forwarded_from_shared_dispatch": False,
                     },
@@ -210,6 +222,9 @@ class TaskRuntimeServiceMixin:
                         "local_instance_id": local_instance_id,
                         "runtime_phase": runtime_phase,
                         "task_status": task_status,
+                        "runtime_lease_active": runtime_lease_active,
+                        "runtime_lease_owner": runtime_lease_owner,
+                        "local_handle_alive": local_handle_alive,
                         "signal_channel": "owner_inbox",
                         "forwarded_from_shared_dispatch": True,
                     },
@@ -240,18 +255,25 @@ class TaskRuntimeServiceMixin:
                     "runtime_phase": runtime_phase,
                     "task_status": task_status,
                     "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    "runtime_lease_active": runtime_lease_active,
+                    "runtime_lease_owner": runtime_lease_owner,
+                    "local_handle_alive": local_handle_alive,
                     "requeue_after_pop": False,
                 },
             )
             db.commit()
             task_manager_module.logger.warning(
                 "binary-security dispatch popped task but claim was not acquired; task dropped after pop: "
-                "task_id=%s reason=%s status=%s runtime_phase=%s dispatcher_instance_id=%s",
+                "task_id=%s reason=%s status=%s runtime_phase=%s dispatcher_instance_id=%s "
+                "runtime_lease_active=%s runtime_lease_owner=%s local_handle_alive=%s",
                 normalized_task_id,
                 normalized_reason,
                 task_status,
                 runtime_phase,
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                runtime_lease_active,
+                runtime_lease_owner,
+                local_handle_alive,
             )
             return
         task_manager_module.logger.warning(
@@ -580,7 +602,9 @@ class TaskRuntimeServiceMixin:
         now_value = task_manager_module._now()
         task.dispatcher_instance_id = self.instance_id
         task.dispatch_started_at = task.dispatch_started_at or now_value
-        task.lease_expires_at = task.lease_expires_at or self._task_lease_expires_at()
+        lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        runtime_lease_expires_at = getattr(lease, "lease_expires_at", None) if lease is not None else None
+        task.lease_expires_at = runtime_lease_expires_at or self._task_lease_expires_at()
         return True
 
     def _commit_stage_item_active_state(
@@ -1207,6 +1231,28 @@ class TaskRuntimeServiceMixin:
                 if queue_state == "dispatching" and recoverable_reason == "pending_task_owned_by_active_runtime":
                     continue
                 if queue_state == "db_pending_not_enqueued":
+                    runtime_lease = self._runtime_lease_for_task(db, normalized_task_id)
+                    runtime_lease_active = bool(self._runtime_lease_is_active(runtime_lease))
+                    runtime_lease_owner = (
+                        str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() or None
+                        if runtime_lease is not None
+                        else None
+                    )
+                    local_handle_alive = bool(self._has_local_task_execution_owner(normalized_task_id))
+                    if runtime_lease_active or local_handle_alive:
+                        task_manager_module.logger.info(
+                            "binary-security pending task reconcile skipped because runtime ownership is still active: "
+                            "task_id=%s task_status=%s queue_state=%s runtime_lease_active=%s runtime_lease_owner=%s "
+                            "local_handle_alive=%s dispatcher_instance_id=%s",
+                            normalized_task_id,
+                            current_status,
+                            queue_state,
+                            runtime_lease_active,
+                            runtime_lease_owner,
+                            local_handle_alive,
+                            str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                        )
+                        continue
                     if active_delete_operation is not None:
                         delete_position = delete_positions.get(normalized_task_id)
                         task_manager_module.logger.warning(
@@ -1321,6 +1367,9 @@ class TaskRuntimeServiceMixin:
                             "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
                             "lease_expires_at": task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
                             "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                            "runtime_lease_active": runtime_lease_active,
+                            "runtime_lease_owner": runtime_lease_owner,
+                            "local_handle_alive": local_handle_alive,
                             "enqueue_context": "queue_reconcile",
                             "owner_released_before_reenqueue": bool(released),
                         },
