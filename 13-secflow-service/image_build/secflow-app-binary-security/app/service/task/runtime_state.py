@@ -40,6 +40,18 @@ class LeaseClearDecision:
     dispatcher_instance_id: str | None = None
 
 
+@dataclass
+class TaskLayerReconcileDeliveryDecision:
+    delivery_channel: str
+    observe_only: bool
+    decision_reason: str
+    target_owner_instance_id: str | None
+    runtime_lease_owner: str | None
+    dispatcher_instance_id: str | None
+    task_status: str | None
+    runtime_phase: str | None
+
+
 class TaskRuntimeStateServiceMixin:
     _STATE_TRANSITION_GUARD_TTL_SECONDS = 30
     _MAIN_STATE_UNSET = object()
@@ -1540,8 +1552,14 @@ class TaskRuntimeStateServiceMixin:
         event_payload: dict[str, Any] | None = None,
     ) -> None:
         signal_stage_name = str(stage_name or task.current_stage or "").strip() or None
-        target_owner_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        observe_only = bool(target_owner_instance_id)
+        delivery_decision = self._task_layer_reconcile_delivery_decision(
+            db,
+            task,
+            source_event_type=source_event_type,
+            reconcile_reason=reconcile_reason,
+        )
+        target_owner_instance_id = delivery_decision.target_owner_instance_id
+        observe_only = delivery_decision.observe_only
         effective_event_type = str(event_type or "").strip() or "owned_execution_takeover_requeued"
         if observe_only and effective_event_type == "owned_execution_takeover_requeued":
             effective_event_type = "owned_execution_owner_reconcile_requested"
@@ -1577,9 +1595,36 @@ class TaskRuntimeStateServiceMixin:
                 "state_event_id": str(state_event_id or "").strip() or None,
                 "fact_applied": True,
                 "reconcile_reason": reconcile_reason,
-                "signal_channel": "owner_inbox" if observe_only else "shared_dispatch",
+                "signal_channel": delivery_decision.delivery_channel,
+                "delivery_channel": delivery_decision.delivery_channel,
+                "decision_reason": delivery_decision.decision_reason,
                 "target_owner_instance_id": target_owner_instance_id,
+                "runtime_lease_owner": delivery_decision.runtime_lease_owner,
+                "dispatcher_instance_id": delivery_decision.dispatcher_instance_id,
+                "task_status": delivery_decision.task_status,
+                "runtime_phase": delivery_decision.runtime_phase,
                 **dict(event_payload or {}),
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "task_layer_reconcile_delivery_decided",
+            "任务层 reconcile 唤醒投递决策已确定",
+            level="info",
+            stage_name=signal_stage_name,
+            payload={
+                "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                "source_event_type": str(source_event_type or "").strip() or None,
+                "reconcile_reason": reconcile_reason,
+                "delivery_channel": delivery_decision.delivery_channel,
+                "decision_reason": delivery_decision.decision_reason,
+                "target_owner_instance_id": target_owner_instance_id,
+                "runtime_lease_owner": delivery_decision.runtime_lease_owner,
+                "dispatcher_instance_id": delivery_decision.dispatcher_instance_id,
+                "task_status": delivery_decision.task_status,
+                "runtime_phase": delivery_decision.runtime_phase,
+                "state_event_id": str(state_event_id or "").strip() or None,
             },
         )
         if observe_only:
@@ -1594,8 +1639,9 @@ class TaskRuntimeStateServiceMixin:
                     "task_id": str(getattr(task, "id", "") or "").strip() or None,
                     "target_owner_instance_id": target_owner_instance_id,
                     "local_instance_id": str(self.instance_id or "").strip() or None,
-                    "signal_channel": "owner_inbox",
+                    "signal_channel": delivery_decision.delivery_channel,
                     "reconcile_reason": reconcile_reason,
+                    "decision_reason": delivery_decision.decision_reason,
                     "source_event_type": str(source_event_type or "").strip() or None,
                 },
             )
@@ -1606,6 +1652,103 @@ class TaskRuntimeStateServiceMixin:
             )
             return
         self._enqueue_task(task.id)
+
+    def _task_layer_reconcile_delivery_decision(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        source_event_type: str,
+        reconcile_reason: str,
+    ) -> TaskLayerReconcileDeliveryDecision:
+        del reconcile_reason
+
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        task_status = str(getattr(task, "status", "") or "").strip().lower() or None
+        runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
+        lease = self._runtime_lease_for_task(db, task.id)
+        runtime_lease_owner = (
+            str(getattr(lease, "owner_instance_id", "") or "").strip() or None
+            if lease is not None and self._runtime_lease_is_active(lease)
+            else None
+        )
+        source_event_type_normalized = str(source_event_type or "").strip() or None
+        owner_local_reconcile_event = bool(
+            source_event_type_normalized
+            and any(
+                token in source_event_type_normalized
+                for token in (
+                    "owner",
+                    "state_event",
+                    "archive",
+                    "item_sync",
+                    "operation",
+                    "fact_apply",
+                    "reconcile",
+                )
+            )
+        )
+
+        target_owner_instance_id = runtime_lease_owner or dispatcher_instance_id
+        if runtime_lease_owner:
+            return TaskLayerReconcileDeliveryDecision(
+                delivery_channel="owner_inbox",
+                observe_only=True,
+                decision_reason="active_runtime_lease_owner_present",
+                target_owner_instance_id=target_owner_instance_id,
+                runtime_lease_owner=runtime_lease_owner,
+                dispatcher_instance_id=dispatcher_instance_id,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+            )
+        if dispatcher_instance_id and task_status not in TASK_TERMINAL_STATUSES:
+            return TaskLayerReconcileDeliveryDecision(
+                delivery_channel="owner_inbox",
+                observe_only=True,
+                decision_reason="dispatcher_owner_present",
+                target_owner_instance_id=target_owner_instance_id,
+                runtime_lease_owner=runtime_lease_owner,
+                dispatcher_instance_id=dispatcher_instance_id,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+            )
+        if (
+            runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION
+            and task_status
+            and task_status != "pending"
+            and owner_local_reconcile_event
+        ):
+            return TaskLayerReconcileDeliveryDecision(
+                delivery_channel="owner_inbox",
+                observe_only=True,
+                decision_reason="owned_execution_non_pending_reconcile_owner_preferred",
+                target_owner_instance_id=target_owner_instance_id,
+                runtime_lease_owner=runtime_lease_owner,
+                dispatcher_instance_id=dispatcher_instance_id,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+            )
+        if owner_local_reconcile_event and runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION and task_status != "pending":
+            return TaskLayerReconcileDeliveryDecision(
+                delivery_channel="owner_inbox",
+                observe_only=True,
+                decision_reason="owned_execution_reconcile_without_row_owner_prefers_owner_channel",
+                target_owner_instance_id=target_owner_instance_id,
+                runtime_lease_owner=runtime_lease_owner,
+                dispatcher_instance_id=dispatcher_instance_id,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+            )
+        return TaskLayerReconcileDeliveryDecision(
+            delivery_channel="shared_dispatch",
+            observe_only=False,
+            decision_reason="pending_task_without_owner_requires_shared_dispatch",
+            target_owner_instance_id=target_owner_instance_id,
+            runtime_lease_owner=runtime_lease_owner,
+            dispatcher_instance_id=dispatcher_instance_id,
+            task_status=task_status,
+            runtime_phase=runtime_phase,
+        )
 
     def _reconcile_lease_view(
         self: TaskManager,
