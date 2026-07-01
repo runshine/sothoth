@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,22 @@ if TYPE_CHECKING:
 class FirmwareUnpackStageHandler(BinarySecurityStageHandler):
     def __init__(self) -> None:
         super().__init__(stage_name="firmware_unpack")
+
+    def build_inputs(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
+        del manager, db
+        return [
+            dict(item)
+            for item in list((task.summary or {}).get("input_files") or [])
+            if isinstance(item, dict)
+        ]
+
+    def has_runnable_inputs(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> bool:
+        return bool(self.build_inputs(manager, db, task))
+
+    def continue_stage_input_error(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> str | None:
+        if not self.has_runnable_inputs(manager, db, task):
+            return "缺少输入文件"
+        return None
 
     def manages_stage_refresh(self) -> bool:
         return True

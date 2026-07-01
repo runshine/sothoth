@@ -64,6 +64,26 @@ class FirmwareUnpackStageHandlerTests(unittest.TestCase):
         self.manager = TaskManager()
         self.handler = FirmwareUnpackStageHandler()
 
+    def test_has_runnable_inputs_uses_task_input_files(self):
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", task_type=TASK_TYPE_BINARY, workspace_root="/tmp/ws", output_root="/tmp/out")
+        task.summary = {
+            "input_files": [
+                {"filename": "fw1.bin", "firmware_key": "fw1", "path": "/tmp/fw1.bin"},
+            ]
+        }
+
+        self.assertTrue(self.handler.has_runnable_inputs(self.manager, _ModelAwareDb(tasks=[task]), task))
+        self.assertEqual(
+            [{"filename": "fw1.bin", "firmware_key": "fw1", "path": "/tmp/fw1.bin"}],
+            self.handler.build_inputs(self.manager, _ModelAwareDb(tasks=[task]), task),
+        )
+
+    def test_continue_stage_input_error_reports_missing_input_files(self):
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", task_type=TASK_TYPE_BINARY, workspace_root="/tmp/ws", output_root="/tmp/out")
+        task.summary = {}
+
+        self.assertEqual("缺少输入文件", self.handler.continue_stage_input_error(self.manager, _ModelAwareDb(tasks=[task]), task))
+
     def test_archive_signature_uses_system_analysis_inputs(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", task_type=TASK_TYPE_BINARY, workspace_root="/tmp/ws", output_root="/tmp/out")
         task.summary = {
