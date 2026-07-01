@@ -37286,6 +37286,47 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal(s
     self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
 
 
+def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal_for_dispatching_nonresumable_reason(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="binary",
+        status="dispatching",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/tmp",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        dispatcher_instance_id="worker-owner",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], events=[])
+    self.manager.instance_id = "worker-local"
+    forwarded = []
+
+    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
+    self.manager._enqueue_owner_signal = (
+        lambda owner_instance_id, task_id, **_kwargs: forwarded.append((owner_instance_id, task_id))
+    )
+    try:
+        asyncio.run(
+            self.manager._drop_unclaimed_dispatch_task_after_pop(
+                db,
+                "t1",
+                reason="task_status_not_pending_without_resumable_operation",
+            )
+        )
+    finally:
+        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
+
+    self.assertEqual([("worker-owner", "t1")], forwarded)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
+    self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
+    self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
+
+
 def _test_prepare_retry_failed_items_reconciles_affected_stages_in_session(self):
     task = BinarySecurityTask(
         id="task1",

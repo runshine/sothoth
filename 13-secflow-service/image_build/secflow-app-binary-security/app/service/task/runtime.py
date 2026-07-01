@@ -154,12 +154,21 @@ class TaskRuntimeServiceMixin:
         if task is not None:
             dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
             local_instance_id = str(self.instance_id or "").strip() or None
-            if (
-                normalized_reason == "non_pending_task_already_owned_by_supported_runtime"
+            runtime_phase = self._task_runtime_phase(task)
+            task_status = str(getattr(task, "status", "") or "").strip() or None
+            should_forward_owner_signal = (
+                normalized_reason in {
+                    "non_pending_task_already_owned_by_supported_runtime",
+                    "task_status_not_pending_without_resumable_operation",
+                    "non_pending_status_without_runtime_resume",
+                }
                 and dispatcher_instance_id
                 and local_instance_id
                 and dispatcher_instance_id != local_instance_id
-            ):
+                and str(runtime_phase or "").strip() == "owned_execution"
+                and str(task_status or "").strip().lower() not in {"pending", "success", "failed", "cancelled"}
+            )
+            if should_forward_owner_signal:
                 self._record_event(
                     db,
                     task,
@@ -173,8 +182,8 @@ class TaskRuntimeServiceMixin:
                         "dispatcher_instance_id": dispatcher_instance_id,
                         "target_owner_instance_id": dispatcher_instance_id,
                         "local_instance_id": local_instance_id,
-                        "runtime_phase": self._task_runtime_phase(task),
-                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                        "runtime_phase": runtime_phase,
+                        "task_status": task_status,
                         "signal_channel": "shared_dispatch",
                         "forwarded_from_shared_dispatch": False,
                     },
@@ -197,8 +206,8 @@ class TaskRuntimeServiceMixin:
                         "dispatcher_instance_id": dispatcher_instance_id,
                         "target_owner_instance_id": dispatcher_instance_id,
                         "local_instance_id": local_instance_id,
-                        "runtime_phase": self._task_runtime_phase(task),
-                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                        "runtime_phase": runtime_phase,
+                        "task_status": task_status,
                         "signal_channel": "owner_inbox",
                         "forwarded_from_shared_dispatch": True,
                     },
@@ -211,8 +220,8 @@ class TaskRuntimeServiceMixin:
                     normalized_reason,
                     dispatcher_instance_id,
                     local_instance_id,
-                    str(getattr(task, "status", "") or "").strip() or None,
-                    self._task_runtime_phase(task),
+                    task_status,
+                    runtime_phase,
                 )
                 return
             self._record_event(
@@ -226,8 +235,8 @@ class TaskRuntimeServiceMixin:
                     "task_id": normalized_task_id,
                     "reason": normalized_reason,
                     "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                    "runtime_phase": self._task_runtime_phase(task),
-                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "runtime_phase": runtime_phase,
+                    "task_status": task_status,
                     "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
                     "requeue_after_pop": False,
                 },
@@ -238,8 +247,8 @@ class TaskRuntimeServiceMixin:
                 "task_id=%s reason=%s status=%s runtime_phase=%s dispatcher_instance_id=%s",
                 normalized_task_id,
                 normalized_reason,
-                str(getattr(task, "status", "") or "").strip() or None,
-                self._task_runtime_phase(task),
+                task_status,
+                runtime_phase,
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
             )
             return

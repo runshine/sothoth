@@ -666,6 +666,74 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
         self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
 
+    async def test_dispatch_loop_forwards_foreign_owner_signal_for_nonpending_without_resumable_operation(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        requeued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            def __init__(self):
+                self._popped = False
+
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
+                if not self._popped:
+                    self._popped = True
+                    return "task-1"
+                manager._running = False
+                return None
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                requeued.append((task_id, context))
+
+        async def _reconcile(_db):
+            return None
+
+        async def _observe(_db):
+            return None
+
+        def _dispatch_task_by_id(_db, _task_id):
+            manager._set_dispatch_claim_decision(
+                task_id="task-1",
+                claimed_task_id=None,
+                blocked_reason="task_status_not_pending_without_resumable_operation",
+                should_requeue=False,
+            )
+            return None
+
+        manager._dispatch_task_by_id = _dispatch_task_by_id
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("dispatch-forward-dispatching"),
+            runtime_phase="owned_execution",
+            dispatcher_instance_id="worker-a",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+        ):
+            await manager._dispatch_loop()
+
+        self.assertEqual([], requeued)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
+        self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
+        self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
+
     async def test_dispatch_loop_starts_cooldown_when_claim_decision_requests_handoff_delay(self):
         manager = TaskManager()
         manager._running = True
