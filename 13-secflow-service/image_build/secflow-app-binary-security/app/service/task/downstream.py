@@ -1780,6 +1780,7 @@ class TaskDownstreamServiceMixin:
         audit_outcome = self._string_or_none(sync_payload.get("outcome"))
         audit_sync_status = self._string_or_none(sync_payload.get("sync_status")) or audit_outcome
         state_applied = sync_payload.get("state_applied")
+        audit_error_message = self._string_or_none(sync_payload.get("error_message"))
         if audit_event_type in {"downstream_child_created", "retry_item_new_child_created"}:
             operation = "downstream_create"
             audit_event_type = "applied"
@@ -1811,6 +1812,12 @@ class TaskDownstreamServiceMixin:
             audit_event_type = "retry_scheduled"
             audit_outcome = audit_outcome or "error"
             audit_sync_status = audit_sync_status or "transport_error"
+        elif audit_event_type in {"child_task_create_succeeded", "child_task_create_requested"}:
+            operation = "create"
+            audit_outcome = audit_outcome or "success"
+            audit_sync_status = audit_sync_status or "observed"
+            if state_applied is None:
+                state_applied = False
         self._record_event(
             db,
             task,
@@ -1835,7 +1842,7 @@ class TaskDownstreamServiceMixin:
                     outcome=audit_outcome,
                     state_applied=state_applied,
                     error_type=self._string_or_none(sync_payload.get("error_type")),
-                    error_message=self._string_or_none(sync_payload.get("error_message")) or message,
+                    error_message=audit_error_message,
                     http_status=sync_payload.get("http_status"),
                     payload=sync_payload,
                 )

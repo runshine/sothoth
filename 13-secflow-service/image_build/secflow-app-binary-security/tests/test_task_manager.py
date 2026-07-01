@@ -50571,9 +50571,20 @@ def _test_record_downstream_item_disposition_maps_create_and_retry_audit_events(
         message="recreated",
         payload={"new_downstream_task_id": "sa-2"},
     )
+    self.manager._record_downstream_item_disposition(
+        db,
+        task,
+        item,
+        event_type="child_task_create_succeeded",
+        message="下游子任务创建成功: system_analyse:sa-3",
+        payload={"operation": "create", "downstream_task_id": "sa-3"},
+    )
     sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
-    self.assertEqual(["applied", "adopted", "recreated"], [row.event_type for row in sync_rows])
-    self.assertEqual(["downstream_create", "retry_control", "retry_control"], [row.operation for row in sync_rows])
+    self.assertEqual(["applied", "adopted", "recreated", "child_task_create_succeeded"], [row.event_type for row in sync_rows])
+    self.assertEqual(["downstream_create", "retry_control", "retry_control", "create"], [row.operation for row in sync_rows])
+    self.assertEqual("success", sync_rows[-1].outcome)
+    self.assertEqual("observed", sync_rows[-1].sync_status)
+    self.assertIsNone(sync_rows[-1].error_message)
 
 
 def _test_downstream_create_task_records_requested_and_applied_sync_events(self):
