@@ -621,6 +621,7 @@ class TaskOperationServiceMixin:
         request_payload: dict[str, Any] | None = None,
         accepted_event_type: str,
         accepted_message: str,
+        enqueue_task: bool = True,
     ) -> BinarySecurityTaskOperation:
         from app.service import task_manager as task_manager_module
 
@@ -645,7 +646,8 @@ class TaskOperationServiceMixin:
         )
         db.flush()
         db.commit()
-        self._enqueue_task(task.id)
+        if enqueue_task:
+            self._enqueue_task(task.id)
         task_manager_module.observe_control_operation(operation.operation_type, "queued")
         return operation
 

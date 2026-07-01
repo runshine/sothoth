@@ -1,7 +1,10 @@
 import asyncio
+import shutil
+import tempfile
 import unittest
 from datetime import timedelta, datetime
 from contextlib import suppress
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -178,6 +181,14 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._tmpdirs: list[str] = []
+
+    def _workspace_root(self, name: str = "ws") -> str:
+        path = tempfile.mkdtemp(prefix=f"binary-security-{name}-")
+        self._tmpdirs.append(path)
+        return path
+
     async def asyncTearDown(self):
         current_task = asyncio.current_task()
         leftovers = [
@@ -189,6 +200,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             task.cancel()
         if leftovers:
             await asyncio.gather(*leftovers, return_exceptions=True)
+        for tmpdir in self._tmpdirs:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     async def test_start_stops_partially_started_loops_when_seed_work_queues_fails(self):
         manager = TaskManager()
@@ -572,7 +585,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("dispatch-requeue"),
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
 
@@ -635,7 +648,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("dispatch-drop"),
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-a",
         )
@@ -704,7 +717,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("dispatch-cooldown"),
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-old",
         )
@@ -953,6 +966,16 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.manager = TaskManager()
         self.manager.cfg.queue.seed_batch_size = 20
         self.manager.cfg.queue.reconcile_interval_seconds = 5
+        self._tmpdirs: list[str] = []
+
+    def _workspace_root(self, name: str = "ws") -> str:
+        path = tempfile.mkdtemp(prefix=f"binary-security-{name}-")
+        self._tmpdirs.append(path)
+        return path
+
+    async def asyncTearDown(self):
+        for tmpdir in self._tmpdirs:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     async def test_consume_delete_queue_task_defers_when_parent_lease_still_active(self):
         manager = TaskManager()
@@ -1072,7 +1095,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("reconcile-missing"),
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
         reenqueued: list[tuple[str, str | None]] = []
@@ -1122,7 +1145,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("reconcile-cooldown"),
             summary_json={},
         )
         task.summary = {
@@ -1225,7 +1248,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("reconcile-queued"),
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
         pushed: list[tuple[str, str | None]] = []
@@ -1318,7 +1341,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("reconcile-stale-owner"),
             dispatcher_instance_id="worker-a",
             current_operation_id="op-1",
         )
@@ -1382,7 +1405,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("reconcile-delete"),
             current_operation_id="op-delete",
         )
         task.cleanup_snapshot = {
@@ -1456,7 +1479,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("reconcile-delete-queued"),
             current_operation_id="op-delete",
         )
         task.cleanup_snapshot = {

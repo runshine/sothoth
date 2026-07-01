@@ -1245,7 +1245,8 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
         event_types = [event.event_type for event in db.added]
         self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-        self.assertIn("owned_execution_takeover_requeued", event_types)
+        self.assertIn("owned_execution_owner_reconcile_requested", event_types)
+        self.assertIn("owner_reconcile_signal_enqueued", event_types)
 
     def test_source_workflow_e2e_dataflow_downstream_missing_recovers_on_next_owner_prepare(self):
         now = _now()
@@ -7078,7 +7079,8 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("running", task.status)
         event_types = [event.event_type for event in db.added]
         self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-        self.assertIn("owned_execution_takeover_requeued", event_types)
+        self.assertIn("owned_execution_owner_reconcile_requested", event_types)
+        self.assertIn("owner_reconcile_signal_enqueued", event_types)
 
     def test_binary_module_workflow_e2e_dataflow_downstream_missing_recovers_on_next_owner_prepare(self):
         now = _now()

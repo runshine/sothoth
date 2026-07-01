@@ -639,6 +639,26 @@ class TaskRuntimeServiceMixin:
                 )
                 db.commit()
                 return
+            current_stage_before_sync = str(task.current_stage or "").strip()
+            if current_stage_before_sync != "dataflow_vuln_scan":
+                failure_ctx = self._current_stage_authoritative_failure_context(db, task)
+                if failure_ctx is None:
+                    failure_ctx = self._earlier_stage_authoritative_failure_context(db, task)
+                if failure_ctx is not None:
+                    self._finalize_task_after_authoritative_failure(
+                        db,
+                        task,
+                        failure_ctx=failure_ctx,
+                        previous_status=str(task.status or "").strip() or None,
+                        event_type="tail_state_sync_authoritative_failure_terminalized",
+                    )
+                    await self._write_task_metadata_async(
+                        task,
+                        Path(task.workspace_root) / "input" / "task-metadata.json",
+                        status=task.status,
+                    )
+                    db.commit()
+                    return
             tail_items = self._stage_items(db, task.id, "dataflow_vuln_scan")
             tail_runs = [
                 run
@@ -687,7 +707,6 @@ class TaskRuntimeServiceMixin:
                     summary = dict(task.summary or {})
                     summary["entry_results"] = rebuilt_rows
                     task.summary = summary
-            current_stage_before_sync = str(task.current_stage or "").strip()
             authoritative_tail_item_present = any(
                 str(getattr(item, "status", "") or "").strip() in {"running", "dispatching", "success", "failed", "partial_success", "cancelled"}
                 or bool(getattr(item, "started_at", None))
