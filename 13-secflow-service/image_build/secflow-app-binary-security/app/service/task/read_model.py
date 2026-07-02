@@ -3777,8 +3777,12 @@ class TaskReadModelServiceMixin:
         nodes = []
         for index, stage_name in enumerate(stage_sequence, start=1):
             summary = summaries_by_stage.get(stage_name) or task_manager_module.BinarySecurityStageSummary(stage_name=stage_name, sequence_no=index, status="pending")
-            stage_jobs = jobs_by_stage.get(stage_name, [])
             current_stage_items = items_by_stage.get(stage_name, [])
+            archive_jobs_by_item = self._archive_jobs_by_item_id(jobs_by_stage.get(stage_name, []))
+            stage_jobs = self._canonical_archive_jobs_for_stage_items(
+                current_stage_items,
+                archive_jobs_by_item=archive_jobs_by_item,
+            )
             downstream_status_counts = {}
             for item in current_stage_items:
                 item_result = self._load_stage_item_result_payload(item)

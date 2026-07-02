@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,7 @@ task_manager_module = _TaskManagerModuleProxy()
 class TaskDownstreamServiceMixin:
     CHILD_TRANSITION_IN_PLACE_RESTART = "in_place_restart"
     CHILD_TRANSITION_DESTRUCTIVE_REBUILD = "destructive_rebuild"
+    _ARCHIVE_NONBLOCKING_STATUSES = frozenset({"superseded", "ignored"})
 
     def _increment_stage_item_rebuild_rerun_count(
         self: TaskManager,
@@ -2315,6 +2317,77 @@ class TaskDownstreamServiceMixin:
         current_task_id = str(getattr(item, "downstream_task_id", "") or "").strip()
         return current_task_id or None
 
+    def _archive_job_status_value(self, job: BinarySecurityArchiveJob | None) -> str:
+        return str(getattr(job, "archive_status", "") or "").strip().lower()
+
+    def _archive_job_is_nonblocking_terminal(self, job: BinarySecurityArchiveJob | None) -> bool:
+        return self._archive_job_status_value(job) in self._ARCHIVE_NONBLOCKING_STATUSES
+
+    def _archive_job_sort_key(self, job: BinarySecurityArchiveJob | None) -> tuple[Any, str]:
+        timestamp = (
+            getattr(job, "updated_at", None)
+            or getattr(job, "completed_at", None)
+            or getattr(job, "started_at", None)
+            or getattr(job, "created_at", None)
+            or datetime.min
+        )
+        return timestamp, str(getattr(job, "id", "") or "")
+
+    def _archive_job_matches_current_binding(
+        self,
+        item: BinarySecurityStageItem,
+        job: BinarySecurityArchiveJob | None,
+    ) -> bool:
+        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
+        if not authoritative_task_id:
+            return True
+        bound_task_id = self._archive_job_bound_downstream_task_id(job) or str(getattr(job, "downstream_task_id", "") or "").strip()
+        return bool(bound_task_id) and bound_task_id == authoritative_task_id
+
+    def _canonical_archive_job_for_item(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> BinarySecurityArchiveJob | None:
+        jobs = [
+            job
+            for job in list(archive_jobs or [])
+            if not self._archive_job_is_nonblocking_terminal(job)
+        ]
+        if not jobs:
+            return None
+        matching_current_binding = [job for job in jobs if self._archive_job_matches_current_binding(item, job)]
+        if matching_current_binding:
+            jobs = matching_current_binding
+        jobs.sort(key=self._archive_job_sort_key)
+        return jobs[-1] if jobs else None
+
+    def _canonical_archive_jobs_for_stage_items(
+        self,
+        items: list[BinarySecurityStageItem],
+        *,
+        archive_jobs_by_item: dict[str, list[BinarySecurityArchiveJob]] | None = None,
+    ) -> list[BinarySecurityArchiveJob]:
+        grouped = archive_jobs_by_item or {}
+        canonical: list[BinarySecurityArchiveJob] = []
+        seen_job_ids: set[str] = set()
+        for item in list(items or []):
+            job = self._canonical_archive_job_for_item(
+                item,
+                archive_jobs=grouped.get(str(getattr(item, "id", "") or "").strip(), []),
+            )
+            if job is None:
+                continue
+            job_id = str(getattr(job, "id", "") or "").strip()
+            if job_id and job_id in seen_job_ids:
+                continue
+            if job_id:
+                seen_job_ids.add(job_id)
+            canonical.append(job)
+        canonical.sort(key=self._archive_job_sort_key)
+        return canonical
+
     def _item_authoritative_archive_refs(
         self,
         item: BinarySecurityStageItem,
@@ -2331,22 +2404,14 @@ class TaskDownstreamServiceMixin:
         ).strip()
         if authoritative_task_id and archive_task_id and archive_task_id != authoritative_task_id:
             return {}
-        if archive_jobs:
-            matching_job = next(
-                (
-                    job
-                    for job in reversed(list(archive_jobs))
-                    if self._archive_job_bound_downstream_task_id(job) == authoritative_task_id
-                ),
-                None,
-            )
-            if matching_job is not None:
-                resolved = {
-                    **resolved,
-                    "archive_job_id": resolved.get("archive_job_id") or getattr(matching_job, "id", None),
-                    "archive_status": resolved.get("archive_status") or getattr(matching_job, "archive_status", None),
-                    "bound_downstream_task_id": authoritative_task_id,
-                }
+        matching_job = self._canonical_archive_job_for_item(item, archive_jobs=archive_jobs)
+        if matching_job is not None:
+            resolved = {
+                **resolved,
+                "archive_job_id": resolved.get("archive_job_id") or getattr(matching_job, "id", None),
+                "archive_status": resolved.get("archive_status") or getattr(matching_job, "archive_status", None),
+                "bound_downstream_task_id": authoritative_task_id,
+            }
         if authoritative_task_id and resolved.get("archive_root"):
             resolved["bound_downstream_task_id"] = authoritative_task_id
         return resolved
@@ -2357,15 +2422,8 @@ class TaskDownstreamServiceMixin:
         *,
         archive_jobs: list[BinarySecurityArchiveJob] | None = None,
     ) -> bool:
-        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
-        if not authoritative_task_id:
-            return False
-        for job in list(archive_jobs or []):
-            if self._archive_job_bound_downstream_task_id(job) != authoritative_task_id:
-                continue
-            if str(getattr(job, "archive_status", "") or "").strip().lower() == "success":
-                return True
-        return False
+        matching_job = self._canonical_archive_job_for_item(item, archive_jobs=archive_jobs)
+        return self._archive_job_status_value(matching_job) == "success"
 
     def _item_has_active_authoritative_archive_job(
         self,
@@ -2373,15 +2431,9 @@ class TaskDownstreamServiceMixin:
         *,
         archive_jobs: list[BinarySecurityArchiveJob] | None = None,
     ) -> bool:
-        authoritative_task_id = self._item_authoritative_downstream_task_id(item)
-        if not authoritative_task_id:
-            return False
         active_statuses = {"pending", "queued", "running", "applying", "reconciling", "archived"}
-        return any(
-            self._archive_job_bound_downstream_task_id(job) == authoritative_task_id
-            and str(getattr(job, "archive_status", "") or "").strip().lower() in active_statuses
-            for job in list(archive_jobs or [])
-        )
+        matching_job = self._canonical_archive_job_for_item(item, archive_jobs=archive_jobs)
+        return self._archive_job_status_value(matching_job) in active_statuses
 
     def _item_can_enqueue_authoritative_archive(
         self,
@@ -2650,6 +2702,42 @@ class TaskDownstreamServiceMixin:
             )
         return superseded
 
+    def _delete_superseded_archive_jobs(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        old_downstream_task_id: str | None,
+        new_downstream_task_id: str | None,
+        superseded_jobs: list[BinarySecurityArchiveJob],
+        reason: str,
+    ) -> list[str]:
+        deleted_job_ids: list[str] = []
+        for job in list(superseded_jobs or []):
+            job_id = str(getattr(job, "id", "") or "").strip()
+            if not job_id:
+                continue
+            db.delete(job)
+            deleted_job_ids.append(job_id)
+        if deleted_job_ids:
+            self._record_event(
+                db,
+                task,
+                "superseded_archive_jobs_deleted",
+                "旧 child 绑定的归档任务记录已删除",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "old_downstream_task_id": str(old_downstream_task_id or "").strip() or None,
+                    "new_downstream_task_id": str(new_downstream_task_id or "").strip() or None,
+                    "deleted_archive_job_ids": deleted_job_ids,
+                    "reason": reason,
+                },
+            )
+        return deleted_job_ids
+
     def _cleanup_superseded_archive_roots(
         self,
         db: Session,
@@ -2812,6 +2900,15 @@ class TaskDownstreamServiceMixin:
             superseded_jobs=superseded_jobs,
             reason=reason,
         )
+        deleted_archive_job_ids = self._delete_superseded_archive_jobs(
+            db,
+            task,
+            item,
+            old_downstream_task_id=old_task_id,
+            new_downstream_task_id=new_task_id,
+            superseded_jobs=superseded_jobs,
+            reason=reason,
+        )
         task_manager_module.logger.info(
             "binary-security child binding replaced: task_id=%s stage=%s item_id=%s item_key=%s old_downstream_task_id=%s new_downstream_task_id=%s reason=%s",
             task.id,
@@ -2835,6 +2932,7 @@ class TaskDownstreamServiceMixin:
                 "new_downstream_task_id": new_task_id,
                 "reason": reason,
                 "deleted_archive_roots": deleted_archive_roots,
+                "deleted_archive_job_ids": deleted_archive_job_ids,
                 "rebuild_rerun_count": rebuild_rerun_count,
                 "transition_type": normalized_transition_type,
             },

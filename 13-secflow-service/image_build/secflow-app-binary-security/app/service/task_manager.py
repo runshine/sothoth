@@ -7831,7 +7831,9 @@ class TaskManager(
         normalized_status = self._normalize_downstream_status(getattr(item, "status", None)) or str(getattr(item, "status", "") or "").strip().lower()
         if normalized_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
             return False
-        return any(str(getattr(job, "archive_status", "") or "").strip().lower() == "success" for job in list(archive_jobs or []))
+        return self._archive_job_status_value(
+            self._canonical_archive_job_for_item(item, archive_jobs=archive_jobs)
+        ) == "success"
 
     def _stage_archived_success_items(
         self,
@@ -7995,10 +7997,13 @@ class TaskManager(
                 normalized_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip()
                 if normalized_status not in ARCHIVE_SUCCESS_MAPPED_STATUSES:
                     continue
-                item_jobs = jobs_by_item.get(str(item.id or ""), [])
-                if not item_jobs:
+                canonical_job = self._canonical_archive_job_for_item(
+                    item,
+                    archive_jobs=jobs_by_item.get(str(item.id or ""), []),
+                )
+                if canonical_job is None:
                     return True
-                if item_jobs and any(str(job.archive_status or "").strip() != "success" for job in item_jobs):
+                if self._archive_job_status_value(canonical_job) != "success":
                     return True
             return False
         finally:

@@ -37,15 +37,10 @@ class TaskStateMachineMixin:
         if not normalized_stage:
             return False
         active_statuses = {"pending", "queued", "dispatching", "running", "applying", "reconciling"}
-        archive_jobs = (
-            db.query(task_manager_module.BinarySecurityArchiveJob)
-            .filter(
-                task_manager_module.BinarySecurityArchiveJob.task_id == task.id,
-                task_manager_module.BinarySecurityArchiveJob.stage_name == normalized_stage,
-            )
-            .all()
-        )
-        return any((str(getattr(job, "archive_status", "") or "").strip().lower() in active_statuses) for job in archive_jobs)
+        stage_items = self._stage_items(db, task.id, normalized_stage)
+        jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalized_stage)
+        canonical_jobs = self._canonical_archive_jobs_for_stage_items(stage_items, archive_jobs_by_item=jobs_by_item)
+        return any(self._archive_job_status_value(job) in active_statuses for job in canonical_jobs)
 
     def _task_has_any_active_children(
         self: TaskManager,
@@ -80,13 +75,14 @@ class TaskStateMachineMixin:
                 return True
             if self._stage_has_active_archive_jobs(db, task, stage_name):
                 return True
-        archive_jobs = (
-            db.query(task_manager_module.BinarySecurityArchiveJob)
-            .filter(task_manager_module.BinarySecurityArchiveJob.task_id == task.id)
-            .all()
-        )
-        if any(str(getattr(job, "archive_status", "") or "").strip() in active_statuses for job in archive_jobs):
-            return True
+        jobs_by_stage: dict[str, list[BinarySecurityStageItem]] = {}
+        for item in items:
+            jobs_by_stage.setdefault(str(getattr(item, "stage_name", "") or "").strip(), []).append(item)
+        for stage_name, current_stage_items in jobs_by_stage.items():
+            jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, stage_name)
+            canonical_jobs = self._canonical_archive_jobs_for_stage_items(current_stage_items, archive_jobs_by_item=jobs_by_item)
+            if any(self._archive_job_status_value(job) in active_statuses for job in canonical_jobs):
+                return True
         if str(getattr(task, "status", "") or "").strip().lower() in active_statuses and (
             str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         ):

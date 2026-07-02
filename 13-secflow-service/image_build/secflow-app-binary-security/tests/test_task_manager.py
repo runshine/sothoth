@@ -646,6 +646,42 @@ class ArchiveReclaimTests(unittest.TestCase):
         self.assertFalse(blocked)
         self.assertEqual(status, "success")
 
+    def test_stage_archive_success_gate_ignores_deleted_old_binding_jobs(self):
+        task = self._task()
+        task.current_stage = "firmware_unpack"
+        stage_run = self._stage_run(status="success")
+        stage_run.stage_name = "firmware_unpack"
+        item = self._item(status="success")
+        item.stage_name = "firmware_unpack"
+        item.downstream_service = "firmware_unpacker"
+        item.downstream_task_id = "child-current"
+        old_job = self._archive_job(status="superseded")
+        old_job.stage_name = "firmware_unpack"
+        old_job.item_id = item.id
+        old_job.downstream_service = "firmware_unpacker"
+        old_job.downstream_task_id = "child-old"
+        old_job.payload = {"bound_downstream_task_id": "child-old", "mapped_status": "success"}
+        current_job = self._archive_job(status="success")
+        current_job.id = "aj-current"
+        current_job.stage_name = "firmware_unpack"
+        current_job.item_id = item.id
+        current_job.downstream_service = "firmware_unpacker"
+        current_job.downstream_task_id = "child-current"
+        current_job.payload = {"bound_downstream_task_id": "child-current", "mapped_status": "success"}
+        current_job.archive_root = "/tmp/archive-current"
+        current_job.completed_at = _now()
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[stage_run],
+            stage_items=[item],
+            archive_jobs=[old_job, current_job],
+        )
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            blocked = self.manager._stage_archive_success_blocked(task, "firmware_unpack", [item])
+            status = self.manager._business_stage_status(task, "firmware_unpack", stage_run, [item], db=db)
+        self.assertFalse(blocked)
+        self.assertEqual("success", status)
+
     def test_run_archive_copy_job_missing_source_schedules_delayed_retry(self):
         task = self._task()
         item = self._item()
@@ -760,12 +796,12 @@ class ArchiveReclaimTests(unittest.TestCase):
 
         self.assertEqual("child-old", old_downstream_task_id)
         self.assertEqual("child-new", item.downstream_task_id)
-        self.assertEqual("superseded", archive_job.archive_status)
-        self.assertTrue(bool((archive_job.payload or {}).get("superseded")))
+        self.assertEqual([], db.archive_jobs)
         self.assertEqual(1, int(item.rerun_count or 0))
         self.assertEqual(1, int((item.result or {}).get("rebuild_rerun_count") or 0))
         event_types = [event.event_type for event in db.events]
         self.assertIn("superseded_archive_jobs_cancelled", event_types)
+        self.assertIn("superseded_archive_jobs_deleted", event_types)
         self.assertIn("child_binding_replaced", event_types)
 
     def test_replace_active_child_binding_supersedes_success_archive_jobs_and_deletes_archive_root(self):
@@ -825,15 +861,17 @@ class ArchiveReclaimTests(unittest.TestCase):
 
             self.assertEqual("child-old", old_downstream_task_id)
             self.assertEqual("child-new", item.downstream_task_id)
-            self.assertEqual("superseded", archive_job.archive_status)
+            self.assertEqual([], db.archive_jobs)
             self.assertFalse(archive_root.exists())
             self.assertEqual(1, int(item.rerun_count or 0))
             self.assertEqual(1, int((item.result or {}).get("rebuild_rerun_count") or 0))
             event_types = [event.event_type for event in db.events]
             self.assertIn("superseded_archive_jobs_cancelled", event_types)
+            self.assertIn("superseded_archive_jobs_deleted", event_types)
             self.assertIn("superseded_archive_roots_deleted", event_types)
             replace_event = next(event for event in db.events if event.event_type == "child_binding_replaced")
             self.assertEqual([str(archive_root)], list((replace_event.payload or {}).get("deleted_archive_roots") or []))
+            self.assertEqual(["aj-old-success"], list((replace_event.payload or {}).get("deleted_archive_job_ids") or []))
             self.assertEqual(1, int((replace_event.payload or {}).get("rebuild_rerun_count") or 0))
 
     def test_replace_active_child_binding_in_place_restart_does_not_increment_rebuild_rerun(self):
