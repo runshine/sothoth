@@ -1855,7 +1855,7 @@ class TaskReadModelServiceMixin:
             stage_items,
             item_stats=item_stats,
             downstream_status_counts=downstream_status_counts,
-            include_retry_support=False,
+            include_retry_support=True,
         )
         abnormal_reason = None
         if isinstance(task.latest_abnormal_reason, dict):
@@ -3769,12 +3769,12 @@ class TaskReadModelServiceMixin:
             if item.stage_name in items_by_stage:
                 items_by_stage[item.stage_name].append(item)
         stage_retry_support = (
-            {stage_name: self._stage_retry_support(db, task, stage_name) for stage_name in stage_sequence if stage_name in runs_by_stage}
+            {stage_name: self._stage_retry_support(db, task, stage_name) for stage_name in stage_sequence}
             if include_retry_support
             else {}
         )
         stage_retry_failed_support = (
-            {stage_name: self._stage_retry_failed_items_support(db, task, stage_name) for stage_name in stage_sequence if stage_name in runs_by_stage}
+            {stage_name: self._stage_retry_failed_items_support(db, task, stage_name) for stage_name in stage_sequence}
             if include_retry_support
             else {}
         )

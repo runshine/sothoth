@@ -35709,10 +35709,122 @@ def _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstre
     self.assertEqual(1, detail.downstream_status_counts.get("downstream_missing"))
 
 
+def _test_build_stage_summaries_exposes_retry_support_without_stage_run(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="firmware",
+        status="failed",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    firmware_run = BinarySecurityStageRun(
+        id="sr-fw",
+        task_id="t1",
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="success",
+        started_at=_now(),
+        finished_at=_now(),
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-system",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id=None,
+        stage_name="system_analysis",
+        item_key="NE20E-V800R022C10SPC100",
+        item_name="NE20E-V800R022C10SPC100",
+        status="failed",
+        downstream_service="system_analyse",
+        downstream_task_id="sa-1",
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[system_item])
+
+    summaries = self.manager._build_stage_summaries(
+        db,
+        task,
+        ["firmware_unpack", "system_analysis", "binary_to_source"],
+        [firmware_run],
+        [system_item],
+    )
+    by_stage = {summary.stage_name: summary for summary in summaries}
+    system_summary = by_stage["system_analysis"]
+
+    self.assertEqual("failed", system_summary.status)
+    self.assertTrue(system_summary.retry_full_supported)
+    self.assertIsNone(system_summary.retry_full_reason)
+    self.assertTrue(system_summary.retry_failed_supported)
+    self.assertIsNone(system_summary.retry_failed_reason)
+
+    response = self.manager._task_response(db, task)
+    self.assertTrue(response.manual_operation_state["can_retry_stage"])
+    self.assertTrue(response.manual_operation_state["can_retry_stage_failed_items"])
+    self.assertTrue(response.manual_operation_state["can_retry_stage_full"])
+
+
+def _test_light_task_detail_context_preserves_retry_support_without_stage_run(self):
+    task = BinarySecurityTask(
+        id="t1",
+        project_id="p1",
+        name="firmware",
+        status="failed",
+        task_type=TASK_TYPE_BINARY,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/fw.bin",
+        output_root="/tmp/out",
+        workspace_root="/tmp/ws",
+    )
+    firmware_run = BinarySecurityStageRun(
+        id="sr-fw",
+        task_id="t1",
+        project_id="p1",
+        stage_name="firmware_unpack",
+        sequence_no=1,
+        status="success",
+        started_at=_now(),
+        finished_at=_now(),
+    )
+    system_item = BinarySecurityStageItem(
+        id="si-system",
+        task_id="t1",
+        project_id="p1",
+        stage_run_id=None,
+        stage_name="system_analysis",
+        item_key="NE20E-V800R022C10SPC100",
+        item_name="NE20E-V800R022C10SPC100",
+        status="failed",
+        downstream_service="system_analyse",
+        downstream_task_id="sa-1",
+    )
+    db = _ModelAwareDb(tasks=[task], stage_runs=[firmware_run], stage_items=[system_item], archive_jobs=[])
+
+    ctx = self.manager._build_light_task_detail_context(db, project_id=task.project_id, task_id=task.id)
+    system_summary = next(summary for summary in ctx.stage_summaries if summary.stage_name == "system_analysis")
+
+    self.assertTrue(system_summary.retry_full_supported)
+    self.assertTrue(system_summary.retry_failed_supported)
+
+    response = self.manager._task_response(db, task, detail_ctx=ctx, projection_only=True)
+    system_response_summary = next(summary for summary in response.stage_summaries if summary.stage_name == "system_analysis")
+    self.assertTrue(system_response_summary.retry_full_supported)
+    self.assertTrue(system_response_summary.retry_failed_supported)
+    self.assertTrue(response.manual_operation_state["can_retry_stage"])
+    self.assertTrue(response.manual_operation_state["can_retry_stage_full"])
+
+
 TaskManagerTests.test_stage_item_response_exposes_downstream_status_from_sync_observation = _test_stage_item_response_exposes_downstream_status_from_sync_observation
 TaskManagerTests.test_stage_item_response_prefers_terminal_item_status_over_stale_running_downstream = _test_stage_item_response_prefers_terminal_item_status_over_stale_running_downstream
 TaskManagerTests.test_active_downstream_payload_treats_dispatching_as_active = _test_active_downstream_payload_treats_dispatching_as_active
 TaskManagerTests.test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses = _test_build_stage_summaries_and_overview_preserve_orchestration_and_downstream_statuses
+TaskManagerTests.test_build_stage_summaries_exposes_retry_support_without_stage_run = _test_build_stage_summaries_exposes_retry_support_without_stage_run
+TaskManagerTests.test_light_task_detail_context_preserves_retry_support_without_stage_run = _test_light_task_detail_context_preserves_retry_support_without_stage_run
 
 
 def _test_apply_child_task_status_change_records_timeline_and_sync_metadata(self):
