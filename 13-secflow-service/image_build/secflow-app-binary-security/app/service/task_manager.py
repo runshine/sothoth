@@ -489,6 +489,8 @@ ENTRY_SELECTION_MODE_MANUAL_CONFIRM = "manual_confirm"
 ENTRY_AUTO_SELECTION_STRATEGY_ALL = "all"
 ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE = "top_n_per_module_by_confidence"
 DEFAULT_ENTRY_AUTO_SELECTION_TOP_N = 20
+KNOWLEDGE_GRAPH_ENTRY_FETCH_MAX_ATTEMPTS = 10
+KNOWLEDGE_GRAPH_ENTRY_FETCH_RETRY_INTERVAL_SECONDS = 20
 ALLOWED_MODULE_RISK_LEVELS = ("高", "中", "低")
 STAGE_SUMMARY_RESULT_KEYS = {
     "firmware_unpack": ["firmware_unpack_results"],
@@ -3619,6 +3621,12 @@ class TaskManager(
             "kind": str(policy.get("knowledge_graph_kind") or "").strip() or None,
             "module": policy.get("knowledge_graph_module"),
         }
+
+    def _knowledge_graph_entry_fetch_max_attempts(self) -> int:
+        return max(1, int(KNOWLEDGE_GRAPH_ENTRY_FETCH_MAX_ATTEMPTS))
+
+    def _knowledge_graph_entry_fetch_retry_interval_seconds(self) -> int:
+        return max(0, int(KNOWLEDGE_GRAPH_ENTRY_FETCH_RETRY_INTERVAL_SECONDS))
 
     async def complete_uploads(
         self,
@@ -12524,6 +12532,8 @@ class TaskManager(
         del token, retry_existing
         upload_id, db_name = self._knowledge_graph_locator(task)
         entries_url = self._knowledge_graph_source_endpoint(upload_id=upload_id, db_name=db_name)
+        max_attempts = self._knowledge_graph_entry_fetch_max_attempts()
+        retry_interval_seconds = self._knowledge_graph_entry_fetch_retry_interval_seconds()
         self._record_event(
             db,
             task,
@@ -12538,8 +12548,36 @@ class TaskManager(
                 "db_name": db_name,
             },
         )
+        attempt = 0
+        entries: list[dict[str, Any]] = []
+        meta: dict[str, Any] = {}
+        previous_entries = self._knowledge_graph_entry_results(task)
         try:
-            entries, meta = await self._fetch_knowledge_graph_entry_results(task)
+            while True:
+                attempt += 1
+                entries, meta = await self._fetch_knowledge_graph_entry_results(task)
+                if entries or previous_entries or attempt >= max_attempts:
+                    break
+                graph_status = str(meta.get("graph_status") or "").strip().lower()
+                if graph_status == "superseded":
+                    break
+                self._record_event(
+                    db,
+                    task,
+                    "knowledge_graph_entry_fetch_retry_scheduled",
+                    "知识图谱入口暂未就绪，等待后重试拉取",
+                    stage_name=stage_run.stage_name,
+                    payload={
+                        "provider": "knowledge_graph_audit_sources",
+                        "entries_url": entries_url,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "retry_interval_seconds": retry_interval_seconds,
+                        **meta,
+                    },
+                )
+                if retry_interval_seconds > 0:
+                    await asyncio.sleep(retry_interval_seconds)
         except Exception as exc:
             self._record_event(
                 db,
@@ -12556,6 +12594,8 @@ class TaskManager(
                     "filtered_out_count": 0,
                     "duration_ms": 0,
                     "error_message": str(exc),
+                    "attempt": attempt or 1,
+                    "max_attempts": max_attempts,
                 },
             )
             failed_module = self._build_knowledge_graph_entry_result_module(
@@ -12589,6 +12629,8 @@ class TaskManager(
                 "knowledge_graph_filtered_out_count": 0,
                 "entries_url": entries_url,
                 "duration_ms": 0,
+                "attempt": attempt or 1,
+                "max_attempts": max_attempts,
             }
             self._persist_stage_run_output_summary(task, stage_run, failure_summary)
             return "failed", failure_summary
@@ -12617,7 +12659,7 @@ class TaskManager(
             completion_state="success",
             completion_ready=False,
         )
-        if graph_status == "failed" or identification_state == "failed" or graph_status == "superseded":
+        if (graph_status == "failed" or identification_state == "failed" or graph_status == "superseded") and not accumulated_entries:
             reason = "知识图谱入口识别失败"
             if graph_status == "superseded":
                 reason = "知识图谱图谱已被替换，当前结果不可用"
@@ -12630,6 +12672,8 @@ class TaskManager(
                 stage_name=stage_run.stage_name,
                 payload={
                     "provider": "knowledge_graph_audit_sources",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
                     **meta,
                 },
             )
@@ -12673,6 +12717,8 @@ class TaskManager(
                 **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
                 **state_summary,
                 **meta,
             }
@@ -12687,6 +12733,8 @@ class TaskManager(
                 stage_name=stage_run.stage_name,
                 payload={
                     "provider": "knowledge_graph_audit_sources",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
                     **meta,
                 },
             )
@@ -12719,6 +12767,8 @@ class TaskManager(
                 **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
                 **state_summary,
                 **meta,
             }
@@ -12733,6 +12783,8 @@ class TaskManager(
                 stage_name=stage_run.stage_name,
                 payload={
                     "provider": "knowledge_graph_audit_sources",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
                     **meta,
                 },
             )
@@ -12765,58 +12817,8 @@ class TaskManager(
                 **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
-                **state_summary,
-                **meta,
-            }
-            self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
-            return "running", waiting_summary
-        if identification_state != "done":
-            self._record_event(
-                db,
-                task,
-                "knowledge_graph_entry_fetch_polling_partial",
-                "知识图谱入口识别仍在进行，已累计部分入口",
-                stage_name=stage_run.stage_name,
-                payload={
-                    "provider": "knowledge_graph_audit_sources",
-                    "current_poll_selected_entry_count": current_poll_selected_entry_count,
-                    "accumulated_selected_entry_count": accumulated_selected_entry_count,
-                    **meta,
-                },
-            )
-            task.summary = {
-                **(task.summary or {}),
-                "knowledge_graph_entry_results": accumulated_entries,
-                "entry_results": [pending_module],
-                "knowledge_graph_state": state_summary,
-            }
-            task.metrics = {
-                **(task.metrics or {}),
-                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
-                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                "candidate_entry_count": executable_entry_count,
-                "selected_entry_count": executable_entry_count,
-                "entry_count": executable_entry_count,
-                **execution_metrics,
-                **self._knowledge_graph_analysis_metrics(meta),
-                **self._entry_selection_metrics(task),
-            }
-            waiting_summary = {
-                "status": "polling_partial",
-                "items": [pending_module],
-                "success_count": executable_entry_count,
-                "failed_count": 0,
-                "candidate_entry_count": executable_entry_count,
-                "selected_entry_count": executable_entry_count,
-                "entry_count": executable_entry_count,
-                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
-                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
-                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
-                **execution_metrics,
-                "current_poll_selected_entry_count": current_poll_selected_entry_count,
-                "accumulated_selected_entry_count": accumulated_selected_entry_count,
-                "entry_results": [pending_module],
+                "attempt": attempt,
+                "max_attempts": max_attempts,
                 **state_summary,
                 **meta,
             }
@@ -12853,6 +12855,8 @@ class TaskManager(
                 stage_name=stage_run.stage_name,
                 payload={
                     "provider": "knowledge_graph_audit_sources",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
                     **meta,
                 },
             )
@@ -12893,6 +12897,8 @@ class TaskManager(
                 "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
                 **execution_metrics,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
                 **state_summary,
                 **meta,
             }
@@ -12927,6 +12933,8 @@ class TaskManager(
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_executable_entry_count": executable_entry_count,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
                 **meta,
             },
         )
@@ -12966,6 +12974,8 @@ class TaskManager(
             "current_poll_selected_entry_count": current_poll_selected_entry_count,
             "accumulated_selected_entry_count": accumulated_selected_entry_count,
             "entry_results": [success_module],
+            "attempt": attempt,
+            "max_attempts": max_attempts,
             **state_summary,
             **meta,
         }
