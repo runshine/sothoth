@@ -67,6 +67,7 @@ class TaskReadModelServiceMixin:
                 pruned = True
         if pruned:
             db.flush()
+            db.commit()
             raw_archive_jobs = (
                 db.query(task_manager_module.BinarySecurityArchiveJob)
                 .filter(task_manager_module.BinarySecurityArchiveJob.task_id == task.id)
