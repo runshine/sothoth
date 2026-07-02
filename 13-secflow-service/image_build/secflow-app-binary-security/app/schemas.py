@@ -293,38 +293,6 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     cleanup_state: dict[str, Any] = Field(default_factory=dict)
 
 
-class BinarySecurityTaskListItemResponse(BinarySecurityBaseModel):
-    id: str
-    project_id: str
-    project_name: Optional[str] = None
-    task_type: str = TASK_TYPE_BINARY
-    pipeline_profile: str = PIPELINE_PROFILE_DEFAULT
-    name: str
-    schedule_user_task_id: Optional[str] = None
-    status: str
-    current_stage: Optional[str] = None
-    last_error: Optional[str] = None
-    firmware_path: str
-    stage_sequence: list[str] = Field(default_factory=list)
-    created_by: Optional[str] = None
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
-    started_at: Optional[datetime] = None
-    finished_at: Optional[datetime] = None
-    abnormal_reason_title: Optional[str] = None
-    abnormal_reason_code: Optional[str] = None
-    stage_summaries: list[BinarySecurityStageSummary] = Field(default_factory=list)
-    manual_operation_state: dict[str, Any] = Field(default_factory=dict)
-    task_lease_owner_instance_id: Optional[str] = None
-    task_lease_expires_at: Optional[datetime] = None
-    task_lease_source: Optional[str] = None
-    last_successful_downstream_sync_at: Optional[datetime] = None
-    last_sync_attempt_at: Optional[datetime] = None
-    last_sync_error_at: Optional[datetime] = None
-    last_sync_error_type: Optional[str] = None
-    last_sync_error_message: Optional[str] = None
-
-
 class BinarySecurityTaskOperationResponse(BinarySecurityBaseModel):
     id: str
     task_id: str
@@ -459,8 +427,14 @@ class BinarySecurityTaskListResponse(BinarySecurityBaseModel):
     page: int = 1
     page_size: int = 50
     total_pages: int = 1
+    running_count: int = 0
+    queued_count: int = 0
+    max_concurrent_tasks: int = 50
     scope: str = "current"
-    items: list[BinarySecurityTaskListItemResponse] = Field(default_factory=list)
+    project_stats: BinarySecurityProjectStats = Field(default_factory=BinarySecurityProjectStats)
+    project_stage_aggregates: list[BinarySecurityProjectStageAggregate] = Field(default_factory=list)
+    queue_runtime: dict[str, Any] = Field(default_factory=dict)
+    items: list[BinarySecurityTaskResponse] = Field(default_factory=list)
 
 
 class BinarySecurityDeleteQueueItem(BinarySecurityBaseModel):
@@ -998,9 +972,6 @@ class BinarySecurityTaskPolicyConfigPayload(BinarySecurityBaseModel):
     max_stage_parallelism: int = Field(default=5, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
     continue_on_item_failure: bool = True
-    entry_selection_mode: str = Field(default="auto")
-    entry_auto_selection_strategy: str = Field(default="top_n_per_module_by_confidence")
-    entry_auto_selection_top_n: int = Field(default=20, ge=1, le=999)
     partial_success_stage_advancement: dict[str, bool] = Field(
         default_factory=lambda: {
             "binary_to_source": True,
@@ -1049,9 +1020,6 @@ class BinarySecurityGlobalConfigPayload(BinarySecurityBaseModel):
     max_stage_parallelism: int = Field(default=5, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
     continue_on_item_failure: bool = True
-    entry_selection_mode: str = Field(default="auto")
-    entry_auto_selection_strategy: str = Field(default="top_n_per_module_by_confidence")
-    entry_auto_selection_top_n: int = Field(default=20, ge=1, le=999)
     partial_success_stage_advancement: dict[str, bool] = Field(
         default_factory=lambda: {
             "binary_to_source": True,

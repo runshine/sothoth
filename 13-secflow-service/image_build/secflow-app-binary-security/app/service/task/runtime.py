@@ -152,6 +152,7 @@ class TaskRuntimeServiceMixin:
             .first()
         )
         if task is not None:
+            shared_dispatch_signal = self._pending_shared_dispatch_signal(task)
             dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
             local_instance_id = str(self.instance_id or "").strip() or None
             runtime_phase = self._task_runtime_phase(task)
@@ -198,10 +199,13 @@ class TaskRuntimeServiceMixin:
                         "runtime_lease_active": runtime_lease_active,
                         "runtime_lease_owner": runtime_lease_owner,
                         "local_handle_alive": local_handle_alive,
+                        "dropped_message_type": str(shared_dispatch_signal.get("signal_type") or normalized_reason or "unknown_shared_dispatch_signal"),
+                        "shared_dispatch_signal": dict(shared_dispatch_signal or {}),
                         "signal_channel": "shared_dispatch",
                         "forwarded_from_shared_dispatch": False,
                     },
                 )
+                self._clear_pending_shared_dispatch_signal(task)
                 self._enqueue_owner_signal(
                     dispatcher_instance_id,
                     normalized_task_id,
@@ -225,6 +229,8 @@ class TaskRuntimeServiceMixin:
                         "runtime_lease_active": runtime_lease_active,
                         "runtime_lease_owner": runtime_lease_owner,
                         "local_handle_alive": local_handle_alive,
+                        "dropped_message_type": str(shared_dispatch_signal.get("signal_type") or normalized_reason or "unknown_shared_dispatch_signal"),
+                        "shared_dispatch_signal": dict(shared_dispatch_signal or {}),
                         "signal_channel": "owner_inbox",
                         "forwarded_from_shared_dispatch": True,
                     },
@@ -251,6 +257,8 @@ class TaskRuntimeServiceMixin:
                 payload={
                     "task_id": normalized_task_id,
                     "reason": normalized_reason,
+                    "dropped_message_type": str(shared_dispatch_signal.get("signal_type") or normalized_reason or "unknown_shared_dispatch_signal"),
+                    "shared_dispatch_signal": dict(shared_dispatch_signal or {}),
                     "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
                     "runtime_phase": runtime_phase,
                     "task_status": task_status,
@@ -261,6 +269,7 @@ class TaskRuntimeServiceMixin:
                     "requeue_after_pop": False,
                 },
             )
+            self._clear_pending_shared_dispatch_signal(task)
             db.commit()
             task_manager_module.logger.warning(
                 "binary-security dispatch popped task but claim was not acquired; task dropped after pop: "
@@ -2069,6 +2078,7 @@ class TaskRuntimeServiceMixin:
             )
         )
         if updated:
+            self._clear_pending_shared_dispatch_signal(task)
             db.commit()
             self._set_dispatch_claim_decision(
                 task_id=task_id,

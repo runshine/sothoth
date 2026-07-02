@@ -33,22 +33,6 @@ if TYPE_CHECKING:
 
 
 class TaskControlServiceMixin:
-    def _request_local_control_wakeup_or_enqueue_fallback(
-        self: TaskManager,
-        task,
-        *,
-        operation_type: str,
-        operation_id: str | None = None,
-    ) -> bool:
-        wakeup_requested = self._request_local_worker_control_wakeup_nowait(
-            str(getattr(task, "id", "") or "").strip(),
-            operation_type,
-            operation_id=operation_id,
-        )
-        if not wakeup_requested:
-            self._enqueue_task(task.id)
-        return wakeup_requested
-
     def _apply_manual_policy_update_direct(
         self: TaskManager,
         db: Session,
@@ -63,32 +47,6 @@ class TaskControlServiceMixin:
             state_event_id=None,
             applied_by="owner_direct",
         )
-        target_owner_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        if target_owner_instance_id:
-            mode = str(payload.get("mode") or "policy").strip() or "policy"
-            self._record_event(
-                db,
-                task,
-                "owner_reconcile_signal_enqueued",
-                "已向当前 owner worker 投递策略收口唤醒信号",
-                level="info",
-                stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
-                payload={
-                    "task_id": str(getattr(task, "id", "") or "").strip() or None,
-                    "target_owner_instance_id": target_owner_instance_id,
-                    "local_instance_id": str(self.instance_id or "").strip() or None,
-                    "signal_channel": "owner_inbox",
-                    "reconcile_reason": "manual_policy_update_requested",
-                    "source_event_type": "manual_policy_update_requested",
-                    "policy_update_mode": mode,
-                },
-            )
-            self._enqueue_owner_signal(
-                target_owner_instance_id,
-                task.id,
-                context="manual_policy_owner_signal_enqueue",
-            )
-            return
         self._enqueue_task(task.id)
 
     def _task_delete_snapshot_state(self: TaskManager, task) -> dict[str, Any]:
@@ -664,9 +622,6 @@ class TaskControlServiceMixin:
             "stage_options": {},
             "module_selection_mode": "auto",
             "module_risk_levels": ["高"],
-            "entry_selection_mode": "auto",
-            "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
-            "entry_auto_selection_top_n": 20,
         }
         defaults["partial_success_stage_advancement"] = {
             stage_name: True for stage_name in stage_names if stage_name in {"binary_to_source", "entry_analysis", "dataflow_vuln_scan"}
@@ -1350,7 +1305,6 @@ class TaskControlServiceMixin:
             request_payload={"current_stage": task.current_stage},
             accepted_event_type="task_cancel_accepted",
             accepted_message="任务取消已受理，后台正在停止执行并清理下游任务",
-            enqueue_task=False,
         )
         self._set_task_status(
             db,
@@ -1384,8 +1338,7 @@ class TaskControlServiceMixin:
                 },
             )
             db.commit()
-        if not wakeup_requested:
-            self._enqueue_task(task.id)
+        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("cancel", "accepted")
         return BinarySecurityActionResponse(
             task_id=task_id,
@@ -1394,97 +1347,6 @@ class TaskControlServiceMixin:
             action="cancel",
             status="accepted",
             message="任务取消已受理，后台正在停止执行并清理下游任务",
-            task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
-        )
-
-    async def finish_task_as_success(
-        self: TaskManager,
-        db: Session,
-        *,
-        project_id: str,
-        task_id: str,
-        requested_by: str | None = None,
-    ) -> BinarySecurityActionResponse:
-        from app.service import task_manager as task_manager_module
-
-        task = self._task_or_404(db, project_id, task_id)
-        self._reject_if_delete_queued(task, action="finish_success")
-        active_operation = self._active_operation(db, task.id)
-        if active_operation is not None and str(active_operation.operation_type or "").strip() == task_manager_module.TASK_ACTION_FINISH_SUCCESS:
-            task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_FINISH_SUCCESS, "already_queued")
-            return BinarySecurityActionResponse(
-                task_id=task_id,
-                operation_id=active_operation.id,
-                accepted=True,
-                action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
-                status="accepted",
-                message="成功结束已受理，后台正在停止下游并收口主任务",
-                task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
-            )
-        if str(task.status or "").strip().lower() in {"success", "partial_success"}:
-            task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_FINISH_SUCCESS, "already_success")
-            return BinarySecurityActionResponse(
-                task_id=task_id,
-                accepted=True,
-                action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
-                status="accepted",
-                message="任务已经处于成功终态",
-                task_status_after_accept=str(task.status or "").strip() or "success",
-            )
-        normalized_requested_by = str(requested_by or getattr(task, "created_by", None) or "").strip() or None
-        operation = self._queue_task_operation(
-            db,
-            task,
-            operation_type=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
-            target_stage=task.current_stage,
-            requested_by=normalized_requested_by,
-            request_payload={"current_stage": task.current_stage, "developer_mode": True},
-            accepted_event_type="task_finish_success_accepted",
-            accepted_message="成功结束已受理，后台正在停止下游并收口主任务",
-            enqueue_task=False,
-        )
-        self._set_task_status(
-            db,
-            task,
-            task_manager_module.TASK_STATUS_CANCELLING,
-            reason="收到开发者成功结束请求",
-            source="task_control",
-            stage_name=task.current_stage,
-        )
-        task.finished_at = None
-        task.last_error = None
-        task.current_operation_id = operation.id
-        db.commit()
-        wakeup_requested = await self._request_local_worker_control_wakeup(
-            task.id,
-            task_manager_module.TASK_ACTION_FINISH_SUCCESS,
-            operation_id=operation.id,
-            wait_for_runner=False,
-        )
-        if wakeup_requested:
-            self._record_event(
-                db,
-                task,
-                "local_owner_control_wakeup_requested",
-                "已通知当前 owner 原地处理成功结束控制操作",
-                stage_name=task.current_stage,
-                payload={
-                    "operation_id": operation.id,
-                    "operation_type": task_manager_module.TASK_ACTION_FINISH_SUCCESS,
-                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                },
-            )
-            db.commit()
-        if not wakeup_requested:
-            self._enqueue_task(task.id)
-        task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_FINISH_SUCCESS, "accepted")
-        return BinarySecurityActionResponse(
-            task_id=task_id,
-            operation_id=operation.id,
-            accepted=True,
-            action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
-            status="accepted",
-            message="成功结束已受理，后台正在停止下游并将主任务标记为成功",
             task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
         )
 
@@ -1537,7 +1399,6 @@ class TaskControlServiceMixin:
             },
             accepted_event_type="task_delete_accepted",
             accepted_message="任务删除已受理，后台正在清理任务及下游资源",
-            enqueue_task=False,
         )
         operation.request_source = normalized_request_source
         task.current_operation_id = operation.id
@@ -1664,10 +1525,8 @@ class TaskControlServiceMixin:
             },
             accepted_event_type="task_force_reset_to_pending_accepted",
             accepted_message="任务强制重置已受理，后台将等待当前 owner 或租约过期后处理",
-            enqueue_task=False,
         )
         await self._request_local_worker_cancel(task.id, wait_for_runner=False)
-        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("force_reset", "accepted")
         return BinarySecurityActionResponse(
             task_id=task_id,
@@ -1808,15 +1667,15 @@ class TaskControlServiceMixin:
             request_payload={"target_stage": target_stage},
             accepted_event_type="task_continue_accepted",
             accepted_message=f"继续任务已受理，后台正在准备从阶段 {target_stage} 继续",
-            enqueue_task=False,
         )
         task.current_operation_id = operation.id
         db.commit()
-        self._request_local_control_wakeup_or_enqueue_fallback(
-            task,
-            operation_type=task_manager_module.TASK_ACTION_CONTINUE,
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_CONTINUE,
             operation_id=operation.id,
         )
+        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("continue", "accepted")
         return operation
 
@@ -1840,15 +1699,15 @@ class TaskControlServiceMixin:
             request_payload={"target_stage": first_stage},
             accepted_event_type="task_retry_accepted",
             accepted_message=f"清空并从头开始已受理，后台正在准备从阶段 {first_stage} 重新排队",
-            enqueue_task=False,
         )
         task.current_operation_id = operation.id
         db.commit()
-        self._request_local_control_wakeup_or_enqueue_fallback(
-            task,
-            operation_type=task_manager_module.TASK_ACTION_RETRY,
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_RETRY,
             operation_id=operation.id,
         )
+        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("retry", "accepted")
         task_manager_module.observe_task_error("retry", stage=first_stage, result="accepted")
         return operation
@@ -1873,15 +1732,15 @@ class TaskControlServiceMixin:
                 },
                 accepted_event_type="task_retry_failed_items_archive_full_accepted",
                 accepted_message=f"检测到阶段 {stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
-                enqueue_task=False,
             )
             task.current_operation_id = operation.id
             db.commit()
-            self._request_local_control_wakeup_or_enqueue_fallback(
-                task,
-                operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+            self._request_local_worker_control_wakeup_nowait(
+                task.id,
+                task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                 operation_id=operation.id,
             )
+            self._enqueue_task(task.id)
             task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
             return operation
         if not supported or not stage_name:
@@ -1900,15 +1759,15 @@ class TaskControlServiceMixin:
                     },
                     accepted_event_type="task_retry_failed_items_archive_full_accepted",
                     accepted_message=f"检测到阶段 {archive_stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
-                    enqueue_task=False,
                 )
                 task.current_operation_id = operation.id
                 db.commit()
-                self._request_local_control_wakeup_or_enqueue_fallback(
-                    task,
-                    operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+                self._request_local_worker_control_wakeup_nowait(
+                    task.id,
+                    task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                     operation_id=operation.id,
                 )
+                self._enqueue_task(task.id)
                 task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
                 return operation
             continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
@@ -1924,15 +1783,15 @@ class TaskControlServiceMixin:
                 request_payload={"target_stage": continue_stage, "fallback_from": task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS},
                 accepted_event_type="task_retry_failed_items_continue_accepted",
                 accepted_message=f"当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
-                enqueue_task=False,
             )
             task.current_operation_id = operation.id
             db.commit()
-            self._request_local_control_wakeup_or_enqueue_fallback(
-                task,
-                operation_type=task_manager_module.TASK_ACTION_CONTINUE,
+            self._request_local_worker_control_wakeup_nowait(
+                task.id,
+                task_manager_module.TASK_ACTION_CONTINUE,
                 operation_id=operation.id,
             )
+            self._enqueue_task(task.id)
             task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
             return operation
         item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
@@ -1957,15 +1816,15 @@ class TaskControlServiceMixin:
             request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
             accepted_event_type="task_retry_failed_items_accepted",
             accepted_message=f"重试失败项已受理，后台正在准备从阶段 {stage_name} 重新排队",
-            enqueue_task=False,
         )
         task.current_operation_id = operation.id
         db.commit()
-        self._request_local_control_wakeup_or_enqueue_fallback(
-            task,
-            operation_type=task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
             operation_id=operation.id,
         )
+        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
         return operation
 
@@ -1999,15 +1858,15 @@ class TaskControlServiceMixin:
                 },
                 accepted_event_type="stage_retry_failed_items_archive_full_accepted",
                 accepted_message=f"阶段 {stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
-                enqueue_task=False,
             )
             task.current_operation_id = operation.id
             db.commit()
-            self._request_local_control_wakeup_or_enqueue_fallback(
-                task,
-                operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+            self._request_local_worker_control_wakeup_nowait(
+                task.id,
+                task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                 operation_id=operation.id,
             )
+            self._enqueue_task(task.id)
             return operation
         if not supported:
             archive_stage_name, archive_reason = self._archive_pending_full_retry_stage(db, task, stage_name)
@@ -2026,15 +1885,15 @@ class TaskControlServiceMixin:
                     },
                     accepted_event_type="stage_retry_failed_items_archive_full_accepted",
                     accepted_message=f"阶段 {archive_stage_name} 的归档仍在处理中，已自动升级为阶段归档完全重试",
-                    enqueue_task=False,
                 )
                 task.current_operation_id = operation.id
                 db.commit()
-                self._request_local_control_wakeup_or_enqueue_fallback(
-                    task,
-                    operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+                self._request_local_worker_control_wakeup_nowait(
+                    task.id,
+                    task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                     operation_id=operation.id,
                 )
+                self._enqueue_task(task.id)
                 return operation
             continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
             if not continue_supported or not continue_stage:
@@ -2048,15 +1907,15 @@ class TaskControlServiceMixin:
                 request_payload={"target_stage": continue_stage, "requested_stage": stage_name},
                 accepted_event_type="stage_retry_failed_items_continue_accepted",
                 accepted_message=f"阶段 {stage_name} 当前没有失败项，已自动转为继续推进，后台将从阶段 {continue_stage} 重新排队",
-                enqueue_task=False,
             )
             task.current_operation_id = operation.id
             db.commit()
-            self._request_local_control_wakeup_or_enqueue_fallback(
-                task,
-                operation_type=task_manager_module.TASK_ACTION_CONTINUE,
+            self._request_local_worker_control_wakeup_nowait(
+                task.id,
+                task_manager_module.TASK_ACTION_CONTINUE,
                 operation_id=operation.id,
             )
+            self._enqueue_task(task.id)
             return operation
         item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
         self._set_retry_plan(
@@ -2080,15 +1939,15 @@ class TaskControlServiceMixin:
             request_payload={"target_stage": stage_name, "retry_item_keys": item_keys, "retry_item_count": len(item_keys)},
             accepted_event_type="stage_retry_failed_items_accepted",
             accepted_message=f"阶段 {stage_name} 的失败项重试已受理，后台正在准备重新排队",
-            enqueue_task=False,
         )
         task.current_operation_id = operation.id
         db.commit()
-        self._request_local_control_wakeup_or_enqueue_fallback(
-            task,
-            operation_type=task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
             operation_id=operation.id,
         )
+        self._enqueue_task(task.id)
         return operation
 
     def retry_stage_full(self: TaskManager, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
@@ -2122,15 +1981,15 @@ class TaskControlServiceMixin:
             request_payload={"target_stage": stage_name},
             accepted_event_type="stage_retry_full_accepted",
             accepted_message=f"阶段 {stage_name} 的完全重试已受理，后台正在清理旧子任务并重建输入",
-            enqueue_task=False,
         )
         task.current_operation_id = operation.id
         db.commit()
-        self._request_local_control_wakeup_or_enqueue_fallback(
-            task,
-            operation_type=task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
             operation_id=operation.id,
         )
+        self._enqueue_task(task.id)
         return operation
 
     def retry_stage_archive(self: TaskManager, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
@@ -2164,15 +2023,15 @@ class TaskControlServiceMixin:
             request_payload={"target_stage": stage_name, "retryable_job_ids": [job.id for job in jobs]},
             accepted_event_type="archive_stage_retry_accepted",
             accepted_message=f"阶段 {stage_name} 的归档失败项重试已受理，后台正在重新排队归档任务",
-            enqueue_task=False,
         )
         task.current_operation_id = operation.id
         db.commit()
-        self._request_local_control_wakeup_or_enqueue_fallback(
-            task,
-            operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
             operation_id=operation.id,
         )
+        self._enqueue_task(task.id)
         task_manager_module.observe_archive_action("retry_stage", "accepted")
         return operation
 
@@ -2204,15 +2063,15 @@ class TaskControlServiceMixin:
             },
             accepted_event_type="archive_stage_full_retry_accepted",
             accepted_message=f"阶段 {stage_name} 的归档全量重试已受理，后台正在清空并重建归档任务",
-            enqueue_task=False,
         )
         task.current_operation_id = operation.id
         db.commit()
-        self._request_local_control_wakeup_or_enqueue_fallback(
-            task,
-            operation_type=task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
             operation_id=operation.id,
         )
+        self._enqueue_task(task.id)
         task_manager_module.observe_archive_action("retry_stage_full", "accepted")
         return operation
 

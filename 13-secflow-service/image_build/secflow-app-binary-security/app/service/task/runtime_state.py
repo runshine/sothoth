@@ -1762,7 +1762,32 @@ class TaskRuntimeStateServiceMixin:
             },
         )
         self._sync_task_abnormal_reason_snapshot(db, task, None)
-        self._enqueue_task(task.id)
+        signal_payload = self._remember_shared_dispatch_signal(
+            task,
+            signal_type="owned_execution_takeover",
+            enqueue_context="shared_dispatch_owned_execution_takeover_enqueue",
+            source="runtime_state._requeue_owned_execution_takeover",
+            reason=reason,
+            stage_name=event_stage_name,
+            extra={
+                "takeover_action": "requeue_owned_execution",
+                "event_type": event_type,
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "shared_dispatch_signal_enqueued",
+            "已向共享 dispatch 队列投递 owned execution 接管信号",
+            level="info",
+            stage_name=event_stage_name,
+            payload={
+                **signal_payload,
+                "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                "signal_channel": "shared_dispatch",
+            },
+        )
+        self._enqueue_task_with_context(task.id, context="shared_dispatch_owned_execution_takeover_enqueue")
 
     def _signal_owned_execution_takeover(
         self: TaskManager,
@@ -1792,7 +1817,32 @@ class TaskRuntimeStateServiceMixin:
                 **(event_payload or {}),
             },
         )
-        self._enqueue_task(task.id)
+        signal_payload = self._remember_shared_dispatch_signal(
+            task,
+            signal_type="owned_execution_signal",
+            enqueue_context="shared_dispatch_owned_execution_signal_enqueue",
+            source="runtime_state._signal_owned_execution_takeover",
+            reason=reason,
+            stage_name=signal_stage_name,
+            extra={
+                "takeover_action": "signal_owned_execution",
+                "event_type": event_type,
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "shared_dispatch_signal_enqueued",
+            "已向共享 dispatch 队列投递 owned execution 唤醒信号",
+            level="info",
+            stage_name=signal_stage_name,
+            payload={
+                **signal_payload,
+                "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                "signal_channel": "shared_dispatch",
+            },
+        )
+        self._enqueue_task_with_context(task.id, context="shared_dispatch_owned_execution_signal_enqueue")
 
     def _request_task_layer_reconcile(
         self: TaskManager,
@@ -1933,7 +1983,35 @@ class TaskRuntimeStateServiceMixin:
                 context="owner_reconcile_signal_enqueue",
             )
             return
-        self._enqueue_task(task.id)
+        signal_payload = self._remember_shared_dispatch_signal(
+            task,
+            signal_type="task_layer_reconcile",
+            enqueue_context="shared_dispatch_task_layer_reconcile_enqueue",
+            source="runtime_state._request_task_layer_reconcile",
+            reason=reconcile_reason,
+            stage_name=signal_stage_name,
+            extra={
+                "source_event_type": str(source_event_type or "").strip() or None,
+                "state_event_id": str(state_event_id or "").strip() or None,
+                "decision_reason": delivery_decision.decision_reason,
+                "delivery_channel": delivery_decision.delivery_channel,
+                "reconcile_mode": "allow_execution",
+            },
+        )
+        self._record_event(
+            db,
+            task,
+            "shared_dispatch_signal_enqueued",
+            "已向共享 dispatch 队列投递任务层 reconcile 信号",
+            level="info",
+            stage_name=signal_stage_name,
+            payload={
+                **signal_payload,
+                "task_id": str(getattr(task, "id", "") or "").strip() or None,
+                "signal_channel": "shared_dispatch",
+            },
+        )
+        self._enqueue_task_with_context(task.id, context="shared_dispatch_task_layer_reconcile_enqueue")
 
     def _task_layer_reconcile_delivery_decision(
         self: TaskManager,

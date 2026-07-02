@@ -271,29 +271,24 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
 
         original_factory = __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory
         original_enqueue = self.manager._enqueue_task
-        original_enqueue_owner_signal = self.manager._enqueue_owner_signal
         queued = []
-        owner_signals = []
         __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = lambda: (lambda: db)
         self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-        self.manager._enqueue_owner_signal = lambda owner_instance_id, task_id, *, context="owner_signal_enqueue": owner_signals.append(
-            (owner_instance_id, task_id, context)
-        )
         try:
             asyncio.run(self.manager._reduce_state_event(event.id))
         finally:
             __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = original_factory
             self.manager._enqueue_task = original_enqueue
-            self.manager._enqueue_owner_signal = original_enqueue_owner_signal
 
         self.assertEqual("processed", event.status)
         self.assertEqual("owner_signal_requeued", event.processing_result)
-        self.assertEqual([], queued)
-        self.assertEqual([("other-owner", "task-1", "owner_reconcile_signal_enqueue")], owner_signals)
+        self.assertEqual(["task-1"], queued)
         self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
-        pending_reconcile = (((task.summary or {}).get("runtime_workset") or {}).get("pending_task_layer_reconcile") or {})
-        self.assertEqual("compat_state_event_forwarded_to_owner", pending_reconcile.get("reason"))
-        self.assertEqual("entry_analysis", pending_reconcile.get("stage_name"))
+        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
+        self.assertTrue((takeover_event.payload or {}).get("compat_replay_forwarded"))
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("owned_execution_takeover_requeued", event_types)
+        self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
 
     def test_reduce_state_event_without_local_runtime_owner_requeues_instead_of_applying_fact(self):
         import asyncio

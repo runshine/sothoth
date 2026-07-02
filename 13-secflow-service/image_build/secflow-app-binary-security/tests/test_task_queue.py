@@ -123,20 +123,6 @@ class _FakeRedisStatsConnectionError(_FakeRedis):
         return None
 
 
-class _FakeRedisBlockingConnectionError(_FakeRedis):
-    def __init__(self):
-        super().__init__()
-        self.closed = False
-
-    async def blpop(self, key, timeout=0):
-        del key, timeout
-        raise RedisConnectionError("Connection closed by server")
-
-    async def aclose(self):
-        self.closed = True
-        return None
-
-
 class _FakeRedisPingFlaky(_FakeRedis):
     def __init__(self, failures_before_success):
         super().__init__()
@@ -151,13 +137,7 @@ class _FakeRedisPingFlaky(_FakeRedis):
 
 
 async def _bind_client_for_current_loop(queue: TaskQueue, client) -> None:
-    queue._command_clients_by_loop_id[asyncio.get_running_loop()] = client
-
-
-async def _bind_blocking_client(queue: TaskQueue, channel: str, client, *, extra: str | None = None) -> tuple[object, ...]:
-    key = queue._blocking_client_key(channel=channel, extra=extra)
-    queue._blocking_clients_by_key[key] = client
-    return key
+    queue._clients_by_loop_id[asyncio.get_running_loop()] = client
 
 
 class TaskQueueTests(unittest.TestCase):
@@ -243,7 +223,6 @@ class TaskQueueTests(unittest.TestCase):
 
         async def _exercise():
             await _bind_client_for_current_loop(queue, fake)
-            await _bind_blocking_client(queue, "task_dispatch_pop", fake)
             await queue.push_task("task-1")
             return await queue.pop_task(timeout_seconds=1)
 
@@ -251,36 +230,21 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual("task-1", popped)
         self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
-        self.assertEqual(1, len(queue._command_clients_by_loop_id))
-        self.assertEqual(1, len(queue._blocking_clients_by_key))
+        self.assertEqual(1, len(queue._clients_by_loop_id))
 
     def test_pop_task_treats_redis_timeout_as_empty_poll(self):
         queue = TaskQueue()
         fake = _FakeRedisTimeout()
 
         async def _exercise():
-            await _bind_blocking_client(queue, "task_dispatch_pop", fake)
+            await _bind_client_for_current_loop(queue, fake)
             return await queue.pop_task(timeout_seconds=1)
 
         popped = asyncio.run(_exercise())
 
         self.assertIsNone(popped)
-        self.assertFalse(fake.closed)
-        self.assertEqual(1, len(queue._blocking_clients_by_key))
-
-    def test_pop_delete_task_treats_redis_timeout_as_empty_poll_without_closing_client(self):
-        queue = TaskQueue()
-        fake = _FakeRedisTimeout()
-
-        async def _exercise():
-            await _bind_blocking_client(queue, "task_delete_dispatch_pop", fake)
-            return await queue.pop_delete_task(timeout_seconds=1)
-
-        popped = asyncio.run(_exercise())
-
-        self.assertIsNone(popped)
-        self.assertFalse(fake.closed)
-        self.assertEqual(1, len(queue._blocking_clients_by_key))
+        self.assertTrue(fake.closed)
+        self.assertEqual({}, queue._clients_by_loop_id)
 
     def test_queue_stats_returns_empty_snapshot_after_connection_error(self):
         queue = TaskQueue()
@@ -294,33 +258,7 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual({"length": 0, "oldest_age_seconds": 0.0}, stats)
         self.assertTrue(fake.closed)
-        self.assertEqual({}, queue._command_clients_by_loop_id)
-
-    def test_pop_task_connection_error_rebuilds_blocking_client_until_healthy(self):
-        queue = TaskQueue()
-        broken = _FakeRedisBlockingConnectionError()
-        healthy = _FakeRedis()
-
-        async def _exercise():
-            key = await _bind_blocking_client(queue, "task_dispatch_pop", broken)
-            rebuilt = []
-
-            async def _fake_rebuild(*, key, channel, context, extra=None):
-                del channel, context, extra
-                queue._blocking_clients_by_key[key] = healthy
-                rebuilt.append(key)
-                return healthy
-
-            with mock.patch.object(queue, "_rebuild_blocking_client_forever", side_effect=_fake_rebuild):
-                popped = await queue.pop_task(timeout_seconds=1)
-            return key, popped, rebuilt
-
-        key, popped, rebuilt = asyncio.run(_exercise())
-
-        self.assertIsNone(popped)
-        self.assertTrue(broken.closed)
-        self.assertEqual([key], rebuilt)
-        self.assertIs(queue._blocking_clients_by_key[key], healthy)
+        self.assertEqual({}, queue._clients_by_loop_id)
 
     def test_snapshot_marks_operation_queue_disabled_under_owner_only_runtime(self):
         queue = TaskQueue()
@@ -336,7 +274,7 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(1, snapshot["task_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["enabled"])
-        self.assertEqual(1, len(queue._command_clients_by_loop_id))
+        self.assertEqual(1, len(queue._clients_by_loop_id))
 
     def test_wait_until_ready_succeeds_after_ping(self):
         queue = TaskQueue()
@@ -386,7 +324,7 @@ class TaskQueueTests(unittest.TestCase):
 
                 asyncio.run(_exercise())
 
-    def test_get_command_client_is_cached_within_same_loop(self):
+    def test_new_client_is_cached_within_same_loop(self):
         queue = TaskQueue()
 
         with mock.patch("app.service.task_queue.Redis.from_url") as from_url:
@@ -394,18 +332,18 @@ class TaskQueueTests(unittest.TestCase):
             from_url.return_value = fake_client
 
             async def _exercise():
-                first = queue._get_command_client(context="startup_warmup")
-                second = queue._get_command_client(context="startup_seed")
+                first = queue._new_client(context="startup_warmup")
+                second = queue._new_client(context="startup_seed")
                 return first, second
 
             first, second = asyncio.run(_exercise())
 
         self.assertIs(fake_client, first)
         self.assertIs(fake_client, second)
-        self.assertEqual(1, len(queue._command_clients_by_loop_id))
+        self.assertEqual(1, len(queue._clients_by_loop_id))
         from_url.assert_called_once()
 
-    def test_get_command_client_is_isolated_per_event_loop(self):
+    def test_new_client_is_isolated_per_event_loop(self):
         queue = TaskQueue()
 
         with mock.patch("app.service.task_queue.Redis.from_url") as from_url:
@@ -414,7 +352,7 @@ class TaskQueueTests(unittest.TestCase):
             from_url.side_effect = [fake_first, fake_second]
 
             async def _create():
-                return queue._get_command_client(context="startup_seed")
+                return queue._new_client(context="startup_seed")
 
             first = asyncio.run(_create())
             second = asyncio.run(_create())
@@ -433,7 +371,7 @@ class TaskQueueTests(unittest.TestCase):
 
         asyncio.run(_exercise())
 
-        self.assertEqual(1, len(queue._command_clients_by_loop_id))
+        self.assertEqual(1, len(queue._clients_by_loop_id))
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
 
     def test_queue_positions_returns_current_queue_membership(self):
@@ -462,7 +400,7 @@ class TaskQueueTests(unittest.TestCase):
         snapshot = asyncio.run(_exercise())
 
         self.assertEqual(0, snapshot["orphan_count"])
-        self.assertEqual(1, len(queue._command_clients_by_loop_id))
+        self.assertEqual(1, len(queue._clients_by_loop_id))
 
 
 if __name__ == "__main__":

@@ -24,6 +24,7 @@ from app.schemas import (
     BinarySecurityGlobalConfigResponse,
     BinarySecurityModuleSelectionResponse,
     BinarySecurityOverviewResponse,
+    BinarySecurityProjectStats,
     BinarySecurityProjectConfigPayload,
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
@@ -34,7 +35,6 @@ from app.schemas import (
     BinarySecurityTaskPolicyConfigPayload,
     BinarySecurityTaskPolicyConfigResponse,
     BinarySecurityTaskDetailResponse,
-    BinarySecurityTaskListItemResponse,
     BinarySecurityTaskListResponse,
     BinarySecurityTaskOperationPageResponse,
     BinarySecurityTaskOperationResponse,
@@ -191,12 +191,7 @@ class _RouteManagerStub:
         self.calls.append(("get_task_policy_config", db))
         return BinarySecurityTaskPolicyConfigResponse(
             project_id="global",
-            config=BinarySecurityTaskPolicyConfigPayload(
-                pipeline_mode="mixed_streaming",
-                entry_selection_mode="auto",
-                entry_auto_selection_strategy="top_n_per_module_by_confidence",
-                entry_auto_selection_top_n=20,
-            ),
+            config=BinarySecurityTaskPolicyConfigPayload(pipeline_mode="mixed_streaming"),
         )
 
     def save_task_policy_config(self, db, payload):
@@ -208,9 +203,6 @@ class _RouteManagerStub:
                 max_stage_parallelism=payload.max_stage_parallelism,
                 max_retries_per_item=payload.max_retries_per_item,
                 continue_on_item_failure=payload.continue_on_item_failure,
-                entry_selection_mode=payload.entry_selection_mode,
-                entry_auto_selection_strategy=payload.entry_auto_selection_strategy,
-                entry_auto_selection_top_n=payload.entry_auto_selection_top_n,
                 partial_success_stage_advancement=payload.partial_success_stage_advancement,
                 stage_parallelism=payload.stage_parallelism,
                 stage_options=payload.stage_options,
@@ -226,9 +218,6 @@ class _RouteManagerStub:
                 dispatch_timeout_seconds=60,
                 lease_timeout_seconds=90,
                 pipeline_mode="mixed_streaming",
-                entry_selection_mode="auto",
-                entry_auto_selection_strategy="top_n_per_module_by_confidence",
-                entry_auto_selection_top_n=20,
             )
         )
 
@@ -317,8 +306,6 @@ class _RouteManagerStub:
             task_id=task_id,
             status="pending_module_confirmation",
             selection_mode="manual_confirm",
-            auto_selection_strategy="top_n_per_module_by_confidence",
-            auto_selection_top_n=20,
             risk_levels=["高", "中"],
             requires_confirmation=True,
             system_analysis_modules=[{"module_key": "m1", "module_name": "module1"}],
@@ -426,13 +413,20 @@ class _RouteManagerStub:
             page=page,
             page_size=page_size,
             total_pages=1,
+            running_count=1,
+            queued_count=0,
+            max_concurrent_tasks=12,
+            project_stats=BinarySecurityProjectStats(total=1, running=1),
+            project_stage_aggregates=[],
+            queue_runtime={"last_reconcile_at": None},
             items=[
-                BinarySecurityTaskListItemResponse(
+                BinarySecurityTaskResponse(
                     id="t-list-1",
                     project_id=project_id or "global-project",
                     task_type=task_type or "source",
                     name="list-task",
                     status="running",
+                    queue_state="dispatching",
                     current_stage="entry_analysis",
                     firmware_path="/src",
                     stage_summaries=[
@@ -628,8 +622,6 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(2, payload["page"])
         self.assertEqual(20, payload["page_size"])
         self.assertEqual("task_running", payload["items"][0]["manual_operation_state"]["blocking_code"])
-        self.assertNotIn("running_count", payload)
-        self.assertNotIn("project_stats", payload)
         self.assertEqual(
             ("list_tasks", fake_db, "p1", "running", "source", None, None, "created_at", "desc", 2, 20),
             manager.calls[0],
@@ -659,13 +651,20 @@ class TaskApiRouteTests(unittest.TestCase):
                 page=page,
                 page_size=page_size,
                 total_pages=1,
+                running_count=0,
+                queued_count=1,
+                max_concurrent_tasks=12,
+                project_stats=BinarySecurityProjectStats(total=1, running=0),
+                project_stage_aggregates=[],
+                queue_runtime={"last_reconcile_at": None},
                 items=[
-                    BinarySecurityTaskListItemResponse(
+                    BinarySecurityTaskResponse(
                         id="t-list-1",
                         project_id=project_id,
                         task_type=task_type or "source",
                         name="list-task",
                         status="pending",
+                        queue_state="idle",
                         current_stage="entry_analysis",
                         firmware_path="/src",
                         stage_summaries=[
@@ -850,8 +849,6 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
-        self.assertEqual("top_n_per_module_by_confidence", payload["config"]["entry_auto_selection_strategy"])
-        self.assertEqual(20, payload["config"]["entry_auto_selection_top_n"])
         self.assertEqual(("get_task_policy_config", fake_db), manager.calls[0])
 
     def test_put_task_policy_config_route_round_trips_pipeline_mode(self):
@@ -862,23 +859,16 @@ class TaskApiRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.put(
                     "/api/app/binary-security/task-policy-config",
-                    json={
-                        "pipeline_mode": "mixed_streaming",
-                        "entry_selection_mode": "auto",
-                        "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
-                        "entry_auto_selection_top_n": 15,
-                    },
+                    json={"pipeline_mode": "mixed_streaming"},
                     headers={"Authorization": "Bearer token"},
                 )
 
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
-        self.assertEqual(15, payload["config"]["entry_auto_selection_top_n"])
         self.assertEqual("save_task_policy_config", manager.calls[0][0])
         self.assertIs(fake_db, manager.calls[0][1])
         self.assertEqual("mixed_streaming", manager.calls[0][2].pipeline_mode)
-        self.assertEqual(15, manager.calls[0][2].entry_auto_selection_top_n)
 
     def test_get_orchestration_observability_route_returns_streaming_snapshot(self):
         app, fake_db = self._build_client()
@@ -976,6 +966,8 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("manual_confirm", payload["selection_mode"])
+        self.assertEqual("top_n_per_module_by_confidence", payload["auto_selection_strategy"])
+        self.assertEqual(3, payload["auto_selection_top_n"])
         self.assertTrue(payload["requires_confirmation"])
         self.assertEqual(("get_module_selection", fake_db, "p1", "t1"), manager.calls[0])
 
@@ -1102,8 +1094,6 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
-        self.assertEqual("top_n_per_module_by_confidence", payload["config"]["entry_auto_selection_strategy"])
-        self.assertEqual(20, payload["config"]["entry_auto_selection_top_n"])
         self.assertEqual(("get_config", fake_db), manager.calls[0])
 
     def test_put_global_config_route_delegates_to_manager(self):
@@ -1114,23 +1104,16 @@ class TaskApiRouteTests(unittest.TestCase):
             with TestClient(app) as client:
                 response = client.put(
                     "/api/app/binary-security/config",
-                    json={
-                        "pipeline_mode": "mixed_streaming",
-                        "entry_selection_mode": "auto",
-                        "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
-                        "entry_auto_selection_top_n": 15,
-                    },
+                    json={"pipeline_mode": "mixed_streaming"},
                     headers={"Authorization": "Bearer token"},
                 )
 
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("mixed_streaming", payload["config"]["pipeline_mode"])
-        self.assertEqual(15, payload["config"]["entry_auto_selection_top_n"])
         self.assertEqual("save_config", manager.calls[0][0])
         self.assertIs(fake_db, manager.calls[0][1])
         self.assertEqual("mixed_streaming", manager.calls[0][2].pipeline_mode)
-        self.assertEqual(15, manager.calls[0][2].entry_auto_selection_top_n)
 
     def test_get_task_detail_route_returns_502_when_project_service_disconnects(self):
         app = FastAPI()

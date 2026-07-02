@@ -1693,8 +1693,6 @@ class TaskStateMachineMixin:
         snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         if self._workflow_success_overridden_by_terminal_dataflow(db, task, snapshots):
             return False
-        if str((failure_ctx or {}).get("failure_category") or "").strip() == "business":
-            return True
         gate = self._evaluate_task_finalization_gate(db, task, stage_runs=stage_runs)
         if gate.allowed or str(gate.reason_code or "").strip() == "authoritative_failure":
             return True
