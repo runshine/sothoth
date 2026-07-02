@@ -53,6 +53,23 @@ class TaskLayerReconcileDeliveryDecision:
     runtime_phase: str | None
 
 
+@dataclass
+class DeleteQueueConsumeDecision:
+    allowed: bool
+    reason_code: str
+    blocker_kind: str
+    lease_state: str
+    task_status: str | None
+    runtime_phase: str | None
+    dispatcher_instance_id: str | None
+    runtime_lease_owner: str | None
+    runtime_lease_expires_at: str | None
+    row_lease_expires_at: str | None
+    active_operation_id: str | None
+    active_operation_type: str | None
+    active_operation_status: str | None
+
+
 class TaskRuntimeStateServiceMixin:
     _STATE_TRANSITION_GUARD_TTL_SECONDS = 30
     _MAIN_STATE_UNSET = object()
@@ -214,6 +231,26 @@ class TaskRuntimeStateServiceMixin:
             "runtime_lease_owner": decision.runtime_lease_owner,
             "runtime_lease_expires_at": decision.runtime_lease_expires_at,
             "row_lease_expires_at": decision.row_lease_expires_at,
+            "decision": "allowed" if decision.allowed else "suppressed",
+        }
+
+    def _delete_queue_consume_decision_payload(
+        self: TaskManager,
+        decision: DeleteQueueConsumeDecision,
+    ) -> dict[str, Any]:
+        return {
+            "reason_code": decision.reason_code,
+            "blocker_kind": decision.blocker_kind,
+            "lease_state": decision.lease_state,
+            "task_status": decision.task_status,
+            "runtime_phase": decision.runtime_phase,
+            "dispatcher_instance_id": decision.dispatcher_instance_id,
+            "runtime_lease_owner": decision.runtime_lease_owner,
+            "runtime_lease_expires_at": decision.runtime_lease_expires_at,
+            "row_lease_expires_at": decision.row_lease_expires_at,
+            "active_operation_id": decision.active_operation_id,
+            "active_operation_type": decision.active_operation_type,
+            "active_operation_status": decision.active_operation_status,
             "decision": "allowed" if decision.allowed else "suppressed",
         }
 
@@ -401,6 +438,115 @@ class TaskRuntimeStateServiceMixin:
                 dispatcher_instance_id=decision.dispatcher_instance_id,
             )
         return decision
+
+    def _can_consume_delete_queue_task(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        active_operation=None,
+    ) -> DeleteQueueConsumeDecision:
+        operation = active_operation or self._active_delete_queue_operation(db, task)
+        active_operation_id = str(getattr(operation, "id", "") or "").strip() or None
+        active_operation_type = str(getattr(operation, "operation_type", "") or "").strip() or None
+        active_operation_status = str(getattr(operation, "status", "") or "").strip().lower() or None
+        task_status = str(getattr(task, "status", "") or "").strip().lower() or None
+        runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
+        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        lease = self._runtime_lease_for_task(db, task.id)
+        runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
+        runtime_lease_expires_at = task_shared._isoformat_or_none(getattr(lease, "lease_expires_at", None)) if lease is not None else None
+        row_lease_expires_at_value = getattr(task, "lease_expires_at", None)
+        row_lease_expires_at = task_shared._isoformat_or_none(row_lease_expires_at_value)
+        lease_active = bool(lease is not None and self._runtime_lease_is_active(lease))
+        row_lease_active = bool(
+            row_lease_expires_at_value is not None
+            and (task_shared._seconds_until(row_lease_expires_at_value) or 0) > 0
+        )
+        row_lease_expired = bool(row_lease_expires_at_value is not None and not row_lease_active)
+        lease_state = (
+            "active"
+            if lease_active
+            else "expired"
+            if (lease is not None or row_lease_expired)
+            else "missing"
+        )
+        if active_operation_type != "delete" or active_operation_status not in {"accepted", "queued", "running", "pending"}:
+            return DeleteQueueConsumeDecision(
+                allowed=False,
+                reason_code="delete_operation_missing_or_inactive",
+                blocker_kind="none",
+                lease_state=lease_state,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+                dispatcher_instance_id=dispatcher_instance_id,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                row_lease_expires_at=row_lease_expires_at,
+                active_operation_id=active_operation_id,
+                active_operation_type=active_operation_type,
+                active_operation_status=active_operation_status,
+            )
+        if self._task_has_supported_control_operation_runtime(db, task, active_operation=operation):
+            return DeleteQueueConsumeDecision(
+                allowed=False,
+                reason_code="delete_control_runtime_active",
+                blocker_kind="supported_control_runtime",
+                lease_state=lease_state,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+                dispatcher_instance_id=dispatcher_instance_id,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                row_lease_expires_at=row_lease_expires_at,
+                active_operation_id=active_operation_id,
+                active_operation_type=active_operation_type,
+                active_operation_status=active_operation_status,
+            )
+        if lease_active:
+            return DeleteQueueConsumeDecision(
+                allowed=False,
+                reason_code="active_runtime_lease_blocks_delete_consume",
+                blocker_kind="active_runtime_lease",
+                lease_state=lease_state,
+                task_status=task_status,
+                runtime_phase=runtime_phase,
+                dispatcher_instance_id=dispatcher_instance_id,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                row_lease_expires_at=row_lease_expires_at,
+                active_operation_id=active_operation_id,
+                active_operation_type=active_operation_type,
+                active_operation_status=active_operation_status,
+            )
+        blocker_kind = "stale_row_owner" if dispatcher_instance_id or row_lease_expires_at else "none"
+        if task_status in TASK_TERMINAL_STATUSES:
+            reason_code = (
+                "terminal_delete_takeover_after_stale_owner_cleanup"
+                if blocker_kind == "stale_row_owner"
+                else "terminal_delete_takeover_without_runtime_lease"
+            )
+        elif lease_state == "expired":
+            reason_code = "delete_takeover_after_runtime_lease_expired"
+        elif blocker_kind == "stale_row_owner":
+            reason_code = "delete_takeover_after_stale_row_owner_cleanup"
+        else:
+            reason_code = "delete_takeover_without_authoritative_blocker"
+        return DeleteQueueConsumeDecision(
+            allowed=True,
+            reason_code=reason_code,
+            blocker_kind=blocker_kind,
+            lease_state=lease_state,
+            task_status=task_status,
+            runtime_phase=runtime_phase,
+            dispatcher_instance_id=dispatcher_instance_id,
+            runtime_lease_owner=runtime_lease_owner,
+            runtime_lease_expires_at=runtime_lease_expires_at,
+            row_lease_expires_at=row_lease_expires_at,
+            active_operation_id=active_operation_id,
+            active_operation_type=active_operation_type,
+            active_operation_status=active_operation_status,
+        )
 
     def _can_owner_release_parent_runtime_for_retry_requeue(
         self: TaskManager,

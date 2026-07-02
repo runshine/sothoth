@@ -370,9 +370,9 @@ class TaskRuntimeServiceMixin:
             self._record_event(
                 db,
                 task,
-                "dispatch_claim_reenqueued",
+                "delete_queue_signal_reconciled" if active_delete_operation is not None else "dispatch_claim_reenqueued",
                 reenqueue_message,
-                level="warning",
+                level="info" if active_delete_operation is not None else "warning",
                 stage_name=task.current_stage,
                 payload={
                     "task_id": normalized_task_id,
@@ -382,6 +382,7 @@ class TaskRuntimeServiceMixin:
                     "task_status": str(getattr(task, "status", "") or "").strip() or None,
                     "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
                     "enqueue_context": reenqueue_context,
+                    "signal_channel": "delete_queue" if active_delete_operation is not None else "shared_dispatch",
                 },
             )
             db.commit()
@@ -430,55 +431,154 @@ class TaskRuntimeServiceMixin:
                 with suppress(Exception):
                     db.close()
 
+    def _normalize_delete_queue_task_state(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        active_operation=None,
+    ) -> dict[str, object]:
+        from app.service import task_manager as task_manager_module
+
+        operation = active_operation or self._active_delete_queue_operation(db, task)
+        operation_id = str(getattr(operation, "id", "") or "").strip() or None
+        force_delete = bool(dict(getattr(operation, "request_payload", {}) or {}).get("force_delete"))
+        runtime_lease = self._runtime_lease_for_task(db, task.id)
+        runtime_lease_active = bool(self._runtime_lease_is_active(runtime_lease))
+        stale_owner_cleared = False
+        runtime_phase_repaired = False
+        hidden_state_repaired = False
+        if operation is not None and not self._task_is_hidden_by_delete_queue(task):
+            self._mark_task_delete_queued(task, operation_id=operation.id, force_delete=force_delete)
+            hidden_state_repaired = True
+        if not runtime_lease_active:
+            if getattr(task, "lease_expires_at", None) is not None:
+                task.lease_expires_at = None
+                stale_owner_cleared = True
+            if str(getattr(task, "dispatcher_instance_id", "") or "").strip():
+                task.dispatcher_instance_id = None
+                task.dispatch_started_at = None
+                stale_owner_cleared = True
+            if runtime_lease is not None:
+                self._clear_runtime_lease(db, task.id)
+            task_status = str(getattr(task, "status", "") or "").strip().lower()
+            if task_status in task_manager_module.TASK_TERMINAL_STATUSES and self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_TERMINAL:
+                self._set_task_runtime_phase(task, task_manager_module.TASK_RUNTIME_PHASE_TERMINAL)
+                runtime_phase_repaired = True
+        if stale_owner_cleared or runtime_phase_repaired or hidden_state_repaired:
+            self._record_event(
+                db,
+                task,
+                "delete_queue_task_state_normalized",
+                "delete queue 消费前已修复陈旧 owner/隐藏态元数据",
+                level="info",
+                stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "operation_id": operation_id,
+                    "stale_owner_cleared": stale_owner_cleared,
+                    "runtime_phase_repaired": runtime_phase_repaired,
+                    "hidden_state_repaired": hidden_state_repaired,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                },
+            )
+        return {
+            "stale_owner_cleared": stale_owner_cleared,
+            "runtime_phase_repaired": runtime_phase_repaired,
+            "hidden_state_repaired": hidden_state_repaired,
+        }
+
+    async def _ensure_delete_queue_signal(
+        self: TaskManager,
+        db: Session,
+        task,
+        queue,
+        delete_positions: dict[str, int],
+        *,
+        enqueue_context: str,
+    ) -> bool:
+        active_delete_operation = self._active_delete_queue_operation(db, task)
+        if active_delete_operation is None:
+            if self._task_is_hidden_by_delete_queue(task):
+                self._clear_stale_delete_queue_hidden_state(
+                    db,
+                    task,
+                    reason="delete_queue_signal_missing_active_delete_operation",
+                )
+                return True
+            return False
+        force_delete = bool(dict(getattr(active_delete_operation, "request_payload", {}) or {}).get("force_delete"))
+        if not self._task_is_hidden_by_delete_queue(task):
+            self._mark_task_delete_queued(task, operation_id=active_delete_operation.id, force_delete=force_delete)
+        task_id = str(getattr(task, "id", "") or "").strip()
+        delete_position = delete_positions.get(task_id)
+        if delete_position is not None:
+            return True
+        await queue.force_requeue_delete_task(task_id, context=enqueue_context)
+        delete_positions[task_id] = len(delete_positions) + 1
+        self._record_event(
+            db,
+            task,
+            "delete_queue_signal_reconciled",
+            "delete queue 信号缺失，已补回 Redis delete queue",
+            level="info",
+            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+            payload={
+                "task_id": task_id,
+                "operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                "force_delete": force_delete,
+                "enqueue_context": enqueue_context,
+                "signal_channel": "delete_queue",
+            },
+        )
+        return True
+
     async def _consume_delete_queue_task(self: TaskManager, db: Session, task_id: str) -> None:
         from app.service import task_manager as task_manager_module
 
         task = db.query(task_manager_module.BinarySecurityTask).filter(task_manager_module.BinarySecurityTask.id == task_id).first()
         if task is None:
             return
-        active_operation = self._active_operation(db, task.id)
-        if active_operation is None or str(getattr(active_operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_DELETE:
+        active_operation = self._active_delete_queue_operation(db, task)
+        if active_operation is None:
+            stale_hidden_state_cleared = False
+            if self._task_is_hidden_by_delete_queue(task):
+                stale_hidden_state_cleared = self._clear_stale_delete_queue_hidden_state(
+                    db,
+                    task,
+                    reason="delete_queue_consumer_missing_active_delete_operation",
+                )
             self._record_event(
                 db,
                 task,
                 "task_delete_queue_consumption_dropped",
                 "删除队列任务缺少活跃 delete operation，已忽略",
                 stage_name=task.current_stage,
-                level="warning",
-                payload={"task_id": task.id},
+                level="info",
+                payload={"task_id": task.id, "stale_hidden_state_cleared": stale_hidden_state_cleared},
             )
             db.commit()
             return
         force_delete = bool(dict(active_operation.request_payload or {}).get("force_delete"))
-        if not self._task_is_hidden_by_delete_queue(task):
-            self._mark_task_delete_queued(task, operation_id=active_operation.id, force_delete=force_delete)
-        delete_takeover_decision = self._can_take_over_parent_control_operation(
+        normalize_result = self._normalize_delete_queue_task_state(
             db,
             task,
-            reason="delete_queue_consumption_takeover_gate",
+            active_operation=active_operation,
         )
+        delete_takeover_decision = self._can_consume_delete_queue_task(db, task, active_operation=active_operation)
         if not delete_takeover_decision.allowed:
-            self._record_parent_runtime_lease_decision(
+            self._record_event(
                 db,
                 task,
-                event_type="task_delete_queue_consumption_deferred_for_active_lease",
-                message="删除队列消费检测到父任务 lease 仍有效，当前暂不接管删除",
-                decision=delete_takeover_decision,
-                reason="delete_queue_consumption_takeover_gate",
+                "task_delete_queue_consumption_deferred_for_active_blocker",
+                "删除队列消费检测到 authoritative blocker，当前暂不接管删除",
                 stage_name=task.current_stage,
                 level="info",
+                payload=self._delete_queue_consume_decision_payload(delete_takeover_decision),
             )
             self._force_requeue_delete_task(task.id)
             db.commit()
             return
-        released_owner = self._release_unsupported_task_row_owner(
-            db,
-            task,
-            active_operation=active_operation,
-            reason="delete_queue_consumption_takeover_gate",
-        )
-        if released_owner:
-            db.flush()
         started_at = task_manager_module._now()
         task.dispatcher_instance_id = self.instance_id
         task.dispatch_started_at = started_at
@@ -503,7 +603,13 @@ class TaskRuntimeServiceMixin:
                 "runtime_phase": self._task_runtime_phase(task),
                 "delete_queued": True,
                 "delete_in_progress": True,
-                "owner_released_before_delete_consume": bool(released_owner),
+                "owner_released_before_delete_consume": bool(normalize_result.get("stale_owner_cleared")),
+                "state_normalized_before_delete_consume": bool(
+                    normalize_result.get("stale_owner_cleared")
+                    or normalize_result.get("runtime_phase_repaired")
+                    or normalize_result.get("hidden_state_repaired")
+                ),
+                "decision_reason_code": delete_takeover_decision.reason_code,
             },
         )
         db.commit()
@@ -1221,13 +1327,42 @@ class TaskRuntimeServiceMixin:
             if self._dispatch_claim_cooldown_active(task):
                 continue
             self._clear_dispatch_claim_cooldown(task)
+            delete_signal_handled = await self._ensure_delete_queue_signal(
+                db,
+                task,
+                queue,
+                delete_positions,
+                enqueue_context="delete_queue_reconcile",
+            )
+            active_delete_operation = self._active_delete_queue_operation(db, task)
+            if delete_signal_handled and active_delete_operation is not None:
+                if current_status == "pending":
+                    delete_position = delete_positions.get(normalized_task_id)
+                    self._record_event(
+                        db,
+                        task,
+                        "pending_task_waiting_for_delete_queue_detected",
+                        "检测到 pending 任务正在等待 delete queue 消费，已优先补偿 delete queue",
+                        level="warning",
+                        payload={
+                            "task_status": current_status,
+                            "queue_state": "db_pending_not_enqueued",
+                            "recoverable_reason": "pending_task_delete_queue_authoritative",
+                            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                            "lease_expires_at": task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
+                            "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                            "delete_operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                            "delete_queue_position": int(delete_position) if delete_position is not None else None,
+                            "enqueue_context": "delete_queue_reconcile",
+                        },
+                    )
+                continue
             if current_status == "pending":
                 queue_state, recoverable_reason = self._task_queue_state(
                     task,
                     {"pending_positions": pending_positions},
                     db=db,
                 )
-                active_delete_operation = self._active_delete_queue_operation(db, task)
                 if queue_state == "dispatching" and recoverable_reason == "pending_task_owned_by_active_runtime":
                     continue
                 if queue_state == "db_pending_not_enqueued":
@@ -1254,81 +1389,6 @@ class TaskRuntimeServiceMixin:
                         )
                         continue
                     if active_delete_operation is not None:
-                        delete_position = delete_positions.get(normalized_task_id)
-                        task_manager_module.logger.warning(
-                            "binary-security pending task waiting for delete queue detected: task_id=%s task_status=%s "
-                            "delete_queue_position=%s dispatcher_instance_id=%s lease_expires_at=%s current_operation_id=%s",
-                            normalized_task_id,
-                            current_status,
-                            int(delete_position) if delete_position is not None else None,
-                            str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                            task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
-                            str(getattr(task, "current_operation_id", "") or "").strip() or None,
-                        )
-                        self._record_event(
-                            db,
-                            task,
-                            "pending_task_waiting_for_delete_queue_detected",
-                            "检测到 pending 任务正在等待 delete queue 消费，已优先补偿 delete queue",
-                            level="warning",
-                            payload={
-                                "task_status": current_status,
-                                "queue_state": queue_state,
-                                "recoverable_reason": recoverable_reason,
-                                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                                "lease_expires_at": task_manager_module._isoformat_or_none(getattr(task, "lease_expires_at", None)),
-                                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
-                                "delete_operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
-                                "delete_queue_position": int(delete_position) if delete_position is not None else None,
-                                "enqueue_context": "delete_queue_reconcile",
-                            },
-                        )
-                        if delete_position is None:
-                            try:
-                                await queue.force_requeue_delete_task(
-                                    normalized_task_id,
-                                    context="delete_queue_reconcile_pending_delete_operation",
-                                )
-                                delete_positions[normalized_task_id] = len(delete_positions) + 1
-                                self._record_event(
-                                    db,
-                                    task,
-                                    "pending_task_reenqueued_by_delete_reconcile",
-                                    "pending 任务已由 delete queue reconcile 同步重新放回 Redis delete queue",
-                                    payload={
-                                        "task_status": current_status,
-                                        "queue_state": queue_state,
-                                        "recoverable_reason": recoverable_reason,
-                                        "enqueue_context": "delete_queue_reconcile",
-                                        "delete_operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
-                                    },
-                                )
-                            except Exception as exc:
-                                task_manager_module.logger.exception(
-                                    "binary-security pending task delete queue reenqueue failed: task_id=%s task_status=%s "
-                                    "queue_state=%s error_type=%s error=%s",
-                                    normalized_task_id,
-                                    current_status,
-                                    queue_state,
-                                    exc.__class__.__name__,
-                                    exc,
-                                )
-                                self._record_event(
-                                    db,
-                                    task,
-                                    "pending_task_delete_reenqueue_failed",
-                                    "pending 任务重新放回 Redis delete queue 失败，等待下一轮自愈重试",
-                                    level="warning",
-                                    payload={
-                                        "task_status": current_status,
-                                        "queue_state": queue_state,
-                                        "recoverable_reason": recoverable_reason,
-                                        "error_type": exc.__class__.__name__,
-                                        "error": str(exc),
-                                        "enqueue_context": "delete_queue_reconcile",
-                                        "delete_operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
-                                    },
-                                )
                         continue
                     released = False
                     if (
@@ -1453,6 +1513,15 @@ class TaskRuntimeServiceMixin:
             )
             if task is None:
                 continue
+            if await self._ensure_delete_queue_signal(
+                db,
+                task,
+                queue,
+                delete_positions,
+                enqueue_context="delete_queue_reconcile_operation",
+            ):
+                if self._active_delete_queue_operation(db, task) is not None:
+                    continue
             current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
             if not current_operation_id:
                 task_manager_module.logger.info(

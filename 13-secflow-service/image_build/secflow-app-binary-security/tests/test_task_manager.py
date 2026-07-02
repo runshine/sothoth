@@ -42847,6 +42847,89 @@ def _test_can_take_over_parent_control_operation_allows_terminal_delete_without_
     self.assertEqual("missing", decision.lease_state)
 
 
+def _test_can_consume_delete_queue_task_blocks_on_active_runtime_lease(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-b"
+    task = BinarySecurityTask(
+        id="task-delete-blocked",
+        project_id="p1",
+        name="source-task",
+        status="running",
+        current_stage="knowledge_graph_entry_fetch",
+        current_operation_id="op-delete-blocked",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/output",
+        workspace_root="/workspace",
+        dispatcher_instance_id="worker-a",
+        dispatch_started_at=_now() - timedelta(minutes=1),
+        lease_expires_at=_now() + timedelta(minutes=3),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-delete-blocked",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_DELETE,
+        status="queued",
+        target_stage=task.current_stage,
+    )
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="worker-a",
+        lease_expires_at=_now() + timedelta(minutes=3),
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
+
+    decision = manager._can_consume_delete_queue_task(db, task, active_operation=operation)
+
+    self.assertFalse(decision.allowed)
+    self.assertEqual("active_runtime_lease", decision.blocker_kind)
+    self.assertEqual("active_runtime_lease_blocks_delete_consume", decision.reason_code)
+
+
+def _test_can_consume_delete_queue_task_allows_stale_dispatcher_without_runtime_lease(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-b"
+    task = BinarySecurityTask(
+        id="task-delete-stale-dispatcher",
+        project_id="p1",
+        name="source-task",
+        status="failed",
+        current_stage="knowledge_graph_entry_fetch",
+        current_operation_id="op-delete-stale-dispatcher",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/output",
+        workspace_root="/workspace",
+        dispatcher_instance_id="worker-a",
+        dispatch_started_at=_now() - timedelta(minutes=5),
+        lease_expires_at=_now() - timedelta(minutes=1),
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-delete-stale-dispatcher",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_DELETE,
+        status="queued",
+        target_stage=task.current_stage,
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+
+    normalized = manager._normalize_delete_queue_task_state(db, task, active_operation=operation)
+    decision = manager._can_consume_delete_queue_task(db, task, active_operation=operation)
+
+    self.assertTrue(bool(normalized.get("stale_owner_cleared")))
+    self.assertTrue(bool(normalized.get("runtime_phase_repaired")))
+    self.assertTrue(decision.allowed)
+    self.assertEqual("terminal_delete_takeover_without_runtime_lease", decision.reason_code)
+    self.assertIsNone(task.dispatcher_instance_id)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+
+
 def _test_consume_delete_queue_task_starts_orphan_delete_without_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "worker-a"
@@ -42898,7 +42981,7 @@ def _test_consume_delete_queue_task_starts_orphan_delete_without_runtime_lease(s
     self.assertIsNotNone(task.lease_expires_at)
     event_types = [event.event_type for event in db.events]
     self.assertIn("task_delete_queue_consumption_started", event_types)
-    self.assertNotIn("task_delete_queue_consumption_deferred_for_active_lease", event_types)
+    self.assertNotIn("task_delete_queue_consumption_deferred_for_active_blocker", event_types)
 
 
 def _test_consume_delete_queue_task_starts_terminal_delete_without_runtime_lease(self):
@@ -42951,7 +43034,56 @@ def _test_consume_delete_queue_task_starts_terminal_delete_without_runtime_lease
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     event_types = [event.event_type for event in db.events]
     self.assertIn("task_delete_queue_consumption_started", event_types)
-    self.assertNotIn("task_delete_queue_consumption_deferred_for_active_lease", event_types)
+    self.assertNotIn("task_delete_queue_consumption_deferred_for_active_blocker", event_types)
+
+
+def _test_consume_delete_queue_task_clears_stale_dispatcher_before_processing(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-b"
+    task = BinarySecurityTask(
+        id="task-delete-terminal-stale-owner-consume",
+        project_id="p1",
+        name="source-task",
+        status="failed",
+        current_stage="knowledge_graph_entry_fetch",
+        current_operation_id="op-delete-terminal-stale-owner-consume",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/output",
+        workspace_root="/workspace",
+        dispatcher_instance_id="worker-a",
+        dispatch_started_at=_now() - timedelta(minutes=8),
+        lease_expires_at=_now() - timedelta(minutes=3),
+        cleanup_snapshot={},
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-delete-terminal-stale-owner-consume",
+        task_id=task.id,
+        project_id="p1",
+        operation_type=task_manager_module.TASK_ACTION_DELETE,
+        status="queued",
+        target_stage="knowledge_graph_entry_fetch",
+        request_payload={},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+    calls = []
+
+    async def _fake_prepare_delete(db_session, current_task):
+        del db_session
+        calls.append(current_task.id)
+
+    manager._prepare_delete_task = _fake_prepare_delete
+    asyncio.run(manager._consume_delete_queue_task(db, task.id))
+
+    self.assertEqual(["task-delete-terminal-stale-owner-consume"], calls)
+    self.assertEqual("worker-b", task.dispatcher_instance_id)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+    normalized_event = next(row for row in db.events if row.event_type == "delete_queue_task_state_normalized")
+    self.assertTrue(bool(dict(normalized_event.payload or {}).get("stale_owner_cleared")))
+    started_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_started")
+    self.assertTrue(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
 
 
 def _test_task_needs_downstream_reconcile_skips_locally_owned_running_task(self):
@@ -52217,8 +52349,11 @@ TaskManagerTests.test_write_task_heartbeat_refreshes_runtime_lease_and_task_row_
 TaskManagerTests.test_queue_reconcile_skips_pending_not_enqueued_when_runtime_lease_is_active = _test_queue_reconcile_skips_pending_not_enqueued_when_runtime_lease_is_active
 TaskManagerTests.test_can_take_over_parent_control_operation_allows_orphan_delete_without_runtime_lease = _test_can_take_over_parent_control_operation_allows_orphan_delete_without_runtime_lease
 TaskManagerTests.test_can_take_over_parent_control_operation_allows_terminal_delete_without_runtime_lease = _test_can_take_over_parent_control_operation_allows_terminal_delete_without_runtime_lease
+TaskManagerTests.test_can_consume_delete_queue_task_blocks_on_active_runtime_lease = _test_can_consume_delete_queue_task_blocks_on_active_runtime_lease
+TaskManagerTests.test_can_consume_delete_queue_task_allows_stale_dispatcher_without_runtime_lease = _test_can_consume_delete_queue_task_allows_stale_dispatcher_without_runtime_lease
 TaskManagerTests.test_consume_delete_queue_task_starts_orphan_delete_without_runtime_lease = _test_consume_delete_queue_task_starts_orphan_delete_without_runtime_lease
 TaskManagerTests.test_consume_delete_queue_task_starts_terminal_delete_without_runtime_lease = _test_consume_delete_queue_task_starts_terminal_delete_without_runtime_lease
+TaskManagerTests.test_consume_delete_queue_task_clears_stale_dispatcher_before_processing = _test_consume_delete_queue_task_clears_stale_dispatcher_before_processing
 TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state = _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state
 TaskManagerTests.test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty = _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty
 TaskManagerTests.test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox = _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox

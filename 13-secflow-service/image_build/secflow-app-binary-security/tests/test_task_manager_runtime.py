@@ -18,6 +18,7 @@ from app.model import (
     BinarySecurityTaskOperation,
     BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_RUNTIME_PHASE_TERMINAL,
     TASK_TYPE_BINARY,
     TASK_TYPE_SOURCE,
 )
@@ -956,7 +957,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], main_reenqueued)
         self.assertEqual([("task-delete-hidden", "dispatch_claim_hidden_delete_reenqueue")], delete_reenqueued)
-        event = next(row for row in db.events if row.event_type == "dispatch_claim_reenqueued")
+        event = next(row for row in db.events if row.event_type == "delete_queue_signal_reconciled")
         self.assertEqual(
             "dispatch_claim_hidden_by_delete_queue_after_redis_pop",
             dict(event.payload or {}).get("reason"),
@@ -1135,7 +1136,12 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             operation_type=task_manager_module.TASK_ACTION_DELETE,
             status="queued",
         )
-        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], state_events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[], state_events=[])
         requeued: list[str] = []
         prepared: list[str] = []
 
@@ -1152,7 +1158,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([task.id], requeued)
         self.assertEqual([], prepared)
         self.assertIn(
-            "task_delete_queue_consumption_deferred_for_active_lease",
+            "task_delete_queue_consumption_deferred_for_active_blocker",
             [row.event_type for row in db.events],
         )
 
@@ -1205,7 +1211,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         await manager._consume_delete_queue_task(db, task.id)
 
-        self.assertEqual(["delete_queue_consumption_takeover_gate"], released)
+        self.assertEqual([], released)
         self.assertEqual([task.id], prepared)
         started_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_started")
         self.assertTrue(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
@@ -1683,10 +1689,10 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             await manager._reconcile_work_queues_once(db)
 
         self.assertEqual([], main_reenqueued)
-        self.assertEqual([("task-pending-delete", "delete_queue_reconcile_pending_delete_operation")], delete_reenqueued)
+        self.assertEqual([("task-pending-delete", "delete_queue_reconcile")], delete_reenqueued)
         event_types = [row.event_type for row in db.events]
         self.assertIn("pending_task_waiting_for_delete_queue_detected", event_types)
-        self.assertIn("pending_task_reenqueued_by_delete_reconcile", event_types)
+        self.assertIn("delete_queue_signal_reconciled", event_types)
         self.assertNotIn("pending_task_not_enqueued_detected", event_types)
 
     async def test_reconcile_work_queues_skips_delete_queue_reenqueue_when_pending_delete_already_queued(self):
@@ -1760,8 +1766,71 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], delete_reenqueued)
         event_types = [row.event_type for row in db.events]
         self.assertIn("pending_task_waiting_for_delete_queue_detected", event_types)
-        self.assertNotIn("pending_task_reenqueued_by_delete_reconcile", event_types)
+        self.assertNotIn("delete_queue_signal_reconciled", event_types)
         self.assertNotIn("pending_task_not_enqueued_detected", event_types)
+
+    async def test_reconcile_work_queues_reenqueues_nonpending_delete_hidden_task_to_delete_queue(self):
+        manager = TaskManager()
+        manager.cfg.queue.seed_batch_size = 20
+        task = BinarySecurityTask(
+            id="task-running-delete-hidden",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("reconcile-running-delete-hidden"),
+            current_operation_id="op-delete",
+            dispatcher_instance_id=None,
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+        )
+        task.cleanup_snapshot = {
+            "delete_queued": True,
+            "delete_operation_id": "op-delete",
+            "delete_mode": "delete",
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], state_events=[])
+        delete_reenqueued: list[tuple[str, str | None]] = []
+        main_reenqueued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, queue_key, *, context=None):
+                del queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                main_reenqueued.append((task_id, context))
+
+            async def force_requeue_delete_task(self, task_id, *, context=None):
+                delete_reenqueued.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                main_reenqueued.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
+            patch.object(manager, "_queue_reconcile_task_rows", return_value=[task]),
+            patch.object(manager, "_queue_reconcile_operation_rows", return_value=[]),
+        ):
+            await manager._reconcile_work_queues_once(db)
+
+        self.assertEqual([], main_reenqueued)
+        self.assertEqual([("task-running-delete-hidden", "delete_queue_reconcile")], delete_reenqueued)
+        self.assertIn("delete_queue_signal_reconciled", [row.event_type for row in db.events])
 
     def test_reclaim_stale_running_prefers_requeue_when_runnable_work_exists(self):
         task = BinarySecurityTask(
