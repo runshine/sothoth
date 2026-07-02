@@ -1510,7 +1510,7 @@ class TaskArchiveServiceMixin:
                     source_event_type="archive_job_copied",
                     state_event_id=state_event_id,
                     reconcile_reason="archive_apply",
-                    message="归档事实已更新，已通知当前 owner worker 收口任务层决策",
+                    message="归档事实已更新，等待 owner worker 串行收口任务层决策",
                     event_payload={
                         "item_id": item.id,
                         "archive_job_id": job.id,

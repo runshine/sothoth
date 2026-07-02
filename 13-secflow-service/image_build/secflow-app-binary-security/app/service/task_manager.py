@@ -373,7 +373,6 @@ TASK_ACTION_RETRY_STAGE_FULL = "retry_stage_full"
 TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS = "retry_archive_failed_items"
 TASK_ACTION_RETRY_ARCHIVE_FULL = "retry_archive_full"
 TASK_ACTION_CANCEL = "cancel"
-TASK_ACTION_FINISH_SUCCESS = "finish_success"
 TASK_ACTION_DELETE = "delete"
 TASK_PENDING_ACTIONS = {
     TASK_ACTION_CONTINUE,
@@ -393,7 +392,6 @@ TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
     TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FULL,
     TASK_ACTION_CANCEL,
-    TASK_ACTION_FINISH_SUCCESS,
     TASK_ACTION_DELETE,
     "force_reset_to_pending",
 }
@@ -710,7 +708,6 @@ class TaskManager(
         self._state_repair_reconcile_task: Optional[asyncio.Task] = None
         self._state_event_inbox_loop_task: Optional[asyncio.Task] = None
         self._state_event_inbox_metrics_loop_task: Optional[asyncio.Task] = None
-        self._owner_reconcile_loop_task: Optional[asyncio.Task] = None
         self._task_heartbeat_loop_task: Optional[asyncio.Task] = None
         self._stage_item_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, TaskRuntimeHandle] = {}
@@ -1674,10 +1671,6 @@ class TaskManager(
                     self._stage_item_dispatch_loop(),
                     name="binary-security-stage-item-dispatcher",
                 )
-                self._owner_reconcile_loop_task = asyncio.create_task(
-                    self._owner_reconcile_signal_loop(),
-                    name="binary-security-owner-reconcile-dispatcher",
-                )
             if self._is_worker_role():
                 self._task_heartbeat_loop_task = asyncio.create_task(
                     self._task_heartbeat_loop(),
@@ -1704,7 +1697,6 @@ class TaskManager(
         await self._cancel_loop_task(self._archive_loop_task)
         await self._cancel_loop_task(self._delete_loop_task)
         await self._cancel_loop_task(self._stage_item_loop_task)
-        await self._cancel_loop_task(self._owner_reconcile_loop_task)
         await self._cancel_loop_task(self._task_heartbeat_loop_task)
         await self._cancel_loop_task(self._state_event_inbox_loop_task)
         await self._cancel_loop_task(self._state_event_inbox_metrics_loop_task)
@@ -2156,11 +2148,7 @@ class TaskManager(
         finally:
             session.close()
         await self._request_local_worker_cancel(normalized_task_id, wait_for_runner=False)
-        self._enqueue_owner_signal(
-            str(self.instance_id or "").strip(),
-            normalized_task_id,
-            context="serial_control_owner_signal_enqueue",
-        )
+        self._enqueue_task(normalized_task_id)
         return True
 
     def _collect_heartbeat_candidates(self) -> list[str]:
@@ -2441,7 +2429,11 @@ class TaskManager(
         )
 
     def _enqueue_task(self, task_id: str) -> None:
+        self._enqueue_task_with_context(task_id, context="task_enqueue")
+
+    def _enqueue_task_with_context(self, task_id: str, *, context: str = "task_enqueue") -> None:
         normalized_task_id = str(task_id or "").strip()
+        normalized_context = str(context or "").strip() or "task_enqueue"
         if not normalized_task_id:
             return
         try:
@@ -2450,23 +2442,27 @@ class TaskManager(
             logger.info(
                 "binary-security enqueue without running loop started: task_id=%s context=%s",
                 normalized_task_id,
-                "task_enqueue",
+                normalized_context,
             )
             try:
-                asyncio.run(get_task_queue().push_task(normalized_task_id, context="task_enqueue"))
+                asyncio.run(get_task_queue().push_task(normalized_task_id, context=normalized_context))
             except Exception:
                 logger.warning(
                     "binary-security enqueue without running loop failed: task_id=%s context=%s",
                     normalized_task_id,
-                    "task_enqueue",
+                    normalized_context,
                     exc_info=True,
                 )
             return
         async def _push() -> None:
             try:
-                await get_task_queue().push_task(normalized_task_id, context="task_enqueue")
+                await get_task_queue().push_task(normalized_task_id, context=normalized_context)
             except Exception:
-                logger.warning("failed to enqueue task", extra={"task_id": normalized_task_id}, exc_info=True)
+                logger.warning(
+                    "failed to enqueue task",
+                    extra={"task_id": normalized_task_id, "context": normalized_context},
+                    exc_info=True,
+                )
 
         loop.create_task(_push())
 
@@ -2522,91 +2518,55 @@ class TaskManager(
 
         loop.create_task(_push())
 
+    def _pending_shared_dispatch_signal(self, task: BinarySecurityTask) -> dict[str, Any]:
+        summary = dict(getattr(task, "summary", None) or {})
+        signal = summary.get("pending_shared_dispatch_signal")
+        return dict(signal) if isinstance(signal, dict) else {}
+
+    def _remember_shared_dispatch_signal(
+        self,
+        task: BinarySecurityTask,
+        *,
+        signal_type: str,
+        enqueue_context: str,
+        source: str,
+        reason: str,
+        stage_name: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        current = self._pending_shared_dispatch_signal(task)
+        now_value = _now().isoformat()
+        merged = {
+            **current,
+            **dict(extra or {}),
+            "signal_type": str(signal_type or "").strip() or current.get("signal_type") or "generic_task_enqueue",
+            "enqueue_context": str(enqueue_context or "").strip() or current.get("enqueue_context") or "task_enqueue",
+            "source": str(source or "").strip() or current.get("source") or "unknown",
+            "reason": str(reason or "").strip() or current.get("reason") or "shared_dispatch_signal",
+            "stage_name": str(stage_name or "").strip() or current.get("stage_name") or None,
+            "requested_by_instance_id": str(self.instance_id or "").strip() or current.get("requested_by_instance_id") or None,
+            "first_requested_at": current.get("first_requested_at") or now_value,
+            "last_requested_at": now_value,
+            "enqueue_count": int(current.get("enqueue_count") or 0) + 1,
+        }
+        summary = dict(getattr(task, "summary", None) or {})
+        summary["pending_shared_dispatch_signal"] = merged
+        task.summary = summary
+        return merged
+
+    def _clear_pending_shared_dispatch_signal(self, task: BinarySecurityTask) -> None:
+        summary = dict(getattr(task, "summary", None) or {})
+        if "pending_shared_dispatch_signal" not in summary:
+            return
+        summary.pop("pending_shared_dispatch_signal", None)
+        task.summary = summary
+
     def _initial_enqueue_wait_timeout_seconds(self) -> int:
         configured = getattr(self.cfg.queue, "initial_enqueue_wait_timeout_seconds", None)
         try:
             return max(1, int(configured or 10))
         except (TypeError, ValueError):
             return 10
-
-    async def _owner_reconcile_signal_loop(self) -> None:
-        from app.service import task_manager as task_manager_module
-
-        session_factory = task_manager_module.get_session_factory()
-        while self._running:
-            task_id = None
-            db = session_factory()
-            try:
-                with task_manager_module.observe_scheduler_loop("owner_reconcile_inbox"):
-                    self._mark_loop_heartbeat("owner_reconcile_inbox")
-                    task_id = await task_manager_module.get_task_queue().pop_owner_signal(
-                        self.instance_id,
-                        self.cfg.queue.block_timeout_seconds,
-                        context="owner_reconcile_inbox_pop",
-                    )
-                    if task_id:
-                        await self._consume_owner_reconcile_signal(db, task_id)
-                    self._mark_loop_heartbeat("owner_reconcile_inbox")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._recover_loop_db_error("owner_reconcile_inbox", db, exc)
-                task_manager_module.logger.exception("binary-security owner reconcile inbox loop crashed and recovered")
-                await asyncio.sleep(1)
-            finally:
-                db.close()
-
-    async def _consume_owner_reconcile_signal(self, db: Session, task_id: str) -> bool:
-        from app.service import task_manager as task_manager_module
-
-        normalized_task_id = str(task_id or "").strip()
-        if not normalized_task_id:
-            return False
-        task = (
-            db.query(task_manager_module.BinarySecurityTask)
-            .filter(task_manager_module.BinarySecurityTask.id == normalized_task_id)
-            .first()
-        )
-        if task is None:
-            return False
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        if dispatcher_instance_id != str(self.instance_id or "").strip():
-            task_manager_module.logger.info(
-                "binary-security owner reconcile signal ignored because task owner changed: task_id=%s signal_owner=%s current_owner=%s",
-                normalized_task_id,
-                self.instance_id,
-                dispatcher_instance_id,
-            )
-            return False
-        if str(getattr(task, "status", "") or "").strip().lower() in TASK_TERMINAL_STATUSES:
-            return False
-        self._record_event(
-            db,
-            task,
-            "owner_reconcile_signal_consumed",
-            "当前 owner worker 已收到任务层收口唤醒信号",
-            level="info",
-            stage_name=task.current_stage,
-            payload={
-                "task_id": normalized_task_id,
-                "target_owner_instance_id": dispatcher_instance_id,
-                "local_instance_id": str(self.instance_id or "").strip() or None,
-                "signal_channel": "owner_inbox",
-                "runtime_phase": self._task_runtime_phase(task),
-                "task_status": str(getattr(task, "status", "") or "").strip() or None,
-            },
-        )
-        db.commit()
-        passes = 0
-        while await self._run_task_runtime_signals(normalized_task_id):
-            passes += 1
-        task_manager_module.logger.info(
-            "binary-security owner reconcile signal processed: task_id=%s passes=%s owner_instance_id=%s",
-            normalized_task_id,
-            passes,
-            dispatcher_instance_id,
-        )
-        return True
 
     def _orphan_parent_reconcile_stale_seconds(self) -> int:
         configured = getattr(self.cfg.scheduler, "orphan_parent_reconcile_stale_seconds", None)
@@ -4505,15 +4465,7 @@ class TaskManager(
             dedupe_key=dedupe_key,
             context="task_sync_enqueue",
         )
-        target_owner_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        if target_owner_instance_id:
-            self._enqueue_owner_signal(
-                target_owner_instance_id,
-                task.id,
-                context="task_sync_owner_signal_enqueue",
-            )
-        else:
-            self._enqueue_task(task.id)
+        self._enqueue_task(task.id)
         return normalized_entry
 
     def _build_expected_sync_requests_from_db(
@@ -5839,11 +5791,11 @@ class TaskManager(
         entry_selection_snapshot = dict(summary.get("entry_selection") or {}) if isinstance(summary.get("entry_selection"), dict) else {}
         if self._pipeline_profile(task) != PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
             auto_candidates, auto_snapshot = self._select_auto_entries_per_module(task, modules, db)
+            entry_selection_snapshot = {
+                **entry_selection_snapshot,
+                **auto_snapshot,
+            }
             if self._entry_selection_mode(task) != ENTRY_SELECTION_MODE_MANUAL_CONFIRM:
-                entry_selection_snapshot = {
-                    **entry_selection_snapshot,
-                    **auto_snapshot,
-                }
                 entry_selection_snapshot.pop("selected_entry_keys", None)
                 entry_selection_snapshot.pop("selected_entries", None)
                 entry_selection_snapshot.pop("confirmed_at", None)
@@ -5859,10 +5811,7 @@ class TaskManager(
                     if str(entry.get("entry_key") or "").strip()
                 ]
         summary["entry_results"] = modules
-        if entry_selection_snapshot:
-            summary["entry_selection"] = entry_selection_snapshot
-        else:
-            summary.pop("entry_selection", None)
+        summary["entry_selection"] = entry_selection_snapshot
         task.summary = summary
         metrics = dict(task.metrics or {})
         metrics.update(self._entry_selection_metrics(task, db))

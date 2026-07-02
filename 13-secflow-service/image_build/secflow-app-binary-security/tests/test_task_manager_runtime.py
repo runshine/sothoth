@@ -1,12 +1,9 @@
 import asyncio
-import shutil
-import tempfile
 import unittest
 from datetime import timedelta, datetime
 from contextlib import suppress
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from redis.exceptions import TimeoutError as RedisTimeoutError
 from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
@@ -182,28 +179,6 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
-        self._tmpdirs: list[str] = []
-
-    def _workspace_root(self, name: str = "ws") -> str:
-        path = tempfile.mkdtemp(prefix=f"binary-security-{name}-")
-        self._tmpdirs.append(path)
-        return path
-
-    async def asyncTearDown(self):
-        current_task = asyncio.current_task()
-        leftovers = [
-            task
-            for task in asyncio.all_tasks()
-            if task is not current_task and not task.done()
-        ]
-        for task in leftovers:
-            task.cancel()
-        if leftovers:
-            await asyncio.gather(*leftovers, return_exceptions=True)
-        for tmpdir in self._tmpdirs:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
     async def test_start_stops_partially_started_loops_when_seed_work_queues_fails(self):
         manager = TaskManager()
         manager.cfg.queue.redis_url = "redis://redis.example:6379/0"
@@ -496,28 +471,21 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         original_factory = task_manager_module.get_session_factory
         original_enqueue = manager._enqueue_task
-        original_enqueue_owner_signal = manager._enqueue_owner_signal
         original_cancel = manager._request_local_worker_cancel
-        owner_signals: list[tuple[str, str, str]] = []
         task_manager_module.get_session_factory = lambda: (lambda: db)
         manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
-        manager._enqueue_owner_signal = lambda owner_instance_id, task_id, *, context="owner_signal_enqueue": owner_signals.append(
-            (owner_instance_id, task_id, context)
-        )
         manager._request_local_worker_cancel = _cancel
         try:
             handed_off = await manager._handoff_active_serial_control_operation_from_runtime(task.id)
         finally:
             task_manager_module.get_session_factory = original_factory
             manager._enqueue_task = original_enqueue
-            manager._enqueue_owner_signal = original_enqueue_owner_signal
             manager._request_local_worker_cancel = original_cancel
             manager._workers.pop(task.id, None)
 
         self.assertTrue(handed_off)
         self.assertEqual([(task.id, False)], cancelled)
-        self.assertEqual([], enqueued)
-        self.assertEqual([("worker-a", task.id, "serial_control_owner_signal_enqueue")], owner_signals)
+        self.assertEqual([task.id], enqueued)
         self.assertTrue(any(event.event_type == "runtime_yielded_for_serial_control_operation" for event in db.events))
 
     def test_recover_loop_db_error_disposes_engine_for_operational_and_timeout_errors(self):
@@ -638,7 +606,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("dispatch-requeue"),
+            workspace_root="/tmp/ws",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
 
@@ -701,7 +669,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("dispatch-drop"),
+            workspace_root="/tmp/ws",
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-a",
         )
@@ -792,10 +760,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             await manager._dispatch_loop()
 
         self.assertEqual([], requeued)
-        event_types = [row.event_type for row in db.events]
-        self.assertIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
-        self.assertIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
-        self.assertNotIn("dispatch_claim_dropped_after_pop", event_types)
+        self.assertIn("dispatch_claim_dropped_after_pop", [row.event_type for row in db.events])
 
     async def test_dispatch_loop_starts_cooldown_when_claim_decision_requests_handoff_delay(self):
         manager = TaskManager()
@@ -848,7 +813,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("dispatch-cooldown"),
+            workspace_root="/tmp/ws",
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-old",
         )
@@ -1086,7 +1051,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 "claimed_task_id": None,
                 "blocked_reason": "task_status_not_pending_without_resumable_operation",
                 "should_requeue": False,
-                "cooldown_seconds": None,
             },
             manager._dispatch_claim_decision(),
         )
@@ -1095,21 +1059,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.manager = TaskManager()
-        self.manager.cfg.queue.seed_batch_size = 20
-        self.manager.cfg.queue.reconcile_interval_seconds = 5
-        self._tmpdirs: list[str] = []
-
-    def _workspace_root(self, name: str = "ws") -> str:
-        path = tempfile.mkdtemp(prefix=f"binary-security-{name}-")
-        self._tmpdirs.append(path)
-        return path
-
-    async def asyncTearDown(self):
-        for tmpdir in self._tmpdirs:
-            shutil.rmtree(tmpdir, ignore_errors=True)
 
     async def test_consume_delete_queue_task_defers_when_parent_lease_still_active(self):
-        manager = TaskManager()
         task = BinarySecurityTask(
             id="task-delete-active-lease",
             project_id="project-1",
@@ -1145,15 +1096,15 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         requeued: list[str] = []
         prepared: list[str] = []
 
-        manager._force_requeue_delete_task = lambda task_id: requeued.append(task_id)
+        self.manager._force_requeue_delete_task = lambda task_id: requeued.append(task_id)
 
         async def _prepare(_db, _task):
             prepared.append(_task.id)
             return None
 
-        manager._prepare_delete_task = _prepare
+        self.manager._prepare_delete_task = _prepare
 
-        await manager._consume_delete_queue_task(db, task.id)
+        await self.manager._consume_delete_queue_task(db, task.id)
 
         self.assertEqual([task.id], requeued)
         self.assertEqual([], prepared)
@@ -1163,7 +1114,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_consume_delete_queue_task_reclaims_expired_owner_before_processing(self):
-        manager = TaskManager()
         task = BinarySecurityTask(
             id="task-delete-expired-lease",
             project_id="project-1",
@@ -1205,11 +1155,11 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             prepared.append(_task.id)
             return None
 
-        manager.instance_id = "worker-b"
-        manager._release_unsupported_task_row_owner = _release
-        manager._prepare_delete_task = _prepare
+        self.manager.instance_id = "worker-b"
+        self.manager._release_unsupported_task_row_owner = _release
+        self.manager._prepare_delete_task = _prepare
 
-        await manager._consume_delete_queue_task(db, task.id)
+        await self.manager._consume_delete_queue_task(db, task.id)
 
         self.assertEqual([], released)
         self.assertEqual([task.id], prepared)
@@ -1219,9 +1169,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
 
     async def test_reconcile_work_queues_force_reenqueues_pending_task_missing_from_redis(self):
-        manager = TaskManager()
-        manager.cfg.queue.seed_batch_size = 20
-        manager.cfg.queue.reconcile_interval_seconds = 5
         task = BinarySecurityTask(
             id="task-pending",
             project_id="project-1",
@@ -1231,7 +1178,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("reconcile-missing"),
+            workspace_root="/tmp/ws",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
         reenqueued: list[tuple[str, str | None]] = []
@@ -1251,21 +1198,11 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
-        manager._last_queue_reconcile_at = None
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
 
-        with (
-            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
-            patch.object(manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
-            patch.object(manager, "_queue_reconcile_task_rows", return_value=[task]),
-            patch.object(manager, "_queue_reconcile_operation_rows", return_value=[]),
-            patch.object(
-                manager,
-                "_task_queue_state",
-                return_value=("db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"),
-            ),
-        ):
-            await manager._reconcile_work_queues_once(db)
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([("task-pending", "queue_reconcile_pending_reenqueue")], reenqueued)
         self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
@@ -1281,7 +1218,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("reconcile-cooldown"),
+            workspace_root="/tmp/ws",
             summary_json={},
         )
         task.summary = {
@@ -1314,11 +1251,8 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
 
-        with (
-            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
-            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
-        ):
-            await self.manager._reconcile_work_queues_once(db)
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([], pushed)
         self.assertIn("dispatch_claim_cooldown", task.summary)
@@ -1459,15 +1393,12 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
             patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", side_effect=_reconcile),
         ):
-            await self.manager._reconcile_work_queues_once(db)
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual("orphan_reconcile", calls[0][0])
         self.assertIn(("queue_positions", "queue_reconcile_snapshot"), calls)
 
     async def test_reconcile_work_queues_does_not_force_reenqueue_pending_task_already_in_redis(self):
-        manager = TaskManager()
-        manager.cfg.queue.seed_batch_size = 20
-        manager.cfg.queue.reconcile_interval_seconds = 5
         task = BinarySecurityTask(
             id="task-pending",
             project_id="project-1",
@@ -1477,7 +1408,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("reconcile-queued"),
+            workspace_root="/tmp/ws",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
         pushed: list[tuple[str, str | None]] = []
@@ -1497,20 +1428,11 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
-        manager._last_queue_reconcile_at = None
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
 
-        with (
-            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
-            patch.object(manager, "_queue_reconcile_task_rows", return_value=[task]),
-            patch.object(manager, "_queue_reconcile_operation_rows", return_value=[]),
-            patch.object(
-                manager,
-                "_task_queue_state",
-                return_value=("queued", None),
-            ),
-        ):
-            await manager._reconcile_work_queues_once(db)
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([("task-pending", None)], pushed)
         self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
@@ -1552,15 +1474,12 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
             patch.object(self.manager, "_task_row_owner_is_runtime_supported", return_value=True),
         ):
-            await self.manager._reconcile_work_queues_once(db)
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([], pushed)
         self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_releases_stale_pending_owner_before_reenqueue(self):
-        manager = TaskManager()
-        manager.cfg.queue.seed_batch_size = 20
-        manager.cfg.queue.reconcile_interval_seconds = 5
         task = BinarySecurityTask(
             id="task-pending-stale-owner",
             project_id="project-1",
@@ -1570,7 +1489,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("reconcile-stale-owner"),
+            workspace_root="/tmp/ws",
             dispatcher_instance_id="worker-a",
             current_operation_id="op-1",
         )
@@ -1601,30 +1520,19 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             _task.current_operation_id = None
             return True
 
-        manager._last_queue_reconcile_at = None
+        self.manager._last_queue_reconcile_at = None
 
         with (
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
-            patch.object(manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
-            patch.object(manager, "_release_unsupported_task_row_owner", side_effect=_release),
-            patch.object(manager, "_queue_reconcile_task_rows", return_value=[task]),
-            patch.object(manager, "_queue_reconcile_operation_rows", return_value=[]),
-            patch.object(
-                manager,
-                "_task_queue_state",
-                return_value=("db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"),
-            ),
+            patch.object(self.manager, "_release_unsupported_task_row_owner", side_effect=_release),
         ):
-            await manager._reconcile_work_queues_once(db)
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual(["pending_task_not_enqueued_reconcile"], release_calls)
         self.assertEqual([("task-pending-stale-owner", "queue_reconcile_pending_reenqueue")], reenqueued)
         self.assertIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_prefers_delete_queue_reenqueue_for_pending_delete_operation(self):
-        manager = TaskManager()
-        manager.cfg.queue.seed_batch_size = 20
-        manager.cfg.queue.reconcile_interval_seconds = 5
         task = BinarySecurityTask(
             id="task-pending-delete",
             project_id="project-1",
@@ -1634,7 +1542,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("reconcile-delete"),
+            workspace_root="/tmp/ws",
             current_operation_id="op-delete",
         )
         task.cleanup_snapshot = {
@@ -1673,20 +1581,10 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        manager._last_queue_reconcile_at = None
+        self.manager._last_queue_reconcile_at = None
 
-        with (
-            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
-            patch.object(manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
-            patch.object(manager, "_queue_reconcile_task_rows", return_value=[task]),
-            patch.object(manager, "_queue_reconcile_operation_rows", return_value=[]),
-            patch.object(
-                manager,
-                "_task_queue_state",
-                return_value=("db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"),
-            ),
-        ):
-            await manager._reconcile_work_queues_once(db)
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([], main_reenqueued)
         self.assertEqual([("task-pending-delete", "delete_queue_reconcile")], delete_reenqueued)
@@ -1696,9 +1594,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("pending_task_not_enqueued_detected", event_types)
 
     async def test_reconcile_work_queues_skips_delete_queue_reenqueue_when_pending_delete_already_queued(self):
-        manager = TaskManager()
-        manager.cfg.queue.seed_batch_size = 20
-        manager.cfg.queue.reconcile_interval_seconds = 5
         task = BinarySecurityTask(
             id="task-pending-delete-already-queued",
             project_id="project-1",
@@ -1708,7 +1603,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             current_stage="system_analysis",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root=self._workspace_root("reconcile-delete-queued"),
+            workspace_root="/tmp/ws",
             current_operation_id="op-delete",
         )
         task.cleanup_snapshot = {
@@ -1747,20 +1642,10 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        manager._last_queue_reconcile_at = None
+        self.manager._last_queue_reconcile_at = None
 
-        with (
-            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
-            patch.object(manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
-            patch.object(manager, "_queue_reconcile_task_rows", return_value=[task]),
-            patch.object(manager, "_queue_reconcile_operation_rows", return_value=[]),
-            patch.object(
-                manager,
-                "_task_queue_state",
-                return_value=("db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"),
-            ),
-        ):
-            await manager._reconcile_work_queues_once(db)
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await self.manager._reconcile_work_queues(db)
 
         self.assertEqual([], main_reenqueued)
         self.assertEqual([], delete_reenqueued)

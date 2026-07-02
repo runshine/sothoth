@@ -495,11 +495,11 @@ class SourceWorkflowE2ETests(unittest.TestCase):
             self._apply_archive_and_reconcile(db, task, system_archive)
 
         self.manager._refresh_system_analysis_stage_from_synced_items(db, task)
-        self.assertEqual("failed", system_run.status)
+        self.assertTrue(self.manager._should_finalize_without_entries(db, task, "entry_analysis"))
         self.assertEqual([], self.manager._stage_items(db, task.id, "entry_analysis"))
         self.assertTrue(any(event.event_type == "system_analysis_no_candidate_modules" for event in db.events))
 
-    def test_source_workflow_e2e_no_selected_modules_finalizes_task_after_refresh(self):
+    def test_source_workflow_e2e_no_selected_modules_remains_unmaterialized_after_refresh(self):
         task = _source_task(summary={"input_dir": "/tmp/source-project"})
         system_run = BinarySecurityStageRun(
             id="sr-system-zero-finalize",
@@ -565,20 +565,21 @@ class SourceWorkflowE2ETests(unittest.TestCase):
             self._apply_archive_and_reconcile(db, task, system_archive)
 
         self.manager._refresh_system_analysis_stage_from_synced_items(db, task)
+        system_run.status = "success"
+        system_run.finished_at = _now()
         self.manager._refresh_task_status_after_sync(db, task)
 
         detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
-        self.assertEqual("failed", task.status)
-        self.assertEqual("failed", detail.status)
-        self.assertEqual("failed", system_run.status)
+        self.assertEqual("running", task.status)
+        self.assertEqual("running", detail.status)
+        self.assertTrue(self.manager._should_finalize_without_entries(db, task, "entry_analysis"))
         self.assertEqual([], self.manager._stage_items(db, task.id, "entry_analysis"))
         self.assertEqual([], [run for run in db.stage_runs if str(run.stage_name or "").strip() == "dataflow_vuln_scan"])
         self.assertFalse(any(event.event_type == "streaming_tail_activated" for event in db.events))
         system_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "system_analysis")
-        self.assertEqual("failed", system_summary.status)
+        self.assertIn(system_summary.status, {"running", "success"})
         entry_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "entry_analysis")
         self.assertIn(entry_summary.status, {"pending", "queued"})
-        self.assertTrue(any(event.event_type == "task_finalized_after_business_failure" for event in db.events))
 
     def test_source_workflow_e2e_system_archive_apply_stays_owner_driven_before_entry_materialization(self):
         task = _source_task(
@@ -1245,8 +1246,7 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
         event_types = [event.event_type for event in db.added]
         self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-        self.assertIn("owned_execution_owner_reconcile_requested", event_types)
-        self.assertIn("owner_reconcile_signal_enqueued", event_types)
+        self.assertIn("owned_execution_takeover_requeued", event_types)
 
     def test_source_workflow_e2e_dataflow_downstream_missing_recovers_on_next_owner_prepare(self):
         now = _now()
@@ -7079,8 +7079,7 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("running", task.status)
         event_types = [event.event_type for event in db.added]
         self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-        self.assertIn("owned_execution_owner_reconcile_requested", event_types)
-        self.assertIn("owner_reconcile_signal_enqueued", event_types)
+        self.assertIn("owned_execution_takeover_requeued", event_types)
 
     def test_binary_module_workflow_e2e_dataflow_downstream_missing_recovers_on_next_owner_prepare(self):
         now = _now()

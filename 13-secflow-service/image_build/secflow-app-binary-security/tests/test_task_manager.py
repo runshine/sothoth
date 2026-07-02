@@ -37294,9 +37294,9 @@ def _test_request_task_layer_reconcile_archive_apply_uses_owner_inbox(self):
     queued_tasks = []
     owner_signals = []
 
-    original_enqueue_task = self.manager._enqueue_task
+    original_enqueue_task = self.manager._enqueue_task_with_context
     original_enqueue_owner_signal = self.manager._enqueue_owner_signal
-    self.manager._enqueue_task = lambda task_id: queued_tasks.append(task_id)
+    self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued_tasks.append(task_id)
     self.manager._enqueue_owner_signal = (
         lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
     )
@@ -37340,9 +37340,9 @@ def _test_request_task_layer_reconcile_non_archive_owner_signal_uses_owner_inbox
     queued_tasks = []
     owner_signals = []
 
-    original_enqueue_task = self.manager._enqueue_task
+    original_enqueue_task = self.manager._enqueue_task_with_context
     original_enqueue_owner_signal = self.manager._enqueue_owner_signal
-    self.manager._enqueue_task = lambda task_id: queued_tasks.append(task_id)
+    self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued_tasks.append(task_id)
     self.manager._enqueue_owner_signal = (
         lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
     )
@@ -37386,9 +37386,9 @@ def _test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispat
     queued_tasks = []
     owner_signals = []
 
-    original_enqueue_task = self.manager._enqueue_task
+    original_enqueue_task = self.manager._enqueue_task_with_context
     original_enqueue_owner_signal = self.manager._enqueue_owner_signal
-    self.manager._enqueue_task = lambda task_id: queued_tasks.append(task_id)
+    self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued_tasks.append(task_id)
     self.manager._enqueue_owner_signal = (
         lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
     )
@@ -37403,13 +37403,20 @@ def _test_request_task_layer_reconcile_without_owner_falls_back_to_shared_dispat
             message="阶段终态事实已落库，等待 owner worker 统一收口任务主状态",
         )
     finally:
-        self.manager._enqueue_task = original_enqueue_task
+        self.manager._enqueue_task_with_context = original_enqueue_task
         self.manager._enqueue_owner_signal = original_enqueue_owner_signal
 
     self.assertEqual(["t3"], queued_tasks)
     self.assertEqual([], owner_signals)
     payload = dict(db.events[0].payload or {})
     self.assertEqual("shared_dispatch", payload.get("signal_channel"))
+    signal_event = next(event for event in db.events if event.event_type == "shared_dispatch_signal_enqueued")
+    signal_payload = dict(signal_event.payload or {})
+    self.assertEqual("task_layer_reconcile", signal_payload.get("signal_type"))
+    self.assertEqual("shared_dispatch_task_layer_reconcile_enqueue", signal_payload.get("enqueue_context"))
+    self.assertEqual("stage_worker_terminal_observed", signal_payload.get("source_event_type"))
+    self.assertEqual(str(self.manager.instance_id or "").strip() or None, signal_payload.get("requested_by_instance_id"))
+    self.assertEqual("pending_task_without_owner_requires_shared_dispatch", signal_payload.get("decision_reason"))
 
 
 def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal(self):
@@ -37432,6 +37439,16 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal(s
         owner_instance_id="worker-owner",
         lease_expires_at=_now() + timedelta(minutes=5),
     )
+    task.summary = {
+        "pending_shared_dispatch_signal": {
+            "signal_type": "task_layer_reconcile",
+            "enqueue_context": "shared_dispatch_task_layer_reconcile_enqueue",
+            "source": "runtime_state._request_task_layer_reconcile",
+            "reason": "stage_worker_terminal_observed",
+            "source_event_type": "stage_worker_terminal_observed",
+            "requested_by_instance_id": "worker-origin",
+        }
+    }
     db = _AppendingModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
     self.manager.instance_id = "worker-local"
     forwarded = []
@@ -37456,6 +37473,13 @@ def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal(s
     self.assertNotIn("dispatch_claim_ignored_foreign_owner_signal", event_types)
     self.assertNotIn("owner_reconcile_signal_forwarded_to_owner_inbox", event_types)
     self.assertIn("dispatch_claim_dropped_after_pop", event_types)
+    drop_event = next(event for event in db.events if event.event_type == "dispatch_claim_dropped_after_pop")
+    drop_payload = dict(drop_event.payload or {})
+    self.assertEqual("task_layer_reconcile", drop_payload.get("dropped_message_type"))
+    self.assertEqual(
+        "shared_dispatch_task_layer_reconcile_enqueue",
+        dict(drop_payload.get("shared_dispatch_signal") or {}).get("enqueue_context"),
+    )
 
 
 def _test_drop_unclaimed_dispatch_task_after_pop_forwards_foreign_owner_signal_for_dispatching_nonresumable_reason(self):
