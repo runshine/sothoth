@@ -626,13 +626,19 @@ class TaskQueryServiceMixin:
         per_page: int = 50,
     ) -> BinarySecurityArchiveJobPageResponse:
         task = self._task_or_404(db, project_id, task_id)
-        query = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id)
         normalized_stage_name = normalize_stage_name(stage_name) or None
+        query = db.query(BinarySecurityArchiveJob).filter(BinarySecurityArchiveJob.task_id == task.id)
         if normalized_stage_name:
             query = query.filter(BinarySecurityArchiveJob.stage_name == normalized_stage_name)
-        query = query.order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
-        total = query.count()
-        rows = query.offset((page - 1) * per_page).limit(per_page).all()
+        raw_rows = query.order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc()).all()
+        stage_items_query = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id)
+        if normalized_stage_name:
+            stage_items_query = stage_items_query.filter(BinarySecurityStageItem.stage_name == normalized_stage_name)
+        scope_items = stage_items_query.order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc()).all()
+        canonical_rows = self._canonicalize_read_model_archive_jobs(db, task, scope_items, raw_rows)
+        total = len(canonical_rows)
+        start = (page - 1) * per_page
+        rows = canonical_rows[start : start + per_page]
         return BinarySecurityArchiveJobPageResponse(
             task_id=task.id,
             stage_name=normalized_stage_name,

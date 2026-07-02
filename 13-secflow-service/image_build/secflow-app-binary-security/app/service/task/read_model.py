@@ -36,6 +36,49 @@ def _schedule_user_task_id_value(task) -> str | None:
 
 
 class TaskReadModelServiceMixin:
+    def _canonicalize_read_model_archive_jobs(
+        self: TaskManager,
+        db: Session,
+        task,
+        stage_items,
+        archive_jobs,
+    ):
+        from app.service import task_manager as task_manager_module
+
+        raw_archive_jobs = list(archive_jobs or [])
+        grouped = self._archive_jobs_by_item_id(raw_archive_jobs)
+        items_by_id = {
+            str(getattr(item, "id", "") or "").strip(): item
+            for item in list(stage_items or [])
+            if str(getattr(item, "id", "") or "").strip()
+        }
+        pruned = False
+        for item_id, item_jobs in list(grouped.items()):
+            item = items_by_id.get(str(item_id or "").strip())
+            if item is None:
+                continue
+            if self._prune_nonblocking_archive_jobs_for_item(
+                db,
+                task,
+                item,
+                archive_jobs=item_jobs,
+                reason="read_model_canonical_archive_jobs",
+            ):
+                pruned = True
+        if pruned:
+            db.flush()
+            raw_archive_jobs = (
+                db.query(task_manager_module.BinarySecurityArchiveJob)
+                .filter(task_manager_module.BinarySecurityArchiveJob.task_id == task.id)
+                .order_by(
+                    task_manager_module.BinarySecurityArchiveJob.created_at.asc(),
+                    task_manager_module.BinarySecurityArchiveJob.id.asc(),
+                )
+                .all()
+            )
+            grouped = self._archive_jobs_by_item_id(raw_archive_jobs)
+        return self._canonical_archive_jobs_for_stage_items(list(stage_items or []), archive_jobs_by_item=grouped)
+
     def _manual_operation_state_from_active_operation(
         self: TaskManager,
         db: Session,
@@ -1672,6 +1715,7 @@ class TaskReadModelServiceMixin:
             )
             .all()
         )
+        archive_jobs = self._canonicalize_read_model_archive_jobs(db, task, stage_items, archive_jobs)
         stage_sequence = self._stage_sequence_for_task(task)
         stage_summaries = self._build_stage_summaries_readonly(db, task, stage_sequence, stage_runs, stage_items)
         abnormal_reason = None
@@ -1773,6 +1817,21 @@ class TaskReadModelServiceMixin:
             .filter(task_manager_module.BinarySecurityStageItem.task_id == task.id)
             .all()
         )
+        archive_scope_items = (
+            db.query(task_manager_module.BinarySecurityStageItem)
+            .options(
+                load_only(
+                    task_manager_module.BinarySecurityStageItem.id,
+                    task_manager_module.BinarySecurityStageItem.stage_name,
+                    task_manager_module.BinarySecurityStageItem.status,
+                    task_manager_module.BinarySecurityStageItem.downstream_task_id,
+                    task_manager_module.BinarySecurityStageItem.created_at,
+                    task_manager_module.BinarySecurityStageItem.updated_at,
+                )
+            )
+            .filter(task_manager_module.BinarySecurityStageItem.task_id == task.id)
+            .all()
+        )
         stage_items_total = len(sync_items)
         item_stats = self._item_stats(sync_items)
         downstream_status_counts = self._downstream_status_counts_from_items(sync_items)
@@ -1786,6 +1845,7 @@ class TaskReadModelServiceMixin:
             )
             .all()
         )
+        archive_jobs = self._canonicalize_read_model_archive_jobs(db, task, archive_scope_items, archive_jobs)
         stage_sequence = self._stage_sequence_for_task(task)
         stage_summaries = self._build_stage_summaries_readonly(
             db,
