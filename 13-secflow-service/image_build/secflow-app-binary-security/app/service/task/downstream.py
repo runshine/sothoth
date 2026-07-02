@@ -2323,6 +2323,13 @@ class TaskDownstreamServiceMixin:
     def _archive_job_is_nonblocking_terminal(self, job: BinarySecurityArchiveJob | None) -> bool:
         return self._archive_job_status_value(job) in self._ARCHIVE_NONBLOCKING_STATUSES
 
+    @staticmethod
+    def _archive_job_root_path(job: BinarySecurityArchiveJob | None) -> str | None:
+        if job is None:
+            return None
+        archive_root = str(getattr(job, "archive_root", "") or "").strip()
+        return archive_root or None
+
     def _archive_job_sort_key(self, job: BinarySecurityArchiveJob | None) -> tuple[Any, str]:
         timestamp = (
             getattr(job, "updated_at", None)
@@ -2733,6 +2740,59 @@ class TaskDownstreamServiceMixin:
                     "old_downstream_task_id": str(old_downstream_task_id or "").strip() or None,
                     "new_downstream_task_id": str(new_downstream_task_id or "").strip() or None,
                     "deleted_archive_job_ids": deleted_job_ids,
+                    "reason": reason,
+                },
+            )
+        return deleted_job_ids
+
+    def _prune_nonblocking_archive_jobs_for_item(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+        reason: str,
+    ) -> list[str]:
+        jobs = list(archive_jobs or [])
+        deletable_jobs = [job for job in jobs if self._archive_job_is_nonblocking_terminal(job)]
+        if not deletable_jobs:
+            return []
+        retained_roots = {
+            root
+            for root in (self._archive_job_root_path(job) for job in jobs if job not in deletable_jobs)
+            if root
+        }
+        deleted_roots: list[str] = []
+        deleted_root_set: set[str] = set()
+        for job in deletable_jobs:
+            archive_root = self._archive_job_root_path(job)
+            if not archive_root or archive_root in retained_roots or archive_root in deleted_root_set:
+                continue
+            if self._delete_archive_root_path(task, archive_root):
+                deleted_roots.append(archive_root)
+                deleted_root_set.add(archive_root)
+        deleted_job_ids: list[str] = []
+        deleted_statuses: list[str] = []
+        for job in deletable_jobs:
+            job_id = str(getattr(job, "id", "") or "").strip()
+            if job_id:
+                deleted_job_ids.append(job_id)
+            deleted_statuses.append(self._archive_job_status_value(job))
+            db.delete(job)
+        if deleted_job_ids:
+            self._record_event(
+                db,
+                task,
+                "noncanonical_archive_jobs_deleted",
+                "非 current binding 的归档任务记录已删除",
+                stage_name=item.stage_name,
+                item=item,
+                level="warning",
+                payload={
+                    "deleted_archive_job_ids": deleted_job_ids,
+                    "deleted_archive_statuses": deleted_statuses,
+                    "deleted_archive_roots": deleted_roots,
                     "reason": reason,
                 },
             )

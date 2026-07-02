@@ -681,6 +681,9 @@ class ArchiveReclaimTests(unittest.TestCase):
             status = self.manager._business_stage_status(task, "firmware_unpack", stage_run, [item], db=db)
         self.assertFalse(blocked)
         self.assertEqual("success", status)
+        self.assertEqual(["aj-current"], [job.id for job in db.archive_jobs])
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("noncanonical_archive_jobs_deleted", event_types)
 
     def test_run_archive_copy_job_missing_source_schedules_delayed_retry(self):
         task = self._task()

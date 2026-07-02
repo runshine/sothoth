@@ -7886,18 +7886,49 @@ class TaskManager(
         return rows
 
     def _stage_archive_jobs_by_item(self, db: Session, task_id: str, stage_name: str) -> dict[str, list[BinarySecurityArchiveJob]]:
-        jobs = (
-            db.query(BinarySecurityArchiveJob)
-            .filter(
-                BinarySecurityArchiveJob.task_id == task_id,
-                BinarySecurityArchiveJob.stage_name == stage_name,
+        def _load_grouped() -> dict[str, list[BinarySecurityArchiveJob]]:
+            jobs = (
+                db.query(BinarySecurityArchiveJob)
+                .filter(
+                    BinarySecurityArchiveJob.task_id == task_id,
+                    BinarySecurityArchiveJob.stage_name == stage_name,
+                )
+                .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
+                .all()
             )
-            .order_by(BinarySecurityArchiveJob.created_at.asc(), BinarySecurityArchiveJob.id.asc())
-            .all()
-        )
-        grouped: dict[str, list[BinarySecurityArchiveJob]] = {}
-        for job in jobs:
-            grouped.setdefault(str(job.item_id or ""), []).append(job)
+            grouped_rows: dict[str, list[BinarySecurityArchiveJob]] = {}
+            for job in jobs:
+                grouped_rows.setdefault(str(job.item_id or ""), []).append(job)
+            return grouped_rows
+
+        grouped = _load_grouped()
+        if not grouped:
+            return grouped
+        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+        if task is None:
+            return grouped
+        stage_items = self._stage_items(db, task_id, stage_name)
+        items_by_id = {
+            str(getattr(item, "id", "") or "").strip(): item
+            for item in stage_items
+            if str(getattr(item, "id", "") or "").strip()
+        }
+        pruned = False
+        for item_id, item_jobs in list(grouped.items()):
+            item = items_by_id.get(str(item_id or "").strip())
+            if item is None:
+                continue
+            if self._prune_nonblocking_archive_jobs_for_item(
+                db,
+                task,
+                item,
+                archive_jobs=item_jobs,
+                reason="stage_archive_jobs_by_item",
+            ):
+                pruned = True
+        if pruned:
+            db.flush()
+            grouped = _load_grouped()
         return grouped
 
     @staticmethod
