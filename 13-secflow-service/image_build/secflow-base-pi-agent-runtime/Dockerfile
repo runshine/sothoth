@@ -1,7 +1,7 @@
 ARG SECFLOW_PYTHON_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-python311-runtime:20260602
 FROM ${SECFLOW_PYTHON_RUNTIME_IMAGE}
 
-ARG PI_NPM_PACKAGE=@mariozechner/pi-coding-agent
+ARG PI_NPM_PACKAGE=@earendil-works/pi-coding-agent
 ARG SECFLOW_BUILD_VERSION=""
 
 ENV PI_CODING_AGENT_DIR=/root/.pi/agent
