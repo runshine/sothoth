@@ -621,6 +621,9 @@ class TaskControlServiceMixin:
             "stage_parallelism": {stage_name: 5 for stage_name in stage_names},
             "stage_options": {},
             "module_selection_mode": "auto",
+            "entry_selection_mode": "auto",
+            "entry_auto_selection_strategy": "all",
+            "entry_auto_selection_top_n": 0,
             "module_risk_levels": ["高"],
         }
         defaults["partial_success_stage_advancement"] = {
@@ -877,9 +880,6 @@ class TaskControlServiceMixin:
         if str(updated.get("entry_selection_mode") or "auto").strip() != task_manager_module.ENTRY_SELECTION_MODE_AUTO:
             updated["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
             updated["entry_auto_selection_top_n"] = 0
-        elif self._pipeline_profile(task) == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
-            updated["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
-            updated["entry_auto_selection_top_n"] = 0
         else:
             strategy = str(updated.get("entry_auto_selection_strategy") or task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
             top_n = int(updated.get("entry_auto_selection_top_n") or 0)
@@ -1133,9 +1133,6 @@ class TaskControlServiceMixin:
         policy_overrides["pipeline_profile"] = pipeline_profile
         policy = self._merge_policy(db, project_id, policy_overrides, payload.stage_options)
         if str(policy.get("entry_selection_mode") or "auto").strip() != task_manager_module.ENTRY_SELECTION_MODE_AUTO:
-            policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
-            policy["entry_auto_selection_top_n"] = 0
-        elif pipeline_profile == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
             policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
             policy["entry_auto_selection_top_n"] = 0
         else:

@@ -56,8 +56,8 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], state_events=[event], stage_runs=[], events=[])
 
         queued = []
-        original_enqueue = self.manager._enqueue_task
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        original_enqueue = self.manager._enqueue_task_with_context
+        self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
         try:
             with (
                 patch.object(self.manager, "_task_runtime_transition_guard_active", return_value=False),
@@ -73,7 +73,7 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
             ):
                 self.manager._apply_stage_worker_start_requested_locked(db, event)
         finally:
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_task_with_context = original_enqueue
 
         self.assertEqual("pending", task.status)
         self.assertEqual("binary_to_source", task.current_stage)
@@ -81,10 +81,11 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         event_types = [row.event_type for row in db.events]
         self.assertNotIn("stage_started", event_types)
         self.assertIn("main_state_write_blocked", event_types)
-        self.assertIn("owned_execution_takeover_requeued", event_types)
+        self.assertIn("owned_execution_owner_reconcile_requested", event_types)
+        self.assertIn("shared_dispatch_signal_enqueued", event_types)
         self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
-        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
-        self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_owner_reconcile_requested")
+        self.assertEqual("notify_owner_reconcile", (takeover_event.payload or {}).get("takeover_action"))
         self.assertFalse((takeover_event.payload or {}).get("stage_start_allowed"))
         self.assertEqual("missing archive success", (takeover_event.payload or {}).get("blocked_reason"))
         self.assertEqual(["task-1"], queued)
@@ -123,8 +124,8 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], state_events=[event], stage_runs=[], events=[])
 
         queued = []
-        original_enqueue = self.manager._enqueue_task
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        original_enqueue = self.manager._enqueue_task_with_context
+        self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
         try:
             with (
                 patch.object(self.manager, "_task_runtime_transition_guard_active", return_value=True),
@@ -132,7 +133,7 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
             ):
                 self.manager._apply_stage_worker_start_requested_locked(db, event)
         finally:
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_task_with_context = original_enqueue
 
         self.assertEqual(0, len(db.stage_runs))
         event_types = [row.event_type for row in db.events]
@@ -163,9 +164,9 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], state_events=[event], events=[])
 
         queued = []
-        original_enqueue = self.manager._enqueue_task
+        original_enqueue = self.manager._enqueue_task_with_context
         original_write = self.manager._write_task_metadata_async
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
 
         async def _noop_write(*_args, **_kwargs):
             return None
@@ -176,7 +177,7 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
 
             asyncio.run(self.manager._apply_task_execution_failed_locked(db, event))
         finally:
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_task_with_context = original_enqueue
             self.manager._write_task_metadata_async = original_write
 
         self.assertEqual("running", task.status)
@@ -223,12 +224,12 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], archive_jobs=[job], state_events=[event], events=[])
 
         queued = []
-        original_enqueue = self.manager._enqueue_task
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        original_enqueue = self.manager._enqueue_task_with_context
+        self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
         try:
             self.manager._apply_archive_job_copy_failed_locked(db, event)
         finally:
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_task_with_context = original_enqueue
 
         self.assertEqual("running", task.status)
         self.assertEqual("failed", job.archive_status)
@@ -270,25 +271,22 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], state_events=[event], events=[])
 
         original_factory = __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory
-        original_enqueue = self.manager._enqueue_task
+        original_enqueue = self.manager._enqueue_owner_signal
         queued = []
         __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = lambda: (lambda: db)
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        self.manager._enqueue_owner_signal = lambda owner_instance_id, task_id, **_kwargs: queued.append((owner_instance_id, task_id))
         try:
             asyncio.run(self.manager._reduce_state_event(event.id))
         finally:
             __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = original_factory
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_owner_signal = original_enqueue
 
         self.assertEqual("processed", event.status)
         self.assertEqual("owner_signal_requeued", event.processing_result)
-        self.assertEqual(["task-1"], queued)
+        self.assertEqual([("other-owner", "task-1")], queued)
         self.assertIn("pending_task_layer_reconcile", ((task.summary or {}).get("runtime_workset") or {}))
-        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
-        self.assertTrue((takeover_event.payload or {}).get("compat_replay_forwarded"))
         event_types = [row.event_type for row in db.events]
-        self.assertIn("owned_execution_takeover_requeued", event_types)
-        self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+        self.assertNotIn("owned_execution_takeover_requeued", event_types)
 
     def test_reduce_state_event_without_local_runtime_owner_requeues_instead_of_applying_fact(self):
         import asyncio
@@ -318,23 +316,24 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], state_events=[event], events=[])
 
         original_factory = __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory
-        original_enqueue = self.manager._enqueue_task
+        original_enqueue = self.manager._enqueue_task_with_context
         queued = []
         __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = lambda: (lambda: db)
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
         try:
             asyncio.run(self.manager._reduce_state_event(event.id))
         finally:
             __import__("app.service.task_manager", fromlist=["get_session_factory"]).get_session_factory = original_factory
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_task_with_context = original_enqueue
 
         self.assertEqual("processed", event.status)
         self.assertEqual("owner_signal_requeued", event.processing_result)
         self.assertEqual(["task-1"], queued)
         self.assertEqual([], db.stage_items)
-        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
+        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_owner_reconcile_requested")
         self.assertEqual("owner_not_active_on_replay_path", (takeover_event.payload or {}).get("forward_reason"))
         self.assertTrue((takeover_event.payload or {}).get("compat_replay_owner_only"))
+        self.assertIn("shared_dispatch_signal_enqueued", [row.event_type for row in db.events])
 
     def test_stage_worker_terminal_observed_only_records_fact_and_reconcile_request(self):
         task = BinarySecurityTask(
@@ -363,9 +362,9 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], state_events=[event], stage_runs=[], events=[])
 
         queued = []
-        original_enqueue = self.manager._enqueue_task
+        original_enqueue = self.manager._enqueue_task_with_context
         original_write = self.manager._write_task_metadata_async
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
 
         async def _noop_write(*_args, **_kwargs):
             return None
@@ -376,13 +375,14 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
 
             asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
         finally:
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_task_with_context = original_enqueue
             self.manager._write_task_metadata_async = original_write
 
         self.assertEqual("running", task.status)
         self.assertEqual(["task-1"], queued)
         event_types = [row.event_type for row in db.events]
         self.assertIn("owned_execution_takeover_requeued", event_types)
+        self.assertIn("shared_dispatch_signal_enqueued", event_types)
         self.assertNotIn("task_finished", event_types)
         takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
         self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
@@ -403,8 +403,8 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], events=[])
 
         queued = []
-        original_enqueue = self.manager._enqueue_task
-        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        original_enqueue = self.manager._enqueue_task_with_context
+        self.manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
         try:
             self.manager._request_task_layer_reconcile(
                 db,
@@ -416,13 +416,14 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
                 message="test reconcile request",
             )
         finally:
-            self.manager._enqueue_task = original_enqueue
+            self.manager._enqueue_task_with_context = original_enqueue
 
         self.assertEqual(["task-1"], queued)
-        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_takeover_requeued")
-        self.assertEqual("request_task_layer_reconcile", (takeover_event.payload or {}).get("takeover_action"))
+        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_owner_reconcile_requested")
+        self.assertEqual("notify_owner_reconcile", (takeover_event.payload or {}).get("takeover_action"))
         self.assertEqual("downstream_status_observed", (takeover_event.payload or {}).get("source_event_type"))
         self.assertTrue((takeover_event.payload or {}).get("fact_applied"))
+        self.assertIn("shared_dispatch_signal_enqueued", [row.event_type for row in db.events])
 
     def test_publish_state_event_inbox_metrics_snapshot_lightweight_skips_full_render(self):
         store = AsyncMock()

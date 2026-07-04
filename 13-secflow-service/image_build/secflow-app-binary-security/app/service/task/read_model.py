@@ -212,14 +212,17 @@ class TaskReadModelServiceMixin:
         queue_info = queue_info or {}
         pending_positions = queue_info.get("pending_positions", {}) or {}
         status = str(task.status or "").strip().lower()
+        snapshot = self._parent_runtime_ownership_snapshot(db, task) if db is not None else None
         if status in {"dispatching", "running"}:
-            if task.dispatcher_instance_id or task.lease_expires_at:
+            if snapshot is not None and snapshot.runtime_lease_active:
                 return "dispatching", None
+            if snapshot is not None and (snapshot.row_mirror_owner or snapshot.row_mirror_lease_expires_at):
+                return "leased", "execution_owner_missing"
             return "leased", "execution_owner_missing"
         if status == "pending":
             if task.id in pending_positions:
                 return "queued", None
-            if db is not None and self._task_row_owner_is_runtime_supported(db, task):
+            if snapshot is not None and snapshot.runtime_lease_active:
                 return "dispatching", "pending_task_owned_by_active_runtime"
             return "db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"
         return "idle", None
@@ -1947,6 +1950,7 @@ class TaskReadModelServiceMixin:
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
         task_retry_failed_supported, task_retry_failed_reason, _, _ = self._task_retry_failed_items_support(db, task)
         lease_owner, lease_expires_at, lease_source, lease_pod_uid, lease_boot_id, lease_generation = self._task_runtime_lease_view(db, task)
+        ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
         base_policy = self._task_base_policy(task)
@@ -2043,6 +2047,7 @@ class TaskReadModelServiceMixin:
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
             task_lease_source=lease_source,
+            row_mirror_drift=ownership_snapshot.row_mirror_drift,
             tail_control_mode=str(tail_summary.get("tail_control_mode") or "idle"),
             tail_has_runnable_unbound_items=bool(tail_summary.get("has_runnable_unbound_items")),
             tail_unbound_runnable_item_count=int(tail_summary.get("unbound_runnable_item_count", 0) or 0),
@@ -3419,6 +3424,7 @@ class TaskReadModelServiceMixin:
                 abnormal_reason = None
         tail_summary = self._tail_stage_work_summary(db, task)
         lease_owner, lease_expires_at, lease_source, reconcile_pod_uid_unused, reconcile_boot_id_unused, reconcile_generation_unused = self._task_runtime_lease_view(db, task)
+        ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
         del reconcile_pod_uid_unused, reconcile_boot_id_unused, reconcile_generation_unused
         runtime_phase = self._task_runtime_phase(task)
         task_control_mode = self._task_control_mode(task)
@@ -3490,6 +3496,7 @@ class TaskReadModelServiceMixin:
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
             task_lease_source=lease_source,
+            row_mirror_drift=ownership_snapshot.row_mirror_drift,
             tail_control_mode=str(tail_summary.get("tail_control_mode") or "idle"),
             tail_has_runnable_unbound_items=bool(tail_summary.get("has_runnable_unbound_items")),
             tail_unbound_runnable_item_count=int(tail_summary.get("unbound_runnable_item_count", 0) or 0),
@@ -4291,6 +4298,12 @@ class TaskReadModelServiceMixin:
                 parsed_last_error_at = datetime.fromisoformat(last_error_at)
             except ValueError:
                 parsed_last_error_at = None
+        has_real_downstream_task = bool(str(getattr(item, "downstream_task_id", "") or "").strip())
+        if not has_real_downstream_task:
+            parsed_last_synced_at = None
+            parsed_last_attempt_at = None
+            parsed_last_error_at = None
+            sync_status = "not_applicable"
         first_started_at = self._stage_item_first_started_at(item)
         latest_started_at = item.started_at
         total_retry_count = int(item.retry_count or 0) + int(item.rerun_count or 0)
@@ -4323,6 +4336,8 @@ class TaskReadModelServiceMixin:
             last_success_at=parsed_last_synced_at if isinstance(parsed_last_synced_at, datetime) else None,
             last_error_at=parsed_last_error_at if isinstance(parsed_last_error_at, datetime) else None,
         )
+        if not has_real_downstream_task:
+            freshness_state = "not_applicable"
         authoritative_archive_success = self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs)
         return task_manager_module.BinarySecurityStageItemResponse(
             id=item.id,

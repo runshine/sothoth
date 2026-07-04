@@ -966,9 +966,9 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.json()
         self.assertEqual("manual_confirm", payload["selection_mode"])
-        self.assertEqual("top_n_per_module_by_confidence", payload["auto_selection_strategy"])
-        self.assertEqual(3, payload["auto_selection_top_n"])
         self.assertTrue(payload["requires_confirmation"])
+        self.assertNotIn("auto_selection_strategy", payload)
+        self.assertNotIn("entry_auto_selection_strategy", payload)
         self.assertEqual(("get_module_selection", fake_db, "p1", "t1"), manager.calls[0])
 
     def test_get_task_archive_jobs_route_preserves_filters(self):

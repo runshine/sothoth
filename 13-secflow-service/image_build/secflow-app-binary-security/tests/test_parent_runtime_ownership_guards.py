@@ -1,0 +1,319 @@
+import unittest
+from datetime import timedelta
+
+from app.model import (
+    BinarySecurityTask,
+    BinarySecurityTaskOperation,
+    BinarySecurityTaskRuntimeLease,
+    TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_TYPE_SOURCE,
+)
+from app.service.task_manager import TaskManager, _now
+from test_task_manager import _ModelAwareDb
+
+
+class ParentRuntimeOwnershipGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.manager = TaskManager()
+        self.manager.instance_id = "worker-local"
+
+    def _task(self, **overrides):
+        data = {
+            "id": "task-1",
+            "project_id": "project-1",
+            "name": "task",
+            "status": "running",
+            "task_type": TASK_TYPE_SOURCE,
+            "current_stage": "system_analysis",
+            "firmware_source": "project_filesystem",
+            "firmware_path": "/tmp/fw.bin",
+            "output_root": "/tmp/out",
+            "workspace_root": "/tmp/ws",
+            "runtime_phase": TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            "dispatcher_instance_id": "worker-stale",
+        }
+        data.update(overrides)
+        return BinarySecurityTask(**data)
+
+    def test_parent_runtime_ownership_snapshot_marks_row_mirror_drift_when_runtime_lease_differs(self):
+        task = self._task(lease_expires_at=_now() - timedelta(seconds=30))
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-live",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        snapshot = self.manager._parent_runtime_ownership_snapshot(db, task)
+
+        self.assertTrue(snapshot.runtime_lease_active)
+        self.assertEqual("worker-live", snapshot.runtime_lease_owner)
+        self.assertEqual("worker-stale", snapshot.row_mirror_owner)
+        self.assertTrue(snapshot.row_mirror_drift)
+
+    def test_release_unsupported_task_row_owner_keeps_running_task_when_runtime_lease_active(self):
+        task = self._task(lease_expires_at=_now() - timedelta(seconds=30))
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-live",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        changed = self.manager._release_unsupported_task_row_owner(
+            db,
+            task,
+            reason="unit_test_runtime_lease_active",
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual("running", task.status)
+        self.assertEqual("worker-stale", task.dispatcher_instance_id)
+        event = next(row for row in db.events if row.event_type == "parent_runtime_reopen_suppressed_active_lease")
+        payload = dict(event.payload or {})
+        self.assertTrue(payload.get("runtime_lease_active"))
+        self.assertEqual("worker-live", payload.get("runtime_lease_owner"))
+        self.assertTrue(payload.get("row_mirror_drift"))
+
+    def test_repair_running_lease_invariant_keeps_running_when_local_handle_alive_without_runtime_lease(self):
+        task = self._task(
+            dispatcher_instance_id="worker-local",
+            lease_expires_at=_now() - timedelta(minutes=1),
+            dispatch_started_at=_now() - timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+        self.manager._has_local_task_execution_owner = lambda _task_id: True
+
+        repaired = self.manager._repair_running_lease_invariant(
+            db,
+            task,
+            reason="unit_test_local_handle_alive",
+        )
+
+        self.assertFalse(repaired)
+        self.assertEqual("running", task.status)
+        event = next(row for row in db.events if row.event_type == "running_without_active_lease_repair_suppressed")
+        payload = dict(event.payload or {})
+        self.assertTrue(payload.get("local_handle_alive"))
+        self.assertEqual("worker-local", payload.get("row_mirror_owner"))
+
+    def test_task_queue_state_prefers_runtime_lease_for_pending_task(self):
+        task = self._task(status="pending", dispatcher_instance_id=None, lease_expires_at=None)
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-live",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        queue_state, recoverable_reason = self.manager._task_queue_state(
+            task,
+            {"pending_positions": {}},
+            db=db,
+        )
+
+        self.assertEqual("dispatching", queue_state)
+        self.assertEqual("pending_task_owned_by_active_runtime", recoverable_reason)
+
+    def test_task_queue_state_marks_row_mirror_only_running_task_as_leased(self):
+        task = self._task(
+            status="running",
+            dispatcher_instance_id="worker-stale",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+        queue_state, recoverable_reason = self.manager._task_queue_state(
+            task,
+            {"pending_positions": {}},
+            db=db,
+        )
+
+        self.assertEqual("leased", queue_state)
+        self.assertEqual("execution_owner_missing", recoverable_reason)
+
+    def test_should_skip_readless_reconcile_for_active_task_keeps_runtime_lease_without_row_owner(self):
+        task = self._task(
+            status="cancelling",
+            dispatcher_instance_id=None,
+            lease_expires_at=None,
+        )
+        self.manager._lease_is_active = lambda _task, db=None: True
+
+        supported = self.manager._should_skip_readless_reconcile_for_active_task(task)
+
+        self.assertTrue(supported)
+
+    def test_should_preserve_task_dispatch_ownership_keeps_runtime_lease_without_row_owner(self):
+        task = self._task(
+            status="cancelling",
+            dispatcher_instance_id=None,
+            lease_expires_at=None,
+        )
+        self.manager._lease_is_active = lambda _task, db=None: True
+
+        supported = self.manager._should_preserve_task_dispatch_ownership(
+            task,
+            previous_status="cancelling",
+            db=None,
+        )
+
+        self.assertTrue(supported)
+
+    def test_dispatch_task_by_id_suppresses_fake_local_owner_without_expired_runtime_lease(self):
+        self.manager.instance_id = "local-worker"
+        task = self._task(
+            id="task-fake-owner-dispatch",
+            status="dispatching",
+            current_stage="system_analysis",
+            dispatcher_instance_id="local-worker",
+            current_operation_id="op-queued",
+            lease_expires_at=_now() + timedelta(seconds=120),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-queued",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="retry",
+            status="queued",
+            current_step=None,
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[])
+        self.manager._enqueue_task = lambda _task_id: None
+
+        claimed = self.manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual("dispatching", task.status)
+        self.assertEqual("local-worker", task.dispatcher_instance_id)
+        self.assertTrue(any(event.event_type == "retry_takeover_suppressed_active_lease" for event in db.events))
+
+    def test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease(self):
+        self.manager.instance_id = "local-worker"
+        task = self._task(
+            id="task-release-owner-repair-op",
+            status="running",
+            current_stage="system_analysis",
+            dispatcher_instance_id="old-worker",
+            current_operation_id="op-old",
+            lease_expires_at=_now() + timedelta(seconds=120),
+        )
+        older = BinarySecurityTaskOperation(
+            id="op-old",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="continue",
+            target_stage="system_analysis",
+            status="accepted",
+            created_at=_now() - timedelta(minutes=2),
+            updated_at=_now() - timedelta(minutes=2),
+        )
+        newer = BinarySecurityTaskOperation(
+            id="op-new",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="retry_stage_full",
+            target_stage="system_analysis",
+            status="queued",
+            created_at=_now() - timedelta(minutes=1),
+            updated_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[older, newer], runtime_leases=[], events=[])
+
+        released = self.manager._release_unsupported_task_row_owner(
+            db,
+            task,
+            active_operation=older,
+            reason="unit_test_owner_drift",
+        )
+
+        self.assertFalse(released)
+        self.assertEqual("running", task.status)
+        self.assertEqual("old-worker", task.dispatcher_instance_id)
+        self.assertEqual("op-old", task.current_operation_id)
+        self.assertEqual("accepted", older.status)
+        self.assertIn("parent_runtime_reopen_suppressed_active_lease", [event.event_type for event in db.events])
+
+    def test_release_unsupported_task_row_owner_suppresses_release_with_active_runtime_lease_mismatch(self):
+        self.manager.instance_id = "local-worker"
+        task = self._task(
+            id="task-release-owner-active-runtime",
+            status="running",
+            current_stage="system_analysis",
+            dispatcher_instance_id="worker-stale",
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-live",
+            lease_expires_at=_now() + timedelta(minutes=2),
+            heartbeat_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[], runtime_leases=[runtime_lease], events=[])
+
+        released = self.manager._release_unsupported_task_row_owner(
+            db,
+            task,
+            reason="unit_test_active_runtime_lease_mismatch",
+        )
+
+        self.assertFalse(released)
+        self.assertEqual("running", task.status)
+        self.assertEqual("worker-stale", task.dispatcher_instance_id)
+        event = next(row for row in db.events if row.event_type == "parent_runtime_reopen_suppressed_active_lease")
+        self.assertEqual("worker-live", (event.payload or {}).get("runtime_lease_owner"))
+
+    def test_dispatch_task_by_id_skips_non_pending_task_when_active_runtime_lease_matches_owner(self):
+        self.manager.instance_id = "local-worker"
+        now_value = _now()
+        task = self._task(
+            id="task-active-lease-owned",
+            status="running",
+            current_stage="system_analysis",
+            dispatcher_instance_id="remote-worker",
+            dispatch_started_at=now_value - timedelta(seconds=5),
+            lease_expires_at=now_value + timedelta(seconds=120),
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=1,
+            owner_instance_id="remote-worker",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(seconds=120),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        claimed = self.manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual("running", task.status)
+        self.assertEqual("remote-worker", task.dispatcher_instance_id)
+
+    def test_repair_running_lease_invariant_requeues_after_runtime_lease_expired(self):
+        self.manager.instance_id = "worker-new"
+        task = self._task(
+            id="task-running-lease-expired",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            dispatcher_instance_id="worker-dead",
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-dead",
+            lease_expires_at=_now() - timedelta(minutes=1),
+            heartbeat_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[expired_lease], events=[])
+
+        repaired = self.manager._repair_running_lease_invariant(
+            db,
+            task,
+            reason="unit_test_running_with_expired_lease",
+            stage_name="dataflow_vuln_scan",
+        )
+
+        self.assertTrue(repaired)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))

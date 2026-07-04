@@ -153,100 +153,11 @@ class TaskRuntimeServiceMixin:
         )
         if task is not None:
             shared_dispatch_signal = self._pending_shared_dispatch_signal(task)
-            dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-            local_instance_id = str(self.instance_id or "").strip() or None
-            runtime_phase = self._task_runtime_phase(task)
+            snapshot = self._parent_runtime_ownership_snapshot(db, task)
+            dispatcher_instance_id = snapshot.row_mirror_owner
+            runtime_phase = snapshot.runtime_phase
             task_status = str(getattr(task, "status", "") or "").strip() or None
             owner_runtime_supported = self._task_row_owner_is_runtime_supported(db, task)
-            runtime_lease = self._runtime_lease_for_task(db, normalized_task_id)
-            runtime_lease_active = bool(self._runtime_lease_is_active(runtime_lease))
-            runtime_lease_owner = (
-                str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() or None
-                if runtime_lease is not None
-                else None
-            )
-            local_handle_alive = bool(self._has_local_task_execution_owner(normalized_task_id))
-            should_forward_owner_signal = (
-                normalized_reason in {
-                    "non_pending_task_already_owned_by_supported_runtime",
-                    "task_status_not_pending_without_resumable_operation",
-                    "non_pending_status_without_runtime_resume",
-                }
-                and dispatcher_instance_id
-                and local_instance_id
-                and dispatcher_instance_id != local_instance_id
-                and str(runtime_phase or "").strip() == "owned_execution"
-                and str(task_status or "").strip().lower() not in {"pending", "success", "failed", "cancelled"}
-                and owner_runtime_supported
-                and not runtime_lease_active
-            )
-            if should_forward_owner_signal:
-                self._record_event(
-                    db,
-                    task,
-                    "dispatch_claim_ignored_foreign_owner_signal",
-                    "共享调度队列消费到 foreign-owner 唤醒信号，已按 owner 定向语义忽略",
-                    level="info",
-                    stage_name=task.current_stage,
-                    payload={
-                        "task_id": normalized_task_id,
-                        "reason": normalized_reason,
-                        "dispatcher_instance_id": dispatcher_instance_id,
-                        "target_owner_instance_id": dispatcher_instance_id,
-                        "local_instance_id": local_instance_id,
-                        "runtime_phase": runtime_phase,
-                        "task_status": task_status,
-                        "runtime_lease_active": runtime_lease_active,
-                        "runtime_lease_owner": runtime_lease_owner,
-                        "local_handle_alive": local_handle_alive,
-                        "dropped_message_type": str(shared_dispatch_signal.get("signal_type") or normalized_reason or "unknown_shared_dispatch_signal"),
-                        "shared_dispatch_signal": dict(shared_dispatch_signal or {}),
-                        "signal_channel": "shared_dispatch",
-                        "forwarded_from_shared_dispatch": False,
-                    },
-                )
-                self._clear_pending_shared_dispatch_signal(task)
-                self._enqueue_owner_signal(
-                    dispatcher_instance_id,
-                    normalized_task_id,
-                    context="shared_dispatch_foreign_owner_forward",
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "owner_reconcile_signal_forwarded_to_owner_inbox",
-                    "共享调度队列上的 foreign-owner 唤醒信号已转投当前 owner inbox",
-                    level="info",
-                    stage_name=task.current_stage,
-                    payload={
-                        "task_id": normalized_task_id,
-                        "reason": normalized_reason,
-                        "dispatcher_instance_id": dispatcher_instance_id,
-                        "target_owner_instance_id": dispatcher_instance_id,
-                        "local_instance_id": local_instance_id,
-                        "runtime_phase": runtime_phase,
-                        "task_status": task_status,
-                        "runtime_lease_active": runtime_lease_active,
-                        "runtime_lease_owner": runtime_lease_owner,
-                        "local_handle_alive": local_handle_alive,
-                        "dropped_message_type": str(shared_dispatch_signal.get("signal_type") or normalized_reason or "unknown_shared_dispatch_signal"),
-                        "shared_dispatch_signal": dict(shared_dispatch_signal or {}),
-                        "signal_channel": "owner_inbox",
-                        "forwarded_from_shared_dispatch": True,
-                    },
-                )
-                db.commit()
-                task_manager_module.logger.info(
-                    "binary-security dispatch popped foreign-owner signal and forwarded to owner inbox: task_id=%s "
-                    "reason=%s current_owner=%s local_instance_id=%s status=%s runtime_phase=%s",
-                    normalized_task_id,
-                    normalized_reason,
-                    dispatcher_instance_id,
-                    local_instance_id,
-                    task_status,
-                    runtime_phase,
-                )
-                return
             self._record_event(
                 db,
                 task,
@@ -257,15 +168,23 @@ class TaskRuntimeServiceMixin:
                 payload={
                     "task_id": normalized_task_id,
                     "reason": normalized_reason,
-                    "dropped_message_type": str(shared_dispatch_signal.get("signal_type") or normalized_reason or "unknown_shared_dispatch_signal"),
+                    "dropped_message_type": (
+                        str(shared_dispatch_signal.get("signal_type") or "").strip()
+                        or normalized_reason
+                        or "unknown_shared_dispatch_signal"
+                    ),
                     "shared_dispatch_signal": dict(shared_dispatch_signal or {}),
                     "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    "row_mirror_owner": dispatcher_instance_id,
                     "runtime_phase": runtime_phase,
                     "task_status": task_status,
                     "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
-                    "runtime_lease_active": runtime_lease_active,
-                    "runtime_lease_owner": runtime_lease_owner,
-                    "local_handle_alive": local_handle_alive,
+                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=normalized_reason),
+                    "owner_runtime_supported": owner_runtime_supported,
+                    "signal_type": str(shared_dispatch_signal.get("signal_type") or "").strip() or None,
+                    "enqueue_context": str(shared_dispatch_signal.get("enqueue_context") or "").strip() or None,
+                    "source_event_type": str(shared_dispatch_signal.get("source_event_type") or "").strip() or None,
+                    "decision_reason": normalized_reason,
                     "requeue_after_pop": False,
                 },
             )
@@ -280,9 +199,9 @@ class TaskRuntimeServiceMixin:
                 task_status,
                 runtime_phase,
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                runtime_lease_active,
-                runtime_lease_owner,
-                local_handle_alive,
+                snapshot.runtime_lease_active,
+                snapshot.runtime_lease_owner,
+                snapshot.local_handle_alive,
             )
             return
         task_manager_module.logger.warning(
@@ -2052,6 +1971,53 @@ class TaskRuntimeServiceMixin:
                 should_requeue=False,
             )
             return None
+        final_claim_snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=current_operation)
+        final_claim_guard = self._should_preserve_parent_runtime_ownership(
+            final_claim_snapshot,
+            reason="dispatch_claim_final_guard",
+        )
+        if (
+            final_claim_guard.preserve
+            and final_claim_guard.decision_reason == "row_mirror_guard_active"
+            and current_status != "pending"
+        ):
+            self._record_event(
+                db,
+                task,
+                (
+                    "cancel_takeover_suppressed_active_lease"
+                    if active_operation_type == task_manager_module.TASK_ACTION_CANCEL
+                    else "delete_takeover_suppressed_active_lease"
+                    if active_operation_type == task_manager_module.TASK_ACTION_DELETE
+                    else "retry_takeover_suppressed_active_lease"
+                    if str(active_operation_type or "").startswith("retry")
+                    or active_operation_type in {task_manager_module.TASK_ACTION_CONTINUE, "force_reset_to_pending"}
+                    else "claim_suppressed_row_mirror_guard"
+                ),
+                "任务 row mirror 仍在短保护窗口内，暂不重新 claim",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "decision_reason": final_claim_guard.decision_reason,
+                    **self._parent_runtime_ownership_snapshot_payload(
+                        final_claim_snapshot,
+                        reason="dispatch_claim_final_guard",
+                    ),
+                },
+            )
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="claim_takeover_gate_suppressed_row_mirror_guard",
+                task=task,
+                current_operation=current_operation,
+            )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="claim_takeover_gate_suppressed_row_mirror_guard",
+                should_requeue=False,
+            )
+            return None
         started_at = task_manager_module._now()
         lease_expires_at = self._next_lease_expiry(db, now_value=started_at)
         next_task_status = "dispatching"
@@ -2150,7 +2116,17 @@ class TaskRuntimeServiceMixin:
                 )
                 seen_non_owner_skip_keys.add(skip_key)
                 continue
-            if not task.dispatch_started_at or not self._lease_is_active(task, db=db):
+            ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
+            if (
+                not task.dispatch_started_at
+                or not (
+                    (
+                        ownership_snapshot.runtime_lease_owner == str(self.instance_id or "").strip()
+                        and ownership_snapshot.runtime_lease_active
+                    )
+                    or self._has_local_runtime_owner_fast_path(task, db=db)
+                )
+            ):
                 continue
             if self._stage_item_orchestration_in_retry_backoff(item):
                 continue
@@ -2834,20 +2810,30 @@ class TaskRuntimeServiceMixin:
                         str(getattr(task, "current_operation_id", "") or "").strip()
                     )
                 )
-                or task.dispatcher_instance_id != self.instance_id
-                or not self._lease_is_active(task, db=db)
+                or not (
+                    (
+                        (ownership_snapshot := self._parent_runtime_ownership_snapshot(db, task)).runtime_lease_owner
+                        == str(self.instance_id or "").strip()
+                        and ownership_snapshot.runtime_lease_active
+                    )
+                    or self._has_local_runtime_owner_fast_path(task, db=db)
+                )
             ):
                 if task is not None:
+                    ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
                     task_manager_module.logger.warning(
                         "binary-security run_task exited before switching to running due to failed precondition: "
-                        "task_id=%s status=%s dispatcher_instance_id=%s expected_instance_id=%s lease_active=%s current_operation_id=%s runtime_phase=%s",
+                        "task_id=%s status=%s dispatcher_instance_id=%s expected_instance_id=%s lease_active=%s current_operation_id=%s runtime_phase=%s runtime_lease_owner=%s row_mirror_owner=%s row_mirror_drift=%s",
                         task_id,
                         str(task.status or "").strip(),
                         str(task.dispatcher_instance_id or "").strip(),
                         str(self.instance_id or "").strip(),
-                        self._lease_is_active(task, db=db),
+                        ownership_snapshot.runtime_lease_active,
                         str(getattr(task, "current_operation_id", "") or "").strip(),
                         self._task_runtime_phase(task),
+                        ownership_snapshot.runtime_lease_owner,
+                        ownership_snapshot.row_mirror_owner,
+                        ownership_snapshot.row_mirror_drift,
                     )
                 return
             task_manager_module.logger.info(
@@ -5040,6 +5026,8 @@ class TaskRuntimeServiceMixin:
             line_hint = ""
             if definition_line:
                 line_hint = definition_line if definition_line.upper().startswith("L") else f"L{definition_line}"
+            dataflow_success_statuses = {"passed", "success", "completed_limited"}
+            dataflow_failure_statuses = {"failed", "error", "cancelled", "invalid_input"}
             allow_rebind = not auto_retrying
             if active_payload is not None:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
@@ -5047,8 +5035,8 @@ class TaskRuntimeServiceMixin:
                 self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, None),
-                    success_statuses={"passed", "success"},
-                    failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                    success_statuses=dataflow_success_statuses,
+                    failure_statuses=dataflow_failure_statuses,
                     task=task,
                     item=item,
                 )
@@ -5073,8 +5061,8 @@ class TaskRuntimeServiceMixin:
                         self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses={"passed", "success"},
-                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            success_statuses=dataflow_success_statuses,
+                            failure_statuses=dataflow_failure_statuses,
                             task=task,
                             item=item,
                         )
@@ -5082,7 +5070,7 @@ class TaskRuntimeServiceMixin:
                         session.commit()
                         payload = await self._downstream_fetch_item_payload(task, item, None)
                         downstream_status = str(payload.get("status") or "").lower()
-                        if downstream_status in {"passed", "success"}:
+                        if downstream_status in dataflow_success_statuses:
                             status = "success"
                         elif downstream_status == "cancelled":
                             status = "cancelled"
@@ -5093,7 +5081,7 @@ class TaskRuntimeServiceMixin:
                 elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
                     session.commit()
                     payload = await self._downstream_fetch_item_payload(task, item, None)
-                    status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
+                    status = self._status_from_downstream_payload(payload, success_statuses=dataflow_success_statuses)
                 elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
@@ -5110,8 +5098,8 @@ class TaskRuntimeServiceMixin:
                         self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses={"passed", "success"},
-                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            success_statuses=dataflow_success_statuses,
+                            failure_statuses=dataflow_failure_statuses,
                             task=task,
                             item=item,
                         )
@@ -5122,8 +5110,8 @@ class TaskRuntimeServiceMixin:
                         self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses={"passed", "success"},
-                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            success_statuses=dataflow_success_statuses,
+                            failure_statuses=dataflow_failure_statuses,
                             task=task,
                             item=item,
                         )
@@ -5131,7 +5119,7 @@ class TaskRuntimeServiceMixin:
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         session.commit()
-                        status = self._status_from_downstream_payload(payload, success_statuses={"passed", "success"})
+                        status = self._status_from_downstream_payload(payload, success_statuses=dataflow_success_statuses)
                     elif outcome == "not_found":
                         item.status = "downstream_missing"
                         item.error_message = str(control.get("error_message") or "下游子任务不存在")
@@ -5174,8 +5162,8 @@ class TaskRuntimeServiceMixin:
                         session.commit()
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses={"passed", "success"},
-                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            success_statuses=dataflow_success_statuses,
+                            failure_statuses=dataflow_failure_statuses,
                             task=task,
                             item=item,
                         )
@@ -5238,8 +5226,8 @@ class TaskRuntimeServiceMixin:
                         session.commit()
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses={"passed", "success"},
-                            failure_statuses={"failed", "error", "cancelled", "invalid_input", "completed_limited"},
+                            success_statuses=dataflow_success_statuses,
+                            failure_statuses=dataflow_failure_statuses,
                             task=task,
                             item=item,
                         )

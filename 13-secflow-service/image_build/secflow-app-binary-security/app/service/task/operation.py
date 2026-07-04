@@ -2887,7 +2887,8 @@ class TaskOperationServiceMixin:
                 ):
                     return True
                 return False
-            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
+            if not self._has_local_runtime_owner_fast_path(task, db=db):
+                self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             handle = self._runtime_handle(task_id)
             if (
                 handle is not None
@@ -2955,7 +2956,8 @@ class TaskOperationServiceMixin:
                     )
                     if rebuild_task is None:
                         return False
-                    self._ensure_task_write_ownership(rebuild_task, db=rebuild_db, allow_dispatching=True)
+                    if not self._has_local_runtime_owner_fast_path(rebuild_task, db=rebuild_db):
+                        self._ensure_task_write_ownership(rebuild_task, db=rebuild_db, allow_dispatching=True)
                     await self._prepare_archive_retry_full(rebuild_db, rebuild_task, stage_name)
                     rebuild_db.commit()
                 finally:
@@ -2994,7 +2996,8 @@ class TaskOperationServiceMixin:
                     )
                     if reconcile_task is None:
                         return False
-                    self._ensure_task_write_ownership(reconcile_task, db=reconcile_db, allow_dispatching=True)
+                    if not self._has_local_runtime_owner_fast_path(reconcile_task, db=reconcile_db):
+                        self._ensure_task_write_ownership(reconcile_task, db=reconcile_db, allow_dispatching=True)
                     reconcile_mode = str(signal.get("reconcile_mode") or "").strip().lower()
                     if reconcile_mode == "observe_only":
                         stage_name = str(signal.get("stage_name") or reconcile_task.current_stage or "").strip()
@@ -3049,7 +3052,6 @@ class TaskOperationServiceMixin:
             )
             if task is None:
                 return False
-            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
             task_manager_module.logger.info(
                 "binary-security task owner evaluating current operation: "
@@ -3061,6 +3063,11 @@ class TaskOperationServiceMixin:
                 str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
             )
             if not current_operation_id:
+                if (
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip()
+                    or not self._lease_is_active(task, db=db)
+                ):
+                    self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
                 if self._repair_active_operations_for_task(db, task):
                     task_manager_module.logger.warning(
                         "binary-security task owner repaired active operation binding before execution: "
@@ -3071,6 +3078,7 @@ class TaskOperationServiceMixin:
                     db.commit()
                     return True
                 return False
+            self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
             operation = (
                 db.query(task_manager_module.BinarySecurityTaskOperation)
                 .filter(task_manager_module.BinarySecurityTaskOperation.id == current_operation_id)
@@ -3583,7 +3591,8 @@ class TaskOperationServiceMixin:
                 return False
             if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
                 return False
-            if not self._lease_is_active(task, db=db):
+            ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
+            if not ownership_snapshot.runtime_lease_active:
                 return False
         if target_stage and str(task.current_stage or "").strip() != target_stage:
             return False
@@ -3603,9 +3612,10 @@ class TaskOperationServiceMixin:
             return False
         if str(getattr(task, "current_operation_id", "") or "").strip() != str(getattr(operation, "id", "") or "").strip():
             return False
-        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+        ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=operation)
+        if ownership_snapshot.runtime_lease_owner != str(self.instance_id or "").strip():
             return False
-        if not self._lease_is_active(task, db=db):
+        if not ownership_snapshot.runtime_lease_active:
             return False
         return True
 

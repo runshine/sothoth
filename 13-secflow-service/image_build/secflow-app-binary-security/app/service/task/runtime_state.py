@@ -54,6 +54,34 @@ class TaskLayerReconcileDeliveryDecision:
 
 
 @dataclass
+class ParentRuntimeOwnershipSnapshot:
+    runtime_lease_present: bool
+    runtime_lease_active: bool
+    runtime_lease_owner: str | None
+    runtime_lease_expires_at: str | None
+    row_mirror_owner: str | None
+    row_mirror_lease_expires_at: str | None
+    row_mirror_lease_active: bool
+    local_handle_alive: bool
+    local_streaming_worker_alive: bool
+    runtime_phase: str | None
+    transition_guard_active: bool
+    supported_control_operation_active: bool
+    row_mirror_drift: bool
+    task_status: str | None
+    active_operation_type: str | None
+    active_operation_status: str | None
+    current_operation_id: str | None
+
+
+@dataclass
+class ParentRuntimeOwnershipGuardDecision:
+    preserve: bool
+    decision_reason: str
+    snapshot: ParentRuntimeOwnershipSnapshot
+
+
+@dataclass
 class DeleteQueueConsumeDecision:
     allowed: bool
     reason_code: str
@@ -234,6 +262,156 @@ class TaskRuntimeStateServiceMixin:
             "decision": "allowed" if decision.allowed else "suppressed",
         }
 
+    def _parent_runtime_ownership_snapshot(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        active_operation=None,
+    ) -> ParentRuntimeOwnershipSnapshot:
+        operation = active_operation if active_operation is not None else self._task_active_operation(db, task)
+        runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        runtime_lease_active = bool(self._runtime_lease_is_active(runtime_lease))
+        runtime_lease_owner = (
+            str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() or None
+            if runtime_lease is not None
+            else None
+        )
+        runtime_lease_expires_at = (
+            task_shared._isoformat_or_none(getattr(runtime_lease, "lease_expires_at", None))
+            if runtime_lease is not None
+            else None
+        )
+        row_mirror_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+        row_mirror_lease_expires_at_value = getattr(task, "lease_expires_at", None)
+        row_mirror_lease_expires_at = task_shared._isoformat_or_none(row_mirror_lease_expires_at_value)
+        row_mirror_lease_active = bool(
+            row_mirror_lease_expires_at_value is not None
+            and (task_shared._seconds_until(row_mirror_lease_expires_at_value) or 0) > 0
+        )
+        runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
+        task_status = str(getattr(task, "status", "") or "").strip().lower() or None
+        active_operation_type = str(getattr(operation, "operation_type", "") or "").strip() or None
+        active_operation_status = str(getattr(operation, "status", "") or "").strip().lower() or None
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
+        row_mirror_drift = bool(
+            (runtime_lease_active and runtime_lease_owner != row_mirror_owner)
+            or (runtime_lease_active and runtime_lease_expires_at != row_mirror_lease_expires_at)
+        )
+        return ParentRuntimeOwnershipSnapshot(
+            runtime_lease_present=runtime_lease is not None,
+            runtime_lease_active=runtime_lease_active,
+            runtime_lease_owner=runtime_lease_owner,
+            runtime_lease_expires_at=runtime_lease_expires_at,
+            row_mirror_owner=row_mirror_owner,
+            row_mirror_lease_expires_at=row_mirror_lease_expires_at,
+            row_mirror_lease_active=row_mirror_lease_active,
+            local_handle_alive=bool(self._has_local_task_execution_owner(str(getattr(task, "id", "") or "").strip())),
+            local_streaming_worker_alive=bool(
+                self._task_has_active_streaming_stage_workers(str(getattr(task, "id", "") or "").strip())
+            ),
+            runtime_phase=runtime_phase,
+            transition_guard_active=bool(self._task_runtime_transition_guard_active(task)),
+            supported_control_operation_active=bool(
+                self._task_has_supported_control_operation_runtime(db, task, active_operation=operation)
+            ),
+            row_mirror_drift=row_mirror_drift,
+            task_status=task_status,
+            active_operation_type=active_operation_type,
+            active_operation_status=active_operation_status,
+            current_operation_id=current_operation_id,
+        )
+
+    def _parent_runtime_ownership_snapshot_payload(
+        self: TaskManager,
+        snapshot: ParentRuntimeOwnershipSnapshot,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "reason": str(reason or "").strip() or None,
+            "runtime_lease_present": snapshot.runtime_lease_present,
+            "runtime_lease_active": snapshot.runtime_lease_active,
+            "runtime_lease_owner": snapshot.runtime_lease_owner,
+            "runtime_lease_expires_at": snapshot.runtime_lease_expires_at,
+            "row_mirror_owner": snapshot.row_mirror_owner,
+            "row_mirror_lease_expires_at": snapshot.row_mirror_lease_expires_at,
+            "row_mirror_lease_active": snapshot.row_mirror_lease_active,
+            "local_handle_alive": snapshot.local_handle_alive,
+            "local_streaming_worker_alive": snapshot.local_streaming_worker_alive,
+            "runtime_phase": snapshot.runtime_phase,
+            "transition_guard_active": snapshot.transition_guard_active,
+            "supported_control_operation_active": snapshot.supported_control_operation_active,
+            "row_mirror_drift": snapshot.row_mirror_drift,
+            "task_status": snapshot.task_status,
+            "active_operation_type": snapshot.active_operation_type,
+            "active_operation_status": snapshot.active_operation_status,
+            "current_operation_id": snapshot.current_operation_id,
+        }
+
+    def _should_preserve_parent_runtime_ownership(
+        self: TaskManager,
+        snapshot: ParentRuntimeOwnershipSnapshot,
+        *,
+        reason: str,
+    ) -> ParentRuntimeOwnershipGuardDecision:
+        if snapshot.local_handle_alive:
+            return ParentRuntimeOwnershipGuardDecision(
+                preserve=True,
+                decision_reason="local_handle_alive",
+                snapshot=snapshot,
+            )
+        if snapshot.local_streaming_worker_alive:
+            return ParentRuntimeOwnershipGuardDecision(
+                preserve=True,
+                decision_reason="local_streaming_worker_alive",
+                snapshot=snapshot,
+            )
+        if snapshot.runtime_lease_active:
+            return ParentRuntimeOwnershipGuardDecision(
+                preserve=True,
+                decision_reason="runtime_lease_active",
+                snapshot=snapshot,
+            )
+        if snapshot.supported_control_operation_active:
+            return ParentRuntimeOwnershipGuardDecision(
+                preserve=True,
+                decision_reason="supported_control_operation_active",
+                snapshot=snapshot,
+            )
+        if snapshot.transition_guard_active:
+            return ParentRuntimeOwnershipGuardDecision(
+                preserve=True,
+                decision_reason="transition_guard_active",
+                snapshot=snapshot,
+            )
+        if snapshot.row_mirror_lease_active and (snapshot.row_mirror_owner or snapshot.row_mirror_lease_expires_at):
+            return ParentRuntimeOwnershipGuardDecision(
+                preserve=True,
+                decision_reason="row_mirror_guard_active",
+                snapshot=snapshot,
+            )
+        return ParentRuntimeOwnershipGuardDecision(
+            preserve=False,
+            decision_reason=str(reason or "").strip() or "no_authoritative_runtime_owner",
+            snapshot=snapshot,
+        )
+
+    def _can_reclaim_parent_after_lease_loss(
+        self: TaskManager,
+        snapshot: ParentRuntimeOwnershipSnapshot,
+        *,
+        reason: str,
+    ) -> ParentRuntimeOwnershipGuardDecision:
+        guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
+        if guard.preserve:
+            return guard
+        return ParentRuntimeOwnershipGuardDecision(
+            preserve=False,
+            decision_reason=str(reason or "").strip() or "authoritative_owner_missing_reclaim_allowed",
+            snapshot=snapshot,
+        )
+
     def _delete_queue_consume_decision_payload(
         self: TaskManager,
         decision: DeleteQueueConsumeDecision,
@@ -262,38 +440,29 @@ class TaskRuntimeStateServiceMixin:
         reason: str,
     ) -> LeaseClearDecision:
         active_operation = self._task_active_operation(db, task)
-        active_operation_type = str(getattr(active_operation, "operation_type", "") or "").strip() or None
-        active_operation_status = str(getattr(active_operation, "status", "") or "").strip().lower() or None
-        lease = self._runtime_lease_for_task(db, task.id)
-        runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
-        runtime_lease_expires_at = task_shared._isoformat_or_none(getattr(lease, "lease_expires_at", None)) if lease is not None else None
-        row_lease_expires_at_value = getattr(task, "lease_expires_at", None)
-        row_lease_expires_at = task_shared._isoformat_or_none(row_lease_expires_at_value)
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        task_status = str(getattr(task, "status", "") or "").strip().lower() or None
-        runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
+        snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
+        active_operation_type = snapshot.active_operation_type
+        active_operation_status = snapshot.active_operation_status
+        runtime_lease_owner = snapshot.runtime_lease_owner
+        runtime_lease_expires_at = snapshot.runtime_lease_expires_at
+        row_lease_expires_at = snapshot.row_mirror_lease_expires_at
+        dispatcher_instance_id = snapshot.row_mirror_owner
+        task_status = snapshot.task_status
+        runtime_phase = snapshot.runtime_phase
         task_terminal = bool(task_status in TASK_TERMINAL_STATUSES)
         owner_matches_current_instance = bool(
-            runtime_lease_owner
-            and runtime_lease_owner == str(self.instance_id or "").strip()
-        )
-        lease_active = bool(lease is not None and self._runtime_lease_is_active(lease))
-        row_lease_active = bool(
-            row_lease_expires_at_value is not None
-            and (task_shared._seconds_until(row_lease_expires_at_value) or 0) > 0
-        )
-        row_lease_expired = bool(
-            row_lease_expires_at_value is not None
-            and not row_lease_active
+            runtime_lease_owner and runtime_lease_owner == str(self.instance_id or "").strip()
         )
         # 仅当 runtime_lease 活跃时才判 "active"；无 runtime_lease 时 task 行 lease
         # 只是陈旧残留（owner 已死/无主），不应阻塞回收——否则孤儿 owner 要等
         # task 行 lease TTL 过期才被回收（rollout/崩溃后卡 ~300s）。
         lease_state = (
             "active"
-            if lease_active
+            if snapshot.runtime_lease_active
+            else "row_guard"
+            if snapshot.row_mirror_lease_active
             else "expired"
-            if (lease is not None or row_lease_expired)
+            if snapshot.runtime_lease_present or row_lease_expires_at
             else "missing"
         )
         if task_terminal and owner_matches_current_instance:
@@ -328,7 +497,10 @@ class TaskRuntimeStateServiceMixin:
                 row_lease_expires_at=row_lease_expires_at,
                 dispatcher_instance_id=dispatcher_instance_id,
             )
-        if lease_state == "active":
+        preserve = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
+        if preserve.preserve:
+            reason_code = f"{preserve.decision_reason}_blocks_owner_clear"
+        elif lease_state == "active":
             reason_code = "active_runtime_lease_non_owner" if not owner_matches_current_instance else "active_runtime_lease_owner_nonterminal"
         else:
             reason_code = "runtime_lease_missing_nonterminal"
@@ -467,6 +639,8 @@ class TaskRuntimeStateServiceMixin:
         lease_state = (
             "active"
             if lease_active
+            else "row_guard"
+            if row_lease_active
             else "expired"
             if (lease is not None or row_lease_expired)
             else "missing"
@@ -581,6 +755,8 @@ class TaskRuntimeStateServiceMixin:
         lease_state = (
             "active"
             if lease_active
+            else "row_guard"
+            if row_lease_active
             else "expired"
             if (lease is not None or row_lease_expired)
             else "missing"
@@ -1696,8 +1872,46 @@ class TaskRuntimeStateServiceMixin:
     ) -> None:
         if bool(getattr(task, "_owned_execution_requeue_emitted", False)):
             return
+        snapshot = self._parent_runtime_ownership_snapshot(db, task)
+        preserve_guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
         decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
         if not decision.allowed:
+            if preserve_guard.preserve and preserve_guard.decision_reason == "row_mirror_guard_active":
+                preferred_stage_name = (
+                    str(getattr(task, "_preferred_requeue_event_stage_name", "") or "").strip()
+                    or (stage_name or task.current_stage)
+                )
+                self._apply_active_owned_execution_main_state(
+                    db,
+                    task,
+                    source="runtime_state",
+                    reason="owned execution 接管重排队被 row mirror 保护窗口抑制，保持运行态",
+                    status="running",
+                    stage_name=str(preferred_stage_name or task.current_stage or "").strip() or None,
+                    runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                    finished_at=None,
+                    last_error=None,
+                    record_blocked_event=False,
+                )
+                self._record_parent_runtime_lease_decision(
+                    db,
+                    task,
+                    event_type=(
+                        "cancel_takeover_suppressed_active_lease"
+                        if decision.active_operation_type == "cancel"
+                        else "delete_takeover_suppressed_active_lease"
+                        if decision.active_operation_type == "delete"
+                        else "retry_takeover_suppressed_active_lease"
+                        if str(decision.active_operation_type or "").startswith("retry")
+                        or decision.active_operation_type in {"continue", "force_reset_to_pending"}
+                        else "parent_runtime_reopen_suppressed_active_lease"
+                    ),
+                    message="父任务 row mirror 仍在保护窗口内，当前不允许重新排队接管",
+                    decision=decision,
+                    reason=reason,
+                    stage_name=stage_name,
+                )
+                return
             self._record_parent_runtime_lease_decision(
                 db,
                 task,
@@ -1934,36 +2148,14 @@ class TaskRuntimeStateServiceMixin:
                 "state_event_id": str(state_event_id or "").strip() or None,
             },
         )
-        if observe_only:
-            self._record_event(
-                db,
-                task,
-                "owner_reconcile_signal_enqueued",
-                "已向当前 owner worker 投递任务层收口唤醒信号",
-                level="info",
-                stage_name=signal_stage_name,
-                payload={
-                    "task_id": str(getattr(task, "id", "") or "").strip() or None,
-                    "target_owner_instance_id": target_owner_instance_id,
-                    "local_instance_id": str(self.instance_id or "").strip() or None,
-                    "signal_channel": delivery_decision.delivery_channel,
-                    "reconcile_reason": reconcile_reason,
-                    "decision_reason": delivery_decision.decision_reason,
-                    "source_event_type": str(source_event_type or "").strip() or None,
-                },
-            )
-            self._enqueue_owner_signal(
-                target_owner_instance_id,
-                task.id,
-                context="owner_reconcile_signal_enqueue",
-            )
-            return
         if delivery_decision.delivery_channel == "owner_inbox" and target_owner_instance_id:
             self._record_event(
                 db,
                 task,
                 "owner_reconcile_signal_enqueued",
-                "已向当前 owner worker 投递可执行的任务层收口信号",
+                "已向当前 owner worker 投递任务层收口唤醒信号"
+                if observe_only
+                else "已向当前 owner worker 投递可执行的任务层收口信号",
                 level="info",
                 stage_name=signal_stage_name,
                 payload={
@@ -1974,7 +2166,7 @@ class TaskRuntimeStateServiceMixin:
                     "reconcile_reason": reconcile_reason,
                     "decision_reason": delivery_decision.decision_reason,
                     "source_event_type": str(source_event_type or "").strip() or None,
-                    "reconcile_mode": "allow_execution",
+                    "reconcile_mode": "observe_only" if observe_only else "allow_execution",
                 },
             )
             self._enqueue_owner_signal(
@@ -1995,7 +2187,7 @@ class TaskRuntimeStateServiceMixin:
                 "state_event_id": str(state_event_id or "").strip() or None,
                 "decision_reason": delivery_decision.decision_reason,
                 "delivery_channel": delivery_decision.delivery_channel,
-                "reconcile_mode": "allow_execution",
+                "reconcile_mode": "observe_only" if observe_only else "allow_execution",
             },
         )
         self._record_event(
@@ -2031,27 +2223,12 @@ class TaskRuntimeStateServiceMixin:
             else None
         )
         source_event_type_normalized = str(source_event_type or "").strip() or None
-        owner_local_reconcile_event = bool(
-            source_event_type_normalized
-            and any(
-                token in source_event_type_normalized
-                for token in (
-                    "owner",
-                    "state_event",
-                    "archive",
-                    "item_sync",
-                    "operation",
-                    "fact_apply",
-                    "reconcile",
-                )
-            )
-        )
         observe_only = not self._task_layer_reconcile_requires_execution(
             source_event_type=source_event_type_normalized,
             reconcile_reason=reconcile_reason,
         )
 
-        target_owner_instance_id = runtime_lease_owner or dispatcher_instance_id
+        target_owner_instance_id = runtime_lease_owner
         if runtime_lease_owner:
             return TaskLayerReconcileDeliveryDecision(
                 delivery_channel="owner_inbox",
@@ -2063,48 +2240,10 @@ class TaskRuntimeStateServiceMixin:
                 task_status=task_status,
                 runtime_phase=runtime_phase,
             )
-        if dispatcher_instance_id and task_status not in TASK_TERMINAL_STATUSES:
-            return TaskLayerReconcileDeliveryDecision(
-                delivery_channel="owner_inbox",
-                observe_only=observe_only,
-                decision_reason="dispatcher_owner_present",
-                target_owner_instance_id=target_owner_instance_id,
-                runtime_lease_owner=runtime_lease_owner,
-                dispatcher_instance_id=dispatcher_instance_id,
-                task_status=task_status,
-                runtime_phase=runtime_phase,
-            )
-        if (
-            runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            and task_status
-            and task_status != "pending"
-            and owner_local_reconcile_event
-        ):
-            return TaskLayerReconcileDeliveryDecision(
-                delivery_channel="owner_inbox",
-                observe_only=observe_only,
-                decision_reason="owned_execution_non_pending_reconcile_owner_preferred",
-                target_owner_instance_id=target_owner_instance_id,
-                runtime_lease_owner=runtime_lease_owner,
-                dispatcher_instance_id=dispatcher_instance_id,
-                task_status=task_status,
-                runtime_phase=runtime_phase,
-            )
-        if owner_local_reconcile_event and runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION and task_status != "pending":
-            return TaskLayerReconcileDeliveryDecision(
-                delivery_channel="owner_inbox",
-                observe_only=observe_only,
-                decision_reason="owned_execution_reconcile_without_row_owner_prefers_owner_channel",
-                target_owner_instance_id=target_owner_instance_id,
-                runtime_lease_owner=runtime_lease_owner,
-                dispatcher_instance_id=dispatcher_instance_id,
-                task_status=task_status,
-                runtime_phase=runtime_phase,
-            )
         return TaskLayerReconcileDeliveryDecision(
             delivery_channel="shared_dispatch",
-            observe_only=False,
-            decision_reason="pending_task_without_owner_requires_shared_dispatch",
+            observe_only=observe_only,
+            decision_reason="runtime_lease_owner_missing_requires_shared_dispatch",
             target_owner_instance_id=target_owner_instance_id,
             runtime_lease_owner=runtime_lease_owner,
             dispatcher_instance_id=dispatcher_instance_id,
@@ -2195,40 +2334,40 @@ class TaskRuntimeStateServiceMixin:
 
         if not self._running_task_requires_live_runtime_lease(db, task):
             return False
-        if self._running_task_has_valid_runtime_ownership(db, task):
+        snapshot = self._parent_runtime_ownership_snapshot(db, task)
+        if snapshot.runtime_lease_active:
+            return False
+        guard = self._can_reclaim_parent_after_lease_loss(snapshot, reason=reason)
+        if snapshot.local_handle_alive:
+            self._record_event(
+                db,
+                task,
+                "running_without_active_lease_repair_suppressed",
+                "检测到本地执行句柄仍然存活，暂不执行 lease invariant 修复",
+                level="warning",
+                stage_name=stage_name or str(task.current_stage or "").strip() or None,
+                payload={
+                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=reason),
+                    **(event_payload or {}),
+                },
+            )
+            return False
+        if guard.preserve:
+            self._record_event(
+                db,
+                task,
+                "running_without_active_lease_repair_suppressed",
+                "检测到 authoritative runtime ownership 仍需保留，暂不执行 lease invariant 修复",
+                level="warning",
+                stage_name=stage_name or str(task.current_stage or "").strip() or None,
+                payload={
+                    "decision_reason": guard.decision_reason,
+                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=reason),
+                    **(event_payload or {}),
+                },
+            )
             return False
         decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
-        if self._task_runtime_owner_matches_current_instance(db, task):
-            self._record_event(
-                db,
-                task,
-                "running_without_active_lease_repair_suppressed",
-                "检测到当前实例 runtime lease 仍具权威性，暂不执行 lease invariant 修复",
-                level="warning",
-                stage_name=stage_name or str(task.current_stage or "").strip() or None,
-                payload={
-                    "reason": reason,
-                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                    **(event_payload or {}),
-                },
-            )
-            return False
-        if self._task_runtime_transition_guard_active(task):
-            guard = self._task_runtime_transition_guard(task)
-            self._record_event(
-                db,
-                task,
-                "running_without_active_lease_repair_suppressed",
-                "检测到阶段切换保护窗口，暂不执行 lease invariant 修复",
-                level="warning",
-                stage_name=stage_name or str(task.current_stage or "").strip() or None,
-                payload={
-                    "reason": reason,
-                    "guard": guard,
-                    **(event_payload or {}),
-                },
-            )
-            return False
         if not decision.allowed:
             self._record_parent_runtime_lease_decision(
                 db,

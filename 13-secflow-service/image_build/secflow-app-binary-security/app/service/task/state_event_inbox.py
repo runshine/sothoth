@@ -167,23 +167,17 @@ class TaskStateEventInboxServiceMixin:
                 task_manager_module.BinarySecurityTask.id == event.task_id
             ).first()
             if task is not None:
-                runtime_lease = self._runtime_lease_for_task(db, task.id)
-                lease_owner = str(getattr(runtime_lease, "owner_instance_id", "") or "").strip()
-                dispatcher_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+                ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
+                lease_owner = str(ownership_snapshot.runtime_lease_owner or "").strip()
+                dispatcher_owner = str(ownership_snapshot.row_mirror_owner or "").strip()
                 local_owner_active = bool(
-                    (lease_owner == str(self.instance_id or "").strip() and self._runtime_lease_is_active(runtime_lease))
-                    or (
-                        dispatcher_owner == str(self.instance_id or "").strip()
-                        and self._lease_is_active(task, db=db)
-                    )
+                    ownership_snapshot.runtime_lease_active
+                    and lease_owner == str(self.instance_id or "").strip()
                 )
                 foreign_owner_active = bool(
-                    (lease_owner and lease_owner != str(self.instance_id or "").strip() and self._runtime_lease_is_active(runtime_lease))
-                    or (
-                        dispatcher_owner
-                        and dispatcher_owner != str(self.instance_id or "").strip()
-                        and self._lease_is_active(task, db=db)
-                    )
+                    ownership_snapshot.runtime_lease_active
+                    and lease_owner
+                    and lease_owner != str(self.instance_id or "").strip()
                 )
                 if (
                     not local_owner_active
@@ -225,6 +219,9 @@ class TaskStateEventInboxServiceMixin:
                             "forward_reason": "foreign_owner_active" if foreign_owner_active else "owner_not_active_on_replay_path",
                             "runtime_lease_owner": lease_owner or None,
                             "dispatcher_instance_id": dispatcher_owner or None,
+                            "runtime_lease_active": ownership_snapshot.runtime_lease_active,
+                            "row_mirror_owner": ownership_snapshot.row_mirror_owner,
+                            "row_mirror_drift": ownership_snapshot.row_mirror_drift,
                         },
                     )
                     observe_state_owner_event(event.event_type, "forwarded")

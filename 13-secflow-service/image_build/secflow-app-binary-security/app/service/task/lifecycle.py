@@ -1109,10 +1109,8 @@ class TaskLifecycleServiceMixin:
                 item = db.query(task_manager_module.BinarySecurityStageItem).filter(task_manager_module.BinarySecurityStageItem.id == job.item_id).first()
                 attempts = int(job.attempts or 0)
                 owner_before = str(job.owner_id or "").strip() or None
-                has_active_task_owner = bool(
-                    str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-                    and self._lease_is_active(task, db=db)
-                )
+                ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
+                has_active_task_owner = bool(ownership_snapshot.runtime_lease_active)
                 if has_active_task_owner:
                     job.archive_status = "failed"
                     job.error_message = "archive worker lost after claim; delegated to task owner repair"
@@ -1131,6 +1129,9 @@ class TaskLifecycleServiceMixin:
                             "rebuild_mode": "failed_items",
                             "resolution_reason": "stale_running_archive_job",
                             "timeout_seconds": timeout_seconds,
+                            "runtime_lease_owner": ownership_snapshot.runtime_lease_owner,
+                            "row_mirror_owner": ownership_snapshot.row_mirror_owner,
+                            "row_mirror_drift": ownership_snapshot.row_mirror_drift,
                         },
                     )
                     self._record_event(

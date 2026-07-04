@@ -2203,8 +2203,9 @@ class TaskManager(
             task_id = str(getattr(task, "id", "") or "").strip()
             project_id = str(getattr(task, "project_id", "") or "").strip()
             if task_id and project_id:
-                session = get_session_factory()()
+                session = None
                 try:
+                    session = get_session_factory()()
                     current_task = (
                         session.query(BinarySecurityTask)
                         .filter(
@@ -2217,8 +2218,17 @@ class TaskManager(
                         cleanup_snapshot = getattr(current_task, "cleanup_snapshot", None)
                         if isinstance(cleanup_snapshot, dict) and bool(cleanup_snapshot.get("delete_in_progress")):
                             delete_in_progress = True
+                except Exception as exc:
+                    logger.warning(
+                        "binary-security workspace delete guard lookup failed: task_id=%s project_id=%s purpose=%s error=%s",
+                        task_id,
+                        project_id,
+                        str(purpose or "").strip() or "unknown",
+                        str(exc),
+                    )
                 finally:
-                    session.close()
+                    if session is not None:
+                        session.close()
         if not delete_in_progress:
             return True
         logger.info(
@@ -3270,28 +3280,22 @@ class TaskManager(
     ) -> bool:
         if task is None:
             return False
-        operation = active_operation
-        if operation is None:
-            current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
-            if current_operation_id:
-                operation = (
-                    db.query(BinarySecurityTaskOperation)
-                    .filter(BinarySecurityTaskOperation.id == current_operation_id)
-                    .first()
-                )
-        operation_status = str(getattr(operation, "status", "") or "").strip().lower() if operation is not None else ""
-        has_active_operation = operation_status in TASK_OPERATION_ACTIVE_STATUSES
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-        if not dispatcher_instance_id:
-            task_status = str(getattr(task, "status", "") or "").strip().lower()
-            if task_status == "pending":
+        snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
+        if snapshot.runtime_lease_active:
+            return bool(
+                snapshot.row_mirror_owner
+                and snapshot.runtime_lease_owner
+                and snapshot.row_mirror_owner == snapshot.runtime_lease_owner
+            )
+        if not snapshot.row_mirror_owner:
+            if snapshot.task_status == "pending":
                 return False
-            return not has_active_operation
-        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
-        return bool(
-            self._runtime_lease_is_active(lease)
-            and str(getattr(lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
-        )
+            return not (
+                snapshot.active_operation_status in TASK_OPERATION_ACTIVE_STATUSES
+                if snapshot.active_operation_status is not None
+                else False
+            )
+        return False
 
     def _release_unsupported_task_row_owner(
         self,
@@ -3301,16 +3305,13 @@ class TaskManager(
         active_operation=None,
         reason: str,
     ) -> bool:
-        previous_dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
-        active_runtime_lease_owner = (
-            str(getattr(lease, "owner_instance_id", "") or "").strip() or None
-            if self._runtime_lease_is_active(lease)
-            else None
-        )
+        snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
+        previous_dispatcher_instance_id = snapshot.row_mirror_owner
+        active_runtime_lease_owner = snapshot.runtime_lease_owner if snapshot.runtime_lease_active else None
         if previous_dispatcher_instance_id is None and active_runtime_lease_owner is None:
             return False
-        if self._task_has_supported_control_operation_runtime(db, task, active_operation=active_operation):
+        guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
+        if guard.preserve and snapshot.supported_control_operation_active:
             self._record_event(
                 db,
                 task,
@@ -3324,10 +3325,25 @@ class TaskManager(
                     "dispatcher_instance_id": previous_dispatcher_instance_id,
                     "active_runtime_lease_owner": active_runtime_lease_owner,
                     "operation_runtime": self._operation_runtime_snapshot(active_operation),
+                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=reason),
                 },
             )
             return False
         if self._task_row_owner_is_runtime_supported(db, task, active_operation=active_operation):
+            return False
+        if guard.preserve:
+            self._record_event(
+                db,
+                task,
+                "parent_runtime_reopen_suppressed_active_lease",
+                "父任务 authoritative runtime ownership 仍有效，不释放任务 owner",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "decision_reason": guard.decision_reason,
+                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=reason),
+                },
+            )
             return False
         decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
         if not decision.allowed:
@@ -4306,11 +4322,16 @@ class TaskManager(
         try:
             row = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
             current_token = row.dispatch_started_at.isoformat() if row and row.dispatch_started_at else None
+            ownership_snapshot = (
+                self._parent_runtime_ownership_snapshot(session, row)
+                if row is not None
+                else None
+            )
             if (
                 row is None
-                or row.dispatcher_instance_id != expected_dispatcher_id
+                or (ownership_snapshot is None or ownership_snapshot.runtime_lease_owner != expected_dispatcher_id)
                 or current_token != expected_token
-                or not self._lease_is_active(row)
+                or not (ownership_snapshot and ownership_snapshot.runtime_lease_active)
             ):
                 raise StaleTaskExecution(f"任务 {task.id} 当前执行 token 已失效")
         finally:
@@ -4662,9 +4683,18 @@ class TaskManager(
         allow_dispatching: bool = False,
     ) -> bool:
         del allow_dispatching
-        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+        if db is None:
+            session = get_session_factory()()
+            try:
+                db = session
+                snapshot = self._parent_runtime_ownership_snapshot(db, task)
+            finally:
+                session.close()
+        else:
+            snapshot = self._parent_runtime_ownership_snapshot(db, task)
+        if snapshot.runtime_lease_owner != str(self.instance_id or "").strip():
             return False
-        if not self._lease_is_active(task, db=db):
+        if not snapshot.runtime_lease_active:
             return False
         return True
 
@@ -4677,6 +4707,17 @@ class TaskManager(
     ) -> None:
         if not self._has_task_write_ownership(task, db=db, allow_dispatching=allow_dispatching):
             raise StaleTaskExecution(f"任务 {task.id} 当前 owner/lease 已失效，禁止继续写入状态")
+
+    def _has_local_runtime_owner_fast_path(
+        self,
+        task: BinarySecurityTask,
+        db: Session | None = None,
+    ) -> bool:
+        if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+            return False
+        if self._has_local_task_execution_owner(str(getattr(task, "id", "") or "").strip()):
+            return True
+        return self._lease_is_active(task, db=db)
 
     async def _ensure_task_write_ownership_async(
         self,
@@ -5139,14 +5180,12 @@ class TaskManager(
         return mode
 
     def _entry_auto_selection_strategy(self, task: BinarySecurityTask) -> str:
-        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
-            return ENTRY_AUTO_SELECTION_STRATEGY_ALL
-        strategy = str((task.policy or {}).get("entry_auto_selection_strategy") or ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE).strip()
+        strategy = str((task.policy or {}).get("entry_auto_selection_strategy") or ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
         if strategy not in {
             ENTRY_AUTO_SELECTION_STRATEGY_ALL,
             ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE,
         }:
-            return ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE
+            return ENTRY_AUTO_SELECTION_STRATEGY_ALL
         return strategy
 
     def _entry_auto_selection_top_n(self, task: BinarySecurityTask) -> int:
@@ -5425,6 +5464,13 @@ class TaskManager(
         return [dict(module) for module in self._entry_result_success_modules(task, db)]
 
     def _rank_entry_confidence(self, entry: dict[str, Any]) -> float:
+        confidence = str(entry.get("confidence") or "").strip().lower()
+        if confidence == "high":
+            return 3.0
+        if confidence == "medium":
+            return 2.0
+        if confidence == "low":
+            return 1.0
         try:
             raw = entry.get("entry_confidence")
             if raw is None:
@@ -5432,6 +5478,59 @@ class TaskManager(
             return max(0.0, float(raw))
         except (TypeError, ValueError):
             return 0.0
+
+    def _select_auto_entries_for_kg_task(
+        self,
+        task: BinarySecurityTask,
+        entries: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        strategy = self._entry_auto_selection_strategy(task)
+        top_n = self._entry_auto_selection_top_n(task)
+        normalized_entries = _deduplicate_entry_keys(
+            [dict(entry) for entry in entries if isinstance(entry, dict)]
+        )
+        if strategy == ENTRY_AUTO_SELECTION_STRATEGY_ALL:
+            return normalized_entries, {
+                "auto_selection_strategy": strategy,
+                "auto_selection_top_n": 0,
+                "selection_source": "auto_policy",
+                "candidate_entries": normalized_entries,
+                "candidate_entries_by_module": [
+                    {
+                        "module_key": "knowledge-graph-source-project",
+                        "module_name": "source-project",
+                        "raw_entry_count": len(normalized_entries),
+                        "selected_entry_count": len(normalized_entries),
+                        "truncated": False,
+                    }
+                ],
+                "truncated_module_count": 0,
+            }
+        sorted_entries = sorted(
+            normalized_entries,
+            key=lambda entry: (
+                -self._rank_entry_confidence(entry),
+                str(entry.get("entry_key") or "").strip(),
+                str(entry.get("function_name") or "").strip(),
+            ),
+        )
+        selected = sorted_entries[:top_n]
+        return selected, {
+            "auto_selection_strategy": strategy,
+            "auto_selection_top_n": top_n,
+            "selection_source": "auto_policy",
+            "candidate_entries": selected,
+            "candidate_entries_by_module": [
+                {
+                    "module_key": "knowledge-graph-source-project",
+                    "module_name": "source-project",
+                    "raw_entry_count": len(sorted_entries),
+                    "selected_entry_count": len(selected),
+                    "truncated": len(sorted_entries) > len(selected),
+                }
+            ],
+            "truncated_module_count": 1 if len(sorted_entries) > len(selected) else 0,
+        }
 
     def _normalize_module_selection_entries(
         self,
@@ -5603,7 +5702,9 @@ class TaskManager(
                 [dict(item) for item in candidate_entries if isinstance(item, dict)],
             )
         if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
-            return self._entry_module_flow_inputs(task, db)
+            entries = self._entry_module_flow_inputs(task, db)
+            selected_entries, _snapshot = self._select_auto_entries_for_kg_task(task, entries)
+            return selected_entries
         modules = self._entry_modules_for_selection(task, db)
         selected_entries, _snapshot = self._select_auto_entries_per_module(task, modules, db)
         return selected_entries
@@ -8856,13 +8957,13 @@ class TaskManager(
             return "dispatching"
         if normalized in {"running", "processing", "in_progress", "cancelling", "started"}:
             return "running"
-        if normalized in {"success", "succeeded", "passed", "completed", "complete", "done"}:
+        if normalized in {"success", "succeeded", "passed", "completed", "complete", "done", "completed_limited"}:
             return "success"
         if normalized == "partial_success":
             return "partial_success"
         if normalized == "skipped":
             return "failed"
-        if normalized in {"invalid_input", "completed_limited"}:
+        if normalized == "invalid_input":
             return "failed"
         if normalized in {"failed", "error", "failure"}:
             return "failed"
@@ -9222,8 +9323,6 @@ class TaskManager(
         return summary
 
     def _should_skip_readless_reconcile_for_active_task(self, task: BinarySecurityTask) -> bool:
-        if not str(task.dispatcher_instance_id or "").strip():
-            return False
         return self._lease_is_active(task)
 
     def _should_preserve_task_dispatch_ownership(
@@ -9234,8 +9333,6 @@ class TaskManager(
         db: Session | None = None,
     ) -> bool:
         del previous_status
-        if not str(task.dispatcher_instance_id or "").strip():
-            return False
         return self._lease_is_active(task, db=db)
 
     def _stage_items(self, db: Session, task_id: str, stage_name: str) -> list[BinarySecurityStageItem]:

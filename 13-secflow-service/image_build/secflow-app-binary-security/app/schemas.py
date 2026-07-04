@@ -222,6 +222,7 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     task_lease_owner_instance_id: Optional[str] = None
     task_lease_expires_at: Optional[datetime] = None
     task_lease_source: Optional[str] = None
+    row_mirror_drift: bool = False
     tail_control_mode: str = "idle"
     tail_has_runnable_unbound_items: bool = False
     tail_unbound_runnable_item_count: int = 0
@@ -257,8 +258,8 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     selected_risk_levels: list[str] = Field(default_factory=list)
     module_selection_mode: str = "auto"
     entry_selection_mode: str = "auto"
-    entry_auto_selection_strategy: str = "top_n_per_module_by_confidence"
-    entry_auto_selection_top_n: int = 20
+    entry_auto_selection_strategy: str = "all"
+    entry_auto_selection_top_n: int = 0
     candidate_entry_count: int = 0
     selected_entry_count: int = 0
     entry_count: int = 0
@@ -953,8 +954,8 @@ class BinarySecurityEntrySelectionResponse(BinarySecurityBaseModel):
     task_id: str
     status: str
     selection_mode: str = "auto"
-    auto_selection_strategy: str = "top_n_per_module_by_confidence"
-    auto_selection_top_n: int = 20
+    auto_selection_strategy: str = "all"
+    auto_selection_top_n: int = 0
     requires_confirmation: bool = False
     candidate_entries: list[dict[str, Any]] = Field(default_factory=list)
     selected_entry_keys: list[str] = Field(default_factory=list)
@@ -972,6 +973,9 @@ class BinarySecurityTaskPolicyConfigPayload(BinarySecurityBaseModel):
     max_stage_parallelism: int = Field(default=5, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
     continue_on_item_failure: bool = True
+    entry_selection_mode: str = Field(default="auto")
+    entry_auto_selection_strategy: str = Field(default="all")
+    entry_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
     partial_success_stage_advancement: dict[str, bool] = Field(
         default_factory=lambda: {
             "binary_to_source": True,
@@ -1020,6 +1024,9 @@ class BinarySecurityGlobalConfigPayload(BinarySecurityBaseModel):
     max_stage_parallelism: int = Field(default=5, ge=1, le=32)
     max_retries_per_item: int = Field(default=2, ge=0, le=20)
     continue_on_item_failure: bool = True
+    entry_selection_mode: str = Field(default="auto")
+    entry_auto_selection_strategy: str = Field(default="all")
+    entry_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
     partial_success_stage_advancement: dict[str, bool] = Field(
         default_factory=lambda: {
             "binary_to_source": True,

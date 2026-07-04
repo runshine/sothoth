@@ -723,9 +723,8 @@ class TaskItemSyncServiceMixin:
             return False
         if self._has_local_task_execution_owner(task.id):
             return self._task_has_stale_active_reconcile_items(db, task)
-        if not str(task.dispatcher_instance_id or "").strip():
-            return True
-        if not self._lease_is_active(task, db=db):
+        ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
+        if not ownership_snapshot.runtime_lease_active:
             return True
         lease = self._runtime_lease_for_task(db, task.id)
         heartbeat_at = (lease.heartbeat_at if lease is not None else None) or task.updated_at or task.dispatch_started_at

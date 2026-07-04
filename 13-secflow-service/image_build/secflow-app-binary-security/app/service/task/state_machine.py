@@ -3220,6 +3220,38 @@ class TaskStateMachineMixin:
                 _normalize_running_lease_invariant("refresh_task_status_after_sync_early_return")
                 return
             stage_runs = self._refresh_task_status_after_sync_refresh_authoritative_stages(db, task)
+            failed_stage_run = next(
+                (run for run in stage_runs if str(run.status or "").strip() in {"failed", "downstream_missing", "cancelled"}),
+                None,
+            )
+            if failed_stage_run is not None:
+                failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
+                recoverable_owner_lost = any(
+                    self._owner_lost_retry_exhausted(task, item) is False
+                    and self._is_owner_lost_recoverable_failure(
+                        failure_message=str(item.error_message or "").strip() or None,
+                        failure_category=self._stage_failure_snapshot(task, failed_stage_run).get("failure_category"),
+                        error_type=self._stage_item_sync_error_type_value(item),
+                        item=item,
+                    )
+                    for item in failed_items
+                )
+                if recoverable_owner_lost and self._task_runtime_owner_matches_current_instance(db, task):
+                    self._apply_task_main_state_update(
+                        db,
+                        task,
+                        source="state_machine",
+                        reason="owner lost 可恢复，当前 owner 仍有效，保持运行态等待恢复",
+                        status="running",
+                        stage_name=failed_stage_run.stage_name or task.current_stage,
+                        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                        finished_at=None,
+                        last_error=None,
+                        clear_runtime_owner=False,
+                    )
+                    self._clear_task_failure_state(task)
+                    self._clear_task_abnormal_reason_snapshot(db, task)
+                    return
             workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
             if self._workflow_success_overridden_by_terminal_dataflow(db, task, workflow_snapshots):
                 self._finalize_task(db, task)
@@ -3335,6 +3367,53 @@ class TaskStateMachineMixin:
                     )
                     return
             if current_status not in TASK_TERMINAL_STATUSES:
+                current_stage_items = self._stage_items(db, task.id, str(task.current_stage or "").strip())
+                if (
+                    str(task.status or "").strip() == "dispatching"
+                    and self._task_runtime_owner_matches_current_instance(db, task)
+                    and any(str(item.status or "").strip() in {"running", "dispatching"} for item in current_stage_items)
+                ):
+                    previous_status = str(task.status or "").strip()
+                    previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
+                    self._apply_task_main_state_update(
+                        db,
+                        task,
+                        source="state_machine",
+                        reason="当前阶段已存在活跃权威子项，dispatching 父任务恢复为 running",
+                        status="running",
+                        stage_name=task.current_stage,
+                        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                        finished_at=None,
+                        last_error=None,
+                        clear_runtime_owner=False,
+                    )
+                    task.tail_reconcile_state = "idle"
+                    self._clear_task_failure_state(task)
+                    self._clear_task_abnormal_reason_snapshot(db, task)
+                    self._record_event(
+                        db,
+                        task,
+                        "streaming_parent_state_recovered",
+                        f"当前阶段存在活跃权威子项，父任务状态已收敛为 running: {task.current_stage}",
+                        level="warning",
+                        stage_name=task.current_stage,
+                        payload={
+                            "from_status": previous_status,
+                            "to_status": str(task.status or "").strip() or None,
+                            "active_stage_name": str(task.current_stage or "").strip() or None,
+                            "active_item_count": sum(
+                                1 for item in current_stage_items if str(item.status or "").strip() in {"running", "dispatching"}
+                            ),
+                            "had_downstream_refs": any(
+                                bool(str(getattr(item, "downstream_task_id", "") or "").strip()) for item in current_stage_items
+                            ),
+                            "previous_dispatcher_instance_id": previous_dispatcher,
+                            "tail_control_mode": "current_stage_activity_recovery",
+                            "runtime_lease_established": self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                            "reason": "refresh_task_status_after_sync",
+                        },
+                    )
+                    return
                 if self._recover_streaming_parent_running_state_locked(
                     db,
                     task,
@@ -3729,6 +3808,34 @@ class TaskStateMachineMixin:
         )
         if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
             failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
+            recoverable_owner_lost = any(
+                self._owner_lost_retry_exhausted(task, item) is False
+                and self._is_owner_lost_recoverable_failure(
+                    failure_message=str(item.error_message or "").strip() or None,
+                    failure_category=self._stage_failure_snapshot(task, failed_stage_run).get("failure_category"),
+                    error_type=self._stage_item_sync_error_type_value(item),
+                    item=item,
+                )
+                for item in failed_items
+            )
+            if recoverable_owner_lost:
+                self._apply_task_main_state_update(
+                    db,
+                    task,
+                    source="state_machine",
+                    reason="owner lost 可恢复，保持运行态等待父任务恢复观测",
+                    status="running",
+                    stage_name=failed_stage_run.stage_name or task.current_stage,
+                    runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                    finished_at=None,
+                    last_error=None,
+                    clear_runtime_owner=False,
+                )
+                self._clear_task_failure_state(task)
+                self._clear_task_abnormal_reason_snapshot(db, task)
+                return True
+        if failed_stage_run is not None and not had_stage_retry_mode and not had_task_retry_mode:
+            failed_items = self._stage_items(db, task.id, str(failed_stage_run.stage_name or ""))
             exhausted_owner_lost_items = [item for item in failed_items if self._owner_lost_retry_exhausted(task, item)]
             if exhausted_owner_lost_items:
                 exhausted_item = exhausted_owner_lost_items[0]
@@ -3827,7 +3934,20 @@ class TaskStateMachineMixin:
             if failed_stage_status == "downstream_missing":
                 return False
             if recoverable_owner_lost:
-                deferred_status = "running" if str(task.status or "").strip() in {"running", "dispatching"} else "pending"
+                ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
+                preserve_guard = self._should_preserve_parent_runtime_ownership(
+                    ownership_snapshot,
+                    reason="owner_lost_recoverable_after_sync",
+                )
+                deferred_status = (
+                    "running"
+                    if (
+                        str(task.status or "").strip() in {"running", "dispatching"}
+                        or self._task_runtime_owner_matches_current_instance(db, task)
+                        or preserve_guard.decision_reason == "row_mirror_guard_active"
+                    )
+                    else "pending"
+                )
                 _apply_retry_reopen_patch(
                     status=deferred_status,
                     reason="owner lost 可恢复，等待父任务恢复观测",
