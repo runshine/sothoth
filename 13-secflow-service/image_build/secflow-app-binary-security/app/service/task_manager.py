@@ -3297,6 +3297,58 @@ class TaskManager(
             )
         return False
 
+    def _task_has_healthy_active_owner_runtime(
+        self,
+        db: Session | None,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> bool:
+        if task is None:
+            return False
+        if db is None:
+            dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
+            task_status = str(getattr(task, "status", "") or "").strip().lower()
+            return bool(dispatcher_instance_id and task_status in {"running", "dispatching", TASK_STATUS_CANCELLING})
+        snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
+        if snapshot.runtime_lease_active:
+            return bool(
+                snapshot.row_mirror_owner
+                and snapshot.runtime_lease_owner
+                and snapshot.row_mirror_owner == snapshot.runtime_lease_owner
+            )
+        return bool(
+            snapshot.local_handle_alive
+            and snapshot.row_mirror_owner
+            and snapshot.row_mirror_owner == str(self.instance_id or "").strip()
+            and snapshot.task_status in {"running", "dispatching", TASK_STATUS_CANCELLING}
+        )
+
+    def _should_enqueue_parent_dispatch_for_task_sync(
+        self,
+        db: Session | None,
+        task: BinarySecurityTask,
+        *,
+        sync_kind: str,
+        force: bool,
+    ) -> bool:
+        normalized_sync_kind = str(sync_kind or "downstream_status").strip() or "downstream_status"
+        normalized_status = str(getattr(task, "status", "") or "").strip().lower()
+        if self._task_is_hidden_by_delete_queue(task):
+            return False
+        if normalized_status in TASK_TERMINAL_STATUSES and not str(getattr(task, "current_operation_id", "") or "").strip():
+            return False
+        if self._task_has_healthy_active_owner_runtime(db, task):
+            return False
+        if normalized_sync_kind in {
+            "downstream_status",
+            "binding_repair",
+            "late_child_terminal_sync",
+            "stale_sync_retry",
+        }:
+            return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING} or bool(force)
+        return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING, "failed"} or bool(force)
+
     def _release_unsupported_task_row_owner(
         self,
         db: Session,
@@ -4446,6 +4498,7 @@ class TaskManager(
         self,
         task: BinarySecurityTask,
         *,
+        db: Session | None = None,
         sync_kind: str,
         source: str,
         reason: str,
@@ -4486,7 +4539,13 @@ class TaskManager(
             dedupe_key=dedupe_key,
             context="task_sync_enqueue",
         )
-        self._enqueue_task(task.id)
+        if self._should_enqueue_parent_dispatch_for_task_sync(
+            db,
+            task,
+            sync_kind=entry["sync_kind"],
+            force=bool(entry["force"]),
+        ):
+            self._enqueue_task(task.id)
         return normalized_entry
 
     def _build_expected_sync_requests_from_db(
@@ -4572,6 +4631,7 @@ class TaskManager(
                     continue
                 await self._enqueue_task_sync_request(
                     task,
+                    db=db,
                     sync_kind=str(entry.get("sync_kind") or "").strip(),
                     source="runtime_start_repair",
                     reason=str(entry.get("reason") or "repair_missing_or_stale_sync_queue_entry").strip(),
@@ -4602,6 +4662,7 @@ class TaskManager(
         )
         return await self._enqueue_task_sync_request(
             task,
+            db=None,
             sync_kind=sync_kind,
             source=str(signal.get("source") or "legacy_runtime_workset").strip() or "legacy_runtime_workset",
             reason=str(signal.get("reason") or ("legacy_pending_binding_repair" if sync_kind == "binding_repair" else "legacy_pending_downstream_sync")).strip()

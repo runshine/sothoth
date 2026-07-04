@@ -69,10 +69,17 @@ from app.service.task_manager import (
 
 
 class _FakeQuery:
-    def __init__(self, rows):
+    def __init__(self, rows, *, annotate_total_count=False):
         self._rows = rows
         self._offset = 0
         self._limit = None
+        self._annotate_total_count = annotate_total_count
+
+    def _clone(self, rows=None):
+        clone = _FakeQuery(self._rows if rows is None else rows, annotate_total_count=self._annotate_total_count)
+        clone._offset = self._offset
+        clone._limit = self._limit
+        return clone
 
     def filter(self, *args, **kwargs):
         del kwargs
@@ -95,7 +102,7 @@ class _FakeQuery:
                 allowed = set(values)
                 rows = [row for row in rows if getattr(row, field_name, None) in allowed]
                 continue
-        return _FakeQuery(rows)
+        return self._clone(rows)
 
     def order_by(self, *args, **kwargs):
         return self
@@ -112,6 +119,12 @@ class _FakeQuery:
     def options(self, *args, **kwargs):
         return self
 
+    def add_columns(self, *args, **kwargs):
+        del args, kwargs
+        clone = self._clone()
+        clone._annotate_total_count = True
+        return clone
+
     def limit(self, *args, **kwargs):
         self._limit = args[0] if args else None
         del kwargs
@@ -127,10 +140,13 @@ class _FakeQuery:
 
     def all(self):
         rows = list(self._rows)
+        total = len(rows)
         if self._offset:
             rows = rows[self._offset :]
         if self._limit is not None:
             rows = rows[: self._limit]
+        if self._annotate_total_count:
+            return [(row, total) for row in rows]
         return rows
 
     def first(self):
@@ -221,9 +237,11 @@ class _ModelAwareDb:
         self.service_configs = list(service_configs or [])
         self.ea_tasks = list(ea_tasks or [])
         self.added = []
+        self.queried_models = []
 
     def query(self, model, *args, **kwargs):
         model_name = getattr(model, "__name__", "")
+        self.queried_models.append(model_name)
         if model_name == "BinarySecurityTask":
             return _FakeQuery(self.tasks)
         if model_name == "BinarySecurityStageRun":
@@ -6702,14 +6720,24 @@ class TaskManagerTests(unittest.TestCase):
                 }
             },
         )
+        task.latest_abnormal_reason = {
+            "code": "owner_lost_retry_exhausted",
+            "title": "下游 owner 丢失自动恢复失败",
+            "category": "runtime",
+            "message": "owner lost",
+            "source_layer": "task",
+            "status": "failed",
+            "service": "binary_security",
+        }
         db = _ModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item])
 
         response = self.manager.list_tasks(db, project_id="p1", task_type="source")
 
         self.assertEqual(1, response.total)
         summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
-        self.assertEqual("owner_lost_retry_exhausted", summary_by_stage["system_analysis"].abnormal_reason.code)
-        self.assertEqual("下游 owner 丢失自动恢复失败", summary_by_stage["system_analysis"].abnormal_reason.title)
+        self.assertIsNone(summary_by_stage["system_analysis"].abnormal_reason)
+        self.assertEqual("owner_lost_retry_exhausted", response.items[0].abnormal_reason_code)
+        self.assertEqual("下游 owner 丢失自动恢复失败", response.items[0].abnormal_reason_title)
 
     def test_stage_run_output_summary_db_payload_is_hard_capped(self):
         task = BinarySecurityTask(
@@ -11441,7 +11469,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         operation = asyncio.run(self.manager.continue_task(db, project_id="p1", task_id="s1"))
 
         self.assertEqual("continue", operation.operation_type)
-        self.assertEqual(["s1", "s1"], enqueued)
+        self.assertEqual(["s1"], enqueued)
 
     def test_continue_task_clears_archive_jobs_for_affected_stages(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -13106,7 +13134,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         operation = self.manager.retry_task(db, project_id="p1", task_id="t1")
 
         self.assertEqual("retry", operation.operation_type)
-        self.assertEqual(["t1", "t1"], enqueued)
+        self.assertEqual(["t1"], enqueued)
 
     def test_cancel_task_holds_lock_during_async_cleanup(self):
         task = BinarySecurityTask(
@@ -14904,7 +14932,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         operation = self.manager.retry_failed_items(db, project_id="p1", task_id="t-archive-pending")
 
         self.assertEqual("retry_archive_full", operation.operation_type)
-        self.assertEqual([task.id, task.id], enqueued)
+        self.assertEqual([task.id], enqueued)
 
     def test_retry_failed_items_archive_only_failed_item_upgrades_to_archive_retry(self):
         task = BinarySecurityTask(
@@ -16062,7 +16090,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         operation = self.manager.retry_stage_full(db, project_id="p1", task_id="s1", stage_name="entry_analysis")
 
         self.assertEqual("retry_stage_full", operation.operation_type)
-        self.assertEqual(["s1", "s1"], enqueued)
+        self.assertEqual(["s1"], enqueued)
 
     def test_retry_stage_failed_items_falls_back_to_shared_dispatch_when_local_control_wakeup_missing(self):
         task = BinarySecurityTask(
@@ -16100,7 +16128,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         operation = self.manager.retry_stage_failed_items(db, project_id="p1", task_id="s1", stage_name="entry_analysis")
 
         self.assertIn(operation.operation_type, {"retry_stage_failed_items", "continue"})
-        self.assertEqual(["s1", "s1"], enqueued)
+        self.assertEqual(["s1"], enqueued)
 
     def test_retry_stage_archive_skips_shared_dispatch_when_local_control_wakeup_succeeds(self):
         task = BinarySecurityTask(
@@ -16147,7 +16175,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         operation = self.manager.retry_stage_archive(db, project_id="p1", task_id="t1", stage_name="entry_analysis")
 
         self.assertEqual("retry_archive_failed_items", operation.operation_type)
-        self.assertEqual(["t1", "t1"], enqueued)
+        self.assertEqual(["t1"], enqueued)
 
     def test_finish_task_as_success_is_not_exposed_on_task_manager(self):
         self.assertFalse(hasattr(self.manager, "finish_task_as_success"))
@@ -16195,7 +16223,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
         operation = self.manager.retry_stage_archive_full(db, project_id="p1", task_id="t-archive-full", stage_name="system_analysis")
 
         self.assertEqual("retry_archive_full", operation.operation_type)
-        self.assertEqual(["t-archive-full", "t-archive-full"], enqueued)
+        self.assertEqual(["t-archive-full"], enqueued)
 
     def test_retry_archive_job_requeues_single_failed_job(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -25873,7 +25901,7 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1, int((task.metrics or {}).get("candidate_module_count") or 0))
             self.assertEqual(1, int((task.metrics or {}).get("selected_module_count") or 0))
 
-    def test_list_tasks_prefers_authoritative_stage_state_over_stale_snapshot(self):
+    def test_list_tasks_prefers_latest_stage_run_over_snapshot_for_light_summary(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -25906,43 +25934,20 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             started_at=datetime(2026, 5, 29, 22, 39, 20),
             finished_at=datetime(2026, 5, 29, 23, 47, 6),
         )
-        system_item = BinarySecurityStageItem(
-            id="si1",
-            task_id="t1",
-            project_id="p1",
-            stage_run_id="sr1",
-            stage_name="system_analysis",
-            item_key="source_project",
-            item_name="source_project",
-            status="success",
-            downstream_service="system_analyse",
-            downstream_task_id="sat1",
-        )
-        system_item.result = {
-            "sync_observation": {
-                "downstream_status": "passed",
-            }
-        }
-        archive_job = BinarySecurityArchiveJob(
-            id="aj-system-list-1",
-            task_id="t1",
-            project_id="p1",
-            stage_name="system_analysis",
-            item_id="si1",
-            archive_status="success",
-        )
-        db = _ModelAwareDb(tasks=[task], stage_runs=[system_run], stage_items=[system_item], archive_jobs=[archive_job])
+        db = _ModelAwareDb(tasks=[task], stage_runs=[system_run])
 
         response = self.manager.list_tasks(db, project_id="p1")
 
         summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
         self.assertEqual("success", summary_by_stage["system_analysis"].status)
-        self.assertEqual(1, summary_by_stage["system_analysis"].total_items)
-        self.assertEqual(1, summary_by_stage["system_analysis"].success_items)
+        self.assertEqual(0, summary_by_stage["system_analysis"].total_items)
+        self.assertEqual(0, summary_by_stage["system_analysis"].success_items)
         self.assertEqual("2026-05-29T22:39:20", summary_by_stage["system_analysis"].started_at.isoformat())
         self.assertEqual("2026-05-29T23:47:06", summary_by_stage["system_analysis"].finished_at.isoformat())
+        self.assertNotIn("BinarySecurityStageItem", db.queried_models)
+        self.assertNotIn("BinarySecurityArchiveJob", db.queried_models)
 
-    def test_list_tasks_does_not_refresh_active_stage_from_authoritative_items(self):
+    def test_list_tasks_uses_light_stage_summary_without_stage_item_refresh(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -25973,34 +25978,18 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             sequence_no=2,
             status="pending",
         )
-        item = BinarySecurityStageItem(
-            id="si1",
-            task_id="t1",
-            project_id="p1",
-            stage_run_id="sr1",
-            stage_name="entry_analysis",
-            item_key="mod-a",
-            item_name="mod-a",
-            status="running",
-            downstream_service="entry_analyse",
-            downstream_task_id="eat1",
-        )
-        item.result = {
-            "sync_observation": {
-                "downstream_status": "running",
-            }
-        }
-        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run])
 
         response = self.manager.list_tasks(db, project_id="p1")
 
         summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
-        self.assertEqual("running", summary_by_stage["entry_analysis"].status)
-        self.assertEqual(1, summary_by_stage["entry_analysis"].total_items)
-        self.assertEqual(1, summary_by_stage["entry_analysis"].running_items)
+        self.assertEqual("pending", summary_by_stage["entry_analysis"].status)
+        self.assertEqual(0, summary_by_stage["entry_analysis"].total_items)
+        self.assertEqual(0, summary_by_stage["entry_analysis"].running_items)
         self.assertEqual("pending", task.stage_summary["entry_analysis"]["status"])
+        self.assertNotIn("BinarySecurityStageItem", db.queried_models)
 
-    def test_list_tasks_manual_operation_state_uses_prefetched_operations_without_new_session(self):
+    def test_list_tasks_manual_operation_state_uses_lightweight_heuristic(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -26015,31 +26004,23 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             workspace_root="/workspace",
         )
         task.policy = {}
-        operation = BinarySecurityTaskOperation(
-            id="op1",
-            task_id="t1",
-            project_id="p1",
-            operation_type="retry_stage_full",
-            operation_token="tok1",
-            status="running",
-        )
-        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        db = _ModelAwareDb(tasks=[task])
 
         with patch.object(task_manager_module, "get_session_factory", side_effect=AssertionError("list_tasks should not allocate per-task sessions")):
             response = self.manager.list_tasks(db, project_id="p1")
 
         manual_state = response.items[0].manual_operation_state
-        self.assertEqual("in_progress", manual_state["overall"])
-        self.assertTrue(manual_state["operation_in_progress"])
-        self.assertEqual("op1", manual_state["operation_id"])
-        self.assertEqual("retry_stage_full", manual_state["operation_type"])
+        self.assertEqual("blocked", manual_state["overall"])
+        self.assertFalse(manual_state["operation_in_progress"])
+        self.assertEqual("task_running", manual_state["blocking_code"])
+        self.assertNotIn("BinarySecurityTaskOperation", db.queried_models)
 
-    def test_list_tasks_manual_operation_state_degrades_stale_requeue_applied_operation(self):
+    def test_list_tasks_manual_operation_state_marks_failed_stage_ready_without_operation_query(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
             name="source-task",
-            status="pending",
+            status="failed",
             task_type=TASK_TYPE_SOURCE,
             current_stage="entry_analysis",
             current_operation_id="op1",
@@ -26050,37 +26031,139 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
             workspace_root="/workspace",
         )
         task.policy = {}
-        operation = BinarySecurityTaskOperation(
-            id="op1",
-            task_id="t1",
-            project_id="p1",
-            operation_type="retry_stage_full",
-            operation_token="tok1",
-            status="running",
-            current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
-            updated_at=_now() - timedelta(seconds=120),
-            result_payload={
-                "requeue": {
-                    "requested": True,
-                    "applied": True,
-                    "current_stage_after": "entry_analysis",
-                    "task_status_after": "pending",
-                    "runtime_phase_after": TASK_RUNTIME_PHASE_TERMINAL,
-                    "in_place_runtime_resume": False,
-                }
-            },
-        )
-        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        task.stage_summary = {
+            "entry_analysis": {
+                "sequence_no": 1,
+                "status": "failed",
+            }
+        }
+        db = _ModelAwareDb(tasks=[task])
 
         with patch.object(task_manager_module, "get_session_factory", side_effect=AssertionError("list_tasks should not allocate per-task sessions")):
             response = self.manager.list_tasks(db, project_id="p1")
 
         manual_state = response.items[0].manual_operation_state
-        self.assertEqual("degraded", manual_state["overall"])
-        self.assertEqual("stale_operation_finalize_pending", manual_state["blocking_code"])
+        self.assertEqual("ready", manual_state["overall"])
+        self.assertIsNone(manual_state["blocking_code"])
         self.assertFalse(manual_state["operation_in_progress"])
-        self.assertTrue(manual_state["operation_stale"])
-        self.assertTrue(manual_state["requeue_applied"])
+        self.assertNotIn("BinarySecurityTaskOperation", db.queried_models)
+
+    def test_list_tasks_without_stage_run_falls_back_to_snapshot_status(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="kg-source-task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        task.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+        task.stage_summary = {
+            "knowledge_graph_entry_fetch": {"sequence_no": 1, "status": "success"},
+            "dataflow_vuln_scan": {"sequence_no": 2, "status": "running", "last_error": "waiting"},
+        }
+        db = _ModelAwareDb(tasks=[task])
+
+        response = self.manager.list_tasks(db, project_id="p1", task_type="source", pipeline_profile="kg_source_vuln_scan")
+
+        summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
+        self.assertEqual("success", summary_by_stage["knowledge_graph_entry_fetch"].status)
+        self.assertEqual("running", summary_by_stage["dataflow_vuln_scan"].status)
+        self.assertEqual("waiting", summary_by_stage["dataflow_vuln_scan"].last_error)
+
+    def test_list_tasks_light_response_keeps_stage_sequences_for_all_task_categories(self):
+        source_default = BinarySecurityTask(
+            id="t-source-default",
+            project_id="p1",
+            name="source-default",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src-default",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        source_default.policy = {}
+        source_kg = BinarySecurityTask(
+            id="t-source-kg",
+            project_id="p1",
+            name="source-kg",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src-kg",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        source_kg.policy = {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN}
+        binary_task = BinarySecurityTask(
+            id="t-binary",
+            project_id="p1",
+            name="binary",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        binary_task.policy = {}
+        module_task = BinarySecurityTask(
+            id="t-module",
+            project_id="p1",
+            name="module",
+            status="pending",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            firmware_source="project_filesystem",
+            firmware_path="/module.bin",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        module_task.policy = {}
+
+        default_response = self.manager.list_tasks(_ModelAwareDb(tasks=[source_default]), project_id="p1", task_type="source", pipeline_profile="default")
+        kg_response = self.manager.list_tasks(_ModelAwareDb(tasks=[source_kg]), project_id="p1", task_type="source", pipeline_profile="kg_source_vuln_scan")
+        binary_response = self.manager.list_tasks(_ModelAwareDb(tasks=[binary_task]), project_id="p1", task_type="binary")
+        module_response = self.manager.list_tasks(_ModelAwareDb(tasks=[module_task]), project_id="p1", task_type="binary_module")
+
+        self.assertEqual(self.manager._stage_sequence_for_task(source_default), default_response.items[0].stage_sequence)
+        self.assertEqual(self.manager._stage_sequence_for_task(source_kg), kg_response.items[0].stage_sequence)
+        self.assertEqual(self.manager._stage_sequence_for_task(binary_task), binary_response.items[0].stage_sequence)
+        self.assertEqual(self.manager._stage_sequence_for_task(module_task), module_response.items[0].stage_sequence)
+
+    def test_list_tasks_light_response_defaults_heavy_runtime_fields(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary-task",
+            status="failed",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        task.policy = {}
+        task.metrics = {"high_risk_module_count": 2, "candidate_module_count": 4}
+        db = _ModelAwareDb(tasks=[task])
+
+        response = self.manager.list_tasks(db, project_id="p1", task_type="binary")
+
+        item = response.items[0]
+        self.assertIsNone(item.dispatcher_instance_id)
+        self.assertIsNone(item.task_lease_owner_instance_id)
+        self.assertEqual("idle", item.tail_reconcile_state)
+        self.assertEqual(0, item.active_sync_error_item_count)
+        self.assertEqual({"last_reconcile_at": None}, response.queue_runtime)
+        self.assertEqual(0, response.running_count)
+        self.assertEqual(0, response.queued_count)
+        self.assertEqual(2, item.high_risk_module_count)
+        self.assertEqual(4, item.candidate_module_count)
 
     def test_refresh_system_analysis_stage_preserves_failed_item_reason_when_no_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -36812,232 +36895,6 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
     self.assertEqual("running", current_run.status)
 
 
-def _test_finalize_task_requeues_owned_execution_without_active_holder(self):
-    task = BinarySecurityTask(
-        id="t1",
-        project_id="p1",
-        name="binary",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/tmp",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    current_run = BinarySecurityStageRun(
-        id="sr1",
-        task_id="t1",
-        project_id="p1",
-        stage_name="system_analysis",
-        sequence_no=2,
-        status="success",
-    )
-    next_run = BinarySecurityStageRun(
-        id="sr2",
-        task_id="t1",
-        project_id="p1",
-        stage_name="binary_to_source",
-        sequence_no=3,
-        status="running",
-    )
-    next_item = BinarySecurityStageItem(
-        id="si1",
-        task_id="t1",
-        project_id="p1",
-        stage_run_id="sr2",
-        stage_name="binary_to_source",
-        item_key="fw1",
-        parent_key="fw1",
-        status="running",
-        downstream_service="binary_to_source",
-        downstream_task_id="b2s1",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[current_run, next_run], stage_items=[next_item], events=[])
-
-    original_enqueue = self.manager._enqueue_task
-    queued = []
-    self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
-    try:
-        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
-            gate = self.manager._evaluate_task_finalization_gate(db, task, stage_runs=db.stage_runs)
-            self.manager._handle_finalize_gate_blocked_active_path(db, task, stage_runs=db.stage_runs, finalize_gate=gate)
-    finally:
-        self.manager._enqueue_task = original_enqueue
-
-    self.assertIn(task.status, {"pending", "running"})
-    self.assertEqual("binary_to_source", task.current_stage)
-    self.assertEqual([], queued)
-    self.assertTrue(any(row.event_type == "parent_runtime_reopen_suppressed_active_lease" for row in db.events))
-
-
-def _test_apply_archive_job_status_requeues_owned_execution_without_active_holder(self):
-    task = BinarySecurityTask(
-        id="t-archive-requeue",
-        project_id="p1",
-        name="binary",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/tmp",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        summary={},
-    )
-    previous_run = BinarySecurityStageRun(
-        id="sr-archive-0",
-        task_id=task.id,
-        project_id="p1",
-        stage_name="firmware_unpack",
-        sequence_no=1,
-        status="success",
-    )
-    current_run = BinarySecurityStageRun(
-        id="sr-archive-1",
-        task_id=task.id,
-        project_id="p1",
-        stage_name="system_analysis",
-        sequence_no=2,
-        status="running",
-    )
-    next_run = BinarySecurityStageRun(
-        id="sr-archive-2",
-        task_id=task.id,
-        project_id="p1",
-        stage_name="binary_to_source",
-        sequence_no=3,
-        status="running",
-    )
-    item = BinarySecurityStageItem(
-        id="si-archive-1",
-        task_id=task.id,
-        project_id="p1",
-        stage_run_id=current_run.id,
-        stage_name="system_analysis",
-        item_key="fw1",
-        parent_key="fw1",
-        status="running",
-        downstream_service="system_analyse",
-        downstream_task_id="sat1",
-    )
-    job = BinarySecurityArchiveJob(
-        id="job-archive-1",
-        task_id=task.id,
-        project_id="p1",
-        stage_name="system_analysis",
-        item_id=item.id,
-        item_key=item.item_key,
-        downstream_service="system_analyse",
-        downstream_task_id="sat1",
-        archive_status="archived",
-    )
-    job.payload = {
-        "mapped_status": "success",
-        "downstream_payload": {"task_id": "sat1", "status": "passed"},
-    }
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[previous_run, current_run, next_run], stage_items=[item], archive_jobs=[job], events=[])
-
-    original_write = self.manager._write_task_metadata_async
-    original_refresh_terminal = self.manager._refresh_terminal_item_result_from_downstream
-    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
-    owner_signals = []
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    async def _noop_refresh(*_args, **_kwargs):
-        return None
-
-    self.manager._write_task_metadata_async = _noop_write
-    self.manager._refresh_terminal_item_result_from_downstream = _noop_refresh
-    self.manager._enqueue_owner_signal = lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
-    try:
-        asyncio.run(self.manager._apply_archive_job_status_locked(db, job.id, "/tmp/archive"))
-    finally:
-        self.manager._write_task_metadata_async = original_write
-        self.manager._refresh_terminal_item_result_from_downstream = original_refresh_terminal
-        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
-
-    self.assertIn(task.status, {"pending", "running"})
-    self.assertEqual("system_analysis", task.current_stage)
-    self.assertEqual([], owner_signals)
-    pending_reconcile = dict(self.manager._task_runtime_workset(task).get("pending_task_layer_reconcile") or {})
-    self.assertEqual("archive_apply", pending_reconcile.get("reconcile_reason"))
-    self.assertEqual("observe_only", pending_reconcile.get("reconcile_mode"))
-    event_types = [event.event_type for event in db.events]
-    self.assertIn("owned_execution_owner_reconcile_requested", event_types)
-    self.assertNotIn("owner_reconcile_signal_enqueued", event_types)
-    self.assertIn("shared_dispatch_signal_enqueued", event_types)
-
-
-def _test_stage_worker_terminal_event_preserves_stage_fact_when_task_layer_fails(self):
-    with tempfile.TemporaryDirectory() as tmp:
-        task = BinarySecurityTask(
-            id="task1",
-            project_id="p1",
-            name="n",
-            status="running",
-            task_type=TASK_TYPE_BINARY,
-            current_stage="firmware_unpack",
-            firmware_source="project_filesystem",
-            firmware_path="/src",
-            output_root="/o",
-            workspace_root=tmp,
-            started_at=_now(),
-        )
-        stage_run = BinarySecurityStageRun(
-            id="sr-sa",
-            task_id="task1",
-            project_id="p1",
-            stage_name="firmware_unpack",
-            sequence_no=1,
-            status="running",
-            started_at=_now(),
-        )
-        event = BinarySecurityStateEvent(
-            id="sev-sa-success",
-            task_id="task1",
-            project_id="p1",
-            stage_name="firmware_unpack",
-            event_type="stage_worker_terminal_observed",
-            idempotency_key="stage_worker_terminal_observed:task1:firmware_unpack:seq:1:success",
-        )
-        event.payload = {
-            "stage_name": "firmware_unpack",
-            "status": "success",
-            "summary": {"success_count": 1},
-        }
-        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], state_events=[event], events=[])
-
-        async def _noop_write(*_args, **_kwargs):
-            return None
-
-        original_write = self.manager._write_task_metadata_async
-        original_request = self.manager._request_task_layer_reconcile
-        calls = []
-        self.manager._write_task_metadata_async = _noop_write
-
-        def _capture_request(_db, _task, **kwargs):
-            calls.append(dict(kwargs))
-            return None
-
-        self.manager._request_task_layer_reconcile = _capture_request
-        try:
-            asyncio.run(self.manager._apply_stage_worker_terminal_event_locked(db, event))
-        finally:
-            self.manager._write_task_metadata_async = original_write
-            self.manager._request_task_layer_reconcile = original_request
-
-        self.assertEqual("success", stage_run.status)
-        self.assertIsNotNone(stage_run.finished_at)
-        self.assertEqual("firmware_unpack", task.current_stage)
-        self.assertEqual("stage_worker_terminal_observed", calls[0]["source_event_type"])
-        self.assertEqual("stage_worker_terminal_observed", calls[0]["reconcile_reason"])
-
-
 def _test_retry_failed_items_requeue_helper_preserves_existing_behavior(self):
     now_value = _now()
     task = BinarySecurityTask(
@@ -37092,176 +36949,6 @@ def _test_retry_failed_items_requeue_helper_preserves_existing_behavior(self):
     self.assertEqual([], queued)
     self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
     self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
-
-
-def _test_downstream_status_event_applied_uses_explicit_task_layer_reconcile(self):
-    with tempfile.TemporaryDirectory() as tmp:
-        task = BinarySecurityTask(
-            id="task1",
-            project_id="p1",
-            name="n",
-            status="running",
-            task_type=TASK_TYPE_BINARY,
-            current_stage="binary_to_source",
-            firmware_source="project_filesystem",
-            firmware_path="/src",
-            output_root="/o",
-            workspace_root=tmp,
-            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        )
-        stage_run = BinarySecurityStageRun(
-            id="sr-b2s",
-            task_id="task1",
-            project_id="p1",
-            stage_name="binary_to_source",
-            sequence_no=3,
-            status="running",
-        )
-        item = BinarySecurityStageItem(
-            id="si-b2s",
-            task_id="task1",
-            project_id="p1",
-            stage_run_id="sr-b2s",
-            stage_name="binary_to_source",
-            item_key="m1",
-            parent_key="fw1",
-            status="running",
-            downstream_service="binary_to_source",
-            downstream_task_id="b2s-task-1",
-        )
-        event = BinarySecurityStateEvent(
-            id="sev-downstream",
-            task_id="task1",
-            project_id="p1",
-            stage_name="binary_to_source",
-            item_id="si-b2s",
-            event_type="downstream_terminal_observed",
-            idempotency_key="downstream-terminal:si-b2s",
-        )
-        event.payload = {
-            "mapped_status": "success",
-            "downstream_status": "success",
-            "downstream_payload": {"task_id": "b2s-task-1", "status": "success"},
-            "status_raw": "success",
-            "state_applied": True,
-        }
-        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], state_events=[event], events=[])
-
-        async def _noop_write(*_args, **_kwargs):
-            return None
-
-        original_write = self.manager._write_task_metadata_async
-        original_reconcile_stage = self.manager._reconcile_stage_domain_in_session
-        original_request = self.manager._request_task_layer_reconcile
-        calls = []
-
-        def _capture_reconcile_stage(_db, _task, _stage_name):
-            return stage_run
-
-        def _capture_request(_db, _task, **kwargs):
-            calls.append(dict(kwargs))
-            return None
-
-        self.manager._write_task_metadata_async = _noop_write
-        self.manager._reconcile_stage_domain_in_session = _capture_reconcile_stage
-        self.manager._request_task_layer_reconcile = _capture_request
-        try:
-            asyncio.run(self.manager._apply_downstream_terminal_observed_locked(db, event))
-        finally:
-            self.manager._write_task_metadata_async = original_write
-            self.manager._reconcile_stage_domain_in_session = original_reconcile_stage
-            self.manager._request_task_layer_reconcile = original_request
-
-        self.assertEqual("success", item.status)
-        self.assertEqual("binary_to_source", calls[0]["stage_name"])
-        self.assertEqual("downstream_terminal_observed", calls[0]["source_event_type"])
-        self.assertEqual("downstream_status_event_applied", calls[0]["reconcile_reason"])
-
-
-def _test_archive_apply_uses_explicit_task_layer_reconcile(self):
-    task = BinarySecurityTask(
-        id="t1",
-        project_id="p1",
-        name="binary",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="firmware_unpack",
-        firmware_source="project_filesystem",
-        firmware_path="/fw.bin",
-        output_root="/o",
-        workspace_root="/tmp",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    item = BinarySecurityStageItem(
-        id="si1",
-        task_id="t1",
-        project_id="p1",
-        stage_run_id="sr1",
-        stage_name="firmware_unpack",
-        item_key="fw-1",
-        item_name="fw-1",
-        status="running",
-        downstream_service="firmware_unpacker",
-        downstream_task_id="child1",
-    )
-    job = BinarySecurityArchiveJob(
-        id="job1",
-        task_id="t1",
-        project_id="p1",
-        stage_name="firmware_unpack",
-        item_id="si1",
-        item_key="fw-1",
-        downstream_service="firmware_unpacker",
-        downstream_task_id="child1",
-        archive_status="archived",
-    )
-    job.payload = {
-        "mapped_status": "success",
-        "bound_downstream_task_id": "child1",
-        "downstream_payload": {"task_id": "child1", "status": "success"},
-    }
-    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[job], events=[])
-
-    async def _noop_refresh_terminal(*_args, **_kwargs):
-        return None
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    original_new = self.manager._reconcile_item_layer_facts_in_session
-    original_refresh_terminal = self.manager._refresh_terminal_item_result_from_downstream
-    original_write = self.manager._write_task_metadata_async
-    original_request = self.manager._request_task_layer_reconcile
-    calls = []
-
-    def _capture_new(_db, _task, **kwargs):
-        calls.append(("facts", dict(kwargs)))
-        return None, self.manager._task_state_snapshot(task)
-
-    def _capture_request(_db, _task, **kwargs):
-        calls.append(("request", dict(kwargs)))
-        return None
-
-    self.manager._reconcile_item_layer_facts_in_session = _capture_new
-    self.manager._refresh_terminal_item_result_from_downstream = _noop_refresh_terminal
-    self.manager._write_task_metadata_async = _noop_write
-    self.manager._request_task_layer_reconcile = _capture_request
-    try:
-        asyncio.run(self.manager._apply_archive_job_status_locked(db, "job1", "/tmp/archive"))
-    finally:
-        self.manager._reconcile_item_layer_facts_in_session = original_new
-        self.manager._refresh_terminal_item_result_from_downstream = original_refresh_terminal
-        self.manager._write_task_metadata_async = original_write
-        self.manager._request_task_layer_reconcile = original_request
-
-    self.assertEqual("facts", calls[0][0])
-    self.assertEqual("firmware_unpack", calls[0][1]["stage_name"])
-    self.assertEqual("request", calls[1][0])
-    self.assertEqual("archive_job_copied", calls[1][1]["source_event_type"])
-    self.assertEqual("archive_apply", calls[1][1]["reconcile_reason"])
-    event_types = [event.event_type for event in db.events]
-    self.assertNotIn("task_finalize_deferred_for_incomplete_stage", event_types)
-    self.assertNotIn("main_state_write_blocked", event_types)
 
 
 def _test_prepare_retry_failed_items_reconciles_affected_stages_in_session(self):
@@ -37494,1431 +37181,14 @@ def _test_retry_stage_full_cleanup_reconciles_affected_stages_in_session(self):
     self.assertEqual(["entry_analysis", "dataflow_vuln_scan"], payload["reconciled_stages"])
 
 
-def _test_requeue_task_after_retry_operation_uses_resume_decision(self):
-    now_value = _now()
-    task = BinarySecurityTask(
-        id="task1",
-        project_id="p1",
-        name="n",
-        status="failed",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="entry_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        dispatcher_instance_id="worker-1",
-        lease_expires_at=now_value + timedelta(seconds=60),
-    )
-    operation = BinarySecurityTaskOperation(
-        id="op1",
-        task_id="task1",
-        project_id="p1",
-        operation_type="retry_failed_items",
-        target_stage="entry_analysis",
-        status="running",
-    )
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="worker-1",
-        heartbeat_at=now_value,
-        lease_expires_at=now_value + timedelta(seconds=60),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
-
-    original_apply = self.manager._apply_task_resume_decision
-    original_enqueue = self.manager._enqueue_task
-    original_should_auto = self.manager._should_auto_advance_to_stage
-    applied = []
-    queued = []
-
-    def _capture_apply(_db, _task, decision, *, operation=None):
-        applied.append({"next_stage": decision.next_stage, "source": decision.source, "operation_id": getattr(operation, "id", None)})
-        return original_apply(_db, _task, decision, operation=operation)
-
-    self.manager.instance_id = "worker-1"
-    self.manager._apply_task_resume_decision = _capture_apply
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
-    try:
-        self.manager._requeue_task_after_retry_operation(
-            db,
-            task,
-            target_stage="entry_analysis",
-            operation=operation,
-        )
-    finally:
-        self.manager._apply_task_resume_decision = original_apply
-        self.manager._enqueue_task = original_enqueue
-        self.manager._should_auto_advance_to_stage = original_should_auto
-
-    self.assertEqual([], queued)
-    self.assertEqual([], applied)
-    self.assertEqual("running", task.status)
-    self.assertEqual("entry_analysis", task.current_stage)
-    self.assertEqual("worker-1", task.dispatcher_instance_id)
-    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
-    self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
-
-
-def _test_requeue_task_after_retry_operation_preserves_local_runtime_owner_for_retry(self):
-    now_value = _now()
-    task = BinarySecurityTask(
-        id="task1",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="entry_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-1",
-        dispatch_started_at=now_value - timedelta(seconds=10),
-        lease_expires_at=now_value + timedelta(seconds=60),
-    )
-    operation = BinarySecurityTaskOperation(
-        id="op1",
-        task_id="task1",
-        project_id="p1",
-        operation_type="retry",
-        target_stage="entry_analysis",
-        status="running",
-    )
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="worker-1",
-        heartbeat_at=now_value,
-        lease_expires_at=now_value + timedelta(seconds=60),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
-
-    original_instance_id = self.manager.instance_id
-    original_enqueue = self.manager._enqueue_task
-    original_should_auto = self.manager._should_auto_advance_to_stage
-    queued = []
-    self.manager.instance_id = "worker-1"
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
-    self.manager._register_task_execution_owner(task.id, "primary_task_worker")
-    try:
-        self.manager._requeue_task_after_retry_operation(
-            db,
-            task,
-            target_stage="entry_analysis",
-            operation=operation,
-        )
-    finally:
-        self.manager._release_task_execution_owner(task.id, "primary_task_worker")
-        self.manager.instance_id = original_instance_id
-        self.manager._enqueue_task = original_enqueue
-        self.manager._should_auto_advance_to_stage = original_should_auto
-
-    self.assertEqual("running", task.status)
-    self.assertEqual("worker-1", task.dispatcher_instance_id)
-    self.assertEqual([], queued)
-    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("requested")))
-    self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
-    self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
-
-
-
-
-def _test_run_task_operation_steps_requeue_uses_resume_decision(self):
-    now_value = _now()
-    task = BinarySecurityTask(
-        id="task-op-requeue",
-        project_id="p1",
-        name="n",
-        status="failed",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="entry_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        dispatcher_instance_id="test-worker",
-        lease_expires_at=now_value + timedelta(minutes=5),
-    )
-    operation = BinarySecurityTaskOperation(
-        id="op-requeue",
-        task_id="task-op-requeue",
-        project_id="p1",
-        operation_type=TASK_ACTION_CONTINUE,
-        target_stage="entry_analysis",
-        status="running",
-        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
-    )
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="test-worker",
-        heartbeat_at=now_value,
-        lease_expires_at=now_value + timedelta(minutes=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
-
-    original_apply = self.manager._apply_task_resume_decision
-    original_enqueue = self.manager._enqueue_task
-    original_should_auto = self.manager._should_auto_advance_to_stage
-    applied = []
-    queued = []
-
-    def _capture_apply(_db, _task, decision, *, operation=None):
-        applied.append(
-            {
-                "next_stage": decision.next_stage,
-                "source": decision.source,
-                "event_type": decision.event_type,
-                "operation_id": getattr(operation, "id", None),
-            }
-        )
-        return original_apply(_db, _task, decision, operation=operation)
-
-    self.manager.instance_id = "test-worker"
-    self.manager._apply_task_resume_decision = _capture_apply
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
-    try:
-        asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
-    finally:
-        self.manager._apply_task_resume_decision = original_apply
-        self.manager._enqueue_task = original_enqueue
-        self.manager._should_auto_advance_to_stage = original_should_auto
-
-    self.assertEqual([], queued)
-    self.assertEqual([], applied)
-    self.assertEqual("running", task.status)
-    self.assertEqual("entry_analysis", task.current_stage)
-    event_types = [event.event_type for event in db.events]
-    self.assertIn("retry_in_place_resume_applied", event_types)
-
-
-def _test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_state_without_requeue_marker(self):
-    now_value = _now()
-    task = BinarySecurityTask(
-        id="task-op-hard-retry",
-        project_id="p1",
-        name="n",
-        status="pending",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        dispatcher_instance_id="test-worker",
-        lease_expires_at=now_value + timedelta(minutes=5),
-    )
-    operation = BinarySecurityTaskOperation(
-        id="op-hard-retry",
-        task_id="task-op-hard-retry",
-        project_id="p1",
-        operation_type=TASK_ACTION_RETRY,
-        target_stage="system_analysis",
-        status="running",
-        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
-        result_payload={},
-    )
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="test-worker",
-        heartbeat_at=now_value,
-        lease_expires_at=now_value + timedelta(minutes=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
-
-    original_apply = self.manager._apply_task_resume_decision
-    original_enqueue = self.manager._enqueue_task
-    original_should_auto = self.manager._should_auto_advance_to_stage
-    applied = []
-    queued = []
-
-    def _capture_apply(_db, _task, decision, *, operation=None):
-        applied.append(
-            {
-                "next_stage": decision.next_stage,
-                "source": decision.source,
-                "event_type": decision.event_type,
-                "operation_id": getattr(operation, "id", None),
-            }
-        )
-        return original_apply(_db, _task, decision, operation=operation)
-
-    self.manager.instance_id = "test-worker"
-    self.manager._apply_task_resume_decision = _capture_apply
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
-    try:
-        asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
-    finally:
-        self.manager._apply_task_resume_decision = original_apply
-        self.manager._enqueue_task = original_enqueue
-        self.manager._should_auto_advance_to_stage = original_should_auto
-
-    self.assertEqual([], queued)
-    self.assertEqual([], applied)
-    self.assertEqual("dispatching", task.status)
-    self.assertEqual("system_analysis", task.current_stage)
-    event_types = [event.event_type for event in db.events]
-    self.assertIn("retry_in_place_resume_applied", event_types)
-
-
-def _test_run_task_operation_steps_requeue_fails_without_owner_release_permission(self):
-    task = BinarySecurityTask(
-        id="task-op-requeue-blocked",
-        project_id="p1",
-        name="n",
-        status="failed",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        dispatcher_instance_id="other-worker",
-        lease_expires_at=_now() + timedelta(minutes=5),
-    )
-    operation = BinarySecurityTaskOperation(
-        id="op-requeue-blocked",
-        task_id=task.id,
-        project_id="p1",
-        operation_type=TASK_ACTION_RETRY,
-        target_stage="system_analysis",
-        status="running",
-        current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
-        result_payload={},
-    )
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="other-worker",
-        heartbeat_at=_now(),
-        lease_expires_at=_now() + timedelta(minutes=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
-
-    original_enqueue = self.manager._enqueue_task
-    original_should_auto = self.manager._should_auto_advance_to_stage
-    queued = []
-
-    self.manager.instance_id = "test-worker"
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
-    try:
-        asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
-    finally:
-        self.manager._enqueue_task = original_enqueue
-        self.manager._should_auto_advance_to_stage = original_should_auto
-
-    self.assertEqual([], queued)
-    self.assertEqual("failed", operation.status)
-    self.assertEqual(TASK_OPERATION_STEP_FAILED, operation.current_step)
-    self.assertEqual("other-worker", task.dispatcher_instance_id)
-    self.assertTrue(any(lease.task_id == task.id for lease in db.runtime_leases))
-    event_types = [event.event_type for event in db.events]
-    self.assertIn("retry_in_place_resume_blocked", event_types)
-
-
-def _test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision(self):
-    task = BinarySecurityTask(
-        id="task-terminal",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], events=[])
-
-    original_decide = self.manager._decide_task_action_after_stage_terminal
-    original_apply = self.manager._apply_task_resume_decision
-    original_metadata = self.manager._write_task_metadata_async
-    original_enqueue = self.manager._enqueue_task
-    applied = []
-    queued = []
-
-    def _fake_decide(*_args, **_kwargs):
-        return task_manager_module._StageTerminalTaskDecision(
-            action="requeue_next_stage",
-            next_stage="entry_analysis",
-            event_type="task_requeued_after_stage_completion",
-            message="阶段完成后任务继续进入下一阶段: entry_analysis",
-            payload={"state_event_id": "sev1", "completed_stage": "system_analysis"},
-        )
-
-    def _capture_apply(_db, _task, decision, *, operation=None, enqueue_task=True):
-        del operation
-        applied.append(
-            {
-                "next_stage": decision.next_stage,
-                "source": decision.source,
-                "event_type": decision.event_type,
-            }
-        )
-        return original_apply(_db, _task, decision, enqueue_task=enqueue_task)
-
-    async def _noop_metadata(*_args, **_kwargs):
-        return None
-
-    self.manager._decide_task_action_after_stage_terminal = _fake_decide
-    self.manager._apply_task_resume_decision = _capture_apply
-    self.manager._write_task_metadata_async = _noop_metadata
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-    try:
-        applied_result = asyncio.run(
-            self.manager._apply_task_action_after_stage_terminal(
-                db,
-                task,
-                stage_name="system_analysis",
-                status="success",
-                summary={},
-                payload={},
-                state_event_id="sev1",
-            )
-        )
-    finally:
-        self.manager._decide_task_action_after_stage_terminal = original_decide
-        self.manager._apply_task_resume_decision = original_apply
-        self.manager._write_task_metadata_async = original_metadata
-        self.manager._enqueue_task = original_enqueue
-
-    self.assertTrue(applied_result)
-    self.assertEqual(["task-terminal"], queued)
-    self.assertEqual("entry_analysis", applied[0]["next_stage"])
-    self.assertEqual("stage_terminal", applied[0]["source"])
-    self.assertEqual("task_requeued_after_stage_completion", applied[0]["event_type"])
-
-
-def _test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision(self):
-    task = BinarySecurityTask(
-        id="task-sync-resume",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-    )
-    current_run = BinarySecurityStageRun(
-        id="sr-system",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="system_analysis",
-        sequence_no=1,
-        status="success",
-    )
-    next_run = BinarySecurityStageRun(
-        id="sr-entry",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="entry_analysis",
-        sequence_no=2,
-        status="pending",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[current_run, next_run], stage_items=[], events=[])
-
-    original_next = self.manager._next_stage_candidate
-    original_items = self.manager._stage_items
-    original_runnable = self.manager._stage_has_real_runnable_work
-    original_nonterminal = self.manager._stage_has_nonterminal_items
-    original_apply = self.manager._apply_task_resume_decision
-    original_enqueue = self.manager._enqueue_task
-    applied = []
-    queued = []
-
-    self.manager._next_stage_candidate = lambda *_args, **_kwargs: "entry_analysis"
-    self.manager._stage_items = lambda *_args, **_kwargs: []
-    self.manager._stage_has_real_runnable_work = lambda *_args, **_kwargs: True
-    self.manager._stage_has_nonterminal_items = lambda *_args, **_kwargs: False
-
-    def _capture_apply(_db, _task, decision, *, operation=None):
-        del operation
-        applied.append(
-            {
-                "next_stage": decision.next_stage,
-                "source": decision.source,
-                "event_type": decision.event_type,
-            }
-        )
-        return original_apply(_db, _task, decision)
-
-    self.manager._apply_task_resume_decision = _capture_apply
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-    try:
-        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
-            self.manager._refresh_task_status_after_sync(db, task)
-    finally:
-        self.manager._next_stage_candidate = original_next
-        self.manager._stage_items = original_items
-        self.manager._stage_has_real_runnable_work = original_runnable
-        self.manager._stage_has_nonterminal_items = original_nonterminal
-        self.manager._apply_task_resume_decision = original_apply
-        self.manager._enqueue_task = original_enqueue
-
-    self.assertEqual(["task-sync-resume"], queued)
-    self.assertEqual("entry_analysis", applied[0]["next_stage"])
-    self.assertEqual("downstream_sync", applied[0]["source"])
-    self.assertEqual("task_requeued_after_downstream_sync", applied[0]["event_type"])
-
-
 TaskManagerTests.test_self_healing_downstream_failure_observation_is_not_applied = _test_self_healing_downstream_failure_observation_is_not_applied
 TaskManagerTests.test_running_message_downstream_failure_observation_is_not_applied = _test_running_message_downstream_failure_observation_is_not_applied
 TaskManagerTests.test_sync_downstream_status_requeues_owned_execution_without_active_holder = _test_sync_downstream_status_requeues_owned_execution_without_active_holder
 TaskManagerTests.test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fails = _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fails
-TaskManagerTests.test_stage_worker_terminal_event_preserves_stage_fact_when_task_layer_fails = _test_stage_worker_terminal_event_preserves_stage_fact_when_task_layer_fails
 TaskManagerTests.test_retry_failed_items_requeue_helper_preserves_existing_behavior = _test_retry_failed_items_requeue_helper_preserves_existing_behavior
-TaskManagerTests.test_downstream_status_event_applied_uses_explicit_task_layer_reconcile = _test_downstream_status_event_applied_uses_explicit_task_layer_reconcile
-TaskManagerTests.test_archive_apply_uses_explicit_task_layer_reconcile = _test_archive_apply_uses_explicit_task_layer_reconcile
 TaskManagerTests.test_prepare_retry_failed_items_reconciles_affected_stages_in_session = _test_prepare_retry_failed_items_reconciles_affected_stages_in_session
 TaskManagerTests.test_finalize_retry_failed_items_reconciles_stages_before_task_layer_decision = _test_finalize_retry_failed_items_reconciles_stages_before_task_layer_decision
 TaskManagerTests.test_retry_stage_full_cleanup_reconciles_affected_stages_in_session = _test_retry_stage_full_cleanup_reconciles_affected_stages_in_session
-
-
-def _test_run_task_layer_reconcile_signal_applies_stage_terminal_decision(self):
-    task = BinarySecurityTask(
-        id="task-reconcile",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    stage_run = BinarySecurityStageRun(
-        id="sr-system",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="system_analysis",
-        sequence_no=1,
-        status="success",
-        output_summary={"success_count": 1},
-    )
-    next_run = BinarySecurityStageRun(
-        id="sr-entry",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="entry_analysis",
-        sequence_no=2,
-        status="pending",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run, next_run], events=[])
-
-    original_refresh = self.manager._refresh_task_status_after_sync
-    original_apply = self.manager._apply_task_action_after_stage_terminal
-    original_write = self.manager._write_task_metadata_async
-    calls = []
-
-    def _capture_refresh(_db, _task):
-        calls.append(("refresh", str(_task.current_stage or "")))
-        return original_refresh(_db, _task)
-
-    async def _capture_apply(_db, _task, **kwargs):
-        calls.append(("apply", dict(kwargs)))
-        return True
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    self.manager._refresh_task_status_after_sync = _capture_refresh
-    self.manager._apply_task_action_after_stage_terminal = _capture_apply
-    self.manager._write_task_metadata_async = _noop_write
-    try:
-        changed = asyncio.run(
-            self.manager._run_task_layer_reconcile_signal(
-                db,
-                task,
-                signal={
-                    "source_event_type": "stage_worker_terminal_observed",
-                    "state_event_id": "sev1",
-                    "reconcile_reason": "stage_worker_terminal_observed",
-                    "stage_name": "system_analysis",
-                    "fact_applied": True,
-                },
-            )
-        )
-    finally:
-        self.manager._refresh_task_status_after_sync = original_refresh
-        self.manager._apply_task_action_after_stage_terminal = original_apply
-        self.manager._write_task_metadata_async = original_write
-
-    self.assertFalse(changed)
-    self.assertEqual("refresh", calls[0][0])
-    self.assertEqual(1, len(calls))
-    self.assertEqual("system_analysis", task.current_stage)
-
-
-TaskManagerTests.test_run_task_layer_reconcile_signal_applies_stage_terminal_decision = _test_run_task_layer_reconcile_signal_applies_stage_terminal_decision
-
-
-def _test_run_task_layer_reconcile_signal_archive_apply_uses_owner_stage_terminal_apply(self):
-    task = BinarySecurityTask(
-        id="task-archive-reconcile",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    stage_run = BinarySecurityStageRun(
-        id="sr-system-archive",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="system_analysis",
-        sequence_no=1,
-        status="success",
-        output_summary={"success_count": 1},
-    )
-    next_run = BinarySecurityStageRun(
-        id="sr-entry-archive",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="entry_analysis",
-        sequence_no=2,
-        status="pending",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run, next_run], events=[])
-
-    original_refresh = self.manager._refresh_task_status_after_sync
-    original_apply = self.manager._apply_task_action_after_stage_terminal
-    original_write = self.manager._write_task_metadata_async
-    calls = []
-
-    def _capture_refresh(_db, _task):
-        calls.append(("refresh", str(_task.current_stage or "")))
-        return original_refresh(_db, _task)
-
-    async def _capture_apply(_db, _task, **kwargs):
-        calls.append(("apply", dict(kwargs)))
-        return True
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    self.manager._refresh_task_status_after_sync = _capture_refresh
-    self.manager._apply_task_action_after_stage_terminal = _capture_apply
-    self.manager._write_task_metadata_async = _noop_write
-    try:
-        changed = asyncio.run(
-            self.manager._run_task_layer_reconcile_signal(
-                db,
-                task,
-                signal={
-                    "source_event_type": "archive_job_copied",
-                    "state_event_id": "sev-archive-1",
-                    "reconcile_reason": "archive_apply",
-                    "stage_name": "system_analysis",
-                    "fact_applied": True,
-                    "archive_job_id": "aj-1",
-                },
-            )
-        )
-    finally:
-        self.manager._refresh_task_status_after_sync = original_refresh
-        self.manager._apply_task_action_after_stage_terminal = original_apply
-        self.manager._write_task_metadata_async = original_write
-
-    self.assertFalse(changed)
-    self.assertEqual("refresh", calls[0][0])
-    self.assertEqual([("refresh", "system_analysis")], calls)
-    self.assertEqual("running", task.status)
-    self.assertEqual("system_analysis", task.current_stage)
-
-
-TaskManagerTests.test_run_task_layer_reconcile_signal_archive_apply_uses_owner_stage_terminal_apply = _test_run_task_layer_reconcile_signal_archive_apply_uses_owner_stage_terminal_apply
-
-
-def _test_missing_stage_terminal_recovery_prefers_owner_inbox_with_allow_execution(self):
-    task = BinarySecurityTask(
-        id="task-missing-stage-terminal",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="firmware_unpack",
-        firmware_source="project_filesystem",
-        firmware_path="/fw.bin",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-a",
-    )
-    task.dispatch_started_at = _now()
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="worker-a",
-        lease_expires_at=_now() + timedelta(seconds=120),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
-
-    decision = self.manager._task_layer_reconcile_delivery_decision(
-        db,
-        task,
-        source_event_type="stage_worker_terminal_observed",
-        reconcile_reason="missing_stage_terminal_recovery",
-    )
-
-    self.assertEqual("owner_inbox", decision.delivery_channel)
-    self.assertFalse(decision.observe_only)
-
-
-TaskManagerTests.test_missing_stage_terminal_recovery_prefers_owner_inbox_with_allow_execution = _test_missing_stage_terminal_recovery_prefers_owner_inbox_with_allow_execution
-
-
-def _test_missing_stage_terminal_recovery_request_uses_allow_execution_signal(self):
-    task = BinarySecurityTask(
-        id="task-missing-stage-terminal-request",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="firmware_unpack",
-        firmware_source="project_filesystem",
-        firmware_path="/fw.bin",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-a",
-    )
-    task.dispatch_started_at = _now()
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="worker-a",
-        lease_expires_at=_now() + timedelta(seconds=120),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
-
-    original_enqueue_owner_signal = self.manager._enqueue_owner_signal
-    enqueued: list[tuple[str, str, str]] = []
-
-    def _capture_enqueue(owner_instance_id: str, task_id: str, *, context: str = "owner_signal_enqueue"):
-        enqueued.append((owner_instance_id, task_id, context))
-
-    self.manager._enqueue_owner_signal = _capture_enqueue
-    try:
-        self.manager._request_task_layer_reconcile(
-            db,
-            task,
-            stage_name="firmware_unpack",
-            source_event_type="stage_worker_terminal_observed",
-            state_event_id="sev-terminal-missing",
-            reconcile_reason="missing_stage_terminal_recovery",
-            message="missing terminal recovery",
-        )
-    finally:
-        self.manager._enqueue_owner_signal = original_enqueue_owner_signal
-
-    pending_reconcile = dict(self.manager._task_runtime_workset(task).get("pending_task_layer_reconcile") or {})
-    self.assertEqual("allow_execution", pending_reconcile.get("reconcile_mode"))
-    self.assertEqual("missing_stage_terminal_recovery", pending_reconcile.get("reconcile_reason"))
-    self.assertEqual("stage_worker_terminal_observed", pending_reconcile.get("source_event_type"))
-    self.assertEqual([("worker-a", task.id, "owner_reconcile_signal_enqueue")], enqueued)
-
-
-TaskManagerTests.test_missing_stage_terminal_recovery_request_uses_allow_execution_signal = _test_missing_stage_terminal_recovery_request_uses_allow_execution_signal
-
-
-def _test_archive_apply_remains_owner_inbox_observe_only(self):
-    task = BinarySecurityTask(
-        id="task-archive-observe-only",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="firmware_unpack",
-        firmware_source="project_filesystem",
-        firmware_path="/fw.bin",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-a",
-    )
-    task.dispatch_started_at = _now()
-    runtime_lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="worker-a",
-        lease_expires_at=_now() + timedelta(seconds=120),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
-
-    decision = self.manager._task_layer_reconcile_delivery_decision(
-        db,
-        task,
-        source_event_type="archive_job_copied",
-        reconcile_reason="archive_apply",
-    )
-
-    self.assertEqual("owner_inbox", decision.delivery_channel)
-    self.assertTrue(decision.observe_only)
-
-
-TaskManagerTests.test_archive_apply_remains_owner_inbox_observe_only = _test_archive_apply_remains_owner_inbox_observe_only
-
-
-def _test_observe_only_reconcile_skips_tail_sync_for_non_tail_stage(self):
-    task = BinarySecurityTask(
-        id="task-non-tail-observe-only",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="firmware_unpack",
-        firmware_source="project_filesystem",
-        firmware_path="/fw.bin",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    task.summary = {
-        "runtime_workset": {
-            "pending_task_layer_reconcile": {
-                "source_event_type": "archive_job_copied",
-                "state_event_id": "sev-non-tail-observe-only",
-                "reconcile_reason": "archive_apply",
-                "stage_name": "firmware_unpack",
-                "reconcile_mode": "observe_only",
-                "fact_applied": True,
-            }
-        }
-    }
-    stage_run = BinarySecurityStageRun(
-        id="sr-non-tail-observe-only",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="firmware_unpack",
-        sequence_no=1,
-        status="success",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
-
-    from app.service import task_manager as task_manager_module
-
-    original_factory = task_manager_module.get_session_factory
-    original_sync_tail = self.manager._sync_streaming_task_tail_state
-    sync_tail_calls: list[str] = []
-
-    async def _capture_sync_tail(task_id: str):
-        sync_tail_calls.append(task_id)
-
-    task_manager_module.get_session_factory = lambda: (lambda: db)
-    self.manager._sync_streaming_task_tail_state = _capture_sync_tail
-    try:
-        changed = asyncio.run(self.manager._run_task_runtime_signals(task.id))
-    finally:
-        task_manager_module.get_session_factory = original_factory
-        self.manager._sync_streaming_task_tail_state = original_sync_tail
-
-        self.assertFalse(changed)
-        self.assertEqual([], sync_tail_calls)
-
-
-TaskManagerTests.test_observe_only_reconcile_skips_tail_sync_for_non_tail_stage = _test_observe_only_reconcile_skips_tail_sync_for_non_tail_stage
-
-
-def _test_finalize_deferred_keeps_running_during_owned_stage_handoff(self):
-    task = BinarySecurityTask(
-        id="task-stage-handoff",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    system_run = BinarySecurityStageRun(
-        id="sr-system-handoff",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="system_analysis",
-        sequence_no=1,
-        status="success",
-        output_summary={"success_count": 1},
-    )
-    entry_run = BinarySecurityStageRun(
-        id="sr-entry-handoff",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="entry_analysis",
-        sequence_no=2,
-        status="pending",
-    )
-    entry_item = BinarySecurityStageItem(
-        id="si-entry-handoff",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="entry_analysis",
-        item_key="source_project-http_parse",
-        status="pending",
-    )
-    db = _AppendingModelAwareDb(
-        tasks=[task],
-        stage_runs=[system_run, entry_run],
-        stage_items=[entry_item],
-        events=[],
-    )
-    original_next_incomplete_stage = self.manager._next_stage_candidate
-    original_workflow_blocked_on_stage = self.manager._workflow_blocked_on_stage
-
-    self.manager._next_stage_candidate = lambda _db, _task: "entry_analysis"
-    self.manager._workflow_blocked_on_stage = lambda _task, _snapshots: None
-    try:
-        changed = self.manager._finalize_task_handle_resume_or_missing_stage(
-            db,
-            task,
-            stage_runs=[system_run, entry_run],
-        )
-    finally:
-        self.manager._next_stage_candidate = original_next_incomplete_stage
-        self.manager._workflow_blocked_on_stage = original_workflow_blocked_on_stage
-
-    self.assertTrue(changed)
-    self.assertEqual("running", task.status)
-    self.assertFalse(
-        any(
-            row.__class__.__name__ == "BinarySecurityEvent"
-            and row.event_type == "task_status_changed"
-            and '"to_status": "pending"' in str(getattr(row, "payload_json", "") or "")
-            for row in db.added
-        )
-    )
-
-
-TaskManagerTests.test_finalize_deferred_keeps_running_during_owned_stage_handoff = _test_finalize_deferred_keeps_running_during_owned_stage_handoff
-
-
-def _test_run_task_layer_reconcile_signal_noops_for_stage_worker_start_requested(self):
-    task = BinarySecurityTask(
-        id="task-start-reconcile",
-        project_id="p1",
-        name="n",
-        status="pending",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="binary_to_source",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    db = _AppendingModelAwareDb(tasks=[task], events=[])
-
-    original_refresh = self.manager._refresh_task_status_after_sync
-    original_apply = self.manager._apply_task_layer_reconcile_decision
-    calls = []
-
-    def _capture_refresh(_db, _task):
-        calls.append("refresh")
-        return None
-
-    async def _capture_apply(_db, _task, *, decision, signal):
-        calls.append({"action": decision.action, "source": signal.get("source_event_type")})
-        return False
-
-    self.manager._refresh_task_status_after_sync = _capture_refresh
-    self.manager._apply_task_layer_reconcile_decision = _capture_apply
-    try:
-        changed = asyncio.run(
-            self.manager._run_task_layer_reconcile_signal(
-                db,
-                task,
-                signal={
-                    "source_event_type": "stage_worker_start_requested",
-                    "reconcile_reason": "stage_worker_start_requested",
-                    "stage_name": "entry_analysis",
-                    "fact_applied": True,
-                },
-            )
-        )
-    finally:
-        self.manager._refresh_task_status_after_sync = original_refresh
-        self.manager._apply_task_layer_reconcile_decision = original_apply
-
-    self.assertFalse(changed)
-    self.assertEqual("refresh", calls[0])
-    self.assertEqual("refresh_only", calls[1]["action"])
-    self.assertEqual("stage_worker_start_requested", calls[1]["source"])
-
-
-def _test_sync_downstream_status_uses_owner_reconcile_instead_of_direct_task_layer_requeue(self):
-    task = BinarySecurityTask(
-        id="t-sync-reconcile",
-        project_id="p1",
-        name="source",
-        status="running",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/tmp",
-    )
-    run = BinarySecurityStageRun(
-        id="sr-system",
-        task_id="t-sync-reconcile",
-        project_id="p1",
-        stage_name="system_analysis",
-        sequence_no=1,
-        status="running",
-    )
-    item = BinarySecurityStageItem(
-        id="si-system",
-        task_id="t-sync-reconcile",
-        project_id="p1",
-        stage_run_id="sr-system",
-        stage_name="system_analysis",
-        item_key="source_project",
-        parent_key="source_project",
-        status="queued",
-        downstream_service="system_analyse",
-        downstream_task_id="sat-1",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
-
-    original_fetch = self.manager._fetch_downstream_task_payload
-    original_write = self.manager._write_task_metadata_async
-    original_reconcile = self.manager._run_task_layer_reconcile_signal
-    original_request = self.manager._request_task_layer_reconcile
-    calls = []
-
-    async def _fetch(_task, _item, _token):
-        return {"task_id": "sat-1", "status": "success"}
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    async def _capture_reconcile(_db, _task, *, signal):
-        calls.append(dict(signal))
-        return False
-
-    def _capture_request(_db, _task, **kwargs):
-        calls.append({"requested": True, **dict(kwargs)})
-
-    self.manager._fetch_downstream_task_payload = _fetch
-    self.manager._write_task_metadata_async = _noop_write
-    self.manager._run_task_layer_reconcile_signal = _capture_reconcile
-    self.manager._request_task_layer_reconcile = _capture_request
-    try:
-        asyncio.run(
-            self.manager.sync_downstream_status(
-                db,
-                project_id="p1",
-                task_id="t-sync-reconcile",
-                stage_name="system_analysis",
-                apply_state=True,
-            )
-        )
-    finally:
-        self.manager._fetch_downstream_task_payload = original_fetch
-        self.manager._write_task_metadata_async = original_write
-        self.manager._run_task_layer_reconcile_signal = original_reconcile
-        self.manager._request_task_layer_reconcile = original_request
-
-    self.assertTrue(calls[0]["requested"])
-    self.assertEqual("downstream_status_observed", calls[0]["source_event_type"])
-    self.assertEqual("system_analysis_sync_next_stage_active_without_owner", calls[0]["reconcile_reason"])
-    self.assertEqual("system_analysis", calls[0]["stage_name"])
-
-
-def _test_sync_downstream_status_runs_inline_reconcile_when_current_instance_is_owner(self):
-    task = BinarySecurityTask(
-        id="t-sync-reconcile-owner",
-        project_id="p1",
-        name="source",
-        status="running",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/tmp",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id=self.manager.instance_id,
-        lease_expires_at=_now() + timedelta(minutes=1),
-    )
-    run = BinarySecurityStageRun(
-        id="sr-system-owner",
-        task_id="t-sync-reconcile-owner",
-        project_id="p1",
-        stage_name="system_analysis",
-        sequence_no=1,
-        status="running",
-    )
-    item = BinarySecurityStageItem(
-        id="si-system-owner",
-        task_id="t-sync-reconcile-owner",
-        project_id="p1",
-        stage_run_id="sr-system-owner",
-        stage_name="system_analysis",
-        item_key="source_project",
-        parent_key="source_project",
-        status="queued",
-        downstream_service="system_analyse",
-        downstream_task_id="sat-1",
-    )
-    lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id=self.manager.instance_id,
-        heartbeat_at=_now(),
-        lease_expires_at=_now() + timedelta(minutes=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], runtime_leases=[lease], events=[])
-
-    original_fetch = self.manager._fetch_downstream_task_payload
-    original_write = self.manager._write_task_metadata_async
-    original_reconcile = self.manager._run_task_layer_reconcile_signal
-    original_request = self.manager._request_task_layer_reconcile
-    calls = []
-
-    async def _fetch(_task, _item, _token):
-        return {"task_id": "sat-1", "status": "success"}
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    async def _capture_reconcile(_db, _task, *, signal):
-        calls.append({"inline": True, **dict(signal)})
-        return False
-
-    def _capture_request(_db, _task, **kwargs):
-        calls.append({"requested": True, **dict(kwargs)})
-
-    self.manager._fetch_downstream_task_payload = _fetch
-    self.manager._write_task_metadata_async = _noop_write
-    self.manager._run_task_layer_reconcile_signal = _capture_reconcile
-    self.manager._request_task_layer_reconcile = _capture_request
-    try:
-        asyncio.run(
-            self.manager.sync_downstream_status(
-                db,
-                project_id=task.project_id,
-                task_id=task.id,
-                stage_name="system_analysis",
-                apply_state=True,
-            )
-        )
-    finally:
-        self.manager._fetch_downstream_task_payload = original_fetch
-        self.manager._write_task_metadata_async = original_write
-        self.manager._run_task_layer_reconcile_signal = original_reconcile
-        self.manager._request_task_layer_reconcile = original_request
-
-    self.assertTrue(calls[0]["inline"])
-    self.assertEqual("downstream_status_observed", calls[0]["source_event_type"])
-    self.assertEqual("system_analysis_sync_next_stage_active_without_owner", calls[0]["reconcile_reason"])
-    self.assertEqual("system_analysis", calls[0]["stage_name"])
-
-
-TaskManagerTests.test_run_task_layer_reconcile_signal_noops_for_stage_worker_start_requested = _test_run_task_layer_reconcile_signal_noops_for_stage_worker_start_requested
-TaskManagerTests.test_sync_downstream_status_uses_owner_reconcile_instead_of_direct_task_layer_requeue = _test_sync_downstream_status_uses_owner_reconcile_instead_of_direct_task_layer_requeue
-TaskManagerTests.test_sync_downstream_status_runs_inline_reconcile_when_current_instance_is_owner = _test_sync_downstream_status_runs_inline_reconcile_when_current_instance_is_owner
-
-
-def _test_run_task_layer_reconcile_signal_failure_finalize_uses_authoritative_failure(self):
-    task = BinarySecurityTask(
-        id="task-failure-reconcile",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_BINARY,
-        current_stage="entry_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    db = _AppendingModelAwareDb(tasks=[task], events=[])
-
-    original_refresh = self.manager._refresh_task_status_after_sync
-    original_current_failure = self.manager._current_stage_authoritative_failure_context
-    original_earlier_failure = self.manager._earlier_stage_authoritative_failure_context
-    original_finalize = self.manager._finalize_task_after_authoritative_failure
-    original_write = self.manager._write_task_metadata_async
-    calls = []
-
-    def _capture_refresh(_db, _task):
-        calls.append(("refresh", str(_task.current_stage or "")))
-        return None
-
-    def _capture_failure(_db, _task, stage_runs=None):
-        del stage_runs
-        return {
-            "stage_name": "entry_analysis",
-            "failure_code": "archive_blocked",
-            "failure_category": "archive_blocked",
-            "failure_message": "archive blocked",
-            "reason": "authoritative_archive_blocked",
-        }
-
-    def _capture_finalize(_db, _task, *, failure_ctx, previous_status=None, event_type="dispatching_state_force_terminalized"):
-        calls.append(
-            (
-                "finalize",
-                {
-                    "failure_ctx": dict(failure_ctx or {}),
-                    "previous_status": previous_status,
-                    "event_type": event_type,
-                },
-            )
-        )
-        _task.status = "failed"
-        return None
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    self.manager._refresh_task_status_after_sync = _capture_refresh
-    self.manager._current_stage_authoritative_failure_context = _capture_failure
-    self.manager._earlier_stage_authoritative_failure_context = lambda *_args, **_kwargs: None
-    self.manager._finalize_task_after_authoritative_failure = _capture_finalize
-    self.manager._write_task_metadata_async = _noop_write
-    try:
-        changed = asyncio.run(
-            self.manager._run_task_layer_reconcile_signal(
-                db,
-                task,
-                signal={
-                    "source_event_type": "task_execution_failed",
-                    "state_event_id": "sev-fail-1",
-                    "reconcile_reason": "task_execution_failed",
-                    "stage_name": "entry_analysis",
-                    "fact_applied": True,
-                },
-            )
-        )
-    finally:
-        self.manager._refresh_task_status_after_sync = original_refresh
-        self.manager._current_stage_authoritative_failure_context = original_current_failure
-        self.manager._earlier_stage_authoritative_failure_context = original_earlier_failure
-        self.manager._finalize_task_after_authoritative_failure = original_finalize
-        self.manager._write_task_metadata_async = original_write
-
-    self.assertTrue(changed)
-    self.assertEqual("refresh", calls[0][0])
-    self.assertEqual("finalize", calls[1][0])
-    self.assertEqual("entry_analysis", calls[1][1]["failure_ctx"]["stage_name"])
-    self.assertEqual("archive_blocked", calls[1][1]["failure_ctx"]["failure_code"])
-
-
-TaskManagerTests.test_run_task_layer_reconcile_signal_failure_finalize_uses_authoritative_failure = _test_run_task_layer_reconcile_signal_failure_finalize_uses_authoritative_failure
-
-
-def _test_run_task_layer_reconcile_signal_archive_apply_advances_system_analysis_only_via_owner(self):
-    task = BinarySecurityTask(
-        id="task-archive-owner-advance",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="system_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-    )
-    stage_run = BinarySecurityStageRun(
-        id="sr-system-owner-advance",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="system_analysis",
-        sequence_no=1,
-        status="success",
-        output_summary={"success_count": 1},
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], events=[])
-
-    original_entry_inputs = self.manager._entry_analysis_inputs
-    original_should_auto = self.manager._should_auto_advance_to_stage
-    original_apply_resume = self.manager._apply_task_resume_decision
-    original_enqueue = self.manager._enqueue_task
-    original_write = self.manager._write_task_metadata_async
-    applied = []
-    queued = []
-
-    self.manager._entry_analysis_inputs = lambda *_args, **_kwargs: [{"entry_key": "entry-a"}]
-    self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
-    self.manager._enqueue_task = lambda task_id: queued.append(task_id)
-
-    def _capture_apply_resume(_db, _task, decision, *, operation=None, enqueue_task=True):
-        del operation
-        applied.append(
-            {
-                "next_stage": decision.next_stage,
-                "source": decision.source,
-                "event_type": decision.event_type,
-            }
-        )
-        return original_apply_resume(_db, _task, decision, enqueue_task=enqueue_task)
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    self.manager._apply_task_resume_decision = _capture_apply_resume
-    self.manager._write_task_metadata_async = _noop_write
-    try:
-        with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
-            changed = asyncio.run(
-                self.manager._run_task_layer_reconcile_signal(
-                    db,
-                    task,
-                    signal={
-                        "source_event_type": "archive_job_copied",
-                        "state_event_id": "sev-archive-owner-advance",
-                        "reconcile_reason": "archive_apply",
-                        "stage_name": "system_analysis",
-                        "fact_applied": True,
-                        "archive_job_id": "aj-system-1",
-                    },
-                )
-            )
-    finally:
-        self.manager._entry_analysis_inputs = original_entry_inputs
-        self.manager._should_auto_advance_to_stage = original_should_auto
-        self.manager._apply_task_resume_decision = original_apply_resume
-        self.manager._enqueue_task = original_enqueue
-        self.manager._write_task_metadata_async = original_write
-
-        self.assertTrue(changed)
-        self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("running", task.status)
-        self.assertEqual(["task-archive-owner-advance"], queued)
-        if applied:
-            self.assertEqual("entry_analysis", applied[0]["next_stage"])
-        self.assertIn(applied[0]["source"], {"stage_terminal", "downstream_sync"})
-        self.assertIn(applied[0]["event_type"], {"task_requeued_after_stage_completion", "task_requeued_after_downstream_sync"})
-    blocked_events = [event for event in db.events if event.event_type == "main_state_write_blocked"]
-    attempted_stages = {
-        str((event.payload or {}).get("attempted_stage_name") or "")
-        for event in blocked_events
-    }
-    self.assertFalse({"entry_analysis", "dataflow_vuln_scan"} & attempted_stages)
-    self.assertTrue(
-        any(
-            event.event_type in {
-                "task_requeued_after_stage_completion",
-                "task_finalize_deferred_for_incomplete_stage",
-                "task_layer_reconcile_completed",
-            }
-            for event in db.events
-        )
-    )
-
-
-TaskManagerTests.test_run_task_layer_reconcile_signal_archive_apply_advances_system_analysis_only_via_owner = _test_run_task_layer_reconcile_signal_archive_apply_advances_system_analysis_only_via_owner
-
-
-def _test_run_task_layer_reconcile_signal_archive_apply_keeps_streaming_entry_parent_running(self):
-    task = BinarySecurityTask(
-        id="task-archive-streaming-entry",
-        project_id="p1",
-        name="n",
-        status="running",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="entry_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-        summary={
-            "entry_results": [
-                {
-                    "module_key": "mod-a",
-                    "module_name": "mod-a",
-                    "entries": [{"entry_key": "entry-a", "function_name": "f"}],
-                }
-            ]
-        },
-    )
-    entry_run = BinarySecurityStageRun(
-        id="sr-entry-streaming",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="entry_analysis",
-        sequence_no=2,
-        status="running",
-        output_summary={"success_count": 1, "entry_count": 1},
-    )
-    tail_run = BinarySecurityStageRun(
-        id="sr-tail-streaming",
-        task_id=task.id,
-        project_id=task.project_id,
-        stage_name="dataflow_vuln_scan",
-        sequence_no=3,
-        status="pending",
-    )
-    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run, tail_run], events=[])
-
-    original_refresh = self.manager._refresh_task_status_after_sync
-    original_apply = self.manager._apply_task_action_after_stage_terminal
-    original_write = self.manager._write_task_metadata_async
-    calls = []
-
-    def _capture_refresh(_db, _task):
-        calls.append(("refresh", str(_task.current_stage or ""), str(_task.status or "")))
-        return None
-
-    async def _capture_apply(_db, _task, **kwargs):
-        calls.append(("apply", dict(kwargs)))
-        return True
-
-    async def _noop_write(*_args, **_kwargs):
-        return None
-
-    self.manager._refresh_task_status_after_sync = _capture_refresh
-    self.manager._apply_task_action_after_stage_terminal = _capture_apply
-    self.manager._write_task_metadata_async = _noop_write
-    try:
-        changed = asyncio.run(
-            self.manager._run_task_layer_reconcile_signal(
-                db,
-                task,
-                signal={
-                    "source_event_type": "archive_job_copied",
-                    "state_event_id": "sev-archive-streaming-entry",
-                    "reconcile_reason": "archive_apply",
-                    "stage_name": "entry_analysis",
-                    "fact_applied": True,
-                    "archive_job_id": "aj-entry-1",
-                },
-            )
-        )
-    finally:
-        self.manager._refresh_task_status_after_sync = original_refresh
-        self.manager._apply_task_action_after_stage_terminal = original_apply
-        self.manager._write_task_metadata_async = original_write
-
-        self.assertFalse(changed)
-        self.assertEqual("running", task.status)
-        self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual([("refresh", "entry_analysis", "running")], calls)
-        self.assertTrue(any(event.event_type == "task_layer_reconcile_noop" for event in db.events))
-        self.assertFalse(any(event.event_type == "task_requeued_after_stage_completion" for event in db.events))
-
-
-TaskManagerTests.test_run_task_layer_reconcile_signal_archive_apply_keeps_streaming_entry_parent_running = _test_run_task_layer_reconcile_signal_archive_apply_keeps_streaming_entry_parent_running
 
 
 def _test_stage_item_response_falls_back_to_downstream_payload_status(self):
@@ -49605,241 +47875,6 @@ def _test_enqueue_task_sync_request_merges_same_dedupe_key(self):
     self.assertEqual([task.id, task.id], queued)
 
 
-def _test_enqueue_task_sync_request_uses_owner_inbox_when_owner_present(self):
-    manager = TaskManager()
-    task = BinarySecurityTask(
-        id="task-sync-owner",
-        project_id="p1",
-        name="sync",
-        task_type=TASK_TYPE_SOURCE,
-        status="running",
-        current_stage="dataflow_vuln_scan",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        dispatcher_instance_id="worker-owner",
-    )
-    fake_queue = _FakeTaskSyncQueue()
-    queued: list[str] = []
-    original_enqueue = manager._enqueue_task
-    original_get_queue = task_manager_module.get_task_queue
-    try:
-        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
-        task_manager_module.get_task_queue = lambda: fake_queue
-        asyncio.run(
-            manager._enqueue_task_sync_request(
-                task,
-                sync_kind="downstream_status",
-                source="test",
-                reason="owner-sync",
-                stage_name="entry_analysis",
-                item_ids=["i1"],
-            )
-        )
-    finally:
-        manager._enqueue_task = original_enqueue
-        task_manager_module.get_task_queue = original_get_queue
-
-    self.assertEqual([task.id], queued)
-    entries = fake_queue.entries_by_task[task.id]
-    self.assertEqual(1, len(entries))
-    self.assertEqual(["i1"], entries[0]["item_ids"])
-
-
-def _test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox(self):
-    manager = TaskManager()
-    manager.instance_id = "worker-owner"
-    fake_handle = SimpleNamespace(
-        done=lambda: False,
-        lease_established=True,
-        owner_active=True,
-        cancel_requested=False,
-        active_commit_succeeded=True,
-        release_requested=False,
-        takeover_observed=False,
-    )
-    task = BinarySecurityTask(
-        id="task-control-owner",
-        project_id="p1",
-        name="control",
-        status="running",
-        task_type=TASK_TYPE_SOURCE,
-        current_stage="entry_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/src",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-owner",
-        current_operation_id="op-1",
-    )
-    operation = BinarySecurityTaskOperation(
-        id="op-1",
-        task_id=task.id,
-        project_id="p1",
-        operation_type=task_manager_module.TASK_ACTION_CANCEL,
-        status="running",
-    )
-    lease = BinarySecurityTaskRuntimeLease(
-        task_id=task.id,
-        owner_instance_id="worker-owner",
-        heartbeat_at=_now(),
-        lease_expires_at=_now() + timedelta(minutes=1),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease], events=[])
-
-    original_factory = task_manager_module.get_session_factory
-    original_runtime_handle = manager._runtime_handle
-    original_cancel = manager._request_local_worker_cancel
-    original_enqueue_task = manager._enqueue_task
-    original_enqueue_owner_signal = manager._enqueue_owner_signal
-    queued: list[str] = []
-    owner_signals: list[tuple[str, str]] = []
-
-    async def _fake_cancel(*_args, **_kwargs):
-        return True
-
-    try:
-        task_manager_module.get_session_factory = lambda: (lambda: db)
-        manager._runtime_handle = lambda task_id: fake_handle if task_id == task.id else None
-        manager._request_local_worker_cancel = _fake_cancel
-        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
-        manager._enqueue_owner_signal = (
-            lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
-        )
-        result = asyncio.run(manager._handoff_active_serial_control_operation_from_runtime(task.id))
-    finally:
-        task_manager_module.get_session_factory = original_factory
-        manager._runtime_handle = original_runtime_handle
-        manager._request_local_worker_cancel = original_cancel
-        manager._enqueue_task = original_enqueue_task
-        manager._enqueue_owner_signal = original_enqueue_owner_signal
-
-    self.assertTrue(result)
-    self.assertEqual([task.id], queued)
-    self.assertEqual([], owner_signals)
-    self.assertTrue(any(event.event_type == "runtime_yielded_for_serial_control_operation" for event in db.events))
-
-
-def _test_reconcile_deferred_cleanup_task_ref_uses_owner_inbox_when_owner_present(self):
-    manager = TaskManager()
-    task = BinarySecurityTask(
-        id="t-reconcile-cleanup-pending",
-        project_id="p1",
-        name="task",
-        task_type=TASK_TYPE_BINARY,
-        firmware_source="project_filesystem",
-        firmware_path="/tmp/in",
-        output_root="/tmp/out",
-        workspace_root="/tmp/ws",
-        status="cancelled",
-        current_stage="firmware_unpack",
-        dispatcher_instance_id="worker-owner",
-    )
-    task.cleanup_snapshot = {
-        "cleanup_partial_failed": True,
-        "deleted_downstream_count": 0,
-        "deferred_cleanup_attempts": 1,
-        "deferred_cleanup_status": "partial_failed",
-        "deferred_downstream_refs": [
-            {"service": "firmware_unpacker", "task_id": "fw-1", "stage_name": "firmware_unpack", "deferred": True}
-        ],
-    }
-    db = _AppendingModelAwareDb(tasks=[task], events=[])
-    queued: list[str] = []
-    owner_signals: list[tuple[str, str]] = []
-
-    async def _run():
-        with (
-            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
-            patch.object(manager, "_delete_downstream_refs", AsyncMock(return_value=0)),
-        ):
-            setattr(
-                manager,
-                "_last_downstream_cleanup_results",
-                [
-                    {
-                        "service": "firmware_unpacker",
-                        "task_id": "fw-1",
-                        "stage_name": "firmware_unpack",
-                        "delete_status": "failed",
-                        "deferred": True,
-                        "error": "still busy",
-                    }
-                ],
-            )
-            original_enqueue = manager._enqueue_task
-            original_enqueue_owner_signal = manager._enqueue_owner_signal
-            try:
-                manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
-                manager._enqueue_owner_signal = (
-                    lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
-                )
-                await manager._reconcile_deferred_cleanup_task_ref({"project_id": "p1", "task_id": task.id}, "token")
-            finally:
-                manager._enqueue_task = original_enqueue
-                manager._enqueue_owner_signal = original_enqueue_owner_signal
-
-    asyncio.run(_run())
-
-    self.assertEqual([task.id], queued)
-    event_types = [row.event_type for row in db.events if isinstance(row, BinarySecurityEvent)]
-    self.assertIn("task_delete_cleanup_retry_deferred", event_types)
-
-
-def _test_update_task_runtime_policy_uses_owner_inbox_when_owner_present(self):
-    manager = TaskManager()
-    task = BinarySecurityTask(
-        id="t-runtime-policy-owner",
-        project_id="p1",
-        name="binary",
-        status="running",
-        task_type=TASK_TYPE_BINARY_MODULE,
-        current_stage="entry_analysis",
-        firmware_source="project_filesystem",
-        firmware_path="/fw",
-        output_root="/o",
-        workspace_root="/w",
-        runtime_phase="tail_reconciliation",
-        dispatcher_instance_id="worker-owner",
-    )
-    task.policy = {
-        "max_stage_parallelism": 4,
-        "max_retries_per_item": 2,
-        "continue_on_item_failure": True,
-        "stage_parallelism": {"binary_to_source": 4, "entry_analysis": 4, "dataflow_vuln_scan": 4},
-    }
-    db = _ModelAwareDb(tasks=[task])
-    queued: list[str] = []
-    owner_signals: list[tuple[str, str]] = []
-    original_enqueue = manager._enqueue_task
-    original_enqueue_owner_signal = manager._enqueue_owner_signal
-    try:
-        manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
-        manager._enqueue_owner_signal = (
-            lambda owner_instance_id, task_id, **_kwargs: owner_signals.append((owner_instance_id, task_id))
-        )
-        manager.update_task_runtime_policy(
-            db,
-            project_id="p1",
-            task_id="t-runtime-policy-owner",
-            payload=BinarySecurityTaskRuntimePolicyUpdatePayload(
-                expected_version=0,
-                stage_parallelism={"entry_analysis": 2},
-                updated_by="tester",
-            ),
-        )
-    finally:
-        manager._enqueue_task = original_enqueue
-        manager._enqueue_owner_signal = original_enqueue_owner_signal
-
-    self.assertEqual([task.id], queued)
-    self.assertEqual([], owner_signals)
-    event_types = [getattr(event, "event_type", "") for event in db.added]
-    self.assertIn("task_runtime_policy_updated", event_types)
-
-
 def _test_update_task_policy_falls_back_to_shared_dispatch_without_owner(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -50504,9 +48539,6 @@ TaskManagerTests.test_ensure_stage_run_records_timeline_event_when_created = _te
 TaskManagerTests.test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage = _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
 TaskManagerTests.test_enqueue_task_sync_request_merges_same_dedupe_key = _test_enqueue_task_sync_request_merges_same_dedupe_key
-TaskManagerTests.test_enqueue_task_sync_request_uses_owner_inbox_when_owner_present = _test_enqueue_task_sync_request_uses_owner_inbox_when_owner_present
-TaskManagerTests.test_reconcile_deferred_cleanup_task_ref_uses_owner_inbox_when_owner_present = _test_reconcile_deferred_cleanup_task_ref_uses_owner_inbox_when_owner_present
-TaskManagerTests.test_update_task_runtime_policy_uses_owner_inbox_when_owner_present = _test_update_task_runtime_policy_uses_owner_inbox_when_owner_present
 TaskManagerTests.test_update_task_policy_falls_back_to_shared_dispatch_without_owner = _test_update_task_policy_falls_back_to_shared_dispatch_without_owner
 TaskManagerTests.test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync = _test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync
 TaskManagerTests.test_drain_task_sync_queue_consumes_and_acks_entry = _test_drain_task_sync_queue_consumes_and_acks_entry

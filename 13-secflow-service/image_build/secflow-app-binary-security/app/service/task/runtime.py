@@ -1402,6 +1402,31 @@ class TaskRuntimeServiceMixin:
                             },
                         )
                     continue
+                if self._task_has_healthy_active_owner_runtime(db, task):
+                    task_manager_module.logger.info(
+                        "binary-security queue reconcile suppressed shared-dispatch reenqueue for pending task with active owner: "
+                        "task_id=%s task_status=%s runtime_phase=%s dispatcher_instance_id=%s",
+                        normalized_task_id,
+                        current_status,
+                        self._task_runtime_phase(task),
+                        str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    )
+                    self._record_event(
+                        db,
+                        task,
+                        "pending_task_shared_dispatch_reenqueue_suppressed_active_owner",
+                        "检测到 pending 任务仍由健康 owner 持有，本次不再注入共享调度队列",
+                        level="info",
+                        stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                        payload={
+                            "task_status": current_status,
+                            "runtime_phase": self._task_runtime_phase(task),
+                            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                            "enqueue_context": "queue_reconcile",
+                            "reason": "pending_task_already_has_active_owner_runtime",
+                        },
+                    )
+                    continue
                 await queue.push_task(normalized_task_id)
                 continue
             if self._task_row_owner_is_runtime_supported(db, task):
@@ -1472,6 +1497,32 @@ class TaskRuntimeServiceMixin:
                         "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
                         "enqueue_context": "queue_reconcile_operation",
                         "reason": "stale_active_operation_row_without_task_binding",
+                    },
+                )
+                continue
+            if self._task_has_healthy_active_owner_runtime(db, task):
+                task_manager_module.logger.info(
+                    "binary-security queue reconcile suppressed shared-dispatch wakeup for task with active operation and active owner: "
+                    "task_id=%s task_status=%s dispatcher_instance_id=%s current_operation_id=%s",
+                    normalized_task_id,
+                    str(getattr(task, "status", "") or "").strip() or None,
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    current_operation_id,
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "active_operation_shared_dispatch_reenqueue_suppressed_active_owner",
+                    "检测到活跃 operation 仍由健康 owner 推进，本次不再注入共享调度队列",
+                    level="info",
+                    stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                    payload={
+                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                        "runtime_phase": self._task_runtime_phase(task),
+                        "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                        "current_operation_id": current_operation_id,
+                        "enqueue_context": "queue_reconcile_operation",
+                        "reason": "active_operation_already_has_active_owner_runtime",
                     },
                 )
                 continue

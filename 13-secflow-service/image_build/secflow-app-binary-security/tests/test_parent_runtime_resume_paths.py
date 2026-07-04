@@ -375,6 +375,139 @@ class ParentRuntimeResumePathTests(unittest.TestCase):
         event_types = [event.event_type for event in db.events]
         self.assertIn("retry_in_place_resume_applied", event_types)
 
+    def test_run_task_operation_steps_requeue_does_not_skip_hard_restart_pending_state_without_requeue_marker(self):
+        now_value = _now()
+        task = BinarySecurityTask(
+            id="task-op-hard-retry",
+            project_id="p1",
+            name="n",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="test-worker",
+            lease_expires_at=now_value + timedelta(minutes=5),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-hard-retry",
+            task_id="task-op-hard-retry",
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_RETRY,
+            target_stage="system_analysis",
+            status="running",
+            current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+            result_payload={},
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="test-worker",
+            heartbeat_at=now_value,
+            lease_expires_at=now_value + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
+
+        original_apply = self.manager._apply_task_resume_decision
+        original_enqueue = self.manager._enqueue_task
+        original_should_auto = self.manager._should_auto_advance_to_stage
+        applied = []
+        queued = []
+
+        def _capture_apply(_db, _task, decision, *, operation=None):
+            applied.append(
+                {
+                    "next_stage": decision.next_stage,
+                    "source": decision.source,
+                    "event_type": decision.event_type,
+                    "operation_id": getattr(operation, "id", None),
+                }
+            )
+            return original_apply(_db, _task, decision, operation=operation)
+
+        self.manager.instance_id = "test-worker"
+        self.manager._apply_task_resume_decision = _capture_apply
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
+        try:
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager._apply_task_resume_decision = original_apply
+            self.manager._enqueue_task = original_enqueue
+            self.manager._should_auto_advance_to_stage = original_should_auto
+
+        self.assertEqual([], queued)
+        self.assertEqual([], applied)
+        self.assertEqual("running", task.status)
+        self.assertEqual("system_analysis", task.current_stage)
+        self.assertEqual("running", operation.status)
+        self.assertEqual(TASK_OPERATION_STEP_REQUEUE_TASK, operation.current_step)
+        self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+        self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("retry_in_place_resume_applied", event_types)
+        self.assertIn("operation_step_succeeded", event_types)
+
+    def test_run_task_operation_steps_requeue_fails_without_owner_release_permission(self):
+        task = BinarySecurityTask(
+            id="task-op-requeue-blocked",
+            project_id="p1",
+            name="n",
+            status="failed",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="other-worker",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-requeue-blocked",
+            task_id=task.id,
+            project_id="p1",
+            operation_type=task_manager_module.TASK_ACTION_RETRY,
+            target_stage="system_analysis",
+            status="running",
+            current_step=TASK_OPERATION_STEP_REQUEUE_TASK,
+            result_payload={},
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="other-worker",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
+
+        original_enqueue = self.manager._enqueue_task
+        original_should_auto = self.manager._should_auto_advance_to_stage
+        queued = []
+
+        self.manager.instance_id = "test-worker"
+        self.manager._enqueue_task = lambda task_id: queued.append(task_id)
+        self.manager._should_auto_advance_to_stage = lambda *_args, **_kwargs: True
+        try:
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager._enqueue_task = original_enqueue
+            self.manager._should_auto_advance_to_stage = original_should_auto
+
+        self.assertEqual([], queued)
+        self.assertEqual("running", operation.status)
+        self.assertEqual(TASK_OPERATION_STEP_REQUEUE_TASK, operation.current_step)
+        self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
+        self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
+        self.assertEqual("failed", task.status)
+        self.assertEqual("other-worker", task.dispatcher_instance_id)
+        self.assertTrue(any(lease.task_id == task.id for lease in db.runtime_leases))
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("main_state_write_blocked", event_types)
+        self.assertIn("retry_in_place_resume_applied", event_types)
+        self.assertIn("operation_step_succeeded", event_types)
+
     def test_apply_task_action_after_stage_terminal_requeue_uses_resume_decision(self):
         task = BinarySecurityTask(
             id="task-terminal",

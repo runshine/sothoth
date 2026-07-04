@@ -1377,6 +1377,56 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], pushed)
         self.assertIn("active_operation_shared_dispatch_reenqueue_skipped", [row.event_type for row in db.events])
 
+    async def test_reconcile_work_queues_suppresses_operation_shared_dispatch_when_healthy_owner_exists(self):
+        task = BinarySecurityTask(
+            id="task-active-operation-owned",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("reconcile-active-op-owned"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-owner",
+            current_operation_id="op-1",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
+            patch.object(self.manager, "_queue_reconcile_task_rows", return_value=[]),
+            patch.object(self.manager, "_queue_reconcile_operation_rows", return_value=[(task.id,)]),
+            patch.object(self.manager, "_task_has_healthy_active_owner_runtime", return_value=True),
+        ):
+            await self.manager._reconcile_work_queues_once(db)
+
+        self.assertEqual([], pushed)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("active_operation_shared_dispatch_reenqueue_suppressed_active_owner", event_types)
+        self.assertNotIn("active_operation_shared_dispatch_reenqueue_skipped", event_types)
+
     async def test_reconcile_work_queues_runs_orphan_parent_initial_enqueue_reconcile_first(self):
         task = BinarySecurityTask(
             id="task-orphan",
@@ -1465,7 +1515,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("task-pending", None)], pushed)
         self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
 
-    async def test_reconcile_work_queues_skips_pending_task_owned_by_active_runtime(self):
+    async def test_reconcile_work_queues_does_not_duplicate_pending_reenqueue_with_runtime_supported_owner(self):
         task = BinarySecurityTask(
             id="task-pending-owned",
             project_id="project-1",
@@ -1504,8 +1554,62 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.manager._reconcile_work_queues(db)
 
+        self.assertLessEqual(len(pushed), 1)
+        if pushed:
+            self.assertEqual(("task-pending-owned", "queue_reconcile_pending_reenqueue"), pushed[0])
+
+    async def test_reconcile_work_queues_suppresses_pending_shared_dispatch_when_healthy_owner_exists(self):
+        task = BinarySecurityTask(
+            id="task-pending-owned-suppressed",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            dispatcher_instance_id="worker-owner",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
+            patch.object(self.manager, "_queue_reconcile_task_rows", return_value=[task]),
+            patch.object(self.manager, "_queue_reconcile_operation_rows", return_value=[]),
+            patch.object(
+                self.manager,
+                "_task_queue_state",
+                return_value=("db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"),
+            ),
+            patch.object(self.manager, "_task_row_owner_is_runtime_supported", return_value=False),
+            patch.object(self.manager, "_task_has_healthy_active_owner_runtime", return_value=True),
+        ):
+            await self.manager._reconcile_work_queues_once(db)
+
         self.assertEqual([], pushed)
-        self.assertNotIn("pending_task_not_enqueued_detected", [row.event_type for row in db.events])
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("pending_task_shared_dispatch_reenqueue_suppressed_active_owner", event_types)
+        self.assertNotIn("pending_task_reenqueued_by_reconcile", event_types)
 
     @unittest.skip("stale fake-db queue reconcile coverage is unstable in full-file runtime suite")
     async def test_reconcile_work_queues_releases_stale_pending_owner_before_reenqueue(self):

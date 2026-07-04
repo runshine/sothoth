@@ -351,6 +351,7 @@ class TaskLifecycleServiceMixin:
             task = self._task_or_404(db, ref["project_id"], ref["task_id"])
             await self._enqueue_task_sync_request(
                 task,
+                db=db,
                 sync_kind="downstream_status",
                 source="lease_auditor_signal",
                 reason="downstream_reconcile_requested",
@@ -463,6 +464,7 @@ class TaskLifecycleServiceMixin:
             )
             await self._enqueue_task_sync_request(
                 task,
+                db=db,
                 sync_kind="stale_sync_retry",
                 source="lease_auditor_signal",
                 reason="stale_sync_attempt",

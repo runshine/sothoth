@@ -1672,7 +1672,6 @@ class TaskControlServiceMixin:
             task_manager_module.TASK_ACTION_CONTINUE,
             operation_id=operation.id,
         )
-        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("continue", "accepted")
         return operation
 
@@ -1704,7 +1703,6 @@ class TaskControlServiceMixin:
             task_manager_module.TASK_ACTION_RETRY,
             operation_id=operation.id,
         )
-        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation("retry", "accepted")
         task_manager_module.observe_task_error("retry", stage=first_stage, result="accepted")
         return operation
@@ -1737,7 +1735,6 @@ class TaskControlServiceMixin:
                 task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                 operation_id=operation.id,
             )
-            self._enqueue_task(task.id)
             task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
             return operation
         if not supported or not stage_name:
@@ -1764,7 +1761,6 @@ class TaskControlServiceMixin:
                     task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                     operation_id=operation.id,
                 )
-                self._enqueue_task(task.id)
                 task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
                 return operation
             continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
@@ -1788,7 +1784,6 @@ class TaskControlServiceMixin:
                 task_manager_module.TASK_ACTION_CONTINUE,
                 operation_id=operation.id,
             )
-            self._enqueue_task(task.id)
             task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
             return operation
         item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
@@ -1821,7 +1816,6 @@ class TaskControlServiceMixin:
             task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS,
             operation_id=operation.id,
         )
-        self._enqueue_task(task.id)
         task_manager_module.observe_task_operation(task_manager_module.TASK_ACTION_RETRY_FAILED_ITEMS, "accepted")
         return operation
 
@@ -1863,7 +1857,6 @@ class TaskControlServiceMixin:
                 task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                 operation_id=operation.id,
             )
-            self._enqueue_task(task.id)
             return operation
         if not supported:
             archive_stage_name, archive_reason = self._archive_pending_full_retry_stage(db, task, stage_name)
@@ -1890,7 +1883,6 @@ class TaskControlServiceMixin:
                     task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
                     operation_id=operation.id,
                 )
-                self._enqueue_task(task.id)
                 return operation
             continue_supported, continue_reason, continue_stage = self._task_continue_support(db, task)
             if not continue_supported or not continue_stage:
@@ -1912,7 +1904,6 @@ class TaskControlServiceMixin:
                 task_manager_module.TASK_ACTION_CONTINUE,
                 operation_id=operation.id,
             )
-            self._enqueue_task(task.id)
             return operation
         item_keys = sorted({self._stage_item_identity(item.item_key, item.parent_key) for item in items})
         self._set_retry_plan(
@@ -1944,7 +1935,6 @@ class TaskControlServiceMixin:
             task_manager_module.TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
             operation_id=operation.id,
         )
-        self._enqueue_task(task.id)
         return operation
 
     def retry_stage_full(self: TaskManager, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
@@ -1986,7 +1976,6 @@ class TaskControlServiceMixin:
             task_manager_module.TASK_ACTION_RETRY_STAGE_FULL,
             operation_id=operation.id,
         )
-        self._enqueue_task(task.id)
         return operation
 
     def retry_stage_archive(self: TaskManager, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
@@ -2028,7 +2017,6 @@ class TaskControlServiceMixin:
             task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
             operation_id=operation.id,
         )
-        self._enqueue_task(task.id)
         task_manager_module.observe_archive_action("retry_stage", "accepted")
         return operation
 
@@ -2068,7 +2056,6 @@ class TaskControlServiceMixin:
             task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
             operation_id=operation.id,
         )
-        self._enqueue_task(task.id)
         task_manager_module.observe_archive_action("retry_stage_full", "accepted")
         return operation
 
