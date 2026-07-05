@@ -361,24 +361,6 @@ class TaskRuntimeStateServiceMixin:
                 decision_reason="runtime_lease_active",
                 snapshot=snapshot,
             )
-        if snapshot.supported_control_operation_active:
-            return ParentRuntimeOwnershipGuardDecision(
-                preserve=True,
-                decision_reason="supported_control_operation_active",
-                snapshot=snapshot,
-            )
-        if snapshot.transition_guard_active:
-            return ParentRuntimeOwnershipGuardDecision(
-                preserve=True,
-                decision_reason="transition_guard_active",
-                snapshot=snapshot,
-            )
-        if snapshot.row_mirror_lease_active and (snapshot.row_mirror_owner or snapshot.row_mirror_lease_expires_at):
-            return ParentRuntimeOwnershipGuardDecision(
-                preserve=True,
-                decision_reason="row_mirror_guard_active",
-                snapshot=snapshot,
-            )
         return ParentRuntimeOwnershipGuardDecision(
             preserve=False,
             decision_reason=str(reason or "").strip() or "no_authoritative_runtime_owner",

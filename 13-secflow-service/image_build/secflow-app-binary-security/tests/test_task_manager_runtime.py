@@ -1111,6 +1111,47 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             or "owned_execution_takeover_requeued" in event_types
         )
 
+    def test_dispatch_task_by_id_reopens_running_ownerless_task_after_runtime_lease_expiry(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        task = BinarySecurityTask(
+            id="task-running-ownerless-expired-lease",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-ownerless-expired-lease",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id=None,
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[])
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertEqual(task.id, claimed)
+        self.assertEqual("worker-new", task.dispatcher_instance_id)
+        self.assertEqual("dispatching", task.status)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": task.id,
+                "blocked_reason": None,
+                "should_requeue": False,
+                "cooldown_seconds": None,
+            },
+            manager._dispatch_claim_decision(),
+        )
+        event_types = [row.event_type for row in db.events]
+        self.assertTrue(
+            "dispatch_claim_allowed_after_runtime_lease_expiry" in event_types
+            or "running_without_active_lease_requeued" in event_types
+        )
+
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):

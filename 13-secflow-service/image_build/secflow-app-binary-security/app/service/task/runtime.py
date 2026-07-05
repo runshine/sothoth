@@ -2026,12 +2026,32 @@ class TaskRuntimeServiceMixin:
                 )
                 return None
             if nonpending_takeover_decision.allow_claim:
+                previous_dispatcher_instance_id = (
+                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
+                )
                 released = self._release_unsupported_task_row_owner(
                     db,
                     task,
                     active_operation=current_operation,
                     reason="dispatch_claim_after_runtime_lease_expiry",
                 )
+                if (
+                    not released
+                    and previous_dispatcher_instance_id is None
+                    and not nonpending_takeover_decision.runtime_lease_active
+                ):
+                    self._apply_release_for_takeover_main_state(
+                        db,
+                        task,
+                        source="runtime_worker",
+                        reason="检测到 non-pending 任务缺少有效 lease 且无旧 owner，已重置为待执行等待重新 claim",
+                        status="pending",
+                        stage_name=task.current_stage,
+                        finished_at=None,
+                        last_error=None,
+                    )
+                    self._clear_runtime_lease(db, task.id)
+                    released = True
                 if not released and str(getattr(task, "dispatcher_instance_id", "") or "").strip():
                     self._log_dispatch_claim_blocked(
                         task_id,
@@ -2051,7 +2071,7 @@ class TaskRuntimeServiceMixin:
                     db,
                     task,
                     "dispatch_claim_allowed_after_runtime_lease_expiry",
-                    "检测到 non-pending 任务 owner 的 runtime lease 已过期，已释放旧 owner 并允许继续 claim",
+                    "检测到 non-pending 任务 owner 的 runtime lease 已过期，已恢复为可重新 claim 状态",
                     level="warning",
                     stage_name=task.current_stage,
                     payload={
