@@ -333,7 +333,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual([], fake_queue.entries_by_task[task.id])
-        discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_after_terminal_error"]
+        discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_after_invalid_item_error"]
         self.assertEqual(1, len(discard_events))
         payload = dict(discard_events[0].payload or {})
         self.assertEqual("tsq-terminal-1", payload.get("queue_item_id"))
@@ -407,21 +407,24 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             manager.sync_downstream_status = _fake_sync
             manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
             manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
-            with self.assertRaises(task_manager_module.NotFoundError):
-                asyncio.run(manager._drain_task_sync_queue(db, task))
+            changed = asyncio.run(manager._drain_task_sync_queue(db, task))
         finally:
             task_manager_module.get_task_queue = original_get_queue
             manager.sync_downstream_status = original_sync
             manager._repair_task_sync_queue_on_runtime_start = original_repair
             manager._reconcile_missing_task_sync_requests = original_reconcile
 
+        self.assertTrue(changed)
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
-        self.assertEqual(1, entries[0]["attempts"])
-        self.assertEqual("阶段子任务不存在", entries[0]["last_error"])
+        self.assertEqual(["si-existing"], entries[0]["item_ids"])
+        self.assertEqual("repair_missing_or_stale_sync_queue_entry", entries[0]["reason"])
+        payload = dict(entries[0].get("payload") or {})
+        self.assertEqual(["si-missing"], payload.get("filtered_missing_item_ids"))
+        self.assertEqual(["si-existing"], payload.get("recovered_existing_item_ids"))
         self.assertEqual(
-            [],
-            [event for event in db.events if event.event_type == "task_sync_request_discarded_after_terminal_error"],
+            ["task_sync_request_discarded_after_invalid_item_error"],
+            [event.event_type for event in db.events if event.event_type == "task_sync_request_discarded_after_invalid_item_error"],
         )
 
     def test_drain_task_sync_queue_discards_missing_single_item_id_entry(self):
@@ -501,7 +504,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             [("task-sync-missing-single", "tsq-missing-single", "downstream_status:entry_analysis:si-missing:*", "task_sync_ack_terminal_discard")],
             acked,
         )
-        discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_after_terminal_error"]
+        discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_after_invalid_item_error"]
         self.assertEqual(1, len(discard_events))
         self.assertEqual(["si-missing"], discard_events[0].payload.get("missing_item_ids"))
 

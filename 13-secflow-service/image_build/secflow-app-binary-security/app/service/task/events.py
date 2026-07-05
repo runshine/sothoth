@@ -484,7 +484,7 @@ class TaskEventServiceMixin:
                 "takeover_reason": payload.get("takeover_reason"),
                 "recovery_action": payload.get("recovery_action"),
                 "task_execution_token": payload.get("task_execution_token"),
-                "dispatcher_instance_id": payload.get("dispatcher_instance_id"),
+                "runtime_lease_owner": payload.get("runtime_lease_owner"),
                 "operation_id": operation_id,
                 "item_id": task_shared._stage_item_attr(item, "id"),
                 "item_key": task_shared._stage_item_attr(item, "item_key"),

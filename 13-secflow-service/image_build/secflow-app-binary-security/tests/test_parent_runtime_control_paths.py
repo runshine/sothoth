@@ -137,7 +137,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
 
         self.assertEqual([], owner_signals)
         self.assertEqual([task.id], queued_tasks)
-        takeover_event = next(row for row in db.events if row.event_type == "owned_execution_owner_reconcile_requested")
+        takeover_event = next(row for row in db.events if row.event_type == "task_layer_reconcile_shared_dispatch_requested")
         payload = dict(takeover_event.payload or {})
         self.assertEqual("owner_not_active_on_replay_path", payload.get("forward_reason"))
         self.assertFalse(bool(payload.get("runtime_lease_active")))

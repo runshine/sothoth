@@ -169,7 +169,6 @@ class TaskStateEventInboxServiceMixin:
             if task is not None:
                 ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
                 lease_owner = str(ownership_snapshot.runtime_lease_owner or "").strip()
-                dispatcher_owner = str(ownership_snapshot.row_mirror_owner or "").strip()
                 local_owner_active = bool(
                     ownership_snapshot.runtime_lease_active
                     and lease_owner == str(self.instance_id or "").strip()
@@ -218,10 +217,7 @@ class TaskStateEventInboxServiceMixin:
                             "owner_apply_required": True,
                             "forward_reason": "foreign_owner_active" if foreign_owner_active else "owner_not_active_on_replay_path",
                             "runtime_lease_owner": lease_owner or None,
-                            "dispatcher_instance_id": dispatcher_owner or None,
                             "runtime_lease_active": ownership_snapshot.runtime_lease_active,
-                            "row_mirror_owner": ownership_snapshot.row_mirror_owner,
-                            "row_mirror_drift": ownership_snapshot.row_mirror_drift,
                         },
                     )
                     observe_state_owner_event(event.event_type, "forwarded")

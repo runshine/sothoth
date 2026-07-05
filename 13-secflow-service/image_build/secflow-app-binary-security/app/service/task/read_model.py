@@ -36,6 +36,15 @@ def _schedule_user_task_id_value(task) -> str | None:
 
 
 class TaskReadModelServiceMixin:
+    def _task_summary_for_detail_from_db_payload(self: TaskManager, task) -> dict[str, Any]:
+        summary_payload = copy.deepcopy(task._load_json(getattr(task, "summary_json", None), {}) or {})
+        if not isinstance(summary_payload, dict):
+            summary_payload = {}
+        runtime_task_keys = summary_payload.get("runtime_task_keys")
+        if isinstance(runtime_task_keys, dict):
+            runtime_task_keys.pop("root_task_key_secret", None)
+        return summary_payload
+
     def _canonicalize_read_model_archive_jobs(
         self: TaskManager,
         db: Session,
@@ -110,7 +119,9 @@ class TaskReadModelServiceMixin:
             if isinstance(row, dict)
         ]
         cleanup_partial_failed = bool(cleanup_result.get("cleanup_partial_failed")) or bool(downstream_cleanup_deferred_refs)
-        task_owner = str(task.dispatcher_instance_id or "").strip() or None
+        lease_owner, lease_expires_at_unused, lease_source_unused, lease_pod_uid_unused, lease_boot_id_unused, lease_generation_unused = self._task_runtime_lease_view(db, task)
+        del lease_expires_at_unused, lease_source_unused, lease_pod_uid_unused, lease_boot_id_unused, lease_generation_unused
+        task_owner = str(lease_owner or "").strip() or None
         age_seconds = self._task_operation_age_seconds(active_operation)
         is_stale = bool(age_seconds is not None and age_seconds >= float(self._operation_stale_threshold_seconds()))
         requeue_applied = bool(self._operation_requeue_applied(task, active_operation, db=db))
@@ -217,8 +228,6 @@ class TaskReadModelServiceMixin:
         if status in {"dispatching", "running"}:
             if snapshot is not None and snapshot.runtime_lease_active:
                 return "dispatching", None
-            if snapshot is not None and (snapshot.row_mirror_owner or snapshot.row_mirror_lease_expires_at):
-                return "leased", "execution_owner_missing"
             return "leased", "execution_owner_missing"
         if status == "pending":
             if task.id in pending_positions:
@@ -375,16 +384,12 @@ class TaskReadModelServiceMixin:
         }
 
     def _runtime_task_keys_snapshot(self: TaskManager, task) -> dict[str, Any]:
-        summary_payload = task.summary if isinstance(task.summary, dict) else {}
+        summary_payload = self._task_summary_for_detail_from_db_payload(task)
         runtime_task_keys = summary_payload.get("runtime_task_keys")
         return runtime_task_keys if isinstance(runtime_task_keys, dict) else {}
 
     def _task_summary_for_detail_response(self: TaskManager, task) -> dict[str, Any]:
-        summary_payload = copy.deepcopy(task.summary if isinstance(task.summary, dict) else {})
-        runtime_task_keys = summary_payload.get("runtime_task_keys")
-        if isinstance(runtime_task_keys, dict):
-            runtime_task_keys.pop("root_task_key_secret", None)
-        return summary_payload
+        return self._task_summary_for_detail_from_db_payload(task)
 
     def _build_task_key_snapshot(self: TaskManager, db: Session, task):
         from app.service import task_manager as task_manager_module
@@ -1812,47 +1817,15 @@ class TaskReadModelServiceMixin:
             .limit(task_manager_module.DETAIL_STAGE_ITEMS_LIMIT)
             .all()
         )
-        sync_items = (
-            db.query(task_manager_module.BinarySecurityStageItem)
-            .options(
-                load_only(
-                    task_manager_module.BinarySecurityStageItem.id,
-                    task_manager_module.BinarySecurityStageItem.result_json,
-                    task_manager_module.BinarySecurityStageItem.status,
-                )
-            )
+        stage_items_total = int(
+            db.query(func.count(task_manager_module.BinarySecurityStageItem.id))
             .filter(task_manager_module.BinarySecurityStageItem.task_id == task.id)
-            .all()
+            .scalar()
+            or 0
         )
-        archive_scope_items = (
-            db.query(task_manager_module.BinarySecurityStageItem)
-            .options(
-                load_only(
-                    task_manager_module.BinarySecurityStageItem.id,
-                    task_manager_module.BinarySecurityStageItem.stage_name,
-                    task_manager_module.BinarySecurityStageItem.status,
-                    task_manager_module.BinarySecurityStageItem.downstream_task_id,
-                    task_manager_module.BinarySecurityStageItem.created_at,
-                    task_manager_module.BinarySecurityStageItem.updated_at,
-                )
-            )
-            .filter(task_manager_module.BinarySecurityStageItem.task_id == task.id)
-            .all()
-        )
-        stage_items_total = len(sync_items)
-        item_stats = self._item_stats(sync_items)
-        downstream_status_counts = self._downstream_status_counts_from_items(sync_items)
-        sync_times = self._task_sync_status_view(sync_items)
-        archive_jobs = (
-            db.query(task_manager_module.BinarySecurityArchiveJob)
-            .filter(task_manager_module.BinarySecurityArchiveJob.task_id == task.id)
-            .order_by(
-                task_manager_module.BinarySecurityArchiveJob.created_at.asc(),
-                task_manager_module.BinarySecurityArchiveJob.id.asc(),
-            )
-            .all()
-        )
-        archive_jobs = self._canonicalize_read_model_archive_jobs(db, task, archive_scope_items, archive_jobs)
+        item_stats, downstream_status_counts = self._stage_item_stats_from_db(db, task.id)
+        sync_times = self._task_sync_status_view(stage_items)
+        archive_jobs: list[Any] = []
         stage_sequence = self._stage_sequence_for_task(task)
         stage_summaries = self._build_stage_summaries_readonly(
             db,
@@ -1878,7 +1851,7 @@ class TaskReadModelServiceMixin:
             )
         return task_manager_module._TaskDetailContext(
             task=task,
-            queue_info=self._build_queue_info(db, project_id=project_id),
+            queue_info={"pending_positions": {}, "running_count": 0, "queued_count": 0, "last_reconcile_at": self._last_queue_reconcile_at},
             stage_sequence=stage_sequence,
             stage_runs=stage_runs,
             stage_items=stage_items,
@@ -2047,11 +2020,9 @@ class TaskReadModelServiceMixin:
             queue_state=queue_state,
             recoverable_reason=recoverable_reason,
             last_reconcile_at=queue_info.get("last_reconcile_at"),
-            dispatcher_instance_id=task.dispatcher_instance_id,
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
             task_lease_source=lease_source,
-            row_mirror_drift=ownership_snapshot.row_mirror_drift,
             tail_control_mode=str(tail_summary.get("tail_control_mode") or "idle"),
             tail_has_runnable_unbound_items=bool(tail_summary.get("has_runnable_unbound_items")),
             tail_unbound_runnable_item_count=int(tail_summary.get("unbound_runnable_item_count", 0) or 0),
@@ -2662,7 +2633,7 @@ class TaskReadModelServiceMixin:
         operation_lock_heartbeat_at = task.operation_lock_heartbeat_at
         operation_lock_expires_at = task.operation_lock_expires_at
         local_operation_alive = False
-        row_owner_is_local = bool(str(task.dispatcher_instance_id or "").strip() == str(self.instance_id or "").strip())
+        row_owner_is_local = bool(str(lease_owner or "").strip() == str(self.instance_id or "").strip())
         runtime_supported_locally = bool(
             row_owner_is_local
             and runtime_lease is not None
@@ -2756,7 +2727,7 @@ class TaskReadModelServiceMixin:
                     unit_label=task_worker_label,
                     unit_kind="coroutine",
                     status=task_worker_status,
-                    owner_instance_id=str(task.dispatcher_instance_id or "").strip() or lease_owner,
+                    owner_instance_id=lease_owner,
                     started_at=task.started_at,
                     last_heartbeat_at=last_task_heartbeat_at,
                     detail=task_worker_detail,
@@ -2781,7 +2752,7 @@ class TaskReadModelServiceMixin:
                     unit_label="主任务执行协程",
                     unit_kind="coroutine",
                     status="done" if task_status in terminal_statuses else "idle",
-                    owner_instance_id=str(task.dispatcher_instance_id or "").strip() or None,
+                    owner_instance_id=lease_owner,
                     started_at=task.started_at,
                     last_heartbeat_at=last_task_heartbeat_at,
                     detail="负责当前父任务阶段推进与调度衔接",
@@ -3049,7 +3020,7 @@ class TaskReadModelServiceMixin:
                     unit_label="下游同步/收口协程",
                     unit_kind="sync",
                     status=sync_status,
-                    owner_instance_id=str(task.dispatcher_instance_id or "").strip() or lease_owner,
+                    owner_instance_id=lease_owner,
                     started_at=task.started_at,
                     last_heartbeat_at=sync_age_reference,
                     detail="负责父任务对子任务状态的同步与收口观察",
@@ -3614,11 +3585,9 @@ class TaskReadModelServiceMixin:
             queue_state=queue_state,
             recoverable_reason=recoverable_reason,
             last_reconcile_at=queue_info.get("last_reconcile_at"),
-            dispatcher_instance_id=task.dispatcher_instance_id,
             task_lease_owner_instance_id=lease_owner,
             task_lease_expires_at=lease_expires_at,
             task_lease_source=lease_source,
-            row_mirror_drift=ownership_snapshot.row_mirror_drift,
             tail_control_mode=str(tail_summary.get("tail_control_mode") or "idle"),
             tail_has_runnable_unbound_items=bool(tail_summary.get("has_runnable_unbound_items")),
             tail_unbound_runnable_item_count=int(tail_summary.get("unbound_runnable_item_count", 0) or 0),

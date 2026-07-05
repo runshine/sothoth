@@ -132,7 +132,8 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             task_manager_module.get_session_factory = original_factory
             manager.cfg.scheduler.heartbeat_update_interval_seconds = original_interval
 
-        self.assertGreater(task.lease_expires_at, original_expiry)
+        self.assertEqual(original_expiry, task.lease_expires_at)
+        self.assertGreater(db.runtime_leases[0].lease_expires_at, original_expiry)
         self.assertGreater(task.updated_at, started_at)
 
     def test_task_heartbeat_controller_keeps_lease_after_runner_exit_when_owner_still_active(self):
@@ -176,10 +177,11 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         )
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
-            previous_expiry = task.lease_expires_at
+            previous_expiry = db.runtime_leases[0].lease_expires_at
             manager._touch_task_heartbeat(task.id)
 
-        self.assertGreater(task.lease_expires_at, previous_expiry)
+        self.assertEqual(now_value + timedelta(seconds=5), task.lease_expires_at)
+        self.assertGreater(db.runtime_leases[0].lease_expires_at, previous_expiry)
         self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
 
     def test_run_task_finally_requeues_tail_runtime_without_active_owner(self):

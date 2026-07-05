@@ -40,7 +40,10 @@ class ParentRuntimeTakeoverRequeueTests(unittest.IsolatedAsyncioTestCase):
         task = self._task()
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
 
-        with patch.object(self.manager, "_enqueue_task_and_wait_sync", return_value=True) as enqueue_mock:
+        with (
+            patch.object(self.manager, "_enqueue_task_and_wait_sync", return_value=True) as enqueue_mock,
+            patch.object(self.manager, "_clear_runtime_lease") as clear_lease_mock,
+        ):
             released = self.manager._release_unsupported_task_row_owner(
                 db,
                 task,
@@ -49,6 +52,7 @@ class ParentRuntimeTakeoverRequeueTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(released)
         enqueue_mock.assert_called_once()
+        clear_lease_mock.assert_not_called()
         self.assertEqual("pending", task.status)
         event_types = [event.event_type for event in db.events]
         self.assertIn("owned_execution_release_reenqueued_for_takeover", event_types)

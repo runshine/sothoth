@@ -37,8 +37,6 @@ class LeaseClearDecision:
     active_operation_status: str | None
     runtime_lease_owner: str | None = None
     runtime_lease_expires_at: str | None = None
-    row_lease_expires_at: str | None = None
-    dispatcher_instance_id: str | None = None
 
 
 @dataclass
@@ -48,7 +46,6 @@ class TaskLayerReconcileDeliveryDecision:
     decision_reason: str
     target_owner_instance_id: str | None
     runtime_lease_owner: str | None
-    dispatcher_instance_id: str | None
     task_status: str | None
     runtime_phase: str | None
 
@@ -59,15 +56,11 @@ class ParentRuntimeOwnershipSnapshot:
     runtime_lease_active: bool
     runtime_lease_owner: str | None
     runtime_lease_expires_at: str | None
-    row_mirror_owner: str | None
-    row_mirror_lease_expires_at: str | None
-    row_mirror_lease_active: bool
     local_handle_alive: bool
     local_streaming_worker_alive: bool
     runtime_phase: str | None
     transition_guard_active: bool
     supported_control_operation_active: bool
-    row_mirror_drift: bool
     task_status: str | None
     active_operation_type: str | None
     active_operation_status: str | None
@@ -89,10 +82,8 @@ class DeleteQueueConsumeDecision:
     lease_state: str
     task_status: str | None
     runtime_phase: str | None
-    dispatcher_instance_id: str | None
     runtime_lease_owner: str | None
     runtime_lease_expires_at: str | None
-    row_lease_expires_at: str | None
     active_operation_id: str | None
     active_operation_type: str | None
     active_operation_status: str | None
@@ -124,9 +115,6 @@ class TaskRuntimeStateServiceMixin:
             "status": str(getattr(task, "status", "") or "").strip() or None,
             "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
             "runtime_phase": str(getattr(task, "runtime_phase", "") or "").strip() or None,
-            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-            "dispatch_started_at": task_shared._isoformat_or_none(getattr(task, "dispatch_started_at", None)),
-            "lease_expires_at": task_shared._isoformat_or_none(getattr(task, "lease_expires_at", None)),
             "finished_at": task_shared._isoformat_or_none(getattr(task, "finished_at", None)),
             "last_error": str(getattr(task, "last_error", "") or "").strip() or None,
             "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
@@ -223,9 +211,6 @@ class TaskRuntimeStateServiceMixin:
         db: Session,
         task,
     ) -> bool:
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-        if dispatcher_instance_id and dispatcher_instance_id != str(self.instance_id or "").strip():
-            return False
         lease = self._runtime_lease_for_task(db, task.id)
         return bool(
             lease is not None
@@ -255,10 +240,8 @@ class TaskRuntimeStateServiceMixin:
             "runtime_phase": decision.runtime_phase,
             "active_operation_type": decision.active_operation_type,
             "active_operation_status": decision.active_operation_status,
-            "dispatcher_instance_id": decision.dispatcher_instance_id,
             "runtime_lease_owner": decision.runtime_lease_owner,
             "runtime_lease_expires_at": decision.runtime_lease_expires_at,
-            "row_lease_expires_at": decision.row_lease_expires_at,
             "decision": "allowed" if decision.allowed else "suppressed",
         }
 
@@ -282,30 +265,16 @@ class TaskRuntimeStateServiceMixin:
             if runtime_lease is not None
             else None
         )
-        row_mirror_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        row_mirror_lease_expires_at_value = getattr(task, "lease_expires_at", None)
-        row_mirror_lease_expires_at = task_shared._isoformat_or_none(row_mirror_lease_expires_at_value)
-        row_mirror_lease_active = bool(
-            row_mirror_lease_expires_at_value is not None
-            and (task_shared._seconds_until(row_mirror_lease_expires_at_value) or 0) > 0
-        )
         runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
         task_status = str(getattr(task, "status", "") or "").strip().lower() or None
         active_operation_type = str(getattr(operation, "operation_type", "") or "").strip() or None
         active_operation_status = str(getattr(operation, "status", "") or "").strip().lower() or None
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
-        row_mirror_drift = bool(
-            (runtime_lease_active and runtime_lease_owner != row_mirror_owner)
-            or (runtime_lease_active and runtime_lease_expires_at != row_mirror_lease_expires_at)
-        )
         return ParentRuntimeOwnershipSnapshot(
             runtime_lease_present=runtime_lease is not None,
             runtime_lease_active=runtime_lease_active,
             runtime_lease_owner=runtime_lease_owner,
             runtime_lease_expires_at=runtime_lease_expires_at,
-            row_mirror_owner=row_mirror_owner,
-            row_mirror_lease_expires_at=row_mirror_lease_expires_at,
-            row_mirror_lease_active=row_mirror_lease_active,
             local_handle_alive=bool(self._has_local_task_execution_owner(str(getattr(task, "id", "") or "").strip())),
             local_streaming_worker_alive=bool(
                 self._task_has_active_streaming_stage_workers(str(getattr(task, "id", "") or "").strip())
@@ -315,7 +284,6 @@ class TaskRuntimeStateServiceMixin:
             supported_control_operation_active=bool(
                 self._task_has_supported_control_operation_runtime(db, task, active_operation=operation)
             ),
-            row_mirror_drift=row_mirror_drift,
             task_status=task_status,
             active_operation_type=active_operation_type,
             active_operation_status=active_operation_status,
@@ -334,15 +302,11 @@ class TaskRuntimeStateServiceMixin:
             "runtime_lease_active": snapshot.runtime_lease_active,
             "runtime_lease_owner": snapshot.runtime_lease_owner,
             "runtime_lease_expires_at": snapshot.runtime_lease_expires_at,
-            "row_mirror_owner": snapshot.row_mirror_owner,
-            "row_mirror_lease_expires_at": snapshot.row_mirror_lease_expires_at,
-            "row_mirror_lease_active": snapshot.row_mirror_lease_active,
             "local_handle_alive": snapshot.local_handle_alive,
             "local_streaming_worker_alive": snapshot.local_streaming_worker_alive,
             "runtime_phase": snapshot.runtime_phase,
             "transition_guard_active": snapshot.transition_guard_active,
             "supported_control_operation_active": snapshot.supported_control_operation_active,
-            "row_mirror_drift": snapshot.row_mirror_drift,
             "task_status": snapshot.task_status,
             "active_operation_type": snapshot.active_operation_type,
             "active_operation_status": snapshot.active_operation_status,
@@ -392,10 +356,8 @@ class TaskRuntimeStateServiceMixin:
             "lease_state": decision.lease_state,
             "task_status": decision.task_status,
             "runtime_phase": decision.runtime_phase,
-            "dispatcher_instance_id": decision.dispatcher_instance_id,
             "runtime_lease_owner": decision.runtime_lease_owner,
             "runtime_lease_expires_at": decision.runtime_lease_expires_at,
-            "row_lease_expires_at": decision.row_lease_expires_at,
             "active_operation_id": decision.active_operation_id,
             "active_operation_type": decision.active_operation_type,
             "active_operation_status": decision.active_operation_status,
@@ -415,24 +377,17 @@ class TaskRuntimeStateServiceMixin:
         active_operation_status = snapshot.active_operation_status
         runtime_lease_owner = snapshot.runtime_lease_owner
         runtime_lease_expires_at = snapshot.runtime_lease_expires_at
-        row_lease_expires_at = snapshot.row_mirror_lease_expires_at
-        dispatcher_instance_id = snapshot.row_mirror_owner
         task_status = snapshot.task_status
         runtime_phase = snapshot.runtime_phase
         task_terminal = bool(task_status in TASK_TERMINAL_STATUSES)
         owner_matches_current_instance = bool(
             runtime_lease_owner and runtime_lease_owner == str(self.instance_id or "").strip()
         )
-        # 仅当 runtime_lease 活跃时才判 "active"；无 runtime_lease 时 task 行 lease
-        # 只是陈旧残留（owner 已死/无主），不应阻塞回收——否则孤儿 owner 要等
-        # task 行 lease TTL 过期才被回收（rollout/崩溃后卡 ~300s）。
         lease_state = (
             "active"
             if snapshot.runtime_lease_active
-            else "row_guard"
-            if snapshot.row_mirror_lease_active
             else "expired"
-            if snapshot.runtime_lease_present or row_lease_expires_at
+            if snapshot.runtime_lease_present
             else "missing"
         )
         if task_terminal and owner_matches_current_instance:
@@ -448,8 +403,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=active_operation_status,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
-                dispatcher_instance_id=dispatcher_instance_id,
             )
         if lease_state in {"expired", "missing"}:
             return LeaseClearDecision(
@@ -464,8 +417,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=active_operation_status,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
-                dispatcher_instance_id=dispatcher_instance_id,
             )
         preserve = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
         if preserve.preserve:
@@ -486,8 +437,6 @@ class TaskRuntimeStateServiceMixin:
             active_operation_status=active_operation_status,
             runtime_lease_owner=runtime_lease_owner,
             runtime_lease_expires_at=runtime_lease_expires_at,
-            row_lease_expires_at=row_lease_expires_at,
-            dispatcher_instance_id=dispatcher_instance_id,
         )
 
     def _can_reopen_parent_task_after_lease_loss(
@@ -511,8 +460,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=decision.active_operation_status,
                 runtime_lease_owner=decision.runtime_lease_owner,
                 runtime_lease_expires_at=decision.runtime_lease_expires_at,
-                row_lease_expires_at=decision.row_lease_expires_at,
-                dispatcher_instance_id=decision.dispatcher_instance_id,
             )
         return decision
 
@@ -528,14 +475,13 @@ class TaskRuntimeStateServiceMixin:
         active_operation_type = str(getattr(active_operation, "operation_type", "") or "").strip() or None
         task_status = str(getattr(task, "status", "") or "").strip().lower() or None
         runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
         if (
             not decision.allowed
             and str(reason or "").strip() == "delete_queue_consumption_takeover_gate"
             and active_operation_type == "delete"
             and decision.reason_code == "runtime_lease_missing_nonterminal"
             and decision.lease_state == "missing"
-            and not dispatcher_instance_id
+            and not decision.runtime_lease_owner
             and runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION
             and task_status in {"pending", "dispatching", "running", "cancelling"}
         ):
@@ -551,8 +497,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=decision.active_operation_status,
                 runtime_lease_owner=decision.runtime_lease_owner,
                 runtime_lease_expires_at=decision.runtime_lease_expires_at,
-                row_lease_expires_at=decision.row_lease_expires_at,
-                dispatcher_instance_id=decision.dispatcher_instance_id,
             )
         if (
             not decision.allowed
@@ -561,7 +505,7 @@ class TaskRuntimeStateServiceMixin:
             and decision.reason_code == "runtime_lease_missing_nonterminal"
             and decision.lease_state == "missing"
             and decision.task_terminal
-            and not dispatcher_instance_id
+            and not decision.runtime_lease_owner
             and runtime_phase == TASK_RUNTIME_PHASE_TERMINAL
         ):
             return LeaseClearDecision(
@@ -576,8 +520,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=decision.active_operation_status,
                 runtime_lease_owner=decision.runtime_lease_owner,
                 runtime_lease_expires_at=decision.runtime_lease_expires_at,
-                row_lease_expires_at=decision.row_lease_expires_at,
-                dispatcher_instance_id=decision.dispatcher_instance_id,
             )
         return decision
 
@@ -594,25 +536,15 @@ class TaskRuntimeStateServiceMixin:
         active_operation_status = str(getattr(operation, "status", "") or "").strip().lower() or None
         task_status = str(getattr(task, "status", "") or "").strip().lower() or None
         runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
         lease = self._runtime_lease_for_task(db, task.id)
         runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
         runtime_lease_expires_at = task_shared._isoformat_or_none(getattr(lease, "lease_expires_at", None)) if lease is not None else None
-        row_lease_expires_at_value = getattr(task, "lease_expires_at", None)
-        row_lease_expires_at = task_shared._isoformat_or_none(row_lease_expires_at_value)
         lease_active = bool(lease is not None and self._runtime_lease_is_active(lease))
-        row_lease_active = bool(
-            row_lease_expires_at_value is not None
-            and (task_shared._seconds_until(row_lease_expires_at_value) or 0) > 0
-        )
-        row_lease_expired = bool(row_lease_expires_at_value is not None and not row_lease_active)
         lease_state = (
             "active"
             if lease_active
-            else "row_guard"
-            if row_lease_active
             else "expired"
-            if (lease is not None or row_lease_expired)
+            if lease is not None
             else "missing"
         )
         if active_operation_type != "delete" or active_operation_status not in {"accepted", "queued", "running", "pending"}:
@@ -623,10 +555,8 @@ class TaskRuntimeStateServiceMixin:
                 lease_state=lease_state,
                 task_status=task_status,
                 runtime_phase=runtime_phase,
-                dispatcher_instance_id=dispatcher_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
                 active_operation_id=active_operation_id,
                 active_operation_type=active_operation_type,
                 active_operation_status=active_operation_status,
@@ -639,10 +569,8 @@ class TaskRuntimeStateServiceMixin:
                 lease_state=lease_state,
                 task_status=task_status,
                 runtime_phase=runtime_phase,
-                dispatcher_instance_id=dispatcher_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
                 active_operation_id=active_operation_id,
                 active_operation_type=active_operation_type,
                 active_operation_status=active_operation_status,
@@ -655,25 +583,17 @@ class TaskRuntimeStateServiceMixin:
                 lease_state=lease_state,
                 task_status=task_status,
                 runtime_phase=runtime_phase,
-                dispatcher_instance_id=dispatcher_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
                 active_operation_id=active_operation_id,
                 active_operation_type=active_operation_type,
                 active_operation_status=active_operation_status,
             )
-        blocker_kind = "stale_row_owner" if dispatcher_instance_id or row_lease_expires_at else "none"
+        blocker_kind = "runtime_lease_missing"
         if task_status in TASK_TERMINAL_STATUSES:
-            reason_code = (
-                "terminal_delete_takeover_after_stale_owner_cleanup"
-                if blocker_kind == "stale_row_owner"
-                else "terminal_delete_takeover_without_runtime_lease"
-            )
+            reason_code = "terminal_delete_takeover_without_runtime_lease"
         elif lease_state == "expired":
             reason_code = "delete_takeover_after_runtime_lease_expired"
-        elif blocker_kind == "stale_row_owner":
-            reason_code = "delete_takeover_after_stale_row_owner_cleanup"
         else:
             reason_code = "delete_takeover_without_authoritative_blocker"
         return DeleteQueueConsumeDecision(
@@ -683,10 +603,8 @@ class TaskRuntimeStateServiceMixin:
             lease_state=lease_state,
             task_status=task_status,
             runtime_phase=runtime_phase,
-            dispatcher_instance_id=dispatcher_instance_id,
             runtime_lease_owner=runtime_lease_owner,
             runtime_lease_expires_at=runtime_lease_expires_at,
-            row_lease_expires_at=row_lease_expires_at,
             active_operation_id=active_operation_id,
             active_operation_type=active_operation_type,
             active_operation_status=active_operation_status,
@@ -703,32 +621,19 @@ class TaskRuntimeStateServiceMixin:
         lease = self._runtime_lease_for_task(db, task.id)
         runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
         runtime_lease_expires_at = task_shared._isoformat_or_none(getattr(lease, "lease_expires_at", None)) if lease is not None else None
-        row_lease_expires_at_value = getattr(task, "lease_expires_at", None)
-        row_lease_expires_at = task_shared._isoformat_or_none(row_lease_expires_at_value)
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
         task_status = str(getattr(task, "status", "") or "").strip().lower() or None
         runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
         operation_type = str(getattr(operation, "operation_type", "") or "").strip() or None
         operation_status = str(getattr(operation, "status", "") or "").strip().lower() or None
         task_terminal = bool(task_status in TASK_TERMINAL_STATUSES)
         current_instance_id = str(self.instance_id or "").strip()
-        runtime_owner_matches = bool(runtime_lease_owner and runtime_lease_owner == current_instance_id)
-        row_owner_matches = bool(dispatcher_instance_id and dispatcher_instance_id == current_instance_id)
-        owner_matches_current_instance = runtime_owner_matches or row_owner_matches
+        owner_matches_current_instance = bool(runtime_lease_owner and runtime_lease_owner == current_instance_id)
         lease_active = bool(lease is not None and self._runtime_lease_is_active(lease))
-        row_lease_active = bool(
-            row_lease_expires_at_value is not None
-            and (task_shared._seconds_until(row_lease_expires_at_value) or 0) > 0
-        )
-        row_lease_expired = bool(row_lease_expires_at_value is not None and not row_lease_active)
-        # 同 _can_clear_parent_runtime_ownership：无 runtime_lease 时不因 task 行 lease 误判 active。
         lease_state = (
             "active"
             if lease_active
-            else "row_guard"
-            if row_lease_active
             else "expired"
-            if (lease is not None or row_lease_expired)
+            if lease is not None
             else "missing"
         )
         if not self._is_retry_like_operation_type(operation_type):
@@ -744,8 +649,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=operation_status,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
-                dispatcher_instance_id=dispatcher_instance_id,
             )
         if not owner_matches_current_instance:
             return LeaseClearDecision(
@@ -760,8 +663,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=operation_status,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
-                dispatcher_instance_id=dispatcher_instance_id,
             )
         if lease_state != "active":
             return LeaseClearDecision(
@@ -776,8 +677,6 @@ class TaskRuntimeStateServiceMixin:
                 active_operation_status=operation_status,
                 runtime_lease_owner=runtime_lease_owner,
                 runtime_lease_expires_at=runtime_lease_expires_at,
-                row_lease_expires_at=row_lease_expires_at,
-                dispatcher_instance_id=dispatcher_instance_id,
             )
         return LeaseClearDecision(
             allowed=True,
@@ -791,8 +690,6 @@ class TaskRuntimeStateServiceMixin:
             active_operation_status=operation_status,
             runtime_lease_owner=runtime_lease_owner,
             runtime_lease_expires_at=runtime_lease_expires_at,
-            row_lease_expires_at=row_lease_expires_at,
-            dispatcher_instance_id=dispatcher_instance_id,
         )
 
     def _record_parent_runtime_lease_decision(
@@ -816,6 +713,18 @@ class TaskRuntimeStateServiceMixin:
             stage_name=stage_name or str(getattr(task, "current_stage", "") or "").strip() or None,
             payload=self._parent_runtime_lease_decision_payload(decision, reason=reason),
         )
+
+    def _parent_runtime_reopen_allowed_event(
+        self: TaskManager,
+        decision: LeaseClearDecision,
+        *,
+        expired_message: str,
+        missing_message: str,
+    ) -> tuple[str, str]:
+        lease_state = str(getattr(decision, "lease_state", "") or "").strip().lower()
+        if lease_state == "missing":
+            return "parent_runtime_reopen_allowed_after_lease_missing", missing_message
+        return "parent_runtime_reopen_allowed_after_lease_expiry", expired_message
 
     def _task_main_state_write_allowed(
         self: TaskManager,
@@ -894,7 +803,6 @@ class TaskRuntimeStateServiceMixin:
             "runtime_owner_valid": bool(self._running_task_has_valid_runtime_ownership(db, task)),
             "transition_guard_active": bool(self._task_runtime_transition_guard_active(task)),
             "transition_guard": transition_guard if transition_guard else None,
-            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
             "runtime_phase": str(self._task_runtime_phase(task) or "").strip() or None,
             "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
         }
@@ -1066,15 +974,7 @@ class TaskRuntimeStateServiceMixin:
                 and effective_runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION
                 and self._runtime_lease_is_active(_runtime_lease)
             ):
-                # 不可变式守卫：running + owned_execution + 仍存在活跃 runtime_lease 时，
-                # 必须保留主 owner。此时清空 dispatcher_instance_id 会让 streaming item
-                # claim (依赖 task.dispatcher_instance_id == self.instance_id) 全部失效，
-                # 而 runtime_lease 仍被心跳续约 → 形成 owned 无 owner 的死锁（SSS 事故根因）。
-                # 仅当存在活跃租约（会触发僵尸心跳）时才抑制清空；租约已失效/缺失时允许清空，
-                # 以放行 drift-repair / 过期租约接管等合法释放场景。
-                # 取消/删除/force_reset 不经过本标志（它们用 _set_task_status 直接置位 +
-                # 直接 _clear_runtime_lease），故守卫只拦截 finalize-deferred/requeue 脱钩路径。
-                _suppress_message = "任务保持 running+owned_execution，不清空主 owner 以避免 owned 无 owner 不可变式破坏"
+                _suppress_message = "任务保持 running+owned_execution，不清理 authoritative runtime lease"
                 if not self._has_recent_matching_task_event(
                     db,
                     task,
@@ -1096,10 +996,6 @@ class TaskRuntimeStateServiceMixin:
                             "reason": str(reason or "").strip() or None,
                         },
                     )
-            else:
-                task.dispatcher_instance_id = None
-                task.dispatch_started_at = None
-                task.lease_expires_at = None
         self._record_parent_task_state_transition(
             db,
             task,
@@ -1540,14 +1436,7 @@ class TaskRuntimeStateServiceMixin:
                 lease = self._runtime_lease_for_task(session, task_id)
             finally:
                 session.close()
-        if lease is not None:
-            return self._runtime_lease_is_active(lease)
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-        lease_expires_at = getattr(task, "lease_expires_at", None)
-        if not dispatcher_instance_id or lease_expires_at is None:
-            return False
-        remaining = task_shared._seconds_until(lease_expires_at)
-        return remaining is not None and remaining > 0
+        return bool(lease is not None and self._runtime_lease_is_active(lease))
 
     def _next_lease_expiry(
         self: TaskManager,
@@ -1836,7 +1725,7 @@ class TaskRuntimeStateServiceMixin:
         preserve_guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
         decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
         if not decision.allowed:
-            if preserve_guard.preserve and preserve_guard.decision_reason == "row_mirror_guard_active":
+            if preserve_guard.preserve and preserve_guard.decision_reason == "transition_guard_active":
                 preferred_stage_name = (
                     str(getattr(task, "_preferred_requeue_event_stage_name", "") or "").strip()
                     or (stage_name or task.current_stage)
@@ -1845,7 +1734,7 @@ class TaskRuntimeStateServiceMixin:
                     db,
                     task,
                     source="runtime_state",
-                    reason="owned execution 接管重排队被 row mirror 保护窗口抑制，保持运行态",
+                    reason="owned execution 接管重排队被 transition guard 抑制，保持运行态",
                     status="running",
                     stage_name=str(preferred_stage_name or task.current_stage or "").strip() or None,
                     runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
@@ -1908,13 +1797,20 @@ class TaskRuntimeStateServiceMixin:
             last_error=None,
         )
         task.tail_reconcile_state = "idle"
-        self._clear_runtime_lease(db, task.id)
+        observed_owner = str(decision.runtime_lease_owner or "").strip() or None
+        if observed_owner:
+            self._clear_runtime_lease(db, task.id, owner_instance_id=observed_owner)
         self._last_task_heartbeat_at.pop(task.id, None)
+        reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
+            decision,
+            expired_message="父任务租约已过期，允许重新排队等待新的 owner 接管",
+            missing_message="父任务租约已缺失，允许重新排队等待新的 owner 接管",
+        )
         self._record_parent_runtime_lease_decision(
             db,
             task,
-            event_type="parent_runtime_reopen_allowed_after_lease_expiry",
-            message="父任务租约已过期，允许重新排队等待新的 owner 接管",
+            event_type=reopen_event_type,
+            message=reopen_message,
             decision=decision,
             reason=reason,
             stage_name=event_stage_name,
@@ -2043,7 +1939,11 @@ class TaskRuntimeStateServiceMixin:
         observe_only = delivery_decision.observe_only
         effective_event_type = str(event_type or "").strip() or "owned_execution_takeover_requeued"
         if observe_only and effective_event_type == "owned_execution_takeover_requeued":
-            effective_event_type = "owned_execution_owner_reconcile_requested"
+            effective_event_type = (
+                "owned_execution_owner_reconcile_requested"
+                if delivery_decision.delivery_channel == "owner_inbox"
+                else "task_layer_reconcile_shared_dispatch_requested"
+            )
         self._merge_task_runtime_signal(
             task,
             "pending_task_layer_reconcile",
@@ -2070,7 +1970,13 @@ class TaskRuntimeStateServiceMixin:
                 "next_stage": signal_stage_name,
                 "reason": reconcile_reason,
                 "takeover_reason": reconcile_reason,
-                "takeover_action": "request_task_layer_reconcile" if not observe_only else "notify_owner_reconcile",
+                "takeover_action": (
+                    "request_task_layer_reconcile"
+                    if not observe_only
+                    else "notify_owner_reconcile"
+                    if delivery_decision.delivery_channel == "owner_inbox"
+                    else "request_shared_dispatch_reconcile"
+                ),
                 "reconcile_mode": "observe_only" if observe_only else "allow_execution",
                 "source_event_type": str(source_event_type or "").strip() or None,
                 "state_event_id": str(state_event_id or "").strip() or None,
@@ -2081,7 +1987,6 @@ class TaskRuntimeStateServiceMixin:
                 "decision_reason": delivery_decision.decision_reason,
                 "target_owner_instance_id": target_owner_instance_id,
                 "runtime_lease_owner": delivery_decision.runtime_lease_owner,
-                "dispatcher_instance_id": delivery_decision.dispatcher_instance_id,
                 "task_status": delivery_decision.task_status,
                 "runtime_phase": delivery_decision.runtime_phase,
                 **dict(event_payload or {}),
@@ -2102,7 +2007,6 @@ class TaskRuntimeStateServiceMixin:
                 "decision_reason": delivery_decision.decision_reason,
                 "target_owner_instance_id": target_owner_instance_id,
                 "runtime_lease_owner": delivery_decision.runtime_lease_owner,
-                "dispatcher_instance_id": delivery_decision.dispatcher_instance_id,
                 "task_status": delivery_decision.task_status,
                 "runtime_phase": delivery_decision.runtime_phase,
                 "state_event_id": str(state_event_id or "").strip() or None,
@@ -2173,7 +2077,6 @@ class TaskRuntimeStateServiceMixin:
         source_event_type: str,
         reconcile_reason: str,
     ) -> TaskLayerReconcileDeliveryDecision:
-        dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
         task_status = str(getattr(task, "status", "") or "").strip().lower() or None
         runtime_phase = str(self._task_runtime_phase(task) or "").strip() or None
         lease = self._runtime_lease_for_task(db, task.id)
@@ -2196,7 +2099,6 @@ class TaskRuntimeStateServiceMixin:
                 decision_reason="active_runtime_lease_owner_present",
                 target_owner_instance_id=target_owner_instance_id,
                 runtime_lease_owner=runtime_lease_owner,
-                dispatcher_instance_id=dispatcher_instance_id,
                 task_status=task_status,
                 runtime_phase=runtime_phase,
             )
@@ -2206,7 +2108,6 @@ class TaskRuntimeStateServiceMixin:
             decision_reason="runtime_lease_owner_missing_requires_shared_dispatch",
             target_owner_instance_id=target_owner_instance_id,
             runtime_lease_owner=runtime_lease_owner,
-            dispatcher_instance_id=dispatcher_instance_id,
             task_status=task_status,
             runtime_phase=runtime_phase,
         )
@@ -2330,8 +2231,6 @@ class TaskRuntimeStateServiceMixin:
         runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
         runtime_lease_expires_at = getattr(lease, "lease_expires_at", None) if lease is not None else None
         next_stage_name = str(stage_name or task.current_stage or "").strip() or None
-        previous_task_lease_owner = str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None
-        previous_task_lease_expires_at = getattr(task, "lease_expires_at", None)
         self._apply_release_for_takeover_main_state(
             db,
             task,
@@ -2345,14 +2244,21 @@ class TaskRuntimeStateServiceMixin:
         )
         task.tail_reconcile_state = "idle"
         task.updated_at = task_manager_module._now()
-        self._clear_runtime_lease(db, task.id)
+        observed_owner = str(runtime_lease_owner or "").strip() or None
+        if observed_owner:
+            self._clear_runtime_lease(db, task.id, owner_instance_id=observed_owner)
         self._last_task_heartbeat_at.pop(task.id, None)
         self._clear_task_abnormal_reason_snapshot(db, task)
+        reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
+            decision,
+            expired_message="父任务 authoritative runtime lease 已过期，允许回收到待执行队列",
+            missing_message="父任务 authoritative runtime lease 已缺失，允许回收到待执行队列",
+        )
         self._record_parent_runtime_lease_decision(
             db,
             task,
-            event_type="parent_runtime_reopen_allowed_after_lease_expiry",
-            message="父任务 authoritative runtime lease 已过期，允许回收到待执行队列",
+            event_type=reopen_event_type,
+            message=reopen_message,
             decision=decision,
             reason=reason,
             stage_name=next_stage_name,
@@ -2369,8 +2275,6 @@ class TaskRuntimeStateServiceMixin:
                 "reason": reason,
                 "runtime_phase": runtime_phase,
                 "previous_task_status": "running",
-                "previous_task_lease_owner": previous_task_lease_owner,
-                "previous_task_lease_expires_at": previous_task_lease_expires_at,
                 "runtime_lease_owner": runtime_lease_owner,
                 "runtime_lease_expires_at": runtime_lease_expires_at,
                 "repair_action": "pending_requeue_owned_execution",

@@ -76,7 +76,14 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         self.assertEqual(["t1"], queued)
         requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
         self.assertTrue(requeue_events)
-        reopen_events = [event for event in db.events if event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry"]
+        reopen_events = [
+            event
+            for event in db.events
+            if event.event_type in {
+                "parent_runtime_reopen_allowed_after_lease_expiry",
+                "parent_runtime_reopen_allowed_after_lease_missing",
+            }
+        ]
         self.assertTrue(reopen_events)
 
     def test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):

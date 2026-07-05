@@ -219,11 +219,9 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     queue_state: str = "idle"
     recoverable_reason: Optional[str] = None
     last_reconcile_at: Optional[datetime] = None
-    dispatcher_instance_id: Optional[str] = None
     task_lease_owner_instance_id: Optional[str] = None
     task_lease_expires_at: Optional[datetime] = None
     task_lease_source: Optional[str] = None
-    row_mirror_drift: bool = False
     tail_control_mode: str = "idle"
     tail_has_runnable_unbound_items: bool = False
     tail_unbound_runnable_item_count: int = 0

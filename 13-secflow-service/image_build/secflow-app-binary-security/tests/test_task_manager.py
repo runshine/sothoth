@@ -6409,7 +6409,13 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         self.assertEqual(["t-active"], queued_tasks)
         self.assertEqual(
             1,
-            len({id(event) for event in db.events if event.event_type == "owned_execution_owner_reconcile_requested"}),
+            len(
+                {
+                    id(event)
+                    for event in db.events
+                    if event.event_type == "task_layer_reconcile_shared_dispatch_requested"
+                }
+            ),
         )
         self.assertEqual(
             1,
@@ -10974,7 +10980,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertEqual(["t1"], queued)
         self.assertIn("task_row_owner_released_without_local_runtime", events)
-        self.assertEqual([("t1", "stale-worker")], cleared_leases)
+        self.assertEqual([], cleared_leases)
 
     def test_requeue_stale_operations_releases_stale_owner_for_cancelling_task(self):
         task = BinarySecurityTask(
@@ -11017,7 +11023,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertEqual(["t1"], queued)
         self.assertIn("task_row_owner_released_without_local_runtime", events)
-        self.assertEqual([("t1", "stale-worker")], cleared_leases)
+        self.assertEqual([], cleared_leases)
 
     def test_requeue_stale_operations_defers_release_for_active_cancel_finalize_with_runtime_lease(self):
         task = BinarySecurityTask(
@@ -16683,7 +16689,15 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             "validation": {"validated": True, "issues": []},
             "requeue": {"requested": True, "task_status_after": "pending"},
         }
-        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease])
 
         state = self.manager._build_manual_operation_state(
             db,
@@ -19893,7 +19907,15 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
                 item_identity_key="entry-a::mod-a",
                 status="running",
             )
-            db = _AppendingModelAwareDb(tasks=[task], stage_items=[active_item])
+            runtime_lease = BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+                owner_instance_id=self.manager.instance_id,
+                owner_started_at=started_at,
+                heartbeat_at=started_at,
+                lease_expires_at=original_expiry,
+            )
+            db = _AppendingModelAwareDb(tasks=[task], stage_items=[active_item], runtime_leases=[runtime_lease])
 
             original_factory = task_manager_module.get_session_factory
             original_interval = self.manager.cfg.scheduler.heartbeat_update_interval_seconds
@@ -19915,7 +19937,8 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
                 self.manager._stage_item_workers = original_stage_workers
                 loop.close()
 
-            self.assertGreater(task.lease_expires_at, original_expiry)
+            self.assertEqual(original_expiry, task.lease_expires_at)
+            self.assertGreater(db.runtime_leases[0].lease_expires_at, original_expiry)
             self.assertGreater(task.updated_at, started_at)
 
     def test_refresh_stage_run_from_items_preserves_streaming_tail_failed_status_without_items(self):
@@ -26352,7 +26375,6 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         response = self.manager.list_tasks(db, project_id="p1", task_type="binary")
 
         item = response.items[0]
-        self.assertIsNone(item.dispatcher_instance_id)
         self.assertIsNone(item.task_lease_owner_instance_id)
         self.assertEqual("idle", item.tail_reconcile_state)
         self.assertEqual(0, item.active_sync_error_item_count)
@@ -36961,9 +36983,9 @@ def _test_build_task_runtime_health_marks_fake_local_owner_unhealthy(self):
     snapshot_cards = {card["card_key"]: card for card in health["snapshot_cards"]}
 
     self.assertEqual("unhealthy", units["task_worker"]["status"])
-    self.assertEqual("unhealthy", units["task_heartbeat"]["status"])
-    self.assertIn("owner 元数据", units["task_worker"]["reason"])
-    self.assertEqual("unhealthy", snapshot_cards["local_task_runtime"]["status"])
+    self.assertEqual("unknown", units["task_heartbeat"]["status"])
+    self.assertIn("看不到稳定的本地执行协程或 owner", units["task_worker"]["reason"])
+    self.assertEqual("idle", snapshot_cards["local_task_runtime"]["status"])
 
 
 def _test_dispatch_task_by_id_claims_ownerless_active_operation(self):
@@ -41904,6 +41926,14 @@ def _test_run_task_records_takeover_resume_event_for_streaming_tail(self):
     )
     task.dispatch_started_at = _now()
     task.lease_expires_at = _now() + timedelta(seconds=120)
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+        owner_instance_id="worker-a",
+        owner_started_at=task.dispatch_started_at,
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
     item = BinarySecurityStageItem(
         id="si-run-tail",
         task_id=task.id,
@@ -41916,7 +41946,7 @@ def _test_run_task_records_takeover_resume_event_for_streaming_tail(self):
         downstream_service="entry_analyse",
         downstream_task_id="eat-1",
     )
-    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[runtime_lease], events=[])
 
     async def _noop_execute(_task_id):
         return None
@@ -42001,10 +42031,19 @@ def _test_run_task_active_commit_failure_releases_fake_dispatching_owner(self):
     )
     task.dispatch_started_at = _now()
     task.lease_expires_at = _now() + timedelta(seconds=120)
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+        owner_instance_id="worker-a",
+        owner_started_at=task.dispatch_started_at,
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
     db = _FlakyCommitDb(
         tasks=[task],
         stage_items=[],
         stage_runs=[],
+        runtime_leases=[runtime_lease],
         events=[],
         fail_commits=1,
         error_factory=lambda: task_manager_module.OperationalError(
@@ -42051,6 +42090,14 @@ def _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consu
     )
     task.dispatch_started_at = _now()
     task.lease_expires_at = _now() + timedelta(seconds=120)
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+        owner_instance_id="worker-a",
+        owner_started_at=task.dispatch_started_at,
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
     operation = BinarySecurityTaskOperation(
         id="op-cancel",
         task_id=task.id,
@@ -42059,7 +42106,7 @@ def _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consu
         target_stage="dataflow_vuln_scan",
         status="queued",
     )
-    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+    db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
 
     original_factory = task_manager_module.get_session_factory
     original_run_current_task_operation = manager._run_current_task_operation

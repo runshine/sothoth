@@ -789,16 +789,22 @@ class TaskOwnerFactApplyServiceMixin:
     ) -> None:
         expected_dispatcher = str(dispatcher_instance_id or "").strip()
         expected_execution_token = str(execution_token or "").strip()
-        current_execution_token = task.dispatch_started_at.isoformat() if task.dispatch_started_at else ""
-        if expected_dispatcher and task.dispatcher_instance_id not in {None, expected_dispatcher}:
+        current_execution_token = str(self._dispatch_token_for_task(db, task) or "").strip()
+        runtime_lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
+        current_dispatcher = (
+            str(getattr(runtime_lease, "owner_instance_id", "") or "").strip()
+            if runtime_lease is not None and self._runtime_lease_is_active(runtime_lease)
+            else ""
+        )
+        if expected_dispatcher and current_dispatcher and current_dispatcher != expected_dispatcher:
             self._record_event(
                 db,
                 task,
                 "task_execution_failed_ignored",
-                "执行失败事件已过期，当前 dispatcher 已变化",
+                "执行失败事件已过期，当前 runtime lease owner 已变化",
                 level="warning",
                 stage_name=task.current_stage,
-                payload={"state_event_id": state_event_id, "dispatcher_instance_id": expected_dispatcher},
+                payload={"state_event_id": state_event_id, "runtime_lease_owner": expected_dispatcher},
             )
             return
         if expected_execution_token and current_execution_token and expected_execution_token != current_execution_token:
@@ -863,7 +869,7 @@ class TaskOwnerFactApplyServiceMixin:
             db,
             task,
             error_message=str(payload.get("error") or "任务执行失败"),
-            dispatcher_instance_id=str(payload.get("dispatcher_instance_id") or "").strip() or None,
+            dispatcher_instance_id=str(payload.get("runtime_lease_owner") or payload.get("dispatcher_instance_id") or "").strip() or None,
             execution_token=str(payload.get("execution_token") or "").strip() or None,
             state_event_id=event.id,
             source_event_type=event.event_type,

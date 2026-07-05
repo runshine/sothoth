@@ -46,6 +46,7 @@ class TaskOperationServiceMixin:
 
         stage_name = str(getattr(operation, "target_stage", "") or getattr(task, "current_stage", "") or "").strip() or None
         now_value = task_manager_module._now()
+        lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
         self._record_operation_event(
             db,
             task,
@@ -59,7 +60,7 @@ class TaskOperationServiceMixin:
                 "operation_type": str(getattr(operation, "operation_type", "") or "").strip() or None,
                 "task_status_before": str(getattr(task, "status", "") or "").strip() or None,
                 "runtime_phase_before": self._task_runtime_phase(task),
-                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                "runtime_lease_owner": str(getattr(lease, "owner_instance_id", "") or "").strip() or None,
                 "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
                 "delete_task_row": bool(delete_task_row),
             },
@@ -156,7 +157,7 @@ class TaskOperationServiceMixin:
                 "operation_type": str(getattr(operation, "operation_type", "") or "").strip() or None,
                 "task_status_after": task_status if not delete_task_row else "deleted",
                 "runtime_phase_after": task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
-                "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                "runtime_lease_owner": str(getattr(lease, "owner_instance_id", "") or "").strip() or None,
                 "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
                 "delete_task_row": bool(delete_task_row),
             },
@@ -2914,12 +2915,14 @@ class TaskOperationServiceMixin:
                             "local_owner_control_wakeup_requested",
                             "当前 owner 已收到控制唤醒并开始消费控制操作",
                             stage_name=followup_task.current_stage,
-                            payload={
-                                "operation_id": operation_id,
-                                "operation_type": operation_type,
-                                "dispatcher_instance_id": str(getattr(followup_task, "dispatcher_instance_id", "") or "").strip() or None,
-                            },
-                        )
+                        payload={
+                            "operation_id": operation_id,
+                            "operation_type": operation_type,
+                            "runtime_lease_owner": str(
+                                getattr(self._runtime_lease_for_task(followup_db, getattr(followup_task, "id", None)), "owner_instance_id", "") or ""
+                            ).strip() or None,
+                        },
+                    )
                         followup_db.commit()
                 finally:
                     followup_db.close()
@@ -3053,20 +3056,18 @@ class TaskOperationServiceMixin:
             if task is None:
                 return False
             current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+            lease = self._runtime_lease_for_task(db, task_id)
             task_manager_module.logger.info(
                 "binary-security task owner evaluating current operation: "
-                "task_id=%s current_operation_id=%s status=%s runtime_phase=%s dispatcher_instance_id=%s",
+                "task_id=%s current_operation_id=%s status=%s runtime_phase=%s runtime_lease_owner=%s",
                 task_id,
                 current_operation_id or None,
                 str(getattr(task, "status", "") or "").strip(),
                 self._task_runtime_phase(task),
-                str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                str(getattr(lease, "owner_instance_id", "") or "").strip() or None,
             )
             if not current_operation_id:
-                if (
-                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip()
-                    or not self._lease_is_active(task, db=db)
-                ):
+                if not self._task_runtime_owner_matches_current_instance(db, task):
                     self._ensure_task_write_ownership(task, db=db, allow_dispatching=True)
                 if self._repair_active_operations_for_task(db, task):
                     task_manager_module.logger.warning(
@@ -3230,7 +3231,9 @@ class TaskOperationServiceMixin:
                             "operation_type": str(getattr(operation, "operation_type", "") or "").strip() or None,
                             "task_status": str(getattr(task_after_stale, "status", "") or "").strip() or None,
                             "runtime_phase": self._task_runtime_phase(task_after_stale),
-                            "dispatcher_instance_id": str(getattr(task_after_stale, "dispatcher_instance_id", "") or "").strip() or None,
+                            "runtime_lease_owner": str(
+                                getattr(self._runtime_lease_for_task(db, getattr(task_after_stale, "id", None)), "owner_instance_id", "") or ""
+                            ).strip() or None,
                             "current_operation_id": str(getattr(task_after_stale, "current_operation_id", "") or "").strip() or None,
                         },
                     )
@@ -3282,9 +3285,7 @@ class TaskOperationServiceMixin:
                             and str(getattr(refreshed_task, "status", "") or "").strip().lower() in {"running", "dispatching"}
                         )
                         or self._task_runtime_phase(refreshed_task) != task_manager_module.TASK_RUNTIME_PHASE_TERMINAL
-                        or getattr(refreshed_task, "dispatcher_instance_id", None) is not None
-                        or getattr(refreshed_task, "dispatch_started_at", None) is not None
-                        or getattr(refreshed_task, "lease_expires_at", None) is not None
+                        or self._task_has_live_runtime_lease(db, refreshed_task)
                     )
                 ):
                     clear_decision = self._can_clear_parent_runtime_ownership(
@@ -3667,8 +3668,9 @@ class TaskOperationServiceMixin:
             "task_status": str(getattr(refreshed_task, "status", "") or "").strip(),
             "runtime_phase": self._task_runtime_phase(refreshed_task),
             "in_place_runtime_resume": bool(dict(self._operation_result_data(refreshed_operation) or {}).get("requeue", {}).get("in_place_runtime_resume")),
-            "previous_owner": str(getattr(refreshed_task, "dispatcher_instance_id", "") or "").strip() or None,
-            "current_owner": str(getattr(refreshed_task, "dispatcher_instance_id", "") or "").strip() or None,
+            "runtime_lease_owner": str(
+                getattr(self._runtime_lease_for_task(db, getattr(refreshed_task, "id", None)), "owner_instance_id", "") or ""
+            ).strip() or None,
             "auto_reconciled": bool(auto_reconciled),
             "source": source,
         }

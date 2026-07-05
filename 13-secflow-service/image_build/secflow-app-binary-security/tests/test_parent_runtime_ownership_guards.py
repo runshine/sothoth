@@ -363,3 +363,25 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertEqual("pending", task.status)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))
+
+    def test_release_unsupported_task_row_owner_records_missing_runtime_lease_distinctly(self):
+        self.manager.instance_id = "worker-new"
+        task = self._task(
+            id="task-running-release-missing",
+            status="running",
+            current_stage="entry_analysis",
+            dispatcher_instance_id="worker-dead",
+            lease_expires_at=None,
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+        released = self.manager._release_unsupported_task_row_owner(
+            db,
+            task,
+            reason="unit_test_release_running_to_pending_after_lease_missing",
+        )
+
+        self.assertTrue(released)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_missing" for event in db.events))

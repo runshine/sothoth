@@ -1108,8 +1108,6 @@ class TaskLifecycleServiceMixin:
                             "resolution_reason": "stale_running_archive_job",
                             "timeout_seconds": timeout_seconds,
                             "runtime_lease_owner": ownership_snapshot.runtime_lease_owner,
-                            "row_mirror_owner": ownership_snapshot.row_mirror_owner,
-                            "row_mirror_drift": ownership_snapshot.row_mirror_drift,
                         },
                     )
                     self._record_event(

@@ -32,6 +32,7 @@ from app.schemas import (
     BinarySecurityDeleteQueueResponse,
     BinarySecurityOverviewResponse,
     BinarySecurityProjectStats,
+    BinarySecurityRuntimeHealthResponse,
     BinarySecurityStageItemSummaryResponse,
     BinarySecurityStageItemDetailResponse,
     BinarySecurityStageSummary,
@@ -330,11 +331,9 @@ class TaskQueryServiceMixin:
             queue_state=queue_state,
             recoverable_reason=None,
             last_reconcile_at=None,
-            dispatcher_instance_id=None,
             task_lease_owner_instance_id=None,
             task_lease_expires_at=None,
             task_lease_source=None,
-            row_mirror_drift=False,
             tail_control_mode="idle",
             tail_has_runnable_unbound_items=False,
             tail_unbound_runnable_item_count=0,
@@ -692,7 +691,6 @@ class TaskQueryServiceMixin:
                     BinarySecurityTask.policy_json,
                     BinarySecurityTask.metrics_json,
                     BinarySecurityTask.stage_summary_json,
-                    BinarySecurityTask.dispatcher_instance_id,
                     BinarySecurityTask.created_by,
                     BinarySecurityTask.created_at,
                     BinarySecurityTask.updated_at,
@@ -850,7 +848,7 @@ class TaskQueryServiceMixin:
                 overview_nodes=[],
                 orchestration_observability={},
                 cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
-                runtime_health=self._build_task_runtime_health(db, ctx.task, ctx=ctx),
+                runtime_health=BinarySecurityRuntimeHealthResponse(),
             )
             self._log_task_read_projection_built(
                 projection_kind="task_detail_read_projection_built",
@@ -1276,7 +1274,6 @@ class TaskQueryServiceMixin:
             and str(left_payload.get("takeover_reason") or "") == str(right_payload.get("takeover_reason") or "")
             and str(left_payload.get("recovery_action") or "") == str(right_payload.get("recovery_action") or "")
             and str(left_payload.get("task_execution_token") or "") == str(right_payload.get("task_execution_token") or "")
-            and str(left_payload.get("dispatcher_instance_id") or "") == str(right_payload.get("dispatcher_instance_id") or "")
             and str(left_recorder.get("instance_id") or "") == str(right_recorder.get("instance_id") or "")
             and str(left_recorder.get("pod_name") or left_recorder.get("hostname") or "") == str(right_recorder.get("pod_name") or right_recorder.get("hostname") or "")
             and str(left_recorder.get("role") or "") == str(right_recorder.get("role") or "")

@@ -12,6 +12,7 @@ from app.model import (
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityTask,
+    BinarySecurityTaskRuntimeLease,
     TASK_TYPE_BINARY,
     TASK_TYPE_BINARY_MODULE,
 )
@@ -146,7 +147,15 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
             status="pending",
             downstream_service="entry_analyse",
         )
-        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id=self.manager.instance_id,
+            owner_started_at=now,
+            heartbeat_at=now,
+            lease_expires_at=now + timedelta(seconds=300),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[runtime_lease])
 
         claimed = self.manager._claim_streaming_stage_items(db)
 

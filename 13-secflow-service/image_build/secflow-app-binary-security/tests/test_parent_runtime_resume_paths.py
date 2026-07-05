@@ -185,7 +185,7 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
         self.assertEqual("archive_apply", pending_reconcile.get("reconcile_reason"))
         self.assertEqual("observe_only", pending_reconcile.get("reconcile_mode"))
         event_types = [event.event_type for event in db.events]
-        self.assertIn("owned_execution_owner_reconcile_requested", event_types)
+        self.assertIn("task_layer_reconcile_shared_dispatch_requested", event_types)
         self.assertNotIn("owner_reconcile_signal_enqueued", event_types)
         self.assertIn("shared_dispatch_signal_enqueued", event_types)
 

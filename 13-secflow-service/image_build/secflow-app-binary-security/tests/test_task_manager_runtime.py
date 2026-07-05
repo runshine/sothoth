@@ -438,7 +438,15 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             dispatcher_instance_id="worker-a",
             lease_expires_at=_now() + timedelta(minutes=5),
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
         heartbeat_cancelled = asyncio.Event()
 
         async def _heartbeat():
@@ -2318,7 +2326,15 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             created_at=_now() - timedelta(minutes=1),
             updated_at=_now() - timedelta(minutes=1),
         )
-        db = _ModelAwareDb(tasks=[task], operations=[older, newer], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[older, newer], runtime_leases=[runtime_lease], events=[])
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             repaired = await manager._run_current_task_operation(task.id)
@@ -2355,7 +2371,15 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 }
             }
         }
-        db = _ModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
         finalized = []
 
         def _finalize(_db, _task):
@@ -2521,7 +2545,15 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 }
             },
         )
-        db = _ModelAwareDb(tasks=[task], stage_items=[item], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[runtime_lease], events=[])
 
         class _Queue:
             async def enqueue_task_sync_request(self, task_id, entry, **kwargs):
@@ -2579,7 +2611,15 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
         }
-        db = _ModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
         rebuilt = []
         finalized = []
 

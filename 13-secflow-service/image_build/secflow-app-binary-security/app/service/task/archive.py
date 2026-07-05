@@ -644,11 +644,16 @@ class TaskArchiveServiceMixin:
                 reason="archive_retry_requeue",
             )
             if clear_decision.allowed:
+                reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
+                    clear_decision,
+                    expired_message="父任务租约已过期，允许归档重试后重新排队",
+                    missing_message="父任务租约已缺失，允许归档重试后重新排队",
+                )
                 self._record_parent_runtime_lease_decision(
                     db,
                     task,
-                    event_type="parent_runtime_reopen_allowed_after_lease_expiry",
-                    message="父任务租约已过期，允许归档重试后重新排队",
+                    event_type=reopen_event_type,
+                    message=reopen_message,
                     decision=clear_decision,
                     reason="archive_retry_requeue",
                     stage_name=stage_name,
@@ -667,10 +672,9 @@ class TaskArchiveServiceMixin:
                 )
         task.finished_at = None
         if should_release_owner:
-            task.dispatcher_instance_id = None
-            task.dispatch_started_at = None
-            task.lease_expires_at = None
-            self._clear_runtime_lease(db, task.id)
+            observed_owner = str(getattr(clear_decision, "runtime_lease_owner", "") or "").strip() or None
+            if observed_owner:
+                self._clear_runtime_lease(db, task.id, owner_instance_id=observed_owner)
             self._enqueue_task(task.id)
         self._write_task_metadata(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=next_status)
         self._record_event(
@@ -1100,7 +1104,6 @@ class TaskArchiveServiceMixin:
             "runtime_phase": self._task_runtime_phase(task),
             "task_status": str(getattr(task, "status", "") or "").strip() or None,
             "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
-            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
             "runtime_lease_active": bool(getattr(ownership_snapshot, "runtime_lease_active", False)),
             "runtime_lease_owner": getattr(ownership_snapshot, "runtime_lease_owner", None),
             "runtime_lease_expires_at": (

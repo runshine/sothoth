@@ -17,7 +17,7 @@ from test_task_manager import _AppendingModelAwareDb, _ModelAwareDb
 
 
 class ParentRuntimeLeaseGuardTests(unittest.TestCase):
-    def test_write_task_heartbeat_refreshes_runtime_lease_and_task_row_mirror(self):
+    def test_write_task_heartbeat_refreshes_runtime_lease_without_touching_task_row_mirror(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         now_value = _now()
@@ -42,14 +42,13 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
         wrote = manager._write_task_heartbeat(db, task.id, now_value=now_value, source="unit_test")
 
         self.assertTrue(wrote)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertEqual(now_value, task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
-        self.assertGreater(task.lease_expires_at, now_value)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIsNone(task.dispatch_started_at)
+        self.assertEqual(now_value - timedelta(minutes=5), task.lease_expires_at)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         lease = db.runtime_leases[0]
         self.assertEqual("worker-a", lease.owner_instance_id)
-        self.assertEqual(lease.lease_expires_at, task.lease_expires_at)
+        self.assertGreater(lease.lease_expires_at, now_value)
 
     def test_queue_reconcile_skips_pending_not_enqueued_when_runtime_lease_is_active(self):
         manager = TaskManager()

@@ -727,7 +727,7 @@ class TaskItemSyncServiceMixin:
         if not ownership_snapshot.runtime_lease_active:
             return True
         lease = self._runtime_lease_for_task(db, task.id)
-        heartbeat_at = (lease.heartbeat_at if lease is not None else None) or task.updated_at or task.dispatch_started_at
+        heartbeat_at = (lease.heartbeat_at if lease is not None else None) or task.updated_at
         from app.service import task_manager as task_manager_module
 
         elapsed_seconds = task_manager_module._elapsed_seconds_since(heartbeat_at)

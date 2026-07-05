@@ -83,9 +83,7 @@ class TaskStateMachineMixin:
             canonical_jobs = self._canonical_archive_jobs_for_stage_items(current_stage_items, archive_jobs_by_item=jobs_by_item)
             if any(self._archive_job_status_value(job) in active_statuses for job in canonical_jobs):
                 return True
-        if str(getattr(task, "status", "") or "").strip().lower() in active_statuses and (
-            str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-        ):
+        if str(getattr(task, "status", "") or "").strip().lower() in active_statuses and self._task_has_live_runtime_lease(db, task):
             current_stage = str(getattr(task, "current_stage", "") or "").strip()
             if current_stage and self._stage_has_real_runnable_work(db, task, current_stage):
                 return True
@@ -3401,7 +3399,6 @@ class TaskStateMachineMixin:
                     and any(str(item.status or "").strip() in {"running", "dispatching"} for item in current_stage_items)
                 ):
                     previous_status = str(task.status or "").strip()
-                    previous_dispatcher = str(task.dispatcher_instance_id or "").strip() or None
                     self._apply_task_main_state_update(
                         db,
                         task,
@@ -3434,7 +3431,6 @@ class TaskStateMachineMixin:
                             "had_downstream_refs": any(
                                 bool(str(getattr(item, "downstream_task_id", "") or "").strip()) for item in current_stage_items
                             ),
-                            "previous_dispatcher_instance_id": previous_dispatcher,
                             "tail_control_mode": "current_stage_activity_recovery",
                             "runtime_lease_established": self._task_runtime_phase(task) == TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                             "reason": "refresh_task_status_after_sync",
@@ -3971,7 +3967,7 @@ class TaskStateMachineMixin:
                     if (
                         str(task.status or "").strip() in {"running", "dispatching"}
                         or self._task_runtime_owner_matches_current_instance(db, task)
-                        or preserve_guard.decision_reason == "row_mirror_guard_active"
+                        or preserve_guard.decision_reason == "transition_guard_active"
                     )
                     else "pending"
                 )
