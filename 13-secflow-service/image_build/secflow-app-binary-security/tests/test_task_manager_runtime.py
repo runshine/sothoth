@@ -1026,7 +1026,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._dispatch_claim_decision(),
         )
 
-    def test_dispatch_task_by_id_marks_running_unsupported_nonresumable_task_as_drop_after_pop(self):
+    def test_dispatch_task_by_id_suppresses_running_unsupported_nonresumable_task_when_runtime_lease_active(self):
         manager = TaskManager()
         task = BinarySecurityTask(
             id="task-running-no-resume",
@@ -1041,8 +1041,13 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-a",
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
-        manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        active_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=2),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[active_lease])
         manager._enqueue_task = lambda *_args, **_kwargs: None
 
         claimed = manager._dispatch_task_by_id(db, task.id)
@@ -1052,11 +1057,58 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             {
                 "task_id": task.id,
                 "claimed_task_id": None,
-                "blocked_reason": "task_status_not_pending_without_resumable_operation",
+                "blocked_reason": "non_pending_task_already_owned_by_supported_runtime",
                 "should_requeue": False,
                 "cooldown_seconds": None,
             },
             manager._dispatch_claim_decision(),
+        )
+
+    def test_dispatch_task_by_id_allows_running_stale_owner_after_runtime_lease_expiry(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        task = BinarySecurityTask(
+            id="task-running-expired-lease",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-expired-lease",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id="worker-old",
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-old",
+            heartbeat_at=_now() - timedelta(minutes=2),
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[expired_lease])
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertEqual(task.id, claimed)
+        self.assertEqual("worker-new", task.dispatcher_instance_id)
+        self.assertEqual("dispatching", task.status)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": task.id,
+                "blocked_reason": None,
+                "should_requeue": False,
+                "cooldown_seconds": None,
+            },
+            manager._dispatch_claim_decision(),
+        )
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("parent_runtime_reopen_allowed_after_lease_expiry", event_types)
+        self.assertTrue(
+            "dispatch_claim_allowed_after_runtime_lease_expiry" in event_types
+            or "owned_execution_takeover_requeued" in event_types
         )
 
 
@@ -1284,7 +1336,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], pushed)
         self.assertIn("dispatch_claim_cooldown", task.summary)
 
-    async def test_reconcile_work_queues_does_not_reenqueue_active_nonpending_task_to_shared_dispatch(self):
+    async def test_reconcile_work_queues_reenqueues_active_nonpending_task_after_runtime_lease_expiry(self):
         task = BinarySecurityTask(
             id="task-running-stale-owner",
             project_id="project-1",
@@ -1298,7 +1350,13 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             dispatcher_instance_id="worker-stale",
         )
-        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-stale",
+            heartbeat_at=_now() - timedelta(minutes=2),
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[], runtime_leases=[expired_lease])
         pushed: list[tuple[str, str | None]] = []
 
         class _Queue:
@@ -1316,7 +1374,58 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
+            patch.object(self.manager, "_queue_reconcile_task_rows", return_value=[task]),
+            patch.object(self.manager, "_queue_reconcile_operation_rows", return_value=[]),
+        ):
+            await self.manager._reconcile_work_queues_once(db)
+
+        self.assertEqual([("task-running-stale-owner", "queue_reconcile_active_nonpending_reenqueue")], pushed)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertIn("active_nonpending_stale_owner_reenqueued", [row.event_type for row in db.events])
+
+    async def test_reconcile_work_queues_suppresses_active_nonpending_takeover_while_runtime_lease_active(self):
+        task = BinarySecurityTask(
+            id="task-running-active-lease",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("reconcile-active-nonpending-active-lease"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-stale",
+        )
+        active_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-stale",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=2),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[], runtime_leases=[active_lease])
+        pushed: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                pushed.append((task_id, context))
+
+            async def push_task(self, task_id, context=None):
+                pushed.append((task_id, context))
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1328,7 +1437,8 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             await self.manager._reconcile_work_queues_once(db)
 
         self.assertEqual([], pushed)
-        self.assertIn("active_nonpending_task_reenqueue_skipped", [row.event_type for row in db.events])
+        self.assertEqual("worker-stale", task.dispatcher_instance_id)
+        self.assertIn("active_nonpending_takeover_suppressed_active_lease", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_skips_stale_operation_row_without_current_operation_binding(self):
         task = BinarySecurityTask(

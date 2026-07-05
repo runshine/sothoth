@@ -330,6 +330,19 @@ class _TaskResumeDecision:
     payload: dict[str, Any] | None = None
     owned_execution_requeue_required: bool = False
 
+
+@dataclass
+class _StaleParentRuntimeTakeoverDecision:
+    runtime_lease_active: bool
+    runtime_lease_owner: str | None
+    local_handle_alive: bool
+    row_mirror_owner: str | None
+    supported_control_operation_active: bool
+    allow_takeover: bool
+    allow_reenqueue: bool
+    allow_claim: bool
+    decision_reason: str
+
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
@@ -3414,6 +3427,74 @@ class TaskManager(
             and snapshot.row_mirror_owner
             and snapshot.row_mirror_owner == str(self.instance_id or "").strip()
             and snapshot.task_status in {"running", "dispatching", TASK_STATUS_CANCELLING}
+        )
+
+    def _stale_parent_runtime_takeover_decision(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+        *,
+        active_operation=None,
+    ) -> _StaleParentRuntimeTakeoverDecision:
+        if task is None:
+            return _StaleParentRuntimeTakeoverDecision(
+                runtime_lease_active=False,
+                runtime_lease_owner=None,
+                local_handle_alive=False,
+                row_mirror_owner=None,
+                supported_control_operation_active=False,
+                allow_takeover=False,
+                allow_reenqueue=False,
+                allow_claim=False,
+                decision_reason="task_missing",
+            )
+        snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
+        if snapshot.runtime_lease_active:
+            return _StaleParentRuntimeTakeoverDecision(
+                runtime_lease_active=True,
+                runtime_lease_owner=snapshot.runtime_lease_owner,
+                local_handle_alive=snapshot.local_handle_alive,
+                row_mirror_owner=snapshot.row_mirror_owner,
+                supported_control_operation_active=snapshot.supported_control_operation_active,
+                allow_takeover=False,
+                allow_reenqueue=False,
+                allow_claim=False,
+                decision_reason="active_runtime_lease",
+            )
+        if snapshot.local_handle_alive:
+            return _StaleParentRuntimeTakeoverDecision(
+                runtime_lease_active=False,
+                runtime_lease_owner=snapshot.runtime_lease_owner,
+                local_handle_alive=True,
+                row_mirror_owner=snapshot.row_mirror_owner,
+                supported_control_operation_active=snapshot.supported_control_operation_active,
+                allow_takeover=False,
+                allow_reenqueue=False,
+                allow_claim=False,
+                decision_reason="local_handle_alive_without_runtime_lease",
+            )
+        if snapshot.supported_control_operation_active:
+            return _StaleParentRuntimeTakeoverDecision(
+                runtime_lease_active=False,
+                runtime_lease_owner=snapshot.runtime_lease_owner,
+                local_handle_alive=False,
+                row_mirror_owner=snapshot.row_mirror_owner,
+                supported_control_operation_active=True,
+                allow_takeover=False,
+                allow_reenqueue=False,
+                allow_claim=False,
+                decision_reason="supported_control_operation_active",
+            )
+        return _StaleParentRuntimeTakeoverDecision(
+            runtime_lease_active=False,
+            runtime_lease_owner=snapshot.runtime_lease_owner,
+            local_handle_alive=False,
+            row_mirror_owner=snapshot.row_mirror_owner,
+            supported_control_operation_active=snapshot.supported_control_operation_active,
+            allow_takeover=True,
+            allow_reenqueue=True,
+            allow_claim=True,
+            decision_reason="runtime_lease_expired_without_local_owner",
         )
 
     def _should_enqueue_parent_dispatch_for_task_sync(
