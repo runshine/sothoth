@@ -655,6 +655,33 @@ class TaskStateMachineMixin:
     ) -> bool:
         if not self._streaming_mode_enabled(task):
             return True
+        if normalize_stage_name(self._pipeline_profile(task)) == normalize_stage_name("kg_source_vuln_scan"):
+            gate = self._build_streaming_dataflow_completion_gate(db, task)
+            return bool(gate.get("ready_for_terminal_status"))
+        entry_stage_run = next(
+            (
+                run
+                for run in db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
+                if normalize_stage_name(run.stage_name) == "entry_analysis"
+            ),
+            None,
+        )
+        entry_items = self._stage_items(db, task.id, "entry_analysis")
+        if entry_stage_run is None:
+            return False
+        entry_status = self._normalize_stage_terminal_status(
+            self._business_stage_status(task, "entry_analysis", entry_stage_run, entry_items, db=db)
+        )
+        if not self._task_status_is_terminal(entry_status):
+            return False
+        if any(
+            (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
+            in {"pending", "queued", "running", "dispatching"}
+            for item in entry_items
+        ):
+            return False
+        if self._stage_archive_success_blocked(task, "entry_analysis", entry_items, db=db):
+            return False
         gate = self._build_streaming_dataflow_completion_gate(db, task)
         return bool(gate.get("ready_for_terminal_status"))
 

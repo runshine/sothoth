@@ -4881,14 +4881,38 @@ class TaskRuntimeServiceMixin:
                 created = None
             else:
                 if str(item.downstream_task_id or "").strip() and not retrying:
-                    return self._defer_item_after_downstream_transport_error(
-                        session,
-                        task,
-                        item,
-                        operation="entry_analysis_observe",
-                        exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
-                        response_item=entry_input if "entry_input" in locals() else module,
+                    terminal_payload = None
+                    try:
+                        terminal_payload = await self._downstream_fetch_item_payload(task, item, token or "")
+                    except Exception:
+                        terminal_payload = None
+                    terminal_status = self._map_downstream_status(
+                        str((terminal_payload or {}).get("status") or "")
                     )
+                    if terminal_payload is not None and terminal_status in {
+                        "success",
+                        "partial_success",
+                        "failed",
+                        "cancelled",
+                        "downstream_missing",
+                    }:
+                        status, payload = await self._poll_until_terminal(
+                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                            success_statuses={"passed", "success"},
+                            failure_statuses={"failed", "error", "cancelled"},
+                            task=task,
+                            item=item,
+                        )
+                        created = None
+                    else:
+                        return self._defer_item_after_downstream_transport_error(
+                            session,
+                            task,
+                            item,
+                            operation="entry_analysis_observe",
+                            exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
+                            response_item=entry_input if "entry_input" in locals() else module,
+                        )
                 else:
                     input_contract = self._build_entry_analysis_input_contract(entry_input)
                     created = await self._downstream_create_task(

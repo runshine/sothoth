@@ -2048,6 +2048,10 @@ class TaskManager(
                 lease_owner_instance_id=str(self.instance_id or "").strip() or None,
             )
             self._workers[normalized_task_id] = handle
+            await asyncio.to_thread(
+                self._touch_task_heartbeat,
+                normalized_task_id,
+            )
             task_manager_module.logger.info(
                 "binary-security start_task_runtime created new local handle: task_id=%s runner_task=%s heartbeat_task=%s lease_owner_instance_id=%s",
                 normalized_task_id,
@@ -3031,6 +3035,16 @@ class TaskManager(
             stale_after_seconds=stale_after_seconds,
         )
         if candidate is None or str(candidate.id or "").strip() != str(latest.id or "").strip():
+            return False
+        latest = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+        if latest is None:
+            return False
+        if str(getattr(latest, "status", "") or "").strip().lower() != "pending":
+            return False
+        if str(getattr(latest, "dispatcher_instance_id", "") or "").strip():
+            return False
+        active_runtime_lease = self._runtime_lease_for_task(db, latest.id)
+        if self._runtime_lease_is_active(active_runtime_lease):
             return False
         requeued = await self._enqueue_task_and_wait(
             latest.id,
@@ -4734,21 +4748,10 @@ class TaskManager(
         stage_names: list[str],
     ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
         direct_refs = self._retry_downstream_refs_for_stages(db, task, stage_names)
-        orphan_refs = [
-            ref
-            for ref in self._discover_parent_linked_downstream_refs(db, task)
-            if self._normalize_downstream_ref_stage_name(ref) in set(stage_names)
-        ]
-        return self._dedupe_downstream_refs(direct_refs + orphan_refs), orphan_refs
+        return self._dedupe_downstream_refs(direct_refs), []
 
     def _parent_linked_downstream_candidates(self) -> list[tuple[str, str, str, str, str | None]]:
-        return [
-            ("firmware_unpacker", "secflow_app_firmware_unpacker_unpack_tasks", "id", "parent_task_id", "parent_stage_name"),
-            ("binary_to_source", "secflow_b2s_task", "id", "parent_task_id", "parent_stage_name"),
-            ("system_analyse", "secflow_app_sa_tasks", "task_id", "parent_task_id", "parent_stage_name"),
-            ("entry_analyse", "secflow_app_ea_tasks", "task_id", "parent_task_id", "parent_stage_name"),
-            ("dataflow_vuln_scan", "secflow_dataflow_vuln_scanner_run_index", "id", "linked_task_id", None),
-        ]
+        return []
 
     def _parent_linked_downstream_soft_delete_column(self, service: str) -> str | None:
         normalized_service = str(service or "").strip()
@@ -4761,102 +4764,8 @@ class TaskManager(
         db: Session,
         task: BinarySecurityTask,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        refs: list[dict[str, Any]] = []
-        scan_errors: list[dict[str, Any]] = []
-        for service, table_name, task_id_column, parent_column, stage_column in self._parent_linked_downstream_candidates():
-            try:
-                soft_delete_column = self._parent_linked_downstream_soft_delete_column(service)
-                column_rows = db.execute(
-                    text(
-                        """
-                        SELECT column_name
-                        FROM information_schema.columns
-                        WHERE table_schema = DATABASE()
-                          AND table_name = :table_name
-                          AND (
-                            column_name = :task_id_column
-                            OR column_name = :parent_column
-                            OR column_name = :stage_column
-                            OR column_name = :soft_delete_column
-                          )
-                        """
-                    ),
-                    {
-                        "table_name": table_name,
-                        "task_id_column": task_id_column,
-                        "parent_column": parent_column,
-                        "stage_column": stage_column or "",
-                        "soft_delete_column": soft_delete_column or "",
-                    },
-                ).fetchall()
-                available_columns = {str(row[0]) for row in column_rows}
-                if task_id_column not in available_columns or parent_column not in available_columns:
-                    error = {
-                        "service": service,
-                        "table_name": table_name,
-                        "reason": "required_columns_missing",
-                        "task_id_column": task_id_column,
-                        "parent_column": parent_column,
-                    }
-                    scan_errors.append(error)
-                    logger.warning(
-                        "parent-linked downstream scan unavailable: service=%s table=%s task_id=%s reason=%s",
-                        service,
-                        table_name,
-                        task.id,
-                        error["reason"],
-                    )
-                    continue
-                select_stage = f"`{stage_column}`" if stage_column and stage_column in available_columns else "NULL"
-                soft_delete_filter = ""
-                if soft_delete_column and soft_delete_column in available_columns:
-                    soft_delete_filter = f" AND COALESCE(`{soft_delete_column}`, 0) = 0"
-                rows = db.execute(
-                    text(
-                        f"""
-                        SELECT `{task_id_column}` AS task_id, {select_stage} AS stage_name
-                        FROM `{table_name}`
-                        WHERE `{parent_column}` = :parent_task_id
-                        {soft_delete_filter}
-                        """
-                    ),
-                    {"parent_task_id": task.id},
-                ).fetchall()
-            except Exception as exc:
-                error = {
-                    "service": service,
-                    "table_name": table_name,
-                    "reason": "scan_failed",
-                    "error": str(exc),
-                }
-                scan_errors.append(error)
-                logger.warning(
-                    "failed to discover parent-linked downstream refs: service=%s table=%s task_id=%s error=%s",
-                    service,
-                    table_name,
-                    task.id,
-                    exc,
-                )
-                continue
-            for row in rows:
-                downstream_task_id = str(row[0] or "").strip()
-                if not downstream_task_id:
-                    continue
-                parent_stage_name = str(row[1] or "").strip() or None
-                inferred_stage_name = SERVICE_STAGE_NAMES.get(service)
-                refs.append(
-                    {
-                        "service": service,
-                        "task_id": downstream_task_id,
-                        "project_id": task.project_id,
-                        "stage_name": parent_stage_name or inferred_stage_name,
-                        "parent_stage_name": parent_stage_name,
-                        "stage_name_inferred": not bool(parent_stage_name) and bool(inferred_stage_name),
-                        "inferred_stage_name": inferred_stage_name if not parent_stage_name else None,
-                        "collect_source": "parent_linked_scan",
-                    }
-                )
-        return refs, scan_errors
+        del db, task
+        return [], []
 
     def update_task_concurrency(
         self,
@@ -5486,6 +5395,11 @@ class TaskManager(
         entry: dict[str, Any],
     ) -> tuple[list[str], list[str]]:
         item_ids = [str(item_id).strip() for item_id in list(entry.get("item_ids") or []) if str(item_id).strip()]
+        single_item_id = str(entry.get("item_id") or "").strip()
+        if single_item_id:
+            item_ids.append(single_item_id)
+        if item_ids:
+            item_ids = list(dict.fromkeys(item_ids))
         if not item_ids:
             return [], []
         stage_name = str(entry.get("stage_name") or "").strip() or None
@@ -5514,6 +5428,11 @@ class TaskManager(
         if not isinstance(exc, NotFoundError):
             return False
         item_ids = [str(item_id).strip() for item_id in list(entry.get("item_ids") or []) if str(item_id).strip()]
+        single_item_id = str(entry.get("item_id") or "").strip()
+        if single_item_id:
+            item_ids.append(single_item_id)
+        if item_ids:
+            item_ids = list(dict.fromkeys(item_ids))
         if not item_ids:
             return False
         existing_item_ids, _missing_item_ids = self._resolve_task_sync_entry_item_targets(db, task, entry)
@@ -8969,6 +8888,65 @@ class TaskManager(
             if owns_session:
                 session.close()
 
+    def _stage_archive_progress_detail(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        items: list[BinarySecurityStageItem] | None = None,
+    ) -> dict[str, Any]:
+        normalized_stage = normalize_stage_name(stage_name)
+        resolved_items = list(items or self._stage_items(db, task.id, normalized_stage) or [])
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalized_stage)
+        canonical_jobs = self._canonical_archive_jobs_for_stage_items(
+            resolved_items,
+            archive_jobs_by_item=archive_jobs_by_item,
+        )
+        success_candidate_items = [
+            item
+            for item in resolved_items
+            if (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
+            in ARCHIVE_SUCCESS_MAPPED_STATUSES
+        ]
+        archived_success_items = sum(
+            1
+            for item in success_candidate_items
+            if self._stage_item_has_successful_archive_job(
+                item,
+                archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []),
+            )
+        )
+        status = self._aggregate_archive_stage_status(
+            [str(getattr(job, "archive_status", None) or "").strip() for job in canonical_jobs]
+        )
+        expected_success_item_count = len(success_candidate_items)
+        missing_archive_item_count = max(0, expected_success_item_count - archived_success_items)
+        if expected_success_item_count <= 0 and not canonical_jobs:
+            status = "pending"
+        elif expected_success_item_count > 0 and archived_success_items >= expected_success_item_count and status == "pending":
+            status = "success"
+        return {
+            "status": status,
+            "expected_success_item_count": expected_success_item_count,
+            "archived_success_item_count": archived_success_items,
+            "missing_archive_item_count": missing_archive_item_count,
+            "job_count": len(canonical_jobs),
+            "success_count": len([job for job in canonical_jobs if str(job.archive_status or "").strip() == "success"]),
+            "failed_count": len([job for job in canonical_jobs if str(job.archive_status or "").strip() == "failed"]),
+            "running_count": len([job for job in canonical_jobs if str(job.archive_status or "").strip() == "running"]),
+            "applying_count": len([job for job in canonical_jobs if str(job.archive_status or "").strip() in {"archived", "applying"}]),
+            "pending_count": len([job for job in canonical_jobs if str(job.archive_status or "").strip() == "pending"]),
+            "latest_error": next(
+                (
+                    job.error_message
+                    for job in reversed(canonical_jobs)
+                    if str(job.archive_status or "").strip() == "failed" and job.error_message
+                ),
+                None,
+            ),
+        }
+
     def _downstream_status_display_value(self, raw_status: str | None) -> str:
         normalized = str(raw_status or "").strip().lower()
         if not normalized:
@@ -11103,99 +11081,8 @@ class TaskManager(
         *,
         keep_task_ids: set[str] | None = None,
     ) -> list[dict[str, str]]:
-        service = str(item.downstream_service or "").strip()
-        item_id = str(item.id or "").strip()
-        item_key = str(item.item_key or "").strip()
-        if not service or (not item_id and not item_key):
-            return []
-        keep = {str(value or "").strip() for value in (keep_task_ids or set()) if str(value or "").strip()}
-        rows: list[dict[str, Any]] = []
-        try:
-            if service == "system_analyse":
-                listed = await self._downstream_list_tasks(
-                    service="system_analyse",
-                    project_id=task.project_id,
-                    token=self._resolve_downstream_token(token),
-                    parent_task_id=task.id,
-                    per_page=100,
-                    sort_by="updated_at",
-                    sort_order="desc",
-                )
-                rows = listed.get("items") if isinstance(listed, dict) else []
-            elif service == "binary_to_source":
-                listed = await self._downstream_list_tasks(
-                    service="binary_to_source",
-                    project_id=task.project_id,
-                    token=token,
-                    parent_task_id=task.id,
-                    parent_stage_item_id=item_id or None,
-                    limit=100,
-                    offset=0,
-                )
-                rows = listed.get("items") if isinstance(listed, dict) else []
-            elif service == "entry_analyse":
-                listed = await self._downstream_list_tasks(
-                    service="entry_analyse",
-                    project_id=task.project_id,
-                    token=token,
-                    parent_task_id=task.id,
-                    parent_stage_item_id=item_id or None,
-                    per_page=100,
-                    sort_by="updated_at",
-                    sort_order="desc",
-                )
-                rows = listed.get("items") if isinstance(listed, dict) else []
-            elif service == "dataflow_analyse":
-                rows = []
-            elif service == "firmware_unpacker":
-                listed = await self._downstream_list_tasks(
-                    service="firmware_unpacker",
-                    project_id=task.project_id,
-                    token=token,
-                    origin_mode="linked",
-                    limit=100,
-                    offset=0,
-                )
-                rows = listed.get("items") if isinstance(listed, dict) else []
-            elif service == "dataflow_vuln_scan":
-                listed = await self._downstream_list_tasks(
-                    service="dataflow_vuln_scan",
-                    project_id=task.project_id,
-                    token=token,
-                    limit=100,
-                    offset=0,
-                )
-                rows = listed if isinstance(listed, list) else listed.get("items") if isinstance(listed, dict) else []
-        except Exception:
-            return []
-        if not isinstance(rows, list):
-            return []
-
-        refs: list[dict[str, str]] = []
-        current_task_id = str(item.downstream_task_id or "").strip()
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            row_task_id = str(row.get("task_id") or row.get("id") or "").strip()
-            if not row_task_id or row_task_id == current_task_id or row_task_id in keep:
-                continue
-            origin_parent_task_id = str(row.get("parent_task_id") or row.get("linked_task_id") or "").strip()
-            if origin_parent_task_id and origin_parent_task_id != str(task.id or "").strip():
-                continue
-            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
-            origin_item_key = str(row.get("parent_stage_item_key") or row.get("item_key") or row.get("firmware_key") or "").strip()
-            matched = bool(item_id and origin_item_id == item_id) or bool(item_key and origin_item_key == item_key)
-            if not matched:
-                continue
-            refs.append(
-                {
-                    "service": service,
-                    "task_id": row_task_id,
-                    "project_id": task.project_id,
-                    "stage_name": item.stage_name,
-                }
-            )
-        return self._dedupe_downstream_refs(refs)
+        del task, item, token, keep_task_ids
+        return []
 
     async def _cleanup_duplicate_downstream_refs_for_item(
         self,
@@ -11206,39 +11093,8 @@ class TaskManager(
         *,
         keep_task_ids: set[str] | None = None,
     ) -> int:
-        refs = await self._duplicate_downstream_refs_for_item(task, item, token, keep_task_ids=keep_task_ids)
-        if not refs:
-            return 0
-        self._record_downstream_item_disposition(
-            db,
-            task,
-            item,
-            event_type="downstream_orphan_cleanup_started",
-            message=f"开始被动清理重复下游子任务 {item.downstream_service}:{len(refs)} 个",
-            payload={"cleanup_refs": refs},
-        )
-        try:
-            await self._cleanup_downstream_refs(db, task, refs, token)
-        except Exception as exc:
-            self._record_downstream_item_disposition(
-                db,
-                task,
-                item,
-                event_type="downstream_orphan_cleanup_failed",
-                message=f"被动清理重复下游子任务失败: {item.downstream_service}:{exc}",
-                level="warning",
-                payload={"cleanup_refs": refs, "error": str(exc)},
-            )
-            return 0
-        self._record_downstream_item_disposition(
-            db,
-            task,
-            item,
-            event_type="downstream_orphan_cleanup_completed",
-            message=f"已被动清理重复下游子任务 {item.downstream_service}:{len(refs)} 个",
-            payload={"cleanup_refs": refs},
-        )
-        return len(refs)
+        del db, task, item, token, keep_task_ids
+        return 0
 
     def _stage_retry_support(
         self,
@@ -12587,19 +12443,12 @@ class TaskManager(
         normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
         if not normalized:
             return []
-        allowed = set(normalized)
         refs = self._downstream_refs_for_stages(db, task, normalized)
-        orphan_refs = [
-            ref
-            for ref in self._discover_parent_linked_downstream_refs(db, task)
-            if self._normalize_downstream_ref_stage_name(ref) in allowed
-        ]
-        return self._dedupe_downstream_refs(refs + orphan_refs)
+        return self._dedupe_downstream_refs(refs)
 
     def _discover_parent_linked_downstream_refs(self, db: Session, task: BinarySecurityTask) -> list[dict[str, str]]:
-        """Find old child tasks that are no longer referenced by current stage items."""
-        refs, _scan_errors = self._discover_parent_linked_downstream_refs_detailed(db, task)
-        return refs
+        del db, task
+        return []
 
     def _retry_cleanup_refs_for_hard_restart(
         self,
@@ -12609,8 +12458,7 @@ class TaskManager(
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
         normalized = [str(stage_name or "").strip() for stage_name in stage_names if str(stage_name or "").strip()]
         direct_refs = self._downstream_refs_for_stages(db, task, normalized)
-        parent_linked_refs, scan_errors = self._discover_parent_linked_downstream_refs_detailed(db, task)
-        return self._dedupe_downstream_refs(direct_refs + parent_linked_refs), parent_linked_refs, scan_errors
+        return self._dedupe_downstream_refs(direct_refs), [], []
 
     def _verify_remaining_parent_linked_downstream_refs(
         self,
@@ -12618,34 +12466,8 @@ class TaskManager(
         task: BinarySecurityTask,
         attempted_refs: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        current_refs, _scan_errors = self._discover_parent_linked_downstream_refs_detailed(db, task)
-        attempted_keys = {
-            (str(ref.get("service") or "").strip(), str(ref.get("task_id") or "").strip())
-            for ref in attempted_refs
-            if str(ref.get("service") or "").strip() and str(ref.get("task_id") or "").strip()
-        }
-        last_results = [
-            dict(result)
-            for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
-            if isinstance(result, dict)
-        ]
-        result_map = {
-            (str(result.get("service") or "").strip(), str(result.get("task_id") or "").strip()): result
-            for result in last_results
-            if str(result.get("service") or "").strip() and str(result.get("task_id") or "").strip()
-        }
-        remaining: list[dict[str, Any]] = []
-        for ref in current_refs:
-            key = (str(ref.get("service") or "").strip(), str(ref.get("task_id") or "").strip())
-            if key not in attempted_keys:
-                remaining.append({**ref, "deferred": True, "deferred_reason": "collect_missed"})
-                continue
-            cleanup_result = result_map.get(key) or {}
-            if bool(cleanup_result.get("deferred")):
-                remaining.append({**ref, **cleanup_result})
-                continue
-            remaining.append({**ref, **cleanup_result, "deferred": True, "deferred_reason": "verify_remaining"})
-        return remaining
+        del db, task, attempted_refs
+        return []
 
     def _downstream_refs_for_stages(
         self,

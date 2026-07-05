@@ -146,6 +146,7 @@ class BinarySecurityStageSummary(BinarySecurityBaseModel):
     authoritative_rebuild_required: bool = False
     authoritative_rebuild_reason: Optional[str] = None
     historical_child_count: int = 0
+    archive_progress: Optional["BinarySecurityStageArchiveProgress"] = None
     abnormal_reason: Optional["BinarySecurityAbnormalReason"] = None
 
 
@@ -579,6 +580,21 @@ class BinarySecurityOverviewBusinessDetail(BinarySecurityBaseModel):
     downstream_services: list[str] = Field(default_factory=list)
     representative_item_key: Optional[str] = None
     representative_downstream_task_id: Optional[str] = None
+    archive_progress: Optional["BinarySecurityStageArchiveProgress"] = None
+
+
+class BinarySecurityStageArchiveProgress(BinarySecurityBaseModel):
+    status: str = "pending"
+    expected_success_item_count: int = 0
+    archived_success_item_count: int = 0
+    missing_archive_item_count: int = 0
+    job_count: int = 0
+    success_count: int = 0
+    failed_count: int = 0
+    running_count: int = 0
+    applying_count: int = 0
+    pending_count: int = 0
+    latest_error: Optional[str] = None
 
 
 class BinarySecurityOverviewArchiveDetail(BinarySecurityBaseModel):

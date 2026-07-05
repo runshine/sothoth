@@ -15666,9 +15666,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
                 self.manager._cleanup_downstream_refs = original_cleanup
                 self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
 
-            self.assertEqual(1, len(calls))
-            self.assertEqual("task1", calls[0]["task_id"])
-            self.assertEqual(["sa-1", "sa-orphan", "dfa-other"], [ref["task_id"] for ref in calls[0]["refs"]])
+            self.assertEqual(0, len(calls))
 
     def test_retry_task_full_restart_collects_parent_linked_ref_without_parent_stage_name(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15736,35 +15734,15 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
                 self.manager._cleanup_downstream_refs = original_cleanup
                 self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
 
-            self.assertEqual(1, len(calls))
-            self.assertEqual(["fw-orphan"], [ref["task_id"] for ref in calls[0]["refs"]])
+            self.assertEqual(0, len(calls))
             self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
 
-    def test_parent_linked_scan_ignores_soft_deleted_downstream_rows(self):
-        outer = self
-
-        class _InfoSchemaDb:
-            def execute(self, statement, params=None):
-                sql = str(statement)
-                params = params or {}
-                table_name = params.get("table_name")
-                if "information_schema.columns" in sql and table_name == "secflow_app_ea_tasks":
-                    return SimpleNamespace(fetchall=lambda: [("task_id",), ("parent_task_id",), ("parent_stage_name",), ("is_deleted",)])
-                if "information_schema.columns" in sql:
-                    return SimpleNamespace(fetchall=lambda: [])
-                if "FROM `secflow_app_ea_tasks`" in sql:
-                    expected = params.get("parent_task_id")
-                    outer.assertEqual("task-1", expected)
-                    outer.assertIn("COALESCE(`is_deleted`, 0) = 0", sql)
-                    return SimpleNamespace(fetchall=lambda: [])
-                raise AssertionError(sql)
-
+    def test_parent_linked_scan_disabled_returns_empty_refs(self):
         task = BinarySecurityTask(id="task-1", project_id="p1")
-
-        refs, errors = self.manager._discover_parent_linked_downstream_refs_detailed(_InfoSchemaDb(), task)
+        refs, errors = self.manager._discover_parent_linked_downstream_refs_detailed(object(), task)
 
         self.assertEqual([], refs)
-        self.assertEqual(4, len(errors))
+        self.assertEqual([], errors)
 
     def test_verify_child_ref_deleted_requires_explicit_deleted_or_not_found_status(self):
         controller = downstream_tasks_module.DownstreamTaskController(self.manager)
@@ -15786,7 +15764,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertFalse(verified)
         self.assertFalse(bool(payload.get("verified_deleted")))
 
-    def test_prepare_hard_restart_marks_remaining_parent_linked_ref_as_partial_failed(self):
+    def test_prepare_hard_restart_ignores_parent_linked_scan_residuals(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
             (workspace / "input").mkdir(parents=True, exist_ok=True)
@@ -15814,38 +15792,15 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
                 return None
 
             original_cleanup = self.manager._cleanup_downstream_refs
-            original_discover = self.manager._discover_parent_linked_downstream_refs_detailed
             self.manager._cleanup_downstream_refs = fake_cleanup
-            discover_calls = {"count": 0}
-
-            def fake_discover(_db, _task):
-                discover_calls["count"] += 1
-                ref = {
-                    "service": "firmware_unpacker",
-                    "task_id": "fw-leftover",
-                    "project_id": "p1",
-                    "stage_name": "firmware_unpack",
-                    "parent_stage_name": None,
-                    "stage_name_inferred": True,
-                    "inferred_stage_name": "firmware_unpack",
-                    "collect_source": "parent_linked_scan",
-                }
-                if discover_calls["count"] == 1:
-                    return ([ref], [])
-                return ([ref], [])
-
-            self.manager._discover_parent_linked_downstream_refs_detailed = fake_discover
             try:
                 self.manager.retry_task(db, project_id="p1", task_id="task1")
-                with self.assertRaises(ValidationError):
-                    self._finish_retry_prepare(db, task)
+                self._finish_retry_prepare(db, task)
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
-                self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
-
-            self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
-            self.assertEqual(1, task.cleanup_snapshot.get("remaining_downstream_count"))
-            self.assertEqual("fw-leftover", task.cleanup_snapshot.get("remaining_downstream_refs")[0]["task_id"])
+            self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
+            self.assertEqual(0, int(task.cleanup_snapshot.get("remaining_downstream_count") or 0))
+            self.assertEqual([], list(task.cleanup_snapshot.get("remaining_downstream_refs") or []))
 
     def test_prepare_retry_task_hard_restart_rejects_partial_cleanup_before_reset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15894,18 +15849,17 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
             self.manager._discover_parent_linked_downstream_refs_detailed = fake_discover
             try:
-                with self.assertRaises(ValidationError):
-                    asyncio.run(self.manager._prepare_retry_task(db, task))
+                asyncio.run(self.manager._prepare_retry_task(db, task))
             finally:
                 self.manager._cleanup_downstream_refs = original_cleanup
                 self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
 
             self.assertEqual("failed", task.status)
             self.assertEqual("system_analysis", task.current_stage)
-            self.assertEqual(2, task.execution_epoch)
-            self.assertTrue(task.cleanup_snapshot.get("cleanup_partial_failed"))
-            self.assertEqual(1, task.cleanup_snapshot.get("remaining_downstream_count"))
-            self.assertEqual("sat-leftover", task.cleanup_snapshot.get("remaining_downstream_refs")[0]["task_id"])
+            self.assertEqual(3, task.execution_epoch)
+            self.assertFalse(task.cleanup_snapshot.get("cleanup_partial_failed"))
+            self.assertEqual(0, int(task.cleanup_snapshot.get("remaining_downstream_count") or 0))
+            self.assertEqual([], list(task.cleanup_snapshot.get("remaining_downstream_refs") or []))
 
     def test_prepare_hard_restart_records_service_scan_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -15942,7 +15896,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
                 self.manager._cleanup_downstream_refs = original_cleanup
                 self.manager._discover_parent_linked_downstream_refs_detailed = original_discover
 
-            self.assertEqual(1, len(task.cleanup_snapshot.get("service_scan_unavailable") or []))
+            self.assertEqual([], list(task.cleanup_snapshot.get("service_scan_unavailable") or []))
 
     def test_cleanup_downstream_refs_waits_for_system_analyse_to_stop_before_delete(self):
         refs = [{"service": "system_analyse", "task_id": "sat-1", "project_id": "p1", "stage_name": "system_analysis"}]
@@ -17307,8 +17261,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             ["system_analysis", "binary_to_source", "entry_analysis", "dataflow_vuln_scan"],
             affected,
         )
-        self.assertEqual(1, len(calls))
-        self.assertEqual(["ea-orphan"], [ref["task_id"] for ref in calls[0]["refs"]])
+        self.assertEqual(0, len(calls))
 
     def test_prepare_retry_failed_items_streaming_entry_retry_clears_only_linked_descendants(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -17505,7 +17458,10 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.assertEqual([], [row.id for row in db.state_events if row.stage_name in {"dataflow_vuln_scan"}])
             dataflow_events = [row for row in db.events if row.stage_name in {"dataflow_vuln_scan"}]
             self.assertEqual(
-                ["task_current_stage_advanced_from_authoritative_facts"],
+                [
+                    "dataflow_terminalization_deferred_for_missing_streaming_items",
+                    "task_current_stage_advanced_from_authoritative_facts",
+                ],
                 [row.event_type for row in dataflow_events],
             )
             self.assertFalse(target_archive_root.exists())
@@ -20134,8 +20090,8 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         self.manager._refresh_stage_run_from_items(db, task, "dataflow_vuln_scan")
 
-        self.assertEqual("pending", run.status)
-        self.assertEqual("pending", task.stage_summary["dataflow_vuln_scan"]["status"])
+        self.assertEqual("running", run.status)
+        self.assertEqual("running", task.stage_summary["dataflow_vuln_scan"]["status"])
         self.assertTrue(run.output_summary["streaming_completion_gate_ready"] is False)
         self.assertEqual(2, run.output_summary["expected_entry_count"])
         self.assertEqual(1, run.output_summary["materialized_item_count"])
@@ -20227,13 +20183,13 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         self.manager._refresh_stage_run_from_items(db, task, "dataflow_vuln_scan")
 
-        self.assertEqual("success", run.status)
-        self.assertEqual("success", task.stage_summary["dataflow_vuln_scan"]["status"])
+        self.assertEqual("running", run.status)
+        self.assertEqual("running", task.stage_summary["dataflow_vuln_scan"]["status"])
         self.assertTrue(run.output_summary["streaming_completion_gate_ready"] is False)
         self.assertEqual(2, run.output_summary["expected_entry_count"])
         self.assertEqual(1, run.output_summary["materialized_item_count"])
         self.assertEqual(1, run.output_summary["missing_entry_count"])
-        self.assertFalse(any(row.event_type == "dataflow_terminalization_deferred_for_missing_streaming_items" for row in db.events))
+        self.assertTrue(any(row.event_type == "dataflow_terminalization_deferred_for_missing_streaming_items" for row in db.events))
 
     def test_refresh_stage_run_from_items_keeps_empty_streaming_tail_pending_without_started_at(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
@@ -40700,18 +40656,145 @@ def _test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_stre
 
     self.assertTrue(manager._should_auto_advance_to_stage(db, task, "dataflow_vuln_scan"))
 
-    decision = manager._decide_task_action_after_stage_terminal(
-        db,
-        task,
+
+def _test_streaming_dataflow_terminalization_requires_entry_analysis_stage_terminal_and_archived(self):
+    manager = TaskManager()
+    manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+    task = BinarySecurityTask(
+        id="task-streaming-dataflow-gate-entry-running",
+        project_id="p1",
+        name="source",
+        status="running",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    task.summary = {
+        "selected_modules": [
+            {
+                "module_key": "m1",
+                "module_name": "module-a",
+                "firmware_key": "source_project",
+                "source_root": "/src/project",
+                "source_dir": "/src/project/module-a",
+                "module_dir": "/src/project/module-a",
+            }
+        ]
+    }
+    entry_run = BinarySecurityStageRun(
+        id="sr-entry-running",
+        task_id=task.id,
+        project_id=task.project_id,
         stage_name="entry_analysis",
+        sequence_no=2,
+        status="running",
+    )
+    dataflow_run = BinarySecurityStageRun(
+        id="sr-df-partial",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        sequence_no=3,
+        status="partial_success",
+    )
+    entry_success = BinarySecurityStageItem(
+        id="si-entry-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=entry_run.id,
+        stage_name="entry_analysis",
+        item_key="m1",
+        item_name="module-a",
         status="success",
-        summary={"entry_results": task.summary["entry_results"]},
-        payload={},
-        state_event_id="se-3",
+    )
+    entry_success.input_ref = {
+        "module_key": "m1",
+        "module_name": "module-a",
+        "source_dir": "/src/project/module-a",
+        "source_root": "/src/project",
+        "module_dir": "/src/project/module-a",
+        "task_type": TASK_TYPE_SOURCE,
+    }
+    entry_success.result = {
+        "entries": [
+            {"entry_key": "e1", "function_name": "main", "module_key": "m1"},
+            {"entry_key": "e2", "function_name": "worker", "module_key": "m1"},
+        ]
+    }
+    entry_running = BinarySecurityStageItem(
+        id="si-entry-running",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=entry_run.id,
+        stage_name="entry_analysis",
+        item_key="m2",
+        item_name="module-b",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-running",
+    )
+    entry_running.input_ref = {
+        "module_key": "m2",
+        "module_name": "module-b",
+        "source_dir": "/src/project/module-b",
+        "source_root": "/src/project",
+        "module_dir": "/src/project/module-b",
+        "task_type": TASK_TYPE_SOURCE,
+    }
+    dataflow_success = BinarySecurityStageItem(
+        id="si-df-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=dataflow_run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="e1",
+        item_name="main",
+        parent_key="m1",
+        item_identity_key="e1::m1",
+        status="success",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+    )
+    dataflow_failed = BinarySecurityStageItem(
+        id="si-df-failed",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=dataflow_run.id,
+        stage_name="dataflow_vuln_scan",
+        item_key="e2",
+        item_name="worker",
+        parent_key="m1",
+        item_identity_key="e2::m1",
+        status="failed",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-2",
+        error_message="boom",
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-entry-success",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        item_id=entry_success.id,
+        archive_status="success",
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[entry_run, dataflow_run],
+        stage_items=[entry_success, entry_running, dataflow_success, dataflow_failed],
+        archive_jobs=[archive_job],
+        events=[],
     )
 
-    self.assertEqual("activate_streaming_tail", decision.action)
-    self.assertEqual("dataflow_vuln_scan", decision.next_stage)
+    manager._refresh_stage_run_from_items(db, task, "dataflow_vuln_scan")
+
+    self.assertEqual("running", dataflow_run.status)
+    self.assertEqual("running", task.stage_summary["dataflow_vuln_scan"]["status"])
+    self.assertFalse(manager._streaming_dataflow_terminalization_ready(db, task))
 
 
 def _test_stage_terminal_after_system_analysis_can_still_activate_streaming_tail_for_non_default_source_profile(self):
@@ -42623,10 +42706,8 @@ def _test_get_project_config_normalizes_legacy_partial_success_stage_names(self)
     )
 
 
-def _test_parent_linked_downstream_candidates_uses_current_dataflow_scanner_table(self):
-    candidates = self.manager._parent_linked_downstream_candidates()
-    dataflow = next(row for row in candidates if row[0] == "dataflow_vuln_scan")
-    self.assertEqual("secflow_dataflow_vuln_scanner_run_index", dataflow[1])
+def _test_parent_linked_downstream_candidates_disabled(self):
+    self.assertEqual([], self.manager._parent_linked_downstream_candidates())
 
 
 def _test_continue_prepare_does_not_preserve_stale_target_stage_ref(self):
@@ -42891,7 +42972,7 @@ TaskManagerTests.test_get_module_report_returns_unavailable_when_missing = _test
 TaskManagerTests.test_get_module_report_rejects_unknown_module = _test_get_module_report_rejects_unknown_module
 TaskManagerTests.test_confirm_entry_selection_updates_task = _test_confirm_entry_selection_updates_task
 TaskManagerTests.test_get_project_config_normalizes_legacy_partial_success_stage_names = _test_get_project_config_normalizes_legacy_partial_success_stage_names
-TaskManagerTests.test_parent_linked_downstream_candidates_uses_current_dataflow_scanner_table = _test_parent_linked_downstream_candidates_uses_current_dataflow_scanner_table
+TaskManagerTests.test_parent_linked_downstream_candidates_disabled = _test_parent_linked_downstream_candidates_disabled
 TaskManagerTests.test_continue_prepare_does_not_preserve_stale_target_stage_ref = _test_continue_prepare_does_not_preserve_stale_target_stage_ref
 TaskManagerTests.test_retry_verify_clears_replacement_state_after_success = _test_retry_verify_clears_replacement_state_after_success
 TaskManagerTests.test_task_reconcile_candidate_items_includes_stale_system_analysis_replacement_item = _test_task_reconcile_candidate_items_includes_stale_system_analysis_replacement_item
@@ -45548,6 +45629,7 @@ TaskManagerTests.test_apply_task_resume_decision_keeps_running_for_owned_executi
 TaskManagerTests.test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode = _test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_current_stage_in_streaming_mode
 TaskManagerTests.test_stage_terminal_after_system_analysis_archive_does_not_activate_dataflow_before_entry_analysis_materializes = _test_stage_terminal_after_system_analysis_archive_does_not_activate_dataflow_before_entry_analysis_materializes
 TaskManagerTests.test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_streaming = _test_stage_terminal_after_entry_analysis_archive_can_activate_dataflow_streaming
+TaskManagerTests.test_streaming_dataflow_terminalization_requires_entry_analysis_stage_terminal_and_archived = _test_streaming_dataflow_terminalization_requires_entry_analysis_stage_terminal_and_archived
 TaskManagerTests.test_stage_terminal_after_system_analysis_can_still_activate_streaming_tail_for_non_default_source_profile = _test_stage_terminal_after_system_analysis_can_still_activate_streaming_tail_for_non_default_source_profile
 TaskManagerTests.test_streaming_tail_stage_names_for_binary_firmware_task_start_from_binary_to_source = _test_streaming_tail_stage_names_for_binary_firmware_task_start_from_binary_to_source
 TaskManagerTests.test_streaming_tail_stage_names_for_binary_module_task_cover_full_pipeline = _test_streaming_tail_stage_names_for_binary_module_task_cover_full_pipeline

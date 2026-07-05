@@ -341,6 +341,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager = TaskManager()
         started: list[str] = []
         heartbeat_started = asyncio.Event()
+        touched: list[str] = []
 
         async def _run_task(task_id):
             started.append(f"runner:{task_id}")
@@ -354,7 +355,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
 
-        created = await manager._start_task_runtime("task-1")
+        with patch.object(manager, "_touch_task_heartbeat", side_effect=lambda task_id: touched.append(task_id)):
+            created = await manager._start_task_runtime("task-1")
         self.assertTrue(created)
         await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
 
@@ -364,7 +366,70 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(handle.heartbeat_task)
         self.assertIn("runner:task-1", started)
         self.assertIn("heartbeat:task-1", started)
+        self.assertEqual(["task-1"], touched)
 
+        handle.cancel()
+        await asyncio.gather(handle.runner_task, handle.heartbeat_task, return_exceptions=True)
+        manager._workers.pop("task-1", None)
+
+    async def test_start_task_runtime_writes_runtime_lease_before_return(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        started = asyncio.Event()
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+        async def _run_task(task_id):
+            del task_id
+            started.set()
+            await asyncio.sleep(3600)
+
+        async def _run_heartbeat(task_id):
+            del task_id
+            await asyncio.sleep(3600)
+
+        manager._run_task = _run_task
+        manager._run_task_heartbeat = _run_heartbeat
+
+        def _touch(task_id):
+            self.assertEqual("task-1", task_id)
+            task.dispatcher_instance_id = "worker-a"
+            task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
+            task.lease_expires_at = _now() + timedelta(minutes=5)
+            db.runtime_leases.append(
+                BinarySecurityTaskRuntimeLease(
+                    task_id=task.id,
+                    owner_instance_id="worker-a",
+                    heartbeat_at=_now(),
+                    lease_expires_at=task.lease_expires_at,
+                )
+            )
+
+        with patch.object(manager, "_touch_task_heartbeat", side_effect=_touch):
+            created = await manager._start_task_runtime("task-1")
+
+        self.assertTrue(created)
+        await asyncio.wait_for(started.wait(), timeout=1)
+        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        lease = next((row for row in db.runtime_leases if row.task_id == "task-1"), None)
+        self.assertIsNotNone(lease)
+        self.assertEqual("worker-a", lease.owner_instance_id)
+        self.assertIsNotNone(task.lease_expires_at)
+
+        handle = manager._workers.get("task-1")
+        self.assertIsNotNone(handle)
         handle.cancel()
         await asyncio.gather(handle.runner_task, handle.heartbeat_task, return_exceptions=True)
         manager._workers.pop("task-1", None)

@@ -87,6 +87,35 @@ class ParentRuntimeTakeoverRequeueTests(unittest.IsolatedAsyncioTestCase):
         enqueue_mock.assert_awaited()
         self.assertTrue(any(event.event_type == "released_parent_takeover_dispatch_reconciled" for event in db.events))
 
+    async def test_released_parent_takeover_reconcile_skips_stale_candidate_after_new_owner_claim(self):
+        task = self._task(
+            status="pending",
+            dispatcher_instance_id="worker-b",
+            updated_at=_now() - timedelta(minutes=2),
+        )
+        lease = task_manager_module.BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-b",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        with patch.object(
+            self.manager,
+            "_peek_released_parent_task_missing_takeover_enqueue",
+            return_value=task,
+        ), patch.object(self.manager, "_enqueue_task_and_wait", AsyncMock(return_value=True)) as enqueue_mock:
+            repaired = await self.manager.reconcile_released_parent_tasks_missing_takeover_enqueue(
+                db,
+                batch_size=1,
+                actor="unit-test",
+                stale_after_seconds=30,
+            )
+
+        self.assertEqual(0, repaired)
+        enqueue_mock.assert_not_awaited()
+        self.assertFalse(any(event.event_type == "released_parent_takeover_dispatch_reconciled" for event in db.events))
+
     async def test_reconcile_work_queues_runs_released_takeover_reconcile_before_queue_scan(self):
         db = _ModelAwareDb(tasks=[], events=[])
         queue = _FakeTaskSyncQueue()

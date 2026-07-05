@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, load_only
 
 from app.exception import NotFoundError, ValidationError
 from app.model import BinarySecurityTaskStateLease, normalize_stage_name
+from app.schemas import BinarySecurityStageArchiveProgress
 
 from . import shared as task_shared
 
@@ -753,6 +754,9 @@ class TaskReadModelServiceMixin:
                 self._lightweight_stage_failure(item if isinstance(item, dict) else {"item": {}, "error": str(item)})
                 for item in cancelled_items[:10]
             ]
+        archive_progress = summary.get("archive_progress")
+        if isinstance(archive_progress, dict):
+            compact["archive_progress"] = dict(archive_progress)
         return self._fit_stage_output_summary_for_db(compact)
 
     def _fit_stage_output_summary_for_db(self: TaskManager, compact: dict[str, Any], *, max_bytes: int = 32768) -> dict[str, Any]:
@@ -3257,6 +3261,11 @@ class TaskReadModelServiceMixin:
                 started_at=payload.get("started_at"),
                 finished_at=payload.get("finished_at"),
                 last_error=payload.get("last_error"),
+                archive_progress=(
+                    BinarySecurityStageArchiveProgress(**dict(payload.get("archive_progress") or {}))
+                    if isinstance(payload.get("archive_progress"), dict)
+                    else None
+                ),
             )
             abnormal_payload = payload.get("abnormal_reason") if isinstance(payload.get("abnormal_reason"), dict) else None
             if abnormal_payload:
@@ -3978,6 +3987,18 @@ class TaskReadModelServiceMixin:
                 authoritative_rebuild_required=bool(rebuild_state.get("required")),
                 authoritative_rebuild_reason=self._string_or_none(rebuild_state.get("reason")),
                 historical_child_count=int(rebuild_state.get("historical_child_count") or 0),
+                archive_progress=(
+                    BinarySecurityStageArchiveProgress(
+                        **self._stage_archive_progress_detail(
+                            db,
+                            task,
+                            stage_name,
+                            items=stage_items,
+                        )
+                    )
+                    if task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+                    else None
+                ),
                 last_error=(
                     run.last_error
                     if run and run.last_error
@@ -4042,6 +4063,16 @@ class TaskReadModelServiceMixin:
                 current_stage_items,
                 archive_jobs_by_item=archive_jobs_by_item,
             )
+            archive_progress = None
+            if task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan":
+                archive_progress = BinarySecurityStageArchiveProgress(
+                    **self._stage_archive_progress_detail(
+                        db,
+                        task,
+                        stage_name,
+                        items=current_stage_items,
+                    )
+                )
             downstream_status_counts = {}
             for item in current_stage_items:
                 item_result = self._load_stage_item_result_payload(item)
@@ -4062,6 +4093,7 @@ class TaskReadModelServiceMixin:
                 downstream_services=sorted({str(item.downstream_service) for item in current_stage_items if item.downstream_service}),
                 representative_item_key=next((item.item_key for item in current_stage_items if item.item_key), None),
                 representative_downstream_task_id=next((item.downstream_task_id for item in current_stage_items if item.downstream_task_id), None),
+                archive_progress=archive_progress,
             )
             nodes.append(
                 task_manager_module.BinarySecurityOverviewNode(
@@ -4086,6 +4118,8 @@ class TaskReadModelServiceMixin:
                     detail=business_detail,
                 )
             )
+            if task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan":
+                continue
             first_created_at = min((job.created_at for job in stage_jobs if job.created_at), default=None)
             last_updated_at = max(
                 (job.completed_at or job.updated_at or job.started_at or job.created_at for job in stage_jobs if (job.completed_at or job.updated_at or job.started_at or job.created_at)),

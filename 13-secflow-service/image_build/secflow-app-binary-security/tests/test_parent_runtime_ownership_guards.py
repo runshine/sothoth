@@ -9,11 +9,12 @@ from app.model import (
     TASK_TYPE_SOURCE,
 )
 from app.service.task_manager import TaskManager, _now
-from test_task_manager import _ModelAwareDb
+from test_task_manager import _ModelAwareDb, _TaskManagerQueuePatchedMixin
 
 
-class ParentRuntimeOwnershipGuardTests(unittest.TestCase):
+class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.manager = TaskManager()
         self.manager.instance_id = "worker-local"
 

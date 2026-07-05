@@ -424,6 +424,87 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             [event for event in db.events if event.event_type == "task_sync_request_discarded_after_terminal_error"],
         )
 
+    def test_drain_task_sync_queue_discards_missing_single_item_id_entry(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-missing-single",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            dispatcher_instance_id=manager.instance_id,
+            lease_expires_at=_now() + timedelta(minutes=5),
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], events=[])
+        fake_queue = _FakeTaskSyncQueue()
+        fake_queue.entries_by_task[task.id] = [
+            {
+                "queue_item_id": "tsq-missing-single",
+                "dedupe_key": "downstream_status:entry_analysis:si-missing:*",
+                "sync_kind": "downstream_status",
+                "source": "test",
+                "reason": "single-item-missing",
+                "source_event_type": "downstream_status_observed",
+                "stage_name": "entry_analysis",
+                "item_id": "si-missing",
+                "item_ids": [],
+                "archive_job_ids": [],
+                "force": False,
+                "requested_at": _now().isoformat(),
+                "last_requested_at": _now().isoformat(),
+                "next_retry_at": _now().isoformat(),
+                "attempts": 0,
+                "priority": 10,
+                "payload": {},
+            }
+        ]
+        acked: list[tuple[str, str, str | None, str | None]] = []
+        original_get_queue = task_manager_module.get_task_queue
+        original_sync = manager.sync_downstream_status
+        original_repair = manager._repair_task_sync_queue_on_runtime_start
+        original_reconcile = manager._reconcile_missing_task_sync_requests
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+
+            async def _fake_ack(task_id, *, queue_item_id, dedupe_key=None, context=""):
+                acked.append((task_id, queue_item_id, dedupe_key, context))
+                entries = fake_queue.entries_by_task.get(task_id, [])
+                fake_queue.entries_by_task[task_id] = [
+                    entry for entry in entries if entry.get("queue_item_id") != queue_item_id
+                ]
+
+            fake_queue.ack_task_sync_request = _fake_ack
+
+            async def _fake_sync(*args, **kwargs):
+                del args, kwargs
+                raise task_manager_module.NotFoundError("阶段子任务不存在")
+
+            manager.sync_downstream_status = _fake_sync
+            manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
+            manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
+
+            changed = asyncio.run(manager._drain_task_sync_queue(db, task))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            manager.sync_downstream_status = original_sync
+            manager._repair_task_sync_queue_on_runtime_start = original_repair
+            manager._reconcile_missing_task_sync_requests = original_reconcile
+
+        self.assertTrue(changed)
+        self.assertEqual([], fake_queue.entries_by_task[task.id])
+        self.assertEqual(
+            [("task-sync-missing-single", "tsq-missing-single", "downstream_status:entry_analysis:si-missing:*", "task_sync_ack_terminal_discard")],
+            acked,
+        )
+        discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_after_terminal_error"]
+        self.assertEqual(1, len(discard_events))
+        self.assertEqual(["si-missing"], discard_events[0].payload.get("missing_item_ids"))
+
     def test_reconcile_missing_task_sync_requests_requeues_due_db_fact(self):
         manager = TaskManager()
         task = BinarySecurityTask(

@@ -15,10 +15,13 @@ from app.model import (
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
-from test_task_manager import _AppendingModelAwareDb, _ModelAwareDb
+from test_task_manager import _AppendingModelAwareDb, _ModelAwareDb, _TaskManagerQueuePatchedMixin
 
 
-class ParentRuntimeControlRecoveryTests(unittest.TestCase):
+class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+
     def test_requeue_orphaned_owned_execution_locked_recovers_orphan(self):
         manager = TaskManager()
         task = BinarySecurityTask(

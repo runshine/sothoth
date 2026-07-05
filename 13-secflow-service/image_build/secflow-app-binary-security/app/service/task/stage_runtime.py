@@ -168,6 +168,7 @@ class TaskStageRuntimeMixin:
 
     def _streaming_dataflow_gate_should_defer_terminal_status(
         self: TaskManager,
+        db: Session,
         task: BinarySecurityTask,
         items: list[BinarySecurityStageItem],
         gate: dict[str, object] | None,
@@ -178,6 +179,8 @@ class TaskStageRuntimeMixin:
             return False
         if aggregated_status not in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
             return False
+        if not self._streaming_dataflow_terminalization_ready(db, task):
+            return True
         if bool(gate.get("ready_for_terminal_status")):
             return False
         expected_entry_count = int(gate.get("expected_entry_count") or 0)
@@ -193,8 +196,12 @@ class TaskStageRuntimeMixin:
 
     def _streaming_dataflow_gate_deferred_status(
         self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
         items: list[BinarySecurityStageItem],
     ) -> str:
+        if items and not self._streaming_dataflow_terminalization_ready(db, task):
+            return "running"
         if any(str(item.status or "").strip() == "running" for item in items):
             return "running"
         if any(str(item.status or "").strip() == "dispatching" for item in items):
@@ -422,12 +429,13 @@ class TaskStageRuntimeMixin:
             ):
                 streaming_dataflow_gate = self._build_streaming_dataflow_completion_gate(db, task)
                 if self._streaming_dataflow_gate_should_defer_terminal_status(
+                    db,
                     task,
                     items,
                     streaming_dataflow_gate,
                     aggregated_status=status,
                 ):
-                    deferred_status = self._streaming_dataflow_gate_deferred_status(items)
+                    deferred_status = self._streaming_dataflow_gate_deferred_status(db, task, items)
                     if deferred_status != status:
                         self._record_event(
                             db,
@@ -471,6 +479,18 @@ class TaskStageRuntimeMixin:
             {
                 "status_synced": True,
                 "sync_status": status,
+                **(
+                    {
+                        "archive_progress": self._stage_archive_progress_detail(
+                            db,
+                            task,
+                            stage_name,
+                            items=items,
+                        ),
+                    }
+                    if normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+                    else {}
+                ),
                 **(
                     {
                         "streaming_completion_gate_ready": bool(streaming_dataflow_gate.get("ready_for_terminal_status")),
