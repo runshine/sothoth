@@ -11057,6 +11057,28 @@ class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(supported)
 
+    def test_task_row_owner_is_runtime_supported_rejects_running_task_without_owner_lease_or_local_handle(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id=None,
+            dispatch_started_at=None,
+            lease_expires_at=None,
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[])
+
+        supported = self.manager._task_row_owner_is_runtime_supported(db, task)
+
+        self.assertFalse(supported)
+
     def test_task_row_owner_is_runtime_supported_accepts_active_cancel_finalize_with_runtime_lease(self):
         task = BinarySecurityTask(
             id="t1",
@@ -36569,7 +36591,7 @@ def _test_service_base_urls_use_service_roots(self):
         self.assertNotIn("/api/", value)
 
 
-def _test_task_heartbeat_controller_refreshes_owned_running_task(self):
+def _test_task_heartbeat_controller_does_not_refresh_owned_running_task_without_active_runtime_lease(self):
     manager = TaskManager()
     now_value = _now()
     task = BinarySecurityTask(
@@ -36595,10 +36617,8 @@ def _test_task_heartbeat_controller_refreshes_owned_running_task(self):
         )
         original_lease = task.lease_expires_at
         manager._refresh_task_heartbeats_once()
-        self.assertEqual(1, len(db.runtime_leases))
-        self.assertEqual(task.id, db.runtime_leases[0].task_id)
-        self.assertIsNotNone(task.lease_expires_at)
-        self.assertGreater(task.lease_expires_at, original_lease)
+        self.assertEqual(0, len(db.runtime_leases))
+        self.assertEqual(original_lease, task.lease_expires_at)
     finally:
         task_manager_module.get_session_factory = original_factory
 
@@ -43045,7 +43065,7 @@ TaskManagerTests.test_firmware_unpacker_client_uses_management_api_prefix = _tes
 TaskManagerTests.test_dataflow_vuln_scan_client_uses_api_prefix = _test_dataflow_vuln_scan_client_uses_api_prefix
 TaskManagerTests.test_downstream_clients_use_scheduler_request_timeout = _test_downstream_clients_use_scheduler_request_timeout
 TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_urls_use_service_roots
-TaskManagerTests.test_task_heartbeat_controller_refreshes_owned_running_task = _test_task_heartbeat_controller_refreshes_owned_running_task
+TaskManagerTests.test_task_heartbeat_controller_does_not_refresh_owned_running_task_without_active_runtime_lease = _test_task_heartbeat_controller_does_not_refresh_owned_running_task_without_active_runtime_lease
 TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
 TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
 TaskManagerTests.test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task

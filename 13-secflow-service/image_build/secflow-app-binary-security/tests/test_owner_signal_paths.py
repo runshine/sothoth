@@ -22,7 +22,7 @@ from test_task_manager import _AppendingModelAwareDb, _FakeTaskSyncQueue, _Model
 
 
 class OwnerSignalPathTests(unittest.TestCase):
-    def test_enqueue_task_sync_request_records_queue_entry_without_parent_wakeup(self):
+    def test_enqueue_task_sync_request_reenqueues_parent_when_owner_has_no_active_runtime_lease(self):
         manager = TaskManager()
         task = BinarySecurityTask(
             id="task-sync-owner",
@@ -58,7 +58,7 @@ class OwnerSignalPathTests(unittest.TestCase):
             manager._enqueue_task = original_enqueue
             task_manager_module.get_task_queue = original_get_queue
 
-        self.assertEqual([], queued)
+        self.assertEqual([task.id], queued)
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
         self.assertEqual(["i1"], entries[0]["item_ids"])

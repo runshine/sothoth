@@ -355,18 +355,6 @@ class TaskRuntimeStateServiceMixin:
         *,
         reason: str,
     ) -> ParentRuntimeOwnershipGuardDecision:
-        if snapshot.local_handle_alive:
-            return ParentRuntimeOwnershipGuardDecision(
-                preserve=True,
-                decision_reason="local_handle_alive",
-                snapshot=snapshot,
-            )
-        if snapshot.local_streaming_worker_alive:
-            return ParentRuntimeOwnershipGuardDecision(
-                preserve=True,
-                decision_reason="local_streaming_worker_alive",
-                snapshot=snapshot,
-            )
         if snapshot.runtime_lease_active:
             return ParentRuntimeOwnershipGuardDecision(
                 preserve=True,
@@ -2338,20 +2326,6 @@ class TaskRuntimeStateServiceMixin:
         if snapshot.runtime_lease_active:
             return False
         guard = self._can_reclaim_parent_after_lease_loss(snapshot, reason=reason)
-        if snapshot.local_handle_alive:
-            self._record_event(
-                db,
-                task,
-                "running_without_active_lease_repair_suppressed",
-                "检测到本地执行句柄仍然存活，暂不执行 lease invariant 修复",
-                level="warning",
-                stage_name=stage_name or str(task.current_stage or "").strip() or None,
-                payload={
-                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=reason),
-                    **(event_payload or {}),
-                },
-            )
-            return False
         if guard.preserve:
             self._record_event(
                 db,

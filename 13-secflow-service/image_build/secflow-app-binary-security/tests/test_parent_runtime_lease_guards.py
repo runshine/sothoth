@@ -132,6 +132,57 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
         finally:
             task_manager_module.get_session_factory = original_factory
 
+    def test_touch_task_heartbeat_does_not_refresh_without_active_runtime_lease_even_if_local_handle_alive(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        now_value = _now()
+        task = BinarySecurityTask(
+            id="task-no-active-lease-local-handle",
+            project_id="p1",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            dispatcher_instance_id="worker-a",
+            dispatch_started_at=now_value - timedelta(minutes=1),
+            lease_expires_at=now_value - timedelta(seconds=1),
+            updated_at=now_value - timedelta(minutes=1),
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            heartbeat_at=now_value - timedelta(minutes=1),
+            lease_expires_at=now_value - timedelta(seconds=1),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[expired_lease], events=[])
+        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
+            task_id=task.id,
+            runner_task=AsyncMock(),
+            heartbeat_task=None,
+            claimed_at=now_value - timedelta(minutes=1),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            owner_active=True,
+        )
+        manager._register_task_execution_owner(task.id, "primary_task_worker")
+
+        original_factory = task_manager_module.get_session_factory
+        try:
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            original_expiry = task.lease_expires_at
+            manager._touch_task_heartbeat(task.id)
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            manager._release_task_execution_owner(task.id, "primary_task_worker")
+            manager._workers.pop(task.id, None)
+
+        self.assertEqual(original_expiry, task.lease_expires_at)
+        self.assertEqual(1, len(db.runtime_leases))
+
     def test_worker_does_not_take_tail_runtime_lease_on_refresh(self):
         manager = TaskManager()
         task = BinarySecurityTask(

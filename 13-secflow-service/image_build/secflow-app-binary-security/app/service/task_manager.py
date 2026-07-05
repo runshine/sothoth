@@ -1967,34 +1967,7 @@ class TaskManager(
             return False
         if not bool(handle.owner_active) or bool(handle.release_requested) or bool(handle.takeover_observed):
             return False
-        if self._task_runtime_transition_guard_owned_by_current_instance(task):
-            return True
-        if self._task_runtime_owner_matches_current_instance(db, task):
-            return True
-        if bool(getattr(handle, "control_wakeup_requested", False)):
-            return True
-        active_operation = self._task_active_operation(db, task)
-        operation_status = str(getattr(active_operation, "status", "") or "").strip().lower() if active_operation is not None else ""
-        if operation_status in TASK_OPERATION_ACTIVE_STATUSES:
-            return True
-        if self._task_has_supported_control_operation_runtime(db, task, active_operation=active_operation):
-            return True
-        if self._task_has_authoritative_active_stage_context(
-            db,
-            task,
-            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
-        ):
-            return True
-        if self._should_preserve_task_dispatch_ownership(
-            task,
-            previous_status=str(getattr(task, "status", "") or "").strip().lower() or None,
-            db=db,
-        ):
-            return True
-        return bool(
-            self._task_has_active_streaming_stage_workers(task.id)
-            or self._has_local_task_execution_owner(task.id)
-        )
+        return self._task_runtime_owner_matches_current_instance(db, task)
 
     def _should_continue_parent_lease_heartbeat(
         self,
@@ -2011,11 +1984,7 @@ class TaskManager(
         dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
         if dispatcher_instance_id and dispatcher_instance_id != str(self.instance_id or "").strip():
             return False
-        if self._task_runtime_transition_guard_owned_by_current_instance(task):
-            return True
-        if self._task_runtime_owner_matches_current_instance(db, task):
-            return True
-        return self._task_should_remain_owned_without_active_runner(db, task, handle)
+        return self._task_runtime_owner_matches_current_instance(db, task)
 
     def _can_stop_parent_lease_heartbeat(
         self,
@@ -3357,9 +3326,11 @@ class TaskManager(
         session = get_session_factory()()
         try:
             runtime_lease = self._runtime_lease_for_task(session, getattr(task, "id", None))
-            if runtime_lease is not None and self._runtime_lease_is_active(runtime_lease):
-                return str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
-            return self._task_runtime_transition_guard_owned_by_current_instance(task)
+            return bool(
+                runtime_lease is not None
+                and self._runtime_lease_is_active(runtime_lease)
+                and str(getattr(runtime_lease, "owner_instance_id", "") or "").strip() == dispatcher_instance_id
+            )
         finally:
             session.close()
 
@@ -3392,14 +3363,6 @@ class TaskManager(
                 and snapshot.runtime_lease_owner
                 and snapshot.row_mirror_owner == snapshot.runtime_lease_owner
             )
-        if not snapshot.row_mirror_owner:
-            if snapshot.task_status == "pending":
-                return False
-            return not (
-                snapshot.active_operation_status in TASK_OPERATION_ACTIVE_STATUSES
-                if snapshot.active_operation_status is not None
-                else False
-            )
         return False
 
     def _task_has_healthy_active_owner_runtime(
@@ -3412,9 +3375,7 @@ class TaskManager(
         if task is None:
             return False
         if db is None:
-            dispatcher_instance_id = str(getattr(task, "dispatcher_instance_id", "") or "").strip()
-            task_status = str(getattr(task, "status", "") or "").strip().lower()
-            return bool(dispatcher_instance_id and task_status in {"running", "dispatching", TASK_STATUS_CANCELLING})
+            return False
         snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
         if snapshot.runtime_lease_active:
             return bool(
@@ -3422,12 +3383,7 @@ class TaskManager(
                 and snapshot.runtime_lease_owner
                 and snapshot.row_mirror_owner == snapshot.runtime_lease_owner
             )
-        return bool(
-            snapshot.local_handle_alive
-            and snapshot.row_mirror_owner
-            and snapshot.row_mirror_owner == str(self.instance_id or "").strip()
-            and snapshot.task_status in {"running", "dispatching", TASK_STATUS_CANCELLING}
-        )
+        return False
 
     def _stale_parent_runtime_takeover_decision(
         self,
@@ -3461,23 +3417,11 @@ class TaskManager(
                 allow_claim=False,
                 decision_reason="active_runtime_lease",
             )
-        if snapshot.local_handle_alive:
-            return _StaleParentRuntimeTakeoverDecision(
-                runtime_lease_active=False,
-                runtime_lease_owner=snapshot.runtime_lease_owner,
-                local_handle_alive=True,
-                row_mirror_owner=snapshot.row_mirror_owner,
-                supported_control_operation_active=snapshot.supported_control_operation_active,
-                allow_takeover=False,
-                allow_reenqueue=False,
-                allow_claim=False,
-                decision_reason="local_handle_alive_without_runtime_lease",
-            )
         if snapshot.supported_control_operation_active:
             return _StaleParentRuntimeTakeoverDecision(
                 runtime_lease_active=False,
                 runtime_lease_owner=snapshot.runtime_lease_owner,
-                local_handle_alive=False,
+                local_handle_alive=snapshot.local_handle_alive,
                 row_mirror_owner=snapshot.row_mirror_owner,
                 supported_control_operation_active=True,
                 allow_takeover=False,
@@ -3488,7 +3432,7 @@ class TaskManager(
         return _StaleParentRuntimeTakeoverDecision(
             runtime_lease_active=False,
             runtime_lease_owner=snapshot.runtime_lease_owner,
-            local_handle_alive=False,
+            local_handle_alive=snapshot.local_handle_alive,
             row_mirror_owner=snapshot.row_mirror_owner,
             supported_control_operation_active=snapshot.supported_control_operation_active,
             allow_takeover=True,
@@ -4938,8 +4882,6 @@ class TaskManager(
     ) -> bool:
         if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
             return False
-        if self._has_local_task_execution_owner(str(getattr(task, "id", "") or "").strip()):
-            return True
         return self._lease_is_active(task, db=db)
 
     async def _ensure_task_write_ownership_async(

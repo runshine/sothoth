@@ -127,6 +127,30 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
 
         self.assertFalse(supported)
 
+    def test_task_row_owner_runtime_supported_rejects_running_task_without_owner_lease_or_local_handle(self):
+        manager = TaskManager()
+        manager.instance_id = "local-worker"
+        task = BinarySecurityTask(
+            id="task-running-no-owner-no-lease",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id=None,
+            dispatch_started_at=None,
+            lease_expires_at=None,
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[])
+
+        supported = manager._task_row_owner_is_runtime_supported(db, task)
+
+        self.assertFalse(supported)
+
     def test_should_skip_readless_reconcile_for_active_task_uses_runtime_lease_without_status_gate(self):
         manager = TaskManager()
         task = BinarySecurityTask(

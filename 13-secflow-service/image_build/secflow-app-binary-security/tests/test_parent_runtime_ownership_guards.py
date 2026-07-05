@@ -75,7 +75,7 @@ class ParentRuntimeOwnershipGuardTests(unittest.TestCase):
         self.assertEqual("worker-live", payload.get("runtime_lease_owner"))
         self.assertTrue(payload.get("row_mirror_drift"))
 
-    def test_repair_running_lease_invariant_keeps_running_when_local_handle_alive_without_runtime_lease(self):
+    def test_repair_running_lease_invariant_requeues_when_runtime_lease_missing_even_if_local_handle_alive(self):
         task = self._task(
             dispatcher_instance_id="worker-local",
             lease_expires_at=_now() - timedelta(minutes=1),
@@ -90,12 +90,10 @@ class ParentRuntimeOwnershipGuardTests(unittest.TestCase):
             reason="unit_test_local_handle_alive",
         )
 
-        self.assertFalse(repaired)
-        self.assertEqual("running", task.status)
-        event = next(row for row in db.events if row.event_type == "running_without_active_lease_repair_suppressed")
-        payload = dict(event.payload or {})
-        self.assertTrue(payload.get("local_handle_alive"))
-        self.assertEqual("worker-local", payload.get("row_mirror_owner"))
+        self.assertTrue(repaired)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertTrue(any(row.event_type == "running_without_active_lease_requeued" for row in db.events))
 
     def test_task_queue_state_prefers_runtime_lease_for_pending_task(self):
         task = self._task(status="pending", dispatcher_instance_id=None, lease_expires_at=None)
@@ -131,6 +129,25 @@ class ParentRuntimeOwnershipGuardTests(unittest.TestCase):
 
         self.assertEqual("leased", queue_state)
         self.assertEqual("execution_owner_missing", recoverable_reason)
+
+    def test_task_owner_runtime_supported_locally_requires_active_runtime_lease(self):
+        self.manager.instance_id = "worker-local"
+        task = self._task(
+            dispatcher_instance_id="worker-local",
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+        import app.service.task_manager as task_manager_module
+
+        original_factory = task_manager_module.get_session_factory
+        try:
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            supported = self.manager._task_owner_runtime_supported_locally(task)
+        finally:
+            task_manager_module.get_session_factory = original_factory
+
+        self.assertFalse(supported)
 
     def test_should_skip_readless_reconcile_for_active_task_keeps_runtime_lease_without_row_owner(self):
         task = self._task(

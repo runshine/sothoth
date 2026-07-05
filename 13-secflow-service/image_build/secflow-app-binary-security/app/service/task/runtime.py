@@ -1302,7 +1302,7 @@ class TaskRuntimeServiceMixin:
                         else None
                     )
                     local_handle_alive = bool(self._has_local_task_execution_owner(normalized_task_id))
-                    if runtime_lease_active or local_handle_alive:
+                    if runtime_lease_active:
                         task_manager_module.logger.info(
                             "binary-security pending task reconcile skipped because runtime ownership is still active: "
                             "task_id=%s task_status=%s queue_state=%s runtime_lease_active=%s runtime_lease_owner=%s "
@@ -1464,34 +1464,6 @@ class TaskRuntimeServiceMixin:
                 )
                 continue
             if self._task_row_owner_is_runtime_supported(db, task):
-                continue
-            if takeover_decision.local_handle_alive:
-                task_manager_module.logger.info(
-                    "binary-security queue reconcile suppressed stale owner takeover for active non-pending task because a local runtime handle is still alive: "
-                    "task_id=%s task_status=%s runtime_phase=%s dispatcher_instance_id=%s",
-                    normalized_task_id,
-                    str(getattr(task, "status", "") or "").strip() or None,
-                    self._task_runtime_phase(task),
-                    str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "active_nonpending_takeover_suppressed_local_runtime",
-                    "检测到 non-pending 任务当前实例仍有本地执行句柄，本次不抢占接管",
-                    level="info",
-                    stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
-                    payload={
-                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
-                        "runtime_phase": self._task_runtime_phase(task),
-                        "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
-                        "runtime_lease_active": takeover_decision.runtime_lease_active,
-                        "runtime_lease_owner": takeover_decision.runtime_lease_owner,
-                        "local_handle_alive": takeover_decision.local_handle_alive,
-                        "reason": takeover_decision.decision_reason,
-                        "enqueue_context": "queue_reconcile",
-                    },
-                )
                 continue
             if takeover_decision.allow_reenqueue:
                 released = self._release_unsupported_task_row_owner(
@@ -2050,20 +2022,6 @@ class TaskRuntimeServiceMixin:
                     task_id=task_id,
                     claimed_task_id=None,
                     blocked_reason="active_nonpending_takeover_suppressed_active_lease",
-                    should_requeue=False,
-                )
-                return None
-            if nonpending_takeover_decision.local_handle_alive:
-                self._log_dispatch_claim_blocked(
-                    task_id,
-                    reason="active_nonpending_takeover_suppressed_local_runtime",
-                    task=task,
-                    current_operation=current_operation,
-                )
-                self._set_dispatch_claim_decision(
-                    task_id=task_id,
-                    claimed_task_id=None,
-                    blocked_reason="active_nonpending_takeover_suppressed_local_runtime",
                     should_requeue=False,
                 )
                 return None
