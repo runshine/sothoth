@@ -61,6 +61,33 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual(["i1", "i2"], entries[0]["item_ids"])
         self.assertEqual([task.id, task.id], queued)
 
+    def test_merge_task_sync_entries_accepts_non_empty_list_and_dict_fields(self):
+        merged = task_manager_module.get_task_queue()._merge_task_sync_entries(
+            {
+                "queue_item_id": "q1",
+                "dedupe_key": "k1",
+                "sync_kind": "downstream_status",
+                "item_ids": ["i1"],
+                "archive_job_ids": [],
+                "payload": {"old": "value"},
+                "reason": "old",
+            },
+            {
+                "queue_item_id": "q1",
+                "dedupe_key": "k1",
+                "sync_kind": "downstream_status",
+                "item_ids": ["i2"],
+                "archive_job_ids": ["a1"],
+                "payload": {"new": "value"},
+                "reason": "new",
+            },
+        )
+
+        self.assertEqual(["i1", "i2"], merged["item_ids"])
+        self.assertEqual(["a1"], merged["archive_job_ids"])
+        self.assertEqual({"old": "value", "new": "value"}, merged["payload"])
+        self.assertEqual("new", merged["reason"])
+
     def test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync(self):
         manager = TaskManager()
         manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"

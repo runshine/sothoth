@@ -451,10 +451,10 @@ class TaskRuntimeStateServiceMixin:
                 row_lease_expires_at=row_lease_expires_at,
                 dispatcher_instance_id=dispatcher_instance_id,
             )
-        if lease_state == "expired":
+        if lease_state in {"expired", "missing"}:
             return LeaseClearDecision(
                 allowed=True,
-                reason_code="runtime_lease_expired",
+                reason_code="runtime_lease_expired" if lease_state == "expired" else "runtime_lease_missing",
                 lease_state=lease_state,
                 owner_matches_current_instance=owner_matches_current_instance,
                 task_terminal=task_terminal,

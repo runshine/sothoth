@@ -69,12 +69,12 @@ class ParentRuntimeControlRecoveryTests(unittest.TestCase):
             manager._enqueue_task_with_context = original_enqueue
 
         self.assertTrue(reclaimed)
-        self.assertEqual("running", task.status)
-        self.assertEqual([], queued)
+        self.assertEqual("pending", task.status)
+        self.assertEqual(["t1"], queued)
         requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
-        self.assertFalse(requeue_events)
-        suppress_events = [event for event in db.events if event.event_type == "parent_runtime_reopen_suppressed_active_lease"]
-        self.assertTrue(suppress_events)
+        self.assertTrue(requeue_events)
+        reopen_events = [event for event in db.events if event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry"]
+        self.assertTrue(reopen_events)
 
     def test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):
         manager = TaskManager()

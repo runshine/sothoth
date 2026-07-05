@@ -183,6 +183,36 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
         self.assertEqual(original_expiry, task.lease_expires_at)
         self.assertEqual(1, len(db.runtime_leases))
 
+    def test_can_reopen_parent_task_after_missing_runtime_lease(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        task = BinarySecurityTask(
+            id="task-missing-lease-reopen",
+            project_id="p1",
+            name="demo",
+            status="pending",
+            current_stage="entry_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            dispatcher_instance_id="worker-old",
+            lease_expires_at=None,
+        )
+        db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+        decision = manager._can_reopen_parent_task_after_lease_loss(
+            db,
+            task,
+            reason="unit_test_missing_runtime_lease",
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual("runtime_lease_missing", decision.reason_code)
+        self.assertEqual("missing", decision.lease_state)
+
     def test_worker_does_not_take_tail_runtime_lease_on_refresh(self):
         manager = TaskManager()
         task = BinarySecurityTask(

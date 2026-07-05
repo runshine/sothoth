@@ -865,9 +865,17 @@ class TaskQueue:
     def _merge_task_sync_entries(cls, existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
         current = cls._normalize_task_sync_entry(existing)
         latest = cls._normalize_task_sync_entry(incoming)
+        def _meaningful_value(value: Any) -> bool:
+            if value is None:
+                return False
+            if isinstance(value, str):
+                return bool(value)
+            if isinstance(value, (list, tuple, set, dict)):
+                return bool(value)
+            return True
         merged = {
             **current,
-            **{key: value for key, value in latest.items() if value not in {None, "", [], {}}},
+            **{key: value for key, value in latest.items() if _meaningful_value(value)},
         }
         merged["item_ids"] = sorted({*list(current.get("item_ids") or []), *list(latest.get("item_ids") or [])})
         merged["archive_job_ids"] = sorted({*list(current.get("archive_job_ids") or []), *list(latest.get("archive_job_ids") or [])})
