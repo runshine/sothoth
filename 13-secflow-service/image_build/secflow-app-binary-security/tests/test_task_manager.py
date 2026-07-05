@@ -331,6 +331,14 @@ class _FakeTaskSyncQueue:
         self.repair_locks: dict[str, str] = {}
         self.owner_signals: dict[tuple[str, str], dict[str, object]] = {}
 
+    async def queue_positions(self, queue_key: str, context: str = "test"):
+        del queue_key, context
+        return {}
+
+    async def cleanup_dedupe_orphans(self, queue_key: str, context: str = "test"):
+        del queue_key, context
+        return 0
+
     @staticmethod
     def _dedupe_key(entry: dict[str, object], fallback: str | None = None) -> str:
         value = str(entry.get("dedupe_key") or fallback or "").strip()

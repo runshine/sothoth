@@ -343,6 +343,18 @@ class _StaleParentRuntimeTakeoverDecision:
     allow_claim: bool
     decision_reason: str
 
+
+@dataclass
+class _RuntimeLeaseOwnershipDecision:
+    should_continue: bool
+    abort_reason: str | None = None
+    runtime_lease_present: bool = False
+    runtime_lease_active: bool = False
+    runtime_lease_owner: str | None = None
+    runtime_lease_expires_at: datetime | None = None
+    local_handle_alive: bool = False
+    verification_error: str | None = None
+
 DB_ENTRY_PREVIEW_LIMIT = 50
 DB_ARTIFACT_PREVIEW_LIMIT = 50
 DB_EVENT_PAYLOAD_LIMIT_BYTES = 32768
@@ -606,6 +618,13 @@ PARTIAL_SUCCESS_ADVANCEMENT_STAGES = (
 DEFAULT_PARTIAL_SUCCESS_STAGE_ADVANCEMENT = {
     stage_name: False for stage_name in PARTIAL_SUCCESS_ADVANCEMENT_STAGES
 }
+
+
+def _already_isoformatted_datetime(value: Any) -> str | None:
+    if isinstance(value, str):
+        normalized = str(value or "").strip()
+        return normalized or None
+    return _isoformat_or_none(value)
 PIPELINE_MODE_BARRIER = "barrier"
 PIPELINE_MODE_MIXED_STREAMING = "mixed_streaming"
 STREAMING_TAIL_STAGES = ("entry_analysis", "dataflow_vuln_scan")
@@ -2061,7 +2080,22 @@ class TaskManager(
                 if await self._handoff_active_serial_control_operation_from_runtime(task_id):
                     return
                 await asyncio.to_thread(self._touch_task_heartbeat, task_id)
-                await self._service_local_runtime_sync_maintenance(task_id)
+                ownership_decision = await asyncio.to_thread(
+                    self._verify_local_runtime_lease_or_abort,
+                    task_id,
+                    "heartbeat_after_touch",
+                )
+                if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
+                    return
+                try:
+                    await self._service_local_runtime_sync_maintenance(task_id)
+                except StaleTaskExecution:
+                    raise
+                except Exception:
+                    logger.exception(
+                        "binary-security local runtime sync maintenance failed but lease is still active: task_id=%s",
+                        task_id,
+                    )
                 handle.last_progress_at = _now()
                 failure_count = 0
             except asyncio.CancelledError:
@@ -2076,10 +2110,79 @@ class TaskManager(
                     return
             await asyncio.sleep(interval_seconds)
 
+    def _verify_local_runtime_lease_or_abort(
+        self,
+        task_id: str,
+        source: str,
+    ) -> _RuntimeLeaseOwnershipDecision:
+        normalized_task_id = str(task_id or "").strip()
+        session = get_session_factory()()
+        try:
+            decision = self._assert_active_runtime_lease_owner(
+                session,
+                normalized_task_id,
+                expected_owner=str(self.instance_id or "").strip() or None,
+                allow_retryable_read_error=True,
+            )
+        finally:
+            session.close()
+        if not self._should_abort_local_runtime_after_lease_loss(decision):
+            return decision
+        handle = self._runtime_handle(normalized_task_id)
+        if handle is not None:
+            handle.cancel_requested = True
+            if handle.runner_task is not None and not handle.runner_task.done():
+                handle.runner_task.cancel()
+        event_type = (
+            "runtime_lease_verification_failed_local_execution_aborted"
+            if decision.abort_reason == "runtime_lease_verification_failed"
+            else "runtime_lease_lost_local_execution_aborted"
+        )
+        message = (
+            "父任务 runtime lease 校验失败，当前 Pod 已停止该任务本地执行"
+            if decision.abort_reason == "runtime_lease_verification_failed"
+            else "父任务 runtime lease 已丢失，当前 Pod 已停止该任务本地执行"
+        )
+        db = get_session_factory()()
+        try:
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == normalized_task_id).first()
+            if task is not None:
+                self._record_event(
+                    db,
+                    task,
+                    event_type,
+                    message,
+                    level="warning",
+                    stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                    payload={
+                        "task_id": normalized_task_id,
+                        "expected_owner": str(self.instance_id or "").strip() or None,
+                        "runtime_lease_owner": decision.runtime_lease_owner,
+                        "runtime_lease_expires_at": _isoformat_or_none(decision.runtime_lease_expires_at),
+                        "local_handle_alive": decision.local_handle_alive,
+                        "abort_reason": decision.abort_reason,
+                        "verification_error": decision.verification_error,
+                        "source": str(source or "").strip() or None,
+                    },
+                )
+                db.commit()
+        finally:
+            db.close()
+        return decision
+
     async def _service_local_runtime_sync_maintenance(self, task_id: str) -> bool:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return False
+        lease_decision = await asyncio.to_thread(
+            self._verify_local_runtime_lease_or_abort,
+            normalized_task_id,
+            "runtime_sync_maintenance",
+        )
+        if self._should_abort_local_runtime_after_lease_loss(lease_decision):
+            raise StaleTaskExecution(
+                f"任务 {normalized_task_id} runtime lease 已失效，停止本地 runtime sync maintenance"
+            )
         handle = self._runtime_handle(normalized_task_id)
         if (
             handle is None
@@ -2515,6 +2618,28 @@ class TaskManager(
     def _enqueue_task(self, task_id: str) -> None:
         self._enqueue_task_with_context(task_id, context="task_enqueue")
 
+    def _force_requeue_task_sync(self, task_id: str, *, context: str) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_context = str(context or "").strip() or "task_enqueue"
+        if not normalized_task_id:
+            return False
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return self._enqueue_task_and_wait_sync(
+                normalized_task_id,
+                context=normalized_context,
+                timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+                force_requeue=True,
+            )
+        loop.create_task(
+            get_task_queue().force_requeue_task(
+                normalized_task_id,
+                context=normalized_context,
+            )
+        )
+        return True
+
     def _enqueue_task_with_context(self, task_id: str, *, context: str = "task_enqueue") -> None:
         normalized_task_id = str(task_id or "").strip()
         normalized_context = str(context or "").strip() or "task_enqueue"
@@ -2848,6 +2973,139 @@ class TaskManager(
             repaired += 1
         return repaired
 
+    def _peek_released_parent_task_missing_takeover_enqueue(
+        self,
+        db: Session,
+        *,
+        stale_after_seconds: int = 30,
+    ) -> BinarySecurityTask | None:
+        cutoff = _now() - timedelta(seconds=max(1, int(stale_after_seconds or 30)))
+        rows = (
+            db.query(BinarySecurityTask)
+            .filter(
+                BinarySecurityTask.status == "pending",
+                BinarySecurityTask.runtime_phase == TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                BinarySecurityTask.current_stage.isnot(None),
+                BinarySecurityTask.updated_at <= cutoff,
+            )
+            .order_by(BinarySecurityTask.updated_at.asc(), BinarySecurityTask.created_at.asc())
+            .all()
+        )
+        for task in rows:
+            if str(getattr(task, "dispatcher_instance_id", "") or "").strip():
+                continue
+            if self._runtime_lease_is_active(self._runtime_lease_for_task(db, task.id)):
+                continue
+            if self._task_has_manual_or_retry_operation(db, task):
+                continue
+            if self._active_delete_queue_operation(db, task) is not None:
+                continue
+            reconcile_snapshot = dict(getattr(task, "summary", None) or {}).get("released_takeover_reconcile")
+            if isinstance(reconcile_snapshot, dict):
+                last_requeued_at = _parse_iso_datetime(reconcile_snapshot.get("last_requeued_at"))
+                if last_requeued_at is not None and last_requeued_at > cutoff:
+                    continue
+            has_stage_run = (
+                db.query(BinarySecurityStageRun)
+                .filter(BinarySecurityStageRun.task_id == task.id)
+                .first()
+                is not None
+            )
+            has_stage_item = (
+                db.query(BinarySecurityStageItem)
+                .filter(BinarySecurityStageItem.task_id == task.id)
+                .first()
+                is not None
+            )
+            stage_name = str(getattr(task, "current_stage", "") or "").strip()
+            has_downstream_ref = bool(stage_name) and any(
+                str(getattr(item, "downstream_task_id", "") or "").strip()
+                for item in self._stage_items(db, task.id, stage_name)
+            )
+            if not (has_stage_run or has_stage_item or has_downstream_ref):
+                continue
+            return task
+        return None
+
+    async def _reconcile_released_parent_task_missing_takeover_enqueue(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        actor: str,
+        stale_after_seconds: int = 30,
+    ) -> bool:
+        latest = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+        if latest is None:
+            return False
+        candidate = self._peek_released_parent_task_missing_takeover_enqueue(
+            db,
+            stale_after_seconds=stale_after_seconds,
+        )
+        if candidate is None or str(candidate.id or "").strip() != str(latest.id or "").strip():
+            return False
+        requeued = await self._enqueue_task_and_wait(
+            latest.id,
+            context="released_takeover_reconcile",
+            timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+            force_requeue=True,
+        )
+        if not requeued:
+            return False
+        latest.updated_at = _now()
+        latest.summary = {
+            **dict(getattr(latest, "summary", None) or {}),
+            "released_takeover_reconcile": {
+                "last_requeued_at": _isoformat_or_none(latest.updated_at),
+                "actor": actor,
+            },
+        }
+        self._record_event(
+            db,
+            latest,
+            "released_parent_takeover_dispatch_reconciled",
+            "检测到已释放父任务未进入共享调度队列，已重新加入调度队列",
+            level="warning",
+            stage_name=latest.current_stage,
+            payload={
+                "reason": "released_parent_missing_takeover_enqueue",
+                "stale_after_seconds": max(1, int(stale_after_seconds or 30)),
+                "runtime_phase": self._task_runtime_phase(latest),
+                "current_stage": str(getattr(latest, "current_stage", "") or "").strip() or None,
+                "enqueue_context": "released_takeover_reconcile",
+                "actor": actor,
+            },
+        )
+        db.commit()
+        return True
+
+    async def reconcile_released_parent_tasks_missing_takeover_enqueue(
+        self,
+        db: Session,
+        *,
+        batch_size: int,
+        actor: str,
+        stale_after_seconds: int = 30,
+    ) -> int:
+        repaired = 0
+        limit = max(1, int(batch_size or 1))
+        for _ in range(limit):
+            candidate = self._peek_released_parent_task_missing_takeover_enqueue(
+                db,
+                stale_after_seconds=stale_after_seconds,
+            )
+            if candidate is None:
+                break
+            if not await self._reconcile_released_parent_task_missing_takeover_enqueue(
+                db,
+                candidate,
+                actor=actor,
+                stale_after_seconds=stale_after_seconds,
+            ):
+                break
+            repaired += 1
+        return repaired
+
     async def repair_orphan_parent_tasks_missing_initial_enqueue(
         self,
         *,
@@ -3091,6 +3349,121 @@ class TaskManager(
             owner = str(lease.owner_instance_id or "").strip() or None
         expires_at = lease.lease_expires_at if lease is not None else task.lease_expires_at
         return lease, owner, expires_at
+
+    def _runtime_lease_ownership_snapshot(
+        self,
+        db: Session,
+        task_id: str,
+        *,
+        expected_owner: str | None = None,
+    ) -> _RuntimeLeaseOwnershipDecision:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_expected_owner = str(expected_owner or self.instance_id or "").strip() or None
+        local_handle_alive = bool(self._has_local_task_execution_owner(normalized_task_id))
+        if not normalized_task_id:
+            return _RuntimeLeaseOwnershipDecision(
+                should_continue=False,
+                abort_reason="task_id_missing",
+                local_handle_alive=local_handle_alive,
+            )
+        lease = self._runtime_lease_for_task(db, normalized_task_id)
+        runtime_lease_present = lease is not None
+        runtime_lease_active = self._runtime_lease_is_active(lease)
+        runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None if lease is not None else None
+        runtime_lease_expires_at = getattr(lease, "lease_expires_at", None) if lease is not None else None
+        if not runtime_lease_present:
+            return _RuntimeLeaseOwnershipDecision(
+                should_continue=False,
+                abort_reason="runtime_lease_missing",
+                runtime_lease_present=False,
+                runtime_lease_active=False,
+                runtime_lease_owner=None,
+                runtime_lease_expires_at=None,
+                local_handle_alive=local_handle_alive,
+            )
+        if not runtime_lease_active:
+            return _RuntimeLeaseOwnershipDecision(
+                should_continue=False,
+                abort_reason="runtime_lease_expired",
+                runtime_lease_present=True,
+                runtime_lease_active=False,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                local_handle_alive=local_handle_alive,
+            )
+        if normalized_expected_owner and runtime_lease_owner != normalized_expected_owner:
+            return _RuntimeLeaseOwnershipDecision(
+                should_continue=False,
+                abort_reason="runtime_lease_owner_changed",
+                runtime_lease_present=True,
+                runtime_lease_active=True,
+                runtime_lease_owner=runtime_lease_owner,
+                runtime_lease_expires_at=runtime_lease_expires_at,
+                local_handle_alive=local_handle_alive,
+            )
+        return _RuntimeLeaseOwnershipDecision(
+            should_continue=True,
+            runtime_lease_present=True,
+            runtime_lease_active=True,
+            runtime_lease_owner=runtime_lease_owner,
+            runtime_lease_expires_at=runtime_lease_expires_at,
+            local_handle_alive=local_handle_alive,
+        )
+
+    def _should_abort_local_runtime_after_lease_loss(
+        self,
+        decision: _RuntimeLeaseOwnershipDecision,
+    ) -> bool:
+        return not bool(decision.should_continue)
+
+    def _assert_active_runtime_lease_owner(
+        self,
+        db: Session,
+        task_id: str,
+        *,
+        expected_owner: str | None = None,
+        allow_retryable_read_error: bool = True,
+        retry_attempts: int = 2,
+    ) -> _RuntimeLeaseOwnershipDecision:
+        attempts = max(1, int(retry_attempts or 1))
+        last_decision: _RuntimeLeaseOwnershipDecision | None = None
+        for attempt in range(attempts):
+            try:
+                decision = self._runtime_lease_ownership_snapshot(
+                    db,
+                    task_id,
+                    expected_owner=expected_owner,
+                )
+            except OperationalError as exc:
+                if allow_retryable_read_error and self._is_retryable_lock_error(exc) and attempt + 1 < attempts:
+                    db.rollback()
+                    continue
+                return _RuntimeLeaseOwnershipDecision(
+                    should_continue=False,
+                    abort_reason="runtime_lease_verification_failed",
+                    local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+                    verification_error=str(exc),
+                )
+            except Exception as exc:
+                if allow_retryable_read_error and attempt + 1 < attempts:
+                    db.rollback()
+                    continue
+                return _RuntimeLeaseOwnershipDecision(
+                    should_continue=False,
+                    abort_reason="runtime_lease_verification_failed",
+                    local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+                    verification_error=str(exc),
+                )
+            last_decision = decision
+            if decision.should_continue or not allow_retryable_read_error:
+                return decision
+            if decision.abort_reason != "runtime_lease_verification_failed" or attempt + 1 >= attempts:
+                return decision
+        return last_decision or _RuntimeLeaseOwnershipDecision(
+            should_continue=False,
+            abort_reason="runtime_lease_verification_failed",
+            local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+        )
 
     def _local_runtime_handle_state(self, task_id: str) -> str:
         handle = self._workers.get(str(task_id or "").strip())
@@ -3563,6 +3936,18 @@ class TaskManager(
             level="warning",
         )
         self._repair_active_operations_for_task(db, task)
+        requeue_succeeded = False
+        requeue_error: str | None = None
+        try:
+            requeue_succeeded = self._force_requeue_task_sync(
+                task.id,
+                context="owned_execution_release_for_takeover",
+            )
+        except Exception as exc:
+            requeue_error = str(exc)
+            requeue_succeeded = False
+        if not requeue_succeeded and not requeue_error:
+            requeue_error = "force_requeue_task_returned_false"
         self._record_event(
             db,
             task,
@@ -3580,8 +3965,49 @@ class TaskManager(
                 "local_task_runtime_handle_alive": self._has_local_task_execution_owner(task.id),
                 "local_streaming_stage_worker_alive": self._task_has_active_streaming_stage_workers(task.id),
                 "active_runtime_lease_owner": active_runtime_lease_owner,
+                "force_requeue": requeue_succeeded,
+                "enqueue_context": "owned_execution_release_for_takeover",
             },
         )
+        if requeue_succeeded:
+            self._record_event(
+                db,
+                task,
+                "owned_execution_release_reenqueued_for_takeover",
+                "检测到父任务 lease 已失效，已释放 owner 并重新加入共享调度队列",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "previous_status": previous_status,
+                    "release_reason": reason,
+                    "runtime_lease_owner": active_runtime_lease_owner,
+                    "runtime_lease_expires_at": _already_isoformatted_datetime(snapshot.runtime_lease_expires_at),
+                    "force_requeue": True,
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                    "row_mirror_owner": snapshot.row_mirror_owner,
+                    "row_mirror_drift": snapshot.row_mirror_drift,
+                },
+            )
+        else:
+            self._record_event(
+                db,
+                task,
+                "owned_execution_release_reenqueue_failed",
+                "父任务 owner 已释放，但重新加入共享调度队列失败，等待后续补偿修复",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "previous_status": previous_status,
+                    "release_reason": reason,
+                    "runtime_lease_owner": active_runtime_lease_owner,
+                    "runtime_lease_expires_at": _already_isoformatted_datetime(snapshot.runtime_lease_expires_at),
+                    "force_requeue": False,
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                    "row_mirror_owner": snapshot.row_mirror_owner,
+                    "row_mirror_drift": snapshot.row_mirror_drift,
+                    "error": requeue_error,
+                },
+            )
         return True
 
     def _write_task_heartbeat(self, session: Session, task_id: str, *, now_value: datetime, source: str) -> bool:

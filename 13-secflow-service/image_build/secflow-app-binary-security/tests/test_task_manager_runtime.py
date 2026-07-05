@@ -2636,7 +2636,12 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             lease_expires_at=_now() + timedelta(minutes=5),
             dispatch_started_at=_now(),
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
         order: list[str] = []
 
         async def _run_current_task_operation(_task_id):
@@ -2670,7 +2675,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         manager._service_role = lambda: "worker"
         manager._lease_is_active = lambda *_args, **_kwargs: True
         manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
-        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: runtime_lease
         manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
         manager._bind_execution_token = lambda *_args, **_kwargs: None
         manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
@@ -2707,7 +2712,12 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             lease_expires_at=_now() + timedelta(minutes=5),
             dispatch_started_at=_now(),
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
         order: list[str] = []
 
         async def _run_current_task_operation(_task_id):
@@ -2743,7 +2753,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         manager._service_role = lambda: "worker"
         manager._lease_is_active = lambda *_args, **_kwargs: True
         manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
-        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: runtime_lease
         manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
         manager._bind_execution_token = lambda *_args, **_kwargs: None
         manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
@@ -2780,7 +2790,12 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             lease_expires_at=_now() + timedelta(minutes=5),
             dispatch_started_at=_now(),
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
         order: list[str] = []
 
         async def _run_current_task_operation(_task_id):
@@ -2823,7 +2838,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         manager._service_role = lambda: "worker"
         manager._lease_is_active = lambda *_args, **_kwargs: True
         manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
-        manager._upsert_runtime_lease = lambda *_args, **_kwargs: None
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: runtime_lease
         manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
         manager._bind_execution_token = lambda *_args, **_kwargs: None
         manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
@@ -2928,7 +2943,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
@@ -3019,7 +3034,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 

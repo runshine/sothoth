@@ -332,9 +332,12 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
         db = _AppendingModelAwareDb(tasks=[task], stage_runs=[system_run, entry_run], stage_items=[entry_item], events=[])
         original_next_incomplete_stage = self.manager._next_stage_candidate
         original_workflow_blocked_on_stage = self.manager._workflow_blocked_on_stage
+        original_enqueue_task = self.manager._enqueue_task
+        enqueued = []
 
         self.manager._next_stage_candidate = lambda _db, _task: "entry_analysis"
         self.manager._workflow_blocked_on_stage = lambda _task, _snapshots: None
+        self.manager._enqueue_task = lambda task_id: enqueued.append(task_id)
         try:
             changed = self.manager._finalize_task_handle_resume_or_missing_stage(
                 db,
@@ -344,9 +347,11 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
         finally:
             self.manager._next_stage_candidate = original_next_incomplete_stage
             self.manager._workflow_blocked_on_stage = original_workflow_blocked_on_stage
+            self.manager._enqueue_task = original_enqueue_task
 
         self.assertTrue(changed)
         self.assertEqual("running", task.status)
+        self.assertEqual([task.id], enqueued)
         self.assertFalse(
             any(
                 row.__class__.__name__ == "BinarySecurityEvent"

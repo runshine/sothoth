@@ -1241,6 +1241,17 @@ class TaskRuntimeServiceMixin:
                 "binary-security orphan parent initial enqueue reconcile repaired tasks: count=%s",
                 orphan_reconciled,
             )
+        released_takeover_reconciled = await self.reconcile_released_parent_tasks_missing_takeover_enqueue(
+            db,
+            batch_size=self._orphan_parent_reconcile_batch_size(),
+            actor="binary-security-released-parent-takeover-reconciler",
+            stale_after_seconds=30,
+        )
+        if released_takeover_reconciled:
+            task_manager_module.logger.info(
+                "binary-security released parent takeover enqueue reconcile repaired tasks: count=%s",
+                released_takeover_reconciled,
+            )
         queue = task_manager_module.get_task_queue()
         pending_positions = await queue.queue_positions(self.cfg.queue.task_queue_key, context="queue_reconcile_snapshot")
         delete_queue_key = str(getattr(self.cfg.queue, "delete_queue_key", "") or "binary_security_delete_queue").strip()
@@ -3214,6 +3225,19 @@ class TaskRuntimeServiceMixin:
                     .first()
                 )
                 if task_before_execute is None:
+                    return
+                lease_decision = self._assert_active_runtime_lease_owner(
+                    execution_gate_db,
+                    task_id,
+                    expected_owner=str(self.instance_id or "").strip() or None,
+                    allow_retryable_read_error=True,
+                )
+                if self._should_abort_local_runtime_after_lease_loss(lease_decision):
+                    await asyncio.to_thread(
+                        self._verify_local_runtime_lease_or_abort,
+                        task_id,
+                        "run_task_before_business_execution",
+                    )
                     return
                 if str(getattr(task_before_execute, "current_operation_id", "") or "").strip():
                     task_manager_module.logger.info(
