@@ -865,18 +865,6 @@ class TaskManager(
                     await asyncio.sleep(0.5)
                 return None
             return _wait_archive_job_completion
-        if item == "_attempt_vuln_downstream_binding_recovery":
-            async def _attempt_vuln_downstream_binding_recovery(db, task, stage_item, *, token=None, force=False):
-                del force
-                payload = await self._find_reusable_vuln_payload(task, stage_item, token)
-                if payload is None:
-                    return False, "create_failed"
-                stage_item.downstream_task_id = payload.get("task_id") or payload.get("id") or stage_item.downstream_task_id
-                stage_item.status = self._map_downstream_status(str(payload.get("status") or "")) or stage_item.status
-                self._mark_downstream_binding_created(stage_item, message="已补齐下游绑定，状态待同步")
-                db.flush()
-                return True, "binding_recovered"
-            return _attempt_vuln_downstream_binding_recovery
         if item == "_repair_stage_item_terminal_downstream_observation":
             def _repair_stage_item_terminal_downstream_observation(db, task, stage_item, *, reason=None):
                 del db, task, reason
@@ -11058,115 +11046,6 @@ class TaskManager(
             return payload
         return None
 
-    def _sort_downstream_payload_priority(self, payload: dict[str, Any]) -> tuple[int, float, str]:
-        status = str(payload.get("status") or "").strip().lower()
-        mapped = self._map_downstream_status(status)
-        if mapped == "running":
-            priority = 0
-        elif mapped == "success":
-            priority = 1
-        elif mapped == "queued":
-            priority = 2
-        elif mapped in {"failed", "cancelled"}:
-            priority = 3
-        else:
-            priority = 4
-        comparable = (
-            self._parse_comparable_datetime(payload.get("updated_at"))
-            or self._parse_comparable_datetime(payload.get("finished_at"))
-            or self._parse_comparable_datetime(payload.get("started_at"))
-            or self._parse_comparable_datetime(payload.get("created_at"))
-            or datetime.min
-        )
-        timestamp = comparable.timestamp() if comparable != datetime.min else float("-inf")
-        return (priority, -timestamp, str(payload.get("task_id") or payload.get("id") or ""))
-
-    async def _find_reusable_dataflow_payload(
-        self,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        *,
-        allow_rebind: bool = True,
-    ) -> dict[str, Any] | None:
-        item_id = str(item.id or "").strip()
-        if not item_id:
-            return None
-        try:
-            listed = await self._downstream_list_tasks(
-                service="dataflow_vuln_scan",
-                project_id=task.project_id,
-                token=self._resolve_downstream_token(),
-                parent_task_id=task.id,
-                parent_stage_item_id=item_id,
-                per_page=100,
-                sort_by="updated_at",
-                sort_order="desc",
-            )
-        except Exception:
-            return None
-        rows = listed.get("items") if isinstance(listed, dict) else None
-        if not isinstance(rows, list):
-            return None
-        candidates = [row for row in rows if isinstance(row, dict)]
-        if not candidates:
-            return None
-        candidates.sort(key=self._sort_downstream_payload_priority)
-        selected = candidates[0]
-        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
-        current_task_id = str(item.downstream_task_id or "").strip()
-        if allow_rebind and selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
-        return selected
-
-    async def _find_reusable_entry_payload(
-        self,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        token: str | None = None,
-    ) -> dict[str, Any] | None:
-        item_id = str(item.id or "").strip()
-        item_key = str(item.item_key or "").strip()
-        if not item_id and not item_key:
-            return None
-        try:
-            listed = await self._downstream_list_tasks(
-                service="entry_analyse",
-                project_id=task.project_id,
-                token=token,
-                parent_task_id=task.id,
-                parent_stage_name=item.stage_name,
-                parent_stage_item_id=item_id or None,
-                parent_stage_item_key=None if item_id else (item_key or None),
-                per_page=100,
-                sort_by="updated_at",
-                sort_order="desc",
-            )
-        except Exception:
-            return None
-        rows = listed.get("items") if isinstance(listed, dict) else None
-        if not isinstance(rows, list):
-            return None
-        candidates = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
-            origin_item_key = str(row.get("parent_stage_item_key") or "").strip()
-            if item_id and origin_item_id == item_id:
-                candidates.append(row)
-                continue
-            if not item_id and item_key and origin_item_key == item_key:
-                candidates.append(row)
-        if not candidates:
-            return None
-        candidates.sort(key=self._sort_downstream_payload_priority)
-        selected = candidates[0]
-        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
-        current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
-        return selected
-
     def _entry_payload_matches_stage_item(
         self,
         item: BinarySecurityStageItem,
@@ -11184,6 +11063,24 @@ class TaskManager(
             return bool(origin_item_key and origin_item_key == item_key)
         return False
 
+    def _entry_payload_binding_mismatch_payload(
+        self,
+        item: BinarySecurityStageItem,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        return {
+            "reason_code": "parent_stage_item_mismatch",
+            "downstream_service": str(item.downstream_service or "").strip() or None,
+            "expected_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+            "observed_downstream_task_id": self._payload_downstream_task_id(payload),
+            "current_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+            "payload_downstream_task_id": self._payload_downstream_task_id(payload),
+            "expected_parent_stage_item_id": str(item.id or "").strip() or None,
+            "expected_parent_stage_item_key": str(item.item_key or "").strip() or None,
+            "observed_parent_stage_item_id": str((payload or {}).get("parent_stage_item_id") or "").strip() or None,
+            "observed_parent_stage_item_key": str((payload or {}).get("parent_stage_item_key") or "").strip() or None,
+        }
+
     async def _reconcile_entry_payload_binding(
         self,
         task: BinarySecurityTask,
@@ -11191,209 +11088,12 @@ class TaskManager(
         payload: dict[str, Any],
         token: str | None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        del task, token
         if str(item.downstream_service or "").strip() != "entry_analyse":
             return payload, None
         if self._entry_payload_matches_stage_item(item, payload):
             return payload, None
-        mismatch_payload = {
-            "downstream_service": item.downstream_service,
-            "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
-            "expected_parent_stage_item_id": str(item.id or "").strip() or None,
-            "expected_parent_stage_item_key": str(item.item_key or "").strip() or None,
-            "observed_parent_stage_item_id": str(payload.get("parent_stage_item_id") or "").strip() or None,
-            "observed_parent_stage_item_key": str(payload.get("parent_stage_item_key") or "").strip() or None,
-        }
-        rebound = await self._find_reusable_entry_payload(task, item, token)
-        if rebound is not None and self._entry_payload_matches_stage_item(item, rebound):
-            mismatch_payload["rebound_downstream_task_id"] = str(rebound.get("task_id") or rebound.get("id") or "").strip() or None
-            return rebound, mismatch_payload
-        return None, mismatch_payload
-
-    async def _find_reusable_firmware_unpack_payload(
-        self,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        token: str | None = None,
-    ) -> dict[str, Any] | None:
-        item_id = str(item.id or "").strip()
-        item_key = str(item.item_key or "").strip()
-        if not item_id and not item_key:
-            return None
-        try:
-            listed = await self._downstream_list_tasks(
-                service="firmware_unpacker",
-                project_id=task.project_id,
-                token=token,
-                origin_mode="linked",
-                limit=100,
-                offset=0,
-            )
-        except Exception:
-            return None
-        rows = listed.get("items") if isinstance(listed, dict) else None
-        if not isinstance(rows, list):
-            return None
-        candidates = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            origin_parent_task_id = str(row.get("parent_task_id") or "").strip()
-            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
-            origin_item_key = str(row.get("parent_stage_item_key") or "").strip()
-            if origin_parent_task_id and origin_parent_task_id != str(task.id or "").strip():
-                continue
-            if item_id and origin_item_id == item_id:
-                candidates.append(row)
-                continue
-            if item_key and origin_item_key == item_key:
-                candidates.append(row)
-        if not candidates:
-            return None
-        candidates.sort(key=self._sort_downstream_payload_priority)
-        selected = candidates[0]
-        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
-        current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
-        return selected
-
-    async def _find_reusable_vuln_payload(
-        self,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        token: str | None = None,
-    ) -> dict[str, Any] | None:
-        item_id = str(item.id or "").strip()
-        item_key = str(item.item_key or "").strip()
-        if not item_id and not item_key:
-            return None
-        try:
-            listed = await self._downstream_list_tasks(
-                service="dataflow_vuln_scan",
-                project_id=task.project_id,
-                token=token,
-                limit=100,
-                offset=0,
-            )
-        except Exception:
-            return None
-        rows = listed if isinstance(listed, list) else listed.get("items") if isinstance(listed, dict) else None
-        if not isinstance(rows, list):
-            return None
-        candidates = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            origin_parent_task_id = str(row.get("parent_task_id") or row.get("linked_task_id") or "").strip()
-            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
-            origin_item_key = str(row.get("parent_stage_item_key") or "").strip()
-            if origin_parent_task_id and origin_parent_task_id != str(task.id or "").strip():
-                continue
-            if item_id and origin_item_id == item_id:
-                candidates.append(row)
-                continue
-            if item_key and origin_item_key == item_key:
-                candidates.append(row)
-        if not candidates:
-            return None
-        candidates.sort(key=self._sort_downstream_payload_priority)
-        selected = candidates[0]
-        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
-        current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
-        return selected
-
-    async def _find_reusable_system_analysis_payload(
-        self,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        token: str | None = None,
-    ) -> dict[str, Any] | None:
-        item_key = str(item.item_key or "").strip()
-        if not item_key:
-            return None
-        try:
-            listed = await self._downstream_list_tasks(
-                service="system_analyse",
-                project_id=task.project_id,
-                token=self._resolve_downstream_token(token),
-                parent_task_id=task.id,
-                per_page=100,
-                sort_by="updated_at",
-                sort_order="desc",
-            )
-        except Exception:
-            return None
-        rows = listed.get("items") if isinstance(listed, dict) else None
-        if not isinstance(rows, list):
-            return None
-        candidates = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
-            row_item_key = str(row.get("item_key") or row.get("firmware_key") or "").strip()
-            if origin_item_id and origin_item_id == str(item.id or "").strip():
-                candidates.append(row)
-                continue
-            if row_item_key and row_item_key == item_key:
-                candidates.append(row)
-        if not candidates:
-            return None
-        candidates.sort(key=self._sort_downstream_payload_priority)
-        selected = candidates[0]
-        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
-        current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
-        return selected
-
-    async def _find_reusable_b2s_payload(
-        self,
-        task: BinarySecurityTask,
-        item: BinarySecurityStageItem,
-        token: str | None = None,
-    ) -> dict[str, Any] | None:
-        item_id = str(item.id or "").strip()
-        item_key = str(item.item_key or "").strip()
-        if not item_id and not item_key:
-            return None
-        try:
-            listed = await self._downstream_list_tasks(
-                service="binary_to_source",
-                project_id=task.project_id,
-                token=token,
-                parent_task_id=task.id,
-                parent_stage_item_id=item_id or None,
-                limit=100,
-                offset=0,
-            )
-        except Exception:
-            return None
-        rows = listed.get("items") if isinstance(listed, dict) else None
-        if not isinstance(rows, list):
-            return None
-        candidates = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            origin_item_id = str(row.get("parent_stage_item_id") or "").strip()
-            origin_item_key = str(row.get("parent_stage_item_key") or "").strip()
-            if item_id and origin_item_id == item_id:
-                candidates.append(row)
-                continue
-            if item_key and origin_item_key == item_key:
-                candidates.append(row)
-        if not candidates:
-            return None
-        candidates.sort(key=self._sort_downstream_payload_priority)
-        selected = candidates[0]
-        selected_task_id = str(selected.get("task_id") or selected.get("id") or "").strip()
-        current_task_id = str(item.downstream_task_id or "").strip()
-        if selected_task_id and selected_task_id != current_task_id:
-            item.downstream_task_id = selected_task_id
-        return selected
+        return None, self._entry_payload_binding_mismatch_payload(item, payload)
 
     async def _duplicate_downstream_refs_for_item(
         self,

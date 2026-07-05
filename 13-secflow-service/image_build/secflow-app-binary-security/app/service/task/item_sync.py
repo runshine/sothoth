@@ -1482,49 +1482,39 @@ class TaskItemSyncServiceMixin:
         ready_items: list[BinarySecurityStageItem] = []
         for item in items:
             if self._item_needs_downstream_binding_reconcile(item):
-                recovered, outcome = await self._attempt_vuln_downstream_binding_recovery(
+                skipped_count += 1
+                binding_payload = {
+                    "operation": "downstream_sync",
+                    "sync_status": "binding_mismatch",
+                    "reason_code": "missing_bound_downstream_task_id",
+                    "downstream_service": str(item.downstream_service or "").strip() or None,
+                    "binding_state": self._downstream_binding_state(item),
+                    "expected_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    "expected_parent_stage_item_id": str(item.id or "").strip() or None,
+                    "expected_parent_stage_item_key": str(item.item_key or "").strip() or None,
+                }
+                self._record_binding_mismatch_event(
                     db,
                     task,
                     item,
-                    token=auth_token,
-                    force=force,
+                    event_type="downstream_binding_missing",
+                    message="下游绑定缺失，当前仅允许通过已绑定 child 同步，已跳过本次自动对账",
+                    payload=binding_payload,
                 )
-                if recovered:
-                    synced_count += 1
-                    touched_stages.add(item.stage_name)
-                else:
-                    if outcome in {"retry_not_due", "invalid_input", "failed_final", "create_failed"}:
-                        skipped_count += 1
-                    else:
-                        failed_count += 1
-                if not str(item.downstream_task_id or "").strip():
-                    continue
-                if not item.downstream_service or not item.downstream_task_id:
-                    skipped_count += 1
-                    if record_noop_events:
-                        self._record_event(
-                            db,
-                        task,
-                        "downstream_status_sync_skipped",
-                        "跳过同步：子任务缺少下游服务或任务ID",
-                        level="warning",
-                        stage_name=item.stage_name,
-                            item=item,
-                            payload={"binding_state": self._downstream_binding_state(item)},
-                        )
-                        self._record_downstream_sync_event(
-                            db,
-                            task=task,
-                            item=item,
-                            stage_name=item.stage_name,
-                            operation="downstream_sync",
-                            event_type="skipped",
-                            sync_status="skipped",
-                            outcome="missing_downstream_binding",
-                            state_applied=False,
-                            payload={"binding_state": self._downstream_binding_state(item)},
-                        )
-                    continue
+                if not self._persist_child_sync_observation(
+                    db,
+                    task=task,
+                    item=item,
+                    change_source="downstream_sync",
+                    sync_status="binding_mismatch",
+                    synced_at=task_manager_module._now(),
+                    error_message="下游绑定缺失：未记录 downstream_task_id，禁止通过列表接口推断或复用 child",
+                    error_type="missing_bound_downstream_task_id",
+                    state_applied=False,
+                    extra_payload=binding_payload,
+                ):
+                    failed_count += 1
+                continue
             ready_items.append(item)
 
         fetch_results = await self._run_with_limits(
@@ -1549,14 +1539,12 @@ class TaskItemSyncServiceMixin:
                 if item.downstream_service == "entry_analyse":
                     payload, rebound_notice_payload = await self._reconcile_entry_payload_binding(task, item, payload, auth_token)
                     if rebound_notice_payload is not None:
-                        self._record_event(
+                        self._record_binding_mismatch_event(
                             db,
                             task,
-                            "downstream_parent_mismatch",
-                            "下游子任务绑定到旧轮次阶段项，已阻断旧轮次状态回写",
-                            level="warning",
-                            stage_name=item.stage_name,
                             item=item,
+                            event_type="downstream_parent_mismatch",
+                            message="下游子任务绑定校验失败：当前只接受绑定 child 的 /tasks/{id} 结果，已阻断状态回写",
                             payload=rebound_notice_payload,
                         )
                     if payload is None:
@@ -1570,7 +1558,10 @@ class TaskItemSyncServiceMixin:
                             error_message="下游子任务仍绑定旧轮次阶段项",
                             error_type="parent_mismatch",
                             state_applied=False,
-                            extra_payload={"operation": "downstream_sync"},
+                            extra_payload={
+                                "operation": "downstream_sync",
+                                **dict(rebound_notice_payload or {}),
+                            },
                         ):
                             failed_count += 1
                             continue

@@ -668,23 +668,6 @@ class TaskRuntimeServiceMixin:
             return True, mapped_status
         return False, mapped_status
 
-    def _allow_reusable_downstream_payload(
-        self: TaskManager,
-        task,
-        *,
-        retrying: bool,
-    ) -> bool:
-        if retrying:
-            return False
-        cleanup_snapshot = dict(getattr(task, "cleanup_snapshot", None) or {})
-        if not cleanup_snapshot:
-            return True
-        previous_epoch = int(cleanup_snapshot.get("previous_epoch") or 0)
-        current_epoch = int(getattr(task, "execution_epoch", 0) or 0)
-        if current_epoch > previous_epoch:
-            return False
-        return True
-
     async def _sync_streaming_task_tail_state(self: TaskManager, task_id: str) -> None:
         from pathlib import Path
 
@@ -3958,47 +3941,7 @@ class TaskRuntimeServiceMixin:
                 )
                 created = None
             else:
-                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_firmware_unpack_payload(
-                    task,
-                    item,
-                    token,
-                )
-                if reusable_payload is not None:
-                    downstream_status = str(reusable_payload.get("status") or "").lower()
-                    mapped_reusable_status = self._map_downstream_status(downstream_status)
-                    item.downstream_task_id = (
-                        reusable_payload.get("task_id") or reusable_payload.get("id") or item.downstream_task_id
-                    )
-                    await self._cleanup_duplicate_downstream_refs_for_item(
-                        session,
-                        task,
-                        item,
-                        token,
-                        keep_task_ids={str(item.downstream_task_id or "").strip()},
-                    )
-                    self._merge_stage_item_result_fields(
-                        task,
-                        item,
-                        stage_name=stage_run.stage_name,
-                        updates={"project_id": task.project_id},
-                    )
-                    if mapped_reusable_status in {"queued", "running"}:
-                        item.status = mapped_reusable_status
-                        item.started_at = item.started_at or _now()
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"success"},
-                            failure_statuses={"failed", "cancelled"},
-                            task=task,
-                            item=item,
-                        )
-                    else:
-                        payload = dict(reusable_payload)
-                        status = self._status_from_downstream_payload(payload, success_statuses={"success"})
-                        session.commit()
-                    created = None
-                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -4594,33 +4537,7 @@ class TaskRuntimeServiceMixin:
                     item=item,
                 )
             else:
-                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_b2s_payload(task, item, token)
-                if reusable_payload is not None:
-                    downstream_status = str(reusable_payload.get("status") or "").lower()
-                    mapped_reusable_status = self._map_downstream_status(downstream_status)
-                    if mapped_reusable_status in {"queued", "running"}:
-                        item.status = mapped_reusable_status
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"success", "partial_success", "completed"},
-                            failure_statuses={"failed", "cancelled"},
-                            task=task,
-                            item=item,
-                        )
-                    else:
-                        session.commit()
-                        payload = await self._downstream_fetch_item_payload(task, item, token or "")
-                        downstream_status = str(payload.get("status") or "").lower()
-                        if downstream_status in {"success", "partial_success", "completed"}:
-                            status = "success"
-                        elif downstream_status == "cancelled":
-                            status = "cancelled"
-                        elif downstream_status == "downstream_missing":
-                            status = "downstream_missing"
-                        else:
-                            status = "failed"
-                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -5286,7 +5203,6 @@ class TaskRuntimeServiceMixin:
                 line_hint = definition_line if definition_line.upper().startswith("L") else f"L{definition_line}"
             dataflow_success_statuses = {"passed", "success", "completed_limited"}
             dataflow_failure_statuses = {"failed", "error", "cancelled", "invalid_input"}
-            allow_rebind = not auto_retrying
             if active_payload is not None:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
@@ -5299,44 +5215,7 @@ class TaskRuntimeServiceMixin:
                     item=item,
                 )
             else:
-                reusable_payload = None if not self._allow_reusable_downstream_payload(task, retrying=retrying) else await self._find_reusable_dataflow_payload(
-                    task,
-                    item,
-                    allow_rebind=allow_rebind,
-                )
-                if reusable_payload is not None:
-                    downstream_status = str(reusable_payload.get("status") or "").lower()
-                    mapped_reusable_status = self._map_downstream_status(downstream_status)
-                    await self._cleanup_duplicate_downstream_refs_for_item(
-                        session,
-                        task,
-                        item=item,
-                        token=token,
-                        keep_task_ids={str(item.downstream_task_id or "").strip()},
-                    )
-                    if mapped_reusable_status in {"queued", "running"}:
-                        item.status = mapped_reusable_status
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses=dataflow_success_statuses,
-                            failure_statuses=dataflow_failure_statuses,
-                            task=task,
-                            item=item,
-                        )
-                    else:
-                        session.commit()
-                        payload = await self._downstream_fetch_item_payload(task, item, None)
-                        downstream_status = str(payload.get("status") or "").lower()
-                        if downstream_status in dataflow_success_statuses:
-                            status = "success"
-                        elif downstream_status == "cancelled":
-                            status = "cancelled"
-                        elif downstream_status == "downstream_missing":
-                            status = "downstream_missing"
-                        else:
-                            status = "failed"
-                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
+                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
                     session.commit()
                     payload = await self._downstream_fetch_item_payload(task, item, None)
                     status = self._status_from_downstream_payload(payload, success_statuses=dataflow_success_statuses)
