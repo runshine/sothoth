@@ -152,7 +152,7 @@ class ParentRuntimeControlRecoveryTests(unittest.TestCase):
         )
 
         self.assertTrue(released)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("op-new", task.current_operation_id)
         self.assertEqual("superseded", older.status)
 
@@ -160,7 +160,7 @@ class ParentRuntimeControlRecoveryTests(unittest.TestCase):
         claimed = manager._dispatch_task_by_id(db, task.id)
 
         self.assertEqual(task.id, claimed)
-        self.assertEqual("running", task.status)
+        self.assertEqual("dispatching", task.status)
         self.assertEqual("local-worker", task.dispatcher_instance_id)
         self.assertIsNotNone(task.dispatch_started_at)
         self.assertIsNotNone(task.lease_expires_at)

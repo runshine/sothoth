@@ -1385,6 +1385,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             await self.manager._reconcile_work_queues_once(db)
 
         self.assertEqual([("task-running-stale-owner", "queue_reconcile_active_nonpending_reenqueue")], pushed)
+        self.assertEqual("pending", task.status)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertIn("active_nonpending_stale_owner_reenqueued", [row.event_type for row in db.events])
 

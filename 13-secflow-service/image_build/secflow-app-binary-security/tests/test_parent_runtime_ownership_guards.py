@@ -317,3 +317,31 @@ class ParentRuntimeOwnershipGuardTests(unittest.TestCase):
         self.assertEqual("pending", task.status)
         self.assertIsNone(task.dispatcher_instance_id)
         self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))
+
+    def test_release_unsupported_task_row_owner_downgrades_running_task_to_pending_after_runtime_lease_expiry(self):
+        self.manager.instance_id = "worker-new"
+        task = self._task(
+            id="task-running-release-expired",
+            status="running",
+            current_stage="entry_analysis",
+            dispatcher_instance_id="worker-dead",
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-dead",
+            lease_expires_at=_now() - timedelta(minutes=1),
+            heartbeat_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[expired_lease], events=[])
+
+        released = self.manager._release_unsupported_task_row_owner(
+            db,
+            task,
+            reason="unit_test_release_running_to_pending_after_lease_expiry",
+        )
+
+        self.assertTrue(released)
+        self.assertEqual("pending", task.status)
+        self.assertIsNone(task.dispatcher_instance_id)
+        self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))

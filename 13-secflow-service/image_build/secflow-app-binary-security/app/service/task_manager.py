@@ -3584,23 +3584,12 @@ class TaskManager(
             return False
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
-        if previous_status == "running":
+        if previous_status in {"running", "dispatching"}:
             self._apply_release_for_takeover_main_state(
                 db,
                 task,
                 source="task_manager",
-                reason="检测到任务 owner 元数据漂移，释放 owner 但保持任务运行态等待重新接管",
-                status="running",
-                stage_name=task.current_stage,
-                finished_at=None,
-                last_error=None,
-            )
-        elif previous_status == "dispatching":
-            self._apply_release_for_takeover_main_state(
-                db,
-                task,
-                source="task_manager",
-                reason="检测到 dispatching 任务 owner 元数据漂移，释放 owner 并等待重新调度",
+                reason="检测到任务 owner 元数据漂移，已释放 owner 并回到可重新调度态等待新实例接管",
                 status="pending",
                 stage_name=task.current_stage,
                 finished_at=None,
