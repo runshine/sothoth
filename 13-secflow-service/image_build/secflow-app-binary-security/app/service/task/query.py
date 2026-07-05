@@ -32,6 +32,8 @@ from app.schemas import (
     BinarySecurityDeleteQueueResponse,
     BinarySecurityOverviewResponse,
     BinarySecurityProjectStats,
+    BinarySecurityStageItemSummaryResponse,
+    BinarySecurityStageItemDetailResponse,
     BinarySecurityStageSummary,
     BinarySecurityStageItemPageResponse,
     BinarySecurityTaskDetailResponse,
@@ -55,6 +57,39 @@ logger = logging.getLogger(__name__)
 
 
 class TaskQueryServiceMixin:
+    def _stage_item_summary_response(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+    ) -> BinarySecurityStageItemSummaryResponse:
+        detail = self._stage_item_response(task, item, archive_jobs=archive_jobs)
+        payload = detail.model_dump(exclude={"input_ref", "output_ref", "result"})
+        return BinarySecurityStageItemSummaryResponse(**payload)
+
+    def _task_summary_for_lite_detail_response(self: TaskManager, task) -> dict[str, Any]:
+        summary_payload = dict(self._task_summary_for_detail_response(task) or {})
+        heavy_keys = {
+            "entry_results",
+            "dataflow_results",
+            "vuln_results",
+            "input_files",
+            "candidate_modules",
+            "selected_modules",
+            "system_analysis_modules",
+            "b2s_results",
+        }
+        for key in heavy_keys:
+            summary_payload.pop(key, None)
+        entry_selection = summary_payload.get("entry_selection")
+        if isinstance(entry_selection, dict):
+            trimmed_entry_selection = dict(entry_selection)
+            trimmed_entry_selection.pop("selected_entries", None)
+            trimmed_entry_selection.pop("candidate_entries", None)
+            summary_payload["entry_selection"] = trimmed_entry_selection
+        return summary_payload
+
     def _task_list_latest_stage_runs_by_task(
         self: TaskManager,
         db: Session,
@@ -786,19 +821,6 @@ class TaskQueryServiceMixin:
                 projection_only=True,
             ).model_dump()
             base.pop("execution_epoch", None)
-            archive_jobs_by_item = self._archive_jobs_by_item_id(ctx.archive_jobs)
-            archive_job_responses = self._archive_job_responses(db, ctx.task, ctx.archive_jobs)
-            stage_item_responses = [
-                self._stage_item_response(ctx.task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
-                for item in ctx.stage_items[: self._detail_stage_items_limit()]
-            ]
-            overview_nodes = self._build_stage_overview_nodes(
-                db,
-                ctx.task,
-                ctx.stage_summaries,
-                archive_job_responses,
-                ctx.stage_items[: self._detail_stage_items_limit()],
-            )
             response = BinarySecurityTaskDetailResponse(
                 **base,
                 execution_epoch=int(getattr(ctx.task, "execution_epoch", 0) or 0),
@@ -817,15 +839,15 @@ class TaskQueryServiceMixin:
                     ctx.task,
                     stage_sequence=ctx.stage_sequence,
                 ),
-                summary=self._task_summary_for_detail_response(ctx.task),
+                summary=self._task_summary_for_lite_detail_response(ctx.task),
                 metrics=ctx.task.metrics,
                 item_stats=ctx.item_stats,
                 stage_items_total=ctx.stage_items_total,
-                stage_items_truncated=ctx.stage_items_total > self._detail_stage_items_limit(),
-                stage_items=stage_item_responses,
-                archive_jobs=archive_job_responses,
+                stage_items_truncated=ctx.stage_items_total > 0,
+                stage_items=[],
+                archive_jobs=[],
                 abnormal_reason_history=[],
-                overview_nodes=overview_nodes,
+                overview_nodes=[],
                 orchestration_observability={},
                 cleanup_snapshot=dict(ctx.task.cleanup_snapshot or {}),
                 runtime_health=self._build_task_runtime_health(db, ctx.task, ctx=ctx),
@@ -883,7 +905,7 @@ class TaskQueryServiceMixin:
         rows = query.order_by(BinarySecurityStageItem.created_at.asc(), BinarySecurityStageItem.id.asc()).all()
         archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalized_stage_name)
         item_responses = [
-            self._stage_item_response(task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
+            self._stage_item_summary_response(task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
             for item in rows
         ]
         item_responses = self._filter_stage_item_responses(
@@ -907,6 +929,29 @@ class TaskQueryServiceMixin:
             per_page=per_page,
             items=item_responses[start:end],
         )
+
+    def get_task_stage_item_detail(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        item_id: str,
+    ) -> BinarySecurityStageItemDetailResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        item = (
+            db.query(BinarySecurityStageItem)
+            .filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.id == item_id,
+            )
+            .first()
+        )
+        if item is None:
+            raise NotFoundError("阶段子任务不存在")
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalize_stage_name(item.stage_name))
+        detail = self._stage_item_response(task, item, archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []))
+        return BinarySecurityStageItemDetailResponse(**detail.model_dump())
 
     def get_task_overview(self: TaskManager, db: Session, *, project_id: str, task_id: str) -> BinarySecurityOverviewResponse:
         def _build() -> BinarySecurityOverviewResponse:

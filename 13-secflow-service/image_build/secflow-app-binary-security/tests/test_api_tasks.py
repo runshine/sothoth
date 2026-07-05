@@ -29,8 +29,9 @@ from app.schemas import (
     BinarySecurityProjectConfigResponse,
     BinarySecurityServiceConfigPayload,
     BinarySecurityServiceConfigResponse,
+    BinarySecurityStageItemDetailResponse,
     BinarySecurityStageItemPageResponse,
-    BinarySecurityStageItemResponse,
+    BinarySecurityStageItemSummaryResponse,
     BinarySecurityStageSummary,
     BinarySecurityTaskPolicyConfigPayload,
     BinarySecurityTaskPolicyConfigResponse,
@@ -149,7 +150,7 @@ class _RouteManagerStub:
             page=page,
             per_page=per_page,
             items=[
-                BinarySecurityStageItemResponse(
+                BinarySecurityStageItemSummaryResponse(
                     id="i-df-1",
                     stage_name=stage_name,
                     item_key="entry-a",
@@ -158,11 +159,28 @@ class _RouteManagerStub:
                     status="queued",
                     downstream_service="dataflow_vuln_scan",
                     downstream_task_id="dfa-1",
-                    input_ref={"upstream_item_id": "i-entry-1"},
                     sync_status="pending",
                     last_synced_at=None,
                 )
             ],
+        )
+
+    def get_task_stage_item_detail(self, db, *, project_id, task_id, item_id):
+        self.calls.append(("get_task_stage_item_detail", db, project_id, task_id, item_id))
+        return BinarySecurityStageItemDetailResponse(
+            id=item_id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-a",
+            item_name="func_a",
+            parent_key="mod-a",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dfa-1",
+            sync_status="pending",
+            last_synced_at=None,
+            input_ref={"upstream_item_id": "i-entry-1"},
+            output_ref={"artifact_root": "/tmp/out"},
+            result={"entry_count": 3},
         )
 
     def get_project_config(self, db, project_id):
@@ -780,7 +798,7 @@ class TaskApiRouteTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(2, payload["page"])
         self.assertEqual(2000, payload["per_page"])
-        self.assertEqual("i-entry-1", payload["items"][0]["input_ref"]["upstream_item_id"])
+        self.assertNotIn("input_ref", payload["items"][0])
         self.assertEqual(
             (
                 "get_task_stage_items_page",
@@ -796,6 +814,27 @@ class TaskApiRouteTests(unittest.TestCase):
                 2,
                 2000,
             ),
+            manager.calls[0],
+        )
+
+    def test_get_task_stage_item_detail_route_returns_heavy_contract_payload(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.get(
+                    "/api/app/binary-security/projects/p1/tasks/t1/stage-items/i-df-1",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual("i-entry-1", payload["input_ref"]["upstream_item_id"])
+        self.assertEqual("/tmp/out", payload["output_ref"]["artifact_root"])
+        self.assertEqual(3, payload["result"]["entry_count"])
+        self.assertEqual(
+            ("get_task_stage_item_detail", fake_db, "p1", "t1", "i-df-1"),
             manager.calls[0],
         )
 

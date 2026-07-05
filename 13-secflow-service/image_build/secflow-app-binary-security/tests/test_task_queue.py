@@ -127,6 +127,7 @@ class _FakeRedisPingFlaky(_FakeRedis):
     def __init__(self, failures_before_success):
         super().__init__()
         self.failures_before_success = failures_before_success
+        self.closed = False
 
     async def ping(self):
         self.ping_calls += 1
@@ -134,6 +135,45 @@ class _FakeRedisPingFlaky(_FakeRedis):
             self.failures_before_success -= 1
             raise RedisTimeoutError("Timeout connecting to server")
         return True
+
+    async def aclose(self):
+        self.closed = True
+        return None
+
+
+class _FakeRedisPushConnectionFlaky(_FakeRedis):
+    def __init__(self, failures_before_success):
+        super().__init__()
+        self.failures_before_success = failures_before_success
+        self.closed = False
+
+    async def sadd(self, key, value):
+        if self.failures_before_success > 0:
+            self.failures_before_success -= 1
+            raise RedisConnectionError("Connection closed by server")
+        return await super().sadd(key, value)
+
+    async def aclose(self):
+        self.closed = True
+        return None
+
+
+class _FakeRedisTaskSyncDueFlaky(_FakeRedis):
+    def __init__(self, failures_before_success):
+        super().__init__()
+        self.failures_before_success = failures_before_success
+        self.closed = False
+
+    async def zrangebyscore(self, key, min_score, max_score, start=0, num=None):
+        del key, min_score, max_score, start, num
+        if self.failures_before_success > 0:
+            self.failures_before_success -= 1
+            raise RedisConnectionError("Connection closed by server")
+        return ["tsq-1"]
+
+    async def aclose(self):
+        self.closed = True
+        return None
 
 
 async def _bind_client_for_current_loop(queue: TaskQueue, client) -> None:
@@ -234,31 +274,48 @@ class TaskQueueTests(unittest.TestCase):
 
     def test_pop_task_treats_redis_timeout_as_empty_poll(self):
         queue = TaskQueue()
-        fake = _FakeRedisTimeout()
+        first = _FakeRedisTimeout()
+        second = _FakeRedis()
+        second.lists[queue.config.task_queue_key] = ["task-1"]
+        created = []
 
-        async def _exercise():
-            await _bind_client_for_current_loop(queue, fake)
-            return await queue.pop_task(timeout_seconds=1)
+        with mock.patch.object(queue, "_new_client") as new_client:
+            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
 
-        popped = asyncio.run(_exercise())
+            async def _no_sleep(_seconds):
+                return None
 
-        self.assertIsNone(popped)
-        self.assertTrue(fake.closed)
-        self.assertEqual({}, queue._clients_by_loop_id)
+            with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+                async def _exercise():
+                    return await queue.pop_task(timeout_seconds=1)
+
+                popped = asyncio.run(_exercise())
+
+        self.assertEqual("task-1", popped)
+        self.assertTrue(first.closed)
 
     def test_queue_stats_returns_empty_snapshot_after_connection_error(self):
         queue = TaskQueue()
-        fake = _FakeRedisStatsConnectionError()
+        first = _FakeRedisStatsConnectionError()
+        second = _FakeRedis()
+        second.lists[queue.config.task_queue_key] = ["task-1"]
+        second.sorted_sets[f"{queue.config.task_queue_key}:enqueued_at"] = {"task-1": 1.0}
+        created = []
 
-        async def _exercise():
-            await _bind_client_for_current_loop(queue, fake)
-            return await queue.queue_stats(queue.config.task_queue_key)
+        with mock.patch.object(queue, "_new_client") as new_client:
+            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
 
-        stats = asyncio.run(_exercise())
+            async def _no_sleep(_seconds):
+                return None
 
-        self.assertEqual({"length": 0, "oldest_age_seconds": 0.0}, stats)
-        self.assertTrue(fake.closed)
-        self.assertEqual({}, queue._clients_by_loop_id)
+            with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+                async def _exercise():
+                    return await queue.queue_stats(queue.config.task_queue_key)
+
+                stats = asyncio.run(_exercise())
+
+        self.assertEqual(1, stats["length"])
+        self.assertTrue(first.closed)
 
     def test_snapshot_marks_operation_queue_disabled_under_owner_only_runtime(self):
         queue = TaskQueue()
@@ -290,19 +347,24 @@ class TaskQueueTests(unittest.TestCase):
 
     def test_wait_until_ready_retries_until_ping_succeeds(self):
         queue = TaskQueue()
-        fake = _FakeRedisPingFlaky(failures_before_success=2)
+        first = _FakeRedisPingFlaky(failures_before_success=1)
+        second = _FakeRedisPingFlaky(failures_before_success=0)
+        created = []
 
-        async def _no_sleep(_seconds):
-            return None
+        with mock.patch.object(queue, "_new_client") as new_client:
+            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
 
-        with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
-            async def _exercise():
-                await _bind_client_for_current_loop(queue, fake)
-                await queue.wait_until_ready(timeout_seconds=3, retry_interval_seconds=1)
+            async def _no_sleep(_seconds):
+                return None
 
-            asyncio.run(_exercise())
+            with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+                async def _exercise():
+                    await queue.wait_until_ready(timeout_seconds=3, retry_interval_seconds=1)
 
-        self.assertEqual(3, fake.ping_calls)
+                asyncio.run(_exercise())
+
+        self.assertTrue(first.closed)
+        self.assertGreaterEqual(second.ping_calls, 1)
 
     def test_wait_until_ready_times_out_when_ping_never_recovers(self):
         queue = TaskQueue()
@@ -311,18 +373,16 @@ class TaskQueueTests(unittest.TestCase):
         async def _no_sleep(_seconds):
             return None
 
-        monotonic_values = iter([0.0, 0.0, 0.6, 1.2] + [2.0] * 64)
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            task = asyncio.create_task(queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1))
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
-        with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep), mock.patch(
-            "app.service.task_queue.time.monotonic",
-            side_effect=lambda: next(monotonic_values),
-        ):
-            with self.assertRaises(TimeoutError):
-                async def _exercise():
-                    await _bind_client_for_current_loop(queue, fake)
-                    await queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1)
-
-                asyncio.run(_exercise())
+        with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+            asyncio.run(_exercise())
 
     def test_new_client_is_cached_within_same_loop(self):
         queue = TaskQueue()
@@ -401,6 +461,69 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual(0, snapshot["orphan_count"])
         self.assertEqual(1, len(queue._clients_by_loop_id))
+
+    def test_push_task_rebuilds_cached_client_after_connection_error(self):
+        queue = TaskQueue()
+        first = _FakeRedisPushConnectionFlaky(failures_before_success=1)
+        second = _FakeRedis()
+        created = []
+
+        with mock.patch.object(queue, "_new_client") as new_client:
+            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+
+            async def _no_sleep(_seconds):
+                return None
+
+            with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+                async def _exercise():
+                    await queue.push_task("task-1")
+
+                asyncio.run(_exercise())
+
+        self.assertTrue(first.closed)
+        self.assertEqual(["task-1"], second.lists[queue.config.task_queue_key])
+
+    def test_has_due_task_sync_request_rebuilds_cached_client_after_connection_error(self):
+        queue = TaskQueue()
+        first = _FakeRedisTaskSyncDueFlaky(failures_before_success=1)
+        second = _FakeRedisTaskSyncDueFlaky(failures_before_success=0)
+        created = []
+
+        with mock.patch.object(queue, "_new_client") as new_client:
+            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+
+            async def _no_sleep(_seconds):
+                return None
+
+            with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+                async def _exercise():
+                    return await queue.has_due_task_sync_request("task-1")
+
+                due = asyncio.run(_exercise())
+
+        self.assertTrue(first.closed)
+        self.assertTrue(due)
+
+    def test_wait_until_ready_retries_forever_until_ping_succeeds(self):
+        queue = TaskQueue()
+        first = _FakeRedisPingFlaky(failures_before_success=1)
+        second = _FakeRedisPingFlaky(failures_before_success=0)
+        created = []
+
+        with mock.patch.object(queue, "_new_client") as new_client:
+            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+
+            async def _no_sleep(_seconds):
+                return None
+
+            with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+                async def _exercise():
+                    await queue.wait_until_ready(timeout_seconds=1, retry_interval_seconds=1)
+
+                asyncio.run(_exercise())
+
+        self.assertTrue(first.closed)
+        self.assertGreaterEqual(second.ping_calls, 1)
 
 
 if __name__ == "__main__":

@@ -472,7 +472,7 @@ class BinarySecurityDeleteQueueResponse(BinarySecurityBaseModel):
     )
 
 
-class BinarySecurityStageItemResponse(BinarySecurityBaseModel):
+class BinarySecurityStageItemSummaryResponse(BinarySecurityBaseModel):
     id: str
     stage_name: str
     item_key: str
@@ -504,9 +504,7 @@ class BinarySecurityStageItemResponse(BinarySecurityBaseModel):
     failure_message: Optional[str] = None
     downstream_business_status: Optional[str] = None
     orchestrator_error: Optional[str] = None
-    input_ref: dict[str, Any] = Field(default_factory=dict)
-    output_ref: dict[str, Any] = Field(default_factory=dict)
-    result: dict[str, Any] = Field(default_factory=dict)
+    entry_count: Optional[int] = None
     error_message: Optional[str] = None
     abnormal_reason: Optional[BinarySecurityAbnormalReason] = None
     sync_status: Optional[str] = None
@@ -527,6 +525,16 @@ class BinarySecurityStageItemResponse(BinarySecurityBaseModel):
     latest_started_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+
+
+class BinarySecurityStageItemDetailResponse(BinarySecurityStageItemSummaryResponse):
+    input_ref: dict[str, Any] = Field(default_factory=dict)
+    output_ref: dict[str, Any] = Field(default_factory=dict)
+    result: dict[str, Any] = Field(default_factory=dict)
+
+
+class BinarySecurityStageItemResponse(BinarySecurityStageItemDetailResponse):
+    """Backward-compatible alias for internal heavy stage-item response usage."""
 
 
 class BinarySecurityArchiveJobResponse(BinarySecurityBaseModel):
@@ -736,7 +744,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     item_stats: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_items_total: int = 0
     stage_items_truncated: bool = False
-    stage_items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
+    stage_items: list[BinarySecurityStageItemSummaryResponse] = Field(default_factory=list)
     archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
     overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)
     orchestration_observability: dict[str, Any] = Field(default_factory=dict)
@@ -757,7 +765,7 @@ class BinarySecurityStageItemPageResponse(BinarySecurityBaseModel):
     total: int = 0
     page: int = 1
     per_page: int = 100
-    items: list[BinarySecurityStageItemResponse] = Field(default_factory=list)
+    items: list[BinarySecurityStageItemSummaryResponse] = Field(default_factory=list)
 
 
 class BinarySecurityArchiveJobPageResponse(BinarySecurityBaseModel):

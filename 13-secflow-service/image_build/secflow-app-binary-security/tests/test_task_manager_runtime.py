@@ -971,8 +971,13 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             runtime_phase="owned_execution",
             dispatcher_instance_id="worker-a",
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
-        manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: True
+        active_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=2),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[active_lease])
 
         claimed = manager._dispatch_task_by_id(db, task.id)
 
@@ -1067,6 +1072,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
     def test_dispatch_task_by_id_allows_running_stale_owner_after_runtime_lease_expiry(self):
         manager = TaskManager()
         manager.instance_id = "worker-new"
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        manager._enqueue_task_with_context = lambda *_args, **_kwargs: None
         task = BinarySecurityTask(
             id="task-running-expired-lease",
             project_id="project-1",
@@ -1116,6 +1123,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager = TaskManager()
         manager.instance_id = "worker-new"
         manager._enqueue_task = lambda *_args, **_kwargs: None
+        manager._enqueue_task_with_context = lambda *_args, **_kwargs: None
         task = BinarySecurityTask(
             id="task-running-ownerless-expired-lease",
             project_id="project-1",
@@ -1158,6 +1166,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager = TaskManager()
         manager.instance_id = "worker-new"
         manager._enqueue_task = lambda *_args, **_kwargs: None
+        manager._enqueue_task_with_context = lambda *_args, **_kwargs: None
         task = BinarySecurityTask(
             id="task-running-ownerless-expired-lease-stale-op",
             project_id="project-1",

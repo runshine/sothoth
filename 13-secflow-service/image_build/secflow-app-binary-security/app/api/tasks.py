@@ -32,6 +32,7 @@ from app.schemas import (
     BinarySecurityTaskPolicyConfigPayload,
     BinarySecurityTaskPolicyConfigResponse,
     BinarySecurityServiceConfigResponse,
+    BinarySecurityStageItemDetailResponse,
     BinarySecurityStateEventInboxPageResponse,
     BinarySecurityStageItemPageResponse,
     BinarySecuritySyncEventPageResponse,
@@ -366,6 +367,22 @@ def get_task_stage_items(
         sort_direction=sort_direction,
         page=page,
         per_page=per_page,
+    )
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/stage-items/{item_id}", response_model=BinarySecurityStageItemDetailResponse)
+def get_task_stage_item_detail(
+    project_id: str,
+    task_id: str,
+    item_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_task_stage_item_detail(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        item_id=item_id,
     )
 
 

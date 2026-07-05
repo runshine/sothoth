@@ -2,20 +2,16 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import time
 from typing import Any
 
-from redis.asyncio import Redis
-
 from app.config import get_config
 from app.observability import CONTENT_TYPE_LATEST
 from app.service.task_queue import (
     DEFAULT_QUEUE_CONTEXT,
-    REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
-    REDIS_SOCKET_TIMEOUT_SECONDS,
+    RedisSelfHealingClientHelper,
 )
 
 
@@ -28,31 +24,11 @@ _SNAPSHOT_KEY = "secflow:binary-security:state-event-inbox:metrics-snapshot:v1"
 class StateEventInboxMetricsSnapshotStore:
     def __init__(self) -> None:
         self._redis_url = get_config().queue.redis_url
-        self._lock = asyncio.Lock()
-        self._client: Redis | None = None
-
-    def _new_client(self, *, context: str = "state_event_inbox_metrics_snapshot") -> Redis:
-        logger.info(
-            "binary-security state event inbox metrics redis client creating: context=%s redis_url=%s socket_connect_timeout=%s socket_timeout=%s",
-            str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
-            str(self._redis_url or "").strip() or None,
-            REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
-            REDIS_SOCKET_TIMEOUT_SECONDS,
+        self._redis_helper = RedisSelfHealingClientHelper(
+            redis_url=self._redis_url,
+            client_log_name="state event inbox metrics redis client",
+            client_type="state_event_inbox_metrics_snapshot",
         )
-        return Redis.from_url(
-            self._redis_url,
-            decode_responses=True,
-            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
-            socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
-            health_check_interval=30,
-            socket_keepalive=True,
-        )
-
-    async def _client_or_create(self, *, context: str = "state_event_inbox_metrics_snapshot") -> Redis:
-        async with self._lock:
-            if self._client is None:
-                self._client = self._new_client(context=context)
-            return self._client
 
     async def write_snapshot(
         self,
@@ -61,27 +37,34 @@ class StateEventInboxMetricsSnapshotStore:
         source_pod: str,
         generated_at: float | None = None,
     ) -> None:
-        client = await self._client_or_create(context="state_event_inbox_metrics_snapshot")
         created_at = float(generated_at or time.time())
         payload = {
             "metrics_payload": str(metrics_payload or ""),
             "source_pod": str(source_pod or "unknown"),
             "generated_at": created_at,
         }
-        try:
+
+        async def _write(client):
             encoded = json.dumps(payload, ensure_ascii=True)
             await client.set(_SNAPSHOT_KEY, encoded, ex=_SNAPSHOT_TTL_SECONDS)
-        except Exception:
-            await self._close_client(client)
-            raise
+
+        await self._redis_helper.execute_with_rebuild_forever(
+            "state_event_inbox_metrics_snapshot_write",
+            context="state_event_inbox_metrics_snapshot",
+            fn=_write,
+        )
 
     async def read_snapshot(self) -> dict[str, Any] | None:
-        client = await self._client_or_create(context="state_event_inbox_metrics_snapshot")
-        try:
+
+        async def _read(client):
             raw = await client.get(_SNAPSHOT_KEY)
-        except Exception:
-            await self._close_client(client)
-            raise
+            return raw
+
+        raw = await self._redis_helper.execute_with_rebuild_forever(
+            "state_event_inbox_metrics_snapshot_read",
+            context="state_event_inbox_metrics_snapshot",
+            fn=_read,
+        )
         if not raw:
             return None
         try:
@@ -143,21 +126,7 @@ class StateEventInboxMetricsSnapshotStore:
         return ("\n".join(line for line in lines if line).strip() + "\n").encode("utf-8"), CONTENT_TYPE_LATEST
 
     async def close(self) -> None:
-        async with self._lock:
-            client = self._client
-            self._client = None
-        if client is not None:
-            await self._close_client(client)
-
-    async def _close_client(self, client: Redis) -> None:
-        try:
-            await client.aclose()
-        except Exception:
-            pass
-        finally:
-            async with self._lock:
-                if self._client is client:
-                    self._client = None
+        await self._redis_helper.close()
 
 
 def _escape_label_value(value: str) -> str:
