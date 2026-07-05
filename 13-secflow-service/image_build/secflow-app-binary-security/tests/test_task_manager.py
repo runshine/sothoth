@@ -57,6 +57,7 @@ from app.schemas import (
 from app.service import downstream_tasks as downstream_tasks_module
 from app.service import llm_gateway as llm_gateway_module
 from app.service import task_manager as task_manager_module
+from app.service.task_queue import TaskQueue
 from app.service.task_manager import (
     TASK_ACTION_CONTINUE,
     TASK_ACTION_RETRY,
@@ -45659,29 +45660,7 @@ def _test_local_runtime_sync_maintenance_drains_due_task_sync_requests(self):
         output_root="/o",
         workspace_root="/w",
     )
-    lease = BinarySecurityTaskRuntimeLease(
-        lease_name=f"task_runtime:{task.id}",
-        task_id=task.id,
-        owner_instance_id="worker-maint",
-        heartbeat_at=_now(),
-        lease_expires_at=_now() + timedelta(minutes=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
     fake_queue = _FakeTaskSyncQueue()
-    asyncio.run(
-        fake_queue.enqueue_task_sync_request(
-            task.id,
-            {
-                "queue_item_id": "tsq_due_1",
-                "dedupe_key": "downstream_status:entry_analysis:si-1",
-                "sync_kind": "downstream_status",
-                "stage_name": "entry_analysis",
-                "item_ids": ["si-1"],
-                "next_retry_at": (_now() - timedelta(seconds=5)).isoformat(),
-            },
-            dedupe_key="downstream_status:entry_analysis:si-1",
-        )
-    )
     runner = SimpleNamespace(done=lambda: False, cancel=lambda: None)
     try:
         manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
@@ -45694,30 +45673,24 @@ def _test_local_runtime_sync_maintenance_drains_due_task_sync_requests(self):
             active_commit_succeeded=True,
             lease_established=True,
         )
-        original_drain = manager._drain_task_sync_queue
-        drain_calls: list[str] = []
+        original_helper = manager._drain_local_runtime_sync_queue_once
+        helper_calls: list[tuple[str, str, int]] = []
 
-        async def _fake_drain(sync_db, sync_task):
-            del sync_db
-            drain_calls.append(str(sync_task.id))
-            await fake_queue.ack_task_sync_request(
-                sync_task.id,
-                queue_item_id="tsq_due_1",
-                dedupe_key="downstream_status:entry_analysis:si-1",
-            )
-            return len(drain_calls) == 1
+        async def _fake_helper(task_id, *, reason, max_passes=5):
+            helper_calls.append((str(task_id), str(reason), int(max_passes)))
+            return True
 
-        manager._drain_task_sync_queue = _fake_drain
+        manager._drain_local_runtime_sync_queue_once = _fake_helper
         with (
-            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(fake_queue, "consume_owner_signal", new=AsyncMock(return_value=None)),
+            patch.object(fake_queue, "has_due_task_sync_request", new=AsyncMock(return_value=True)),
             patch.object(task_manager_module, "get_task_queue", return_value=fake_queue),
         ):
             processed = asyncio.run(manager._service_local_runtime_sync_maintenance(task.id))
         self.assertTrue(processed)
-        self.assertEqual([task.id], drain_calls)
-        self.assertEqual([], fake_queue.entries_by_task.get(task.id, []))
+        self.assertEqual([(task.id, "due_task_sync_request", 5)], helper_calls)
     finally:
-        manager._drain_task_sync_queue = original_drain
+        manager._drain_local_runtime_sync_queue_once = original_helper
         manager._workers.pop(task.id, None)
 
 
@@ -45738,7 +45711,6 @@ def _test_local_runtime_sync_maintenance_consumes_owner_signal(self):
         workspace_root="/w",
     )
     lease = BinarySecurityTaskRuntimeLease(
-        lease_name=f"task_runtime:{task.id}",
         task_id=task.id,
         owner_instance_id="worker-signal",
         heartbeat_at=_now(),
@@ -45781,6 +45753,39 @@ def _test_local_runtime_sync_maintenance_consumes_owner_signal(self):
         manager._workers.pop(task.id, None)
 
 
+def _test_task_sync_entry_score_respects_timezone_iso_retry_at(self):
+    retry_at = "2026-07-05T04:34:48.590704+08:00"
+    score = TaskQueue._task_sync_entry_score({"next_retry_at": retry_at})
+    self.assertAlmostEqual(datetime.fromisoformat(retry_at).timestamp(), score, places=3)
+
+
+def _test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp(self):
+    requested_at = "2026-07-05T04:34:48.590704+08:00"
+    score = TaskQueue._task_sync_entry_score({"requested_at": requested_at})
+    self.assertAlmostEqual(datetime.fromisoformat(requested_at).timestamp(), score, places=3)
+
+
+def _test_fake_task_sync_queue_has_due_request_respects_future_retry_at(self):
+    fake_queue = _FakeTaskSyncQueue()
+    task_id = "task-future-retry"
+    future_retry_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    asyncio.run(
+        fake_queue.enqueue_task_sync_request(
+            task_id,
+            {
+                "queue_item_id": "tsq_future_1",
+                "dedupe_key": "downstream_status:dataflow_vuln_scan:si-future",
+                "sync_kind": "downstream_status",
+                "stage_name": "dataflow_vuln_scan",
+                "item_ids": ["si-future"],
+                "next_retry_at": future_retry_at,
+            },
+            dedupe_key="downstream_status:dataflow_vuln_scan:si-future",
+        )
+    )
+    self.assertFalse(asyncio.run(fake_queue.has_due_task_sync_request(task_id)))
+
+
 TaskManagerTests.test_owned_execution_takeover_requeue_uses_stage_name_for_main_state = _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state
 TaskManagerTests.test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window = _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window
 TaskManagerTests.test_clear_runtime_lease_returns_retry_later_for_lock_timeout = _test_clear_runtime_lease_returns_retry_later_for_lock_timeout
@@ -45819,6 +45824,9 @@ TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test
 TaskManagerTests.test_update_task_policy_falls_back_to_shared_dispatch_without_owner = _test_update_task_policy_falls_back_to_shared_dispatch_without_owner
 TaskManagerTests.test_local_runtime_sync_maintenance_drains_due_task_sync_requests = _test_local_runtime_sync_maintenance_drains_due_task_sync_requests
 TaskManagerTests.test_local_runtime_sync_maintenance_consumes_owner_signal = _test_local_runtime_sync_maintenance_consumes_owner_signal
+TaskManagerTests.test_task_sync_entry_score_respects_timezone_iso_retry_at = _test_task_sync_entry_score_respects_timezone_iso_retry_at
+TaskManagerTests.test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp = _test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp
+TaskManagerTests.test_fake_task_sync_queue_has_due_request_respects_future_retry_at = _test_fake_task_sync_queue_has_due_request_respects_future_retry_at
 TaskManagerTests.test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled = _test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled
 TaskManagerTests.test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled = _test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled
 TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state = _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state
