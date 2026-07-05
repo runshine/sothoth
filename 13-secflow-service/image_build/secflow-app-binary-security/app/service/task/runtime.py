@@ -2250,8 +2250,6 @@ class TaskRuntimeServiceMixin:
         next_task_status = "dispatching"
         if has_active_operation and active_operation_type == task_manager_module.TASK_ACTION_CANCEL:
             next_task_status = task_manager_module.TASK_STATUS_CANCELLING
-        elif has_active_operation and active_operation_type in task_manager_module.TASK_OPERATION_OWNER_GUARDED_TYPES and current_status and current_status != "pending":
-            next_task_status = current_status
         updated = (
             db.query(task_manager_module.BinarySecurityTask)
             .filter(

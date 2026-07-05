@@ -858,16 +858,6 @@ class TaskRuntimeStateServiceMixin:
             return True
         if self._task_runtime_transition_guard_owned_by_current_instance(task):
             return True
-        if self._task_runtime_transition_guard_active(task):
-            return False
-        if self._task_has_active_cancel_operation(db, task):
-            return False
-        if self._task_active_operation(db, task) is not None:
-            return False
-        stage_runs = db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all()
-        stage_items = db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all()
-        if self._task_has_any_active_children(db, task, stage_runs=stage_runs, stage_items=stage_items):
-            return False
         lease = self._runtime_lease_for_task(db, getattr(task, "id", None))
         if self._runtime_lease_is_active(lease):
             return False

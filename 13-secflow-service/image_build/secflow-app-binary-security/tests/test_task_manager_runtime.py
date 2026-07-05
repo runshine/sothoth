@@ -1152,6 +1152,77 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             or "running_without_active_lease_requeued" in event_types
         )
 
+    def test_dispatch_task_by_id_reopens_running_ownerless_task_after_runtime_lease_expiry_even_with_stale_operation(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        task = BinarySecurityTask(
+            id="task-running-ownerless-expired-lease-stale-op",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-ownerless-expired-lease-stale-op",
+            runtime_phase="owned_execution",
+            dispatcher_instance_id=None,
+            current_operation_id="op-old",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-ownerless-expired-lease-stale-op",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si-ownerless-expired-lease-stale-op",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=stage_run.id,
+            stage_name="entry_analysis",
+            item_key="entry1",
+            parent_key="entry1",
+            status="running",
+        )
+        stale_operation = BinarySecurityTaskOperation(
+            id="op-old",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="continue",
+            target_stage="entry_analysis",
+            status="accepted",
+            created_at=_now() - timedelta(minutes=2),
+            updated_at=_now() - timedelta(minutes=2),
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            events=[],
+            runtime_leases=[],
+            stage_runs=[stage_run],
+            stage_items=[item],
+            operations=[stale_operation],
+        )
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertEqual(task.id, claimed)
+        self.assertEqual("worker-new", task.dispatcher_instance_id)
+        self.assertEqual("dispatching", task.status)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": task.id,
+                "blocked_reason": None,
+                "should_requeue": False,
+                "cooldown_seconds": None,
+            },
+            manager._dispatch_claim_decision(),
+        )
+
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
