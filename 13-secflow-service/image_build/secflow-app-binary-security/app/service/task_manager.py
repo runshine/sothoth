@@ -96,8 +96,6 @@ from app.observability import (
     observe_task_snapshot_lock_retry,
     observe_task_duration,
     observe_task_error,
-    observe_task_heartbeat_candidates,
-    observe_task_heartbeat_loop_duration,
     observe_task_list_query,
     observe_task_list_query_stage,
     observe_task_lifecycle,
@@ -741,7 +739,6 @@ class TaskManager(
         self._state_repair_reconcile_task: Optional[asyncio.Task] = None
         self._state_event_inbox_loop_task: Optional[asyncio.Task] = None
         self._state_event_inbox_metrics_loop_task: Optional[asyncio.Task] = None
-        self._task_heartbeat_loop_task: Optional[asyncio.Task] = None
         self._stage_item_loop_task: Optional[asyncio.Task] = None
         self._workers: dict[str, TaskRuntimeHandle] = {}
         self._operation_workers: dict[str, asyncio.Task] = {}
@@ -1692,11 +1689,6 @@ class TaskManager(
                     self._stage_item_dispatch_loop(),
                     name="binary-security-stage-item-dispatcher",
                 )
-            if self._is_worker_role():
-                self._task_heartbeat_loop_task = asyncio.create_task(
-                    self._task_heartbeat_loop(),
-                    name="binary-security-task-heartbeat",
-                )
             logger.info("binary-security task manager started")
         except Exception:
             logger.exception("binary-security task manager start failed; stopping partially started runtime")
@@ -1718,7 +1710,6 @@ class TaskManager(
         await self._cancel_loop_task(self._archive_loop_task)
         await self._cancel_loop_task(self._delete_loop_task)
         await self._cancel_loop_task(self._stage_item_loop_task)
-        await self._cancel_loop_task(self._task_heartbeat_loop_task)
         await self._cancel_loop_task(self._state_event_inbox_loop_task)
         await self._cancel_loop_task(self._state_event_inbox_metrics_loop_task)
         archive_active = list(self._archive_workers)
@@ -1752,7 +1743,6 @@ class TaskManager(
         with self._task_execution_owner_lock:
             self._task_execution_owners.clear()
         self._last_task_heartbeat_at.clear()
-        observe_task_heartbeat_candidates(0)
         observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
 
     def _release_owned_runtime_leases_on_shutdown(self, task_ids: list[str]) -> None:
@@ -4046,55 +4036,6 @@ class TaskManager(
         session.rollback()
         observe_heartbeat_update(f"{source}_skipped")
         return False
-
-    def _refresh_task_heartbeats_once(self) -> None:
-        session = get_session_factory()()
-        try:
-            candidate_ids = sorted(
-                task_id
-                for task_id, handle in self._workers.items()
-                if handle is not None and bool(handle.owner_active)
-            )
-            observe_task_heartbeat_candidates(len(candidate_ids))
-            if not candidate_ids:
-                return
-            rows = session.query(BinarySecurityTask).filter(BinarySecurityTask.id.in_(candidate_ids)).all()
-            tasks_by_id = {task.id: task for task in rows}
-            for task_id in candidate_ids:
-                task = tasks_by_id.get(task_id)
-                handle = self._runtime_handle(task_id)
-                if not self._should_continue_parent_lease_heartbeat(session, task, handle):
-                    if self._can_stop_parent_lease_heartbeat(session, task, handle):
-                        self._last_task_heartbeat_at.pop(task_id, None)
-                        clear_result = self._clear_runtime_lease(session, task_id, owner_instance_id=self.instance_id)
-                        if clear_result.status != "lease_locked_retry_later":
-                            session.commit()
-                        else:
-                            session.rollback()
-                        if handle is not None:
-                            handle.owner_active = False
-                    observe_heartbeat_update("controller_skipped")
-                    continue
-                try:
-                    wrote = False
-                    for attempt in range(self._task_lease_write_retry_attempts()):
-                        try:
-                            wrote = self._write_task_heartbeat(session, task_id, now_value=_now(), source="controller")
-                            break
-                        except OperationalError as exc:
-                            session.rollback()
-                            if not self._is_retryable_lock_error(exc) or attempt >= self._task_lease_write_retry_attempts() - 1:
-                                raise
-                            observe_heartbeat_update("controller_retry")
-                            self._sleep_after_retryable_lock_error(attempt + 1)
-                    if not wrote:
-                        self._last_task_heartbeat_at.pop(task_id, None)
-                except Exception:
-                    session.rollback()
-                    observe_heartbeat_update("controller_failed")
-                    logger.exception("binary-security task heartbeat write failed: task_id=%s", task_id)
-        finally:
-            session.close()
 
     def prepare_task_id(self, db: Session, project_id: str) -> str:
         for _ in range(10):
@@ -7627,7 +7568,7 @@ class TaskManager(
         previous_error_type = self._string_or_none(previous_observation.get("error_type")) or self._string_or_none(dict(item.result or {}).get("last_sync_error_type"))
         previous_error_message = self._string_or_none(previous_observation.get("error_message")) or self._string_or_none(dict(item.result or {}).get("last_sync_error_message"))
         previous_active_error = self._stage_item_has_active_sync_error(item)
-        if not self._child_sync_observation_would_change(
+        observation_would_change = self._child_sync_observation_would_change(
             item,
             sync_status=sync_status,
             synced_at=synced_at,
@@ -7638,8 +7579,7 @@ class TaskManager(
             mapped_status=mapped_status,
             downstream_status=downstream_status,
             state_applied=state_applied,
-        ):
-            return True
+        )
         sync_event_type = "applied" if state_applied else "observed"
         if sync_status in {"transport_error", "rate_limited", "binding_mismatch", "skipped"}:
             sync_event_type = sync_status
@@ -7651,23 +7591,24 @@ class TaskManager(
         for attempt in range(max_attempts):
             try:
                 with self._savepoint(db):
-                    self._mark_stage_item_sync_observation(
-                        item,
-                        sync_status=sync_status,
-                        synced_at=synced_at,
-                        error_message=error_message,
-                        http_status=http_status,
-                        error_type=error_type,
-                        status_raw=status_raw,
-                        mapped_status=mapped_status,
-                        downstream_status=downstream_status,
-                        state_applied=state_applied,
-                        consecutive_error_count=consecutive_error_count,
-                        budget_exhausted=budget_exhausted,
-                        next_retry_at=next_retry_at,
-                        last_sync_result=last_sync_result,
-                        clear_error_state=clear_error_state,
-                    )
+                    if observation_would_change:
+                        self._mark_stage_item_sync_observation(
+                            item,
+                            sync_status=sync_status,
+                            synced_at=synced_at,
+                            error_message=error_message,
+                            http_status=http_status,
+                            error_type=error_type,
+                            status_raw=status_raw,
+                            mapped_status=mapped_status,
+                            downstream_status=downstream_status,
+                            state_applied=state_applied,
+                            consecutive_error_count=consecutive_error_count,
+                            budget_exhausted=budget_exhausted,
+                            next_retry_at=next_retry_at,
+                            last_sync_result=last_sync_result,
+                            clear_error_state=clear_error_state,
+                        )
                     self._record_downstream_sync_event(
                         db,
                         task=task,
@@ -7687,6 +7628,7 @@ class TaskManager(
                             "downstream_status_mapped": mapped_status,
                             "downstream_status": downstream_status,
                             "state_applied": state_applied,
+                            "observation_reused": not observation_would_change,
                             "consecutive_error_count": consecutive_error_count,
                             "budget_exhausted": budget_exhausted,
                             "next_retry_at": _isoformat_or_none(next_retry_at),
@@ -7695,7 +7637,12 @@ class TaskManager(
                         },
                     )
                     current_active_error = self._stage_item_has_active_sync_error(item)
-                    if previous_active_error and not current_active_error and (last_sync_result or "").strip().lower() == "success":
+                    if (
+                        observation_would_change
+                        and previous_active_error
+                        and not current_active_error
+                        and (last_sync_result or "").strip().lower() == "success"
+                    ):
                         self._record_downstream_sync_event(
                             db,
                             task=task,

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from contextlib import suppress
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
@@ -13,7 +12,6 @@ from app.observability import (
     observe_archive_action,
     observe_archive_reclaim,
     observe_scheduler_loop,
-    observe_task_heartbeat_loop_duration,
 )
 
 from . import shared as task_shared
@@ -182,7 +180,6 @@ class TaskLifecycleServiceMixin:
             "archive_runtime_reconcile": self._archive_runtime_reconcile_interval_seconds(),
             "state_repair_reconcile": self._state_repair_reconcile_interval_seconds(),
             "readless_reconcile": max(1, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300)),
-            "task_heartbeat": max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 15) or 15)),
         }.get(loop_name, configured)
         return max(configured, interval_seconds * 2 + 15)
 
@@ -229,14 +226,12 @@ class TaskLifecycleServiceMixin:
             "task_dispatch": self._loop_runtime_detail("task_dispatch", self._loop_task),
             "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
             "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
-            "compat_heartbeat_fallback": self._loop_runtime_detail("task_heartbeat", self._task_heartbeat_loop_task),
         }
         return {
             "running": self._running,
             "loops": {
                 loop_name: bool(detail.get("alive"))
                 for loop_name, detail in loop_details.items()
-                if loop_name not in {"compat_heartbeat_fallback"}
             },
             "loop_details": loop_details,
             "workers": {
@@ -536,25 +531,6 @@ class TaskLifecycleServiceMixin:
                 if len(refs) >= batch_size:
                     return refs
         return refs
-
-    async def _task_heartbeat_loop(self: TaskManager) -> None:
-        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
-        while self._running:
-            started = time.perf_counter()
-            try:
-                self._mark_loop_heartbeat("task_heartbeat")
-                await asyncio.to_thread(self._refresh_task_heartbeats_once)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                from app.service import task_manager as task_manager_module
-
-                task_manager_module.logger.exception("binary-security task heartbeat loop crashed and recovered")
-                await asyncio.sleep(1)
-            finally:
-                self._mark_loop_heartbeat("task_heartbeat")
-                observe_task_heartbeat_loop_duration(time.perf_counter() - started)
-            await asyncio.sleep(interval_seconds)
 
     async def _downstream_reconcile_loop(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module

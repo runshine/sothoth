@@ -126,7 +126,7 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
                 lease_owner_instance_id=manager.instance_id,
             )
             original_lease = task.lease_expires_at
-            manager._refresh_task_heartbeats_once()
+            manager._touch_task_heartbeat(task.id)
             self.assertEqual(0, len(db.runtime_leases))
             self.assertEqual(original_lease, task.lease_expires_at)
         finally:

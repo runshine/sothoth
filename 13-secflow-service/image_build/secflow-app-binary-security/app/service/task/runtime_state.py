@@ -1446,7 +1446,7 @@ class TaskRuntimeStateServiceMixin:
         return True, None
 
     def _runtime_lease_capable(self: TaskManager) -> bool:
-        return bool(self._task_heartbeat_loop_task and not self._task_heartbeat_loop_task.done())
+        return str(self._service_role() or "").strip() == "worker"
 
     def _task_base_policy(self: TaskManager, task: BinarySecurityTask) -> dict[str, Any]:
         return dict(task.policy or {})

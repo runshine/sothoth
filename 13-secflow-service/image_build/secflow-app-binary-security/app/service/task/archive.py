@@ -1077,6 +1077,39 @@ class TaskArchiveServiceMixin:
         observed_at = task_manager_module._now()
         http_status = self._extract_http_status_from_exception(error)
         is_http_429 = http_status == 429
+        ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
+        error_message = str(error or "").strip() or repr(error).strip() or error.__class__.__name__
+        error_detail = str(
+            getattr(error, "error_type_detail", "") or getattr(error, "transport_error_kind", "")
+        ).strip() or None
+        runtime_lease_expires_at = getattr(ownership_snapshot, "runtime_lease_expires_at", None)
+        failure_diagnostics = {
+            "operation": operation,
+            "stage_name": str(getattr(item, "stage_name", "") or "").strip() or None,
+            "item_id": str(getattr(item, "id", "") or "").strip() or None,
+            "item_key": str(getattr(item, "item_key", "") or "").strip() or None,
+            "downstream_service": str(getattr(item, "downstream_service", "") or "").strip() or None,
+            "downstream_task_id": str(getattr(item, "downstream_task_id", "") or "").strip() or None,
+            "error_class": error.__class__.__name__,
+            "error_message": error_message,
+            "error_repr": repr(error),
+            "error_type": error_type,
+            "error_detail": error_detail,
+            "http_status": http_status,
+            "retryable_transport_error": bool(self._is_retryable_downstream_transport_error(error)),
+            "runtime_phase": self._task_runtime_phase(task),
+            "task_status": str(getattr(task, "status", "") or "").strip() or None,
+            "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
+            "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+            "runtime_lease_active": bool(getattr(ownership_snapshot, "runtime_lease_active", False)),
+            "runtime_lease_owner": getattr(ownership_snapshot, "runtime_lease_owner", None),
+            "runtime_lease_expires_at": (
+                runtime_lease_expires_at
+                if isinstance(runtime_lease_expires_at, str)
+                else task_manager_module._isoformat_or_none(runtime_lease_expires_at)
+            ),
+            "local_handle_alive": bool(getattr(ownership_snapshot, "local_handle_alive", False)),
+        }
         state = (
             self._build_next_http_429_failure_state(item, observed_at=observed_at)
             if is_http_429
@@ -1090,16 +1123,16 @@ class TaskArchiveServiceMixin:
             change_source=change_source,
             sync_status=sync_status,
             synced_at=observed_at,
-            error_message=str(error),
+            error_message=error_message,
             http_status=http_status,
             error_type=error_type,
             state_applied=False,
             extra_payload={
-                "operation": operation,
+                **failure_diagnostics,
                 **self._downstream_sync_failure_payload(
                     item,
                     error_type=error_type,
-                    error_message=str(error),
+                    error_message=error_message,
                     state=state,
                 ),
             },
@@ -1113,8 +1146,29 @@ class TaskArchiveServiceMixin:
         failure_payload = self._downstream_sync_failure_payload(
             item,
             error_type=error_type,
-            error_message=str(error),
+            error_message=error_message,
             state=state,
+        )
+        self._log_child_status_event(
+            db,
+            task=task,
+            item=item,
+            event_type="child_transport_failed",
+            change_source=change_source,
+            before_status=before_status or (str(item.status or "").strip().lower() or None),
+            after_status=str(item.status or "").strip().lower() or before_status,
+            sync_status=sync_status,
+            downstream_status_raw=None,
+            downstream_status_mapped=None,
+            downstream_status=None,
+            state_applied=False,
+            error_message=error_message,
+            error_type=error_type,
+            http_status=http_status,
+            extra_payload={
+                **failure_diagnostics,
+                **failure_payload,
+            },
         )
         for event_type in (
             "downstream_http_429_retry_scheduled" if is_http_429 else "downstream_poll_retry_scheduled",
@@ -1137,11 +1191,11 @@ class TaskArchiveServiceMixin:
                 downstream_status_mapped=None,
                 downstream_status=None,
                 state_applied=False,
-                error_message=str(error),
+                error_message=error_message,
                 error_type=error_type,
                 http_status=http_status,
                 extra_payload={
-                    "operation": operation,
+                    **failure_diagnostics,
                     "retry_attempt_count": state.consecutive_error_count,
                     "retry_delay_seconds": (
                         self._next_http_429_retry_backoff_seconds(state.consecutive_error_count)

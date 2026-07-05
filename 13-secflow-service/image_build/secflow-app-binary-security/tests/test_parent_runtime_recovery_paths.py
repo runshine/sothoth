@@ -69,7 +69,7 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         previous_heartbeat_at = lease.heartbeat_at
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
-            manager._refresh_task_heartbeats_once()
+            manager._touch_task_heartbeat(task.id)
 
         self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
         self.assertGreater(task.updated_at, previous_heartbeat_at)
@@ -177,7 +177,7 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             previous_expiry = task.lease_expires_at
-            manager._refresh_task_heartbeats_once()
+            manager._touch_task_heartbeat(task.id)
 
         self.assertGreater(task.lease_expires_at, previous_expiry)
         self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)

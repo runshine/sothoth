@@ -36179,73 +36179,6 @@ def _test_service_base_urls_use_service_roots(self):
         self.assertNotIn("/api/", value)
 
 
-def _test_task_heartbeat_controller_does_not_refresh_owned_running_task_without_active_runtime_lease(self):
-    manager = TaskManager()
-    now_value = _now()
-    task = BinarySecurityTask(
-        id="task-1",
-        project_id="p1",
-        status="running",
-        dispatcher_instance_id=manager.instance_id,
-        dispatch_started_at=now_value,
-        lease_expires_at=now_value + timedelta(seconds=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task])
-    original_factory = task_manager_module.get_session_factory
-    try:
-        task_manager_module.get_session_factory = lambda: (lambda: db)
-        manager._register_task_execution_owner(task.id, "primary_task_worker")
-        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
-            task_id=task.id,
-            runner_task=AsyncMock(),
-            heartbeat_task=None,
-            claimed_at=now_value,
-            execution_token=None,
-            lease_owner_instance_id=manager.instance_id,
-        )
-        original_lease = task.lease_expires_at
-        manager._refresh_task_heartbeats_once()
-        self.assertEqual(0, len(db.runtime_leases))
-        self.assertEqual(original_lease, task.lease_expires_at)
-    finally:
-        task_manager_module.get_session_factory = original_factory
-
-
-def _test_task_heartbeat_controller_skips_task_without_owner(self):
-    manager = TaskManager()
-    now_value = _now()
-    task = BinarySecurityTask(
-        id="task-2",
-        project_id="p1",
-        status="running",
-        dispatcher_instance_id=manager.instance_id,
-        dispatch_started_at=now_value,
-        lease_expires_at=now_value + timedelta(seconds=5),
-    )
-    db = _AppendingModelAwareDb(tasks=[task])
-    original_factory = task_manager_module.get_session_factory
-    try:
-        task_manager_module.get_session_factory = lambda: (lambda: db)
-        manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
-            task_id=task.id,
-            runner_task=AsyncMock(),
-            heartbeat_task=None,
-            claimed_at=now_value,
-            execution_token=None,
-            lease_owner_instance_id=manager.instance_id,
-            owner_active=False,
-            release_requested=True,
-            release_reason="test_skip",
-        )
-        original_updated_at = task.updated_at
-        original_lease = task.lease_expires_at
-        manager._refresh_task_heartbeats_once()
-        self.assertEqual(original_updated_at, task.updated_at)
-        self.assertEqual(original_lease, task.lease_expires_at)
-    finally:
-        task_manager_module.get_session_factory = original_factory
-
-
 def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -36489,7 +36422,6 @@ def _test_start_worker_role_does_not_spawn_state_event_inbox_loops(self):
             asyncio.run(manager.start())
             self.assertIsNone(manager._state_event_inbox_loop_task)
             self.assertIsNone(manager._state_event_inbox_metrics_loop_task)
-            self.assertIsNotNone(manager._task_heartbeat_loop_task)
             self.assertIsNotNone(manager._loop_task)
         asyncio.run(manager.stop())
     finally:
@@ -38186,7 +38118,7 @@ def _test_record_event_skips_duplicate_owned_execution_takeover_requeued_events(
     self.assertEqual(1, len(requeue_events))
 
 
-def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged(self):
+def _test_persist_child_sync_observation_reuses_observation_but_still_records_sync_event(self):
     manager = TaskManager()
     item = BinarySecurityStageItem(
         id="si1",
@@ -38240,7 +38172,12 @@ def _test_persist_child_sync_observation_skips_flush_when_observation_is_unchang
     )
 
     self.assertTrue(persisted)
-    self.assertEqual(0, db.flush_calls)
+    self.assertEqual(1, db.flush_calls)
+    self.assertEqual(1, len(db.sync_events))
+    sync_event = db.sync_events[0]
+    self.assertEqual("skipped", sync_event.event_type)
+    self.assertEqual("skipped", sync_event.sync_status)
+    self.assertTrue(bool((sync_event.payload or {}).get("observation_reused")))
 
 
 def _test_active_operation_ignores_expired_claim_lease(self):
@@ -38660,7 +38597,12 @@ def _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending(self):
     observation = dict((item.result or {}).get("sync_observation") or {})
     self.assertTrue(observation.get("state_applied"))
     self.assertEqual("pending", observation.get("mapped_status"))
-    self.assertFalse(db.sync_events)
+    self.assertEqual(1, len(db.sync_events))
+    sync_event = db.sync_events[0]
+    self.assertEqual("succeeded", sync_event.event_type)
+    self.assertEqual("synced", sync_event.sync_status)
+    self.assertEqual("success", sync_event.outcome)
+    self.assertIn("observation_reused", dict(sync_event.payload or {}))
 
 
 def _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied(self):
@@ -42868,8 +42810,6 @@ TaskManagerTests.test_firmware_unpacker_client_uses_management_api_prefix = _tes
 TaskManagerTests.test_dataflow_vuln_scan_client_uses_api_prefix = _test_dataflow_vuln_scan_client_uses_api_prefix
 TaskManagerTests.test_downstream_clients_use_scheduler_request_timeout = _test_downstream_clients_use_scheduler_request_timeout
 TaskManagerTests.test_service_base_urls_use_service_roots = _test_service_base_urls_use_service_roots
-TaskManagerTests.test_task_heartbeat_controller_does_not_refresh_owned_running_task_without_active_runtime_lease = _test_task_heartbeat_controller_does_not_refresh_owned_running_task_without_active_runtime_lease
-TaskManagerTests.test_task_heartbeat_controller_skips_task_without_owner = _test_task_heartbeat_controller_skips_task_without_owner
 TaskManagerTests.test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease = _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_lease
 TaskManagerTests.test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task = _test_owner_sync_downstream_status_reclaims_pending_tail_reconciliation_task
 TaskManagerTests.test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task = _test_owner_sync_downstream_status_resumes_owned_execution_from_running_tail_reconciliation_task
@@ -42935,7 +42875,7 @@ TaskManagerTests.test_record_event_skips_duplicate_owned_execution_takeover_requ
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child = _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child
-TaskManagerTests.test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged = _test_persist_child_sync_observation_skips_flush_when_observation_is_unchanged
+TaskManagerTests.test_persist_child_sync_observation_reuses_observation_but_still_records_sync_event = _test_persist_child_sync_observation_reuses_observation_but_still_records_sync_event
 TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
 TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed

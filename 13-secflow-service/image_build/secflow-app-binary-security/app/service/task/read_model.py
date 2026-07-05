@@ -2572,7 +2572,6 @@ class TaskReadModelServiceMixin:
         loop_sources = {
             "task_dispatch": getattr(self, "_loop_task", None),
             "stage_item_dispatch": getattr(self, "_stage_item_loop_task", None),
-            "task_heartbeat": getattr(self, "_task_heartbeat_loop_task", None),
             "downstream_reconcile": getattr(self, "_downstream_reconcile_task", None),
             "archive_dispatch": getattr(self, "_archive_loop_task", None),
             "archive_runtime_reconcile": getattr(self, "_archive_runtime_reconcile_task", None),

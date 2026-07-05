@@ -19,7 +19,6 @@ class TaskLifecycleServiceStructureTests(unittest.TestCase):
         self.assertIs(TaskManager._archive_dispatch_loop, TaskLifecycleServiceMixin._archive_dispatch_loop)
         self.assertIs(TaskManager._schedule_archive_workers, TaskLifecycleServiceMixin._schedule_archive_workers)
         self.assertIs(TaskManager._archive_worker, TaskLifecycleServiceMixin._archive_worker)
-        self.assertIs(TaskManager._task_heartbeat_loop, TaskLifecycleServiceMixin._task_heartbeat_loop)
         self.assertIs(TaskManager._downstream_reconcile_loop, TaskLifecycleServiceMixin._downstream_reconcile_loop)
         self.assertIs(TaskManager._stage_item_sync_reconcile_loop, TaskLifecycleServiceMixin._stage_item_sync_reconcile_loop)
         self.assertIs(TaskManager._list_tasks_with_stale_stage_item_syncs, TaskLifecycleServiceMixin._list_tasks_with_stale_stage_item_syncs)

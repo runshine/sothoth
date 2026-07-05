@@ -118,14 +118,6 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
     def test_runtime_status_marks_lease_auditor_capable_for_live_state_event_loops(self):
         self.manager._running = True
 
-        class _Task:
-            def __init__(self, done=False):
-                self._done = done
-
-            def done(self):
-                return self._done
-
-        self.manager._task_heartbeat_loop_task = _Task(False)
         self.manager._service_role = lambda: "worker"
 
         status = self.manager.runtime_status()
@@ -209,8 +201,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager._loop_task)
         self.assertIsNone(manager._archive_loop_task)
         self.assertIsNone(manager._stage_item_loop_task)
-        self.assertIsNone(manager._task_heartbeat_loop_task)
-
     async def test_start_waits_for_redis_before_starting_worker_loops(self):
         manager = TaskManager()
         call_order = []
@@ -230,8 +220,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._dispatch_loop = _idle_loop
         manager._archive_dispatch_loop = _idle_loop
         manager._stage_item_dispatch_loop = _idle_loop
-        manager._task_heartbeat_loop = _idle_loop
-
         with patch.dict("os.environ", {"SECFLOW_BINARY_SECURITY_ROLE": "worker"}, clear=False), patch(
             "app.service.task_manager.get_task_queue",
             return_value=_Queue(),
@@ -265,7 +253,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         manager._state_event_inbox_loop = _inbox_loop
         manager._state_event_inbox_metrics_loop = _inbox_loop
-        manager._task_heartbeat_loop = _dispatch_loop
         manager._seed_work_queues = _seed
         manager._dispatch_loop = _dispatch_loop
         manager._archive_dispatch_loop = _dispatch_loop
