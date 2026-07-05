@@ -646,6 +646,7 @@ class TaskRuntimeHandle:
     pending_operation_type: str | None = None
     runner_generation: int = 0
     last_wakeup_at: datetime | None = None
+    sync_maintenance_in_progress: bool = False
 
     def done(self) -> bool:
         return self.runner_task.done()
@@ -1936,6 +1937,7 @@ class TaskManager(
                 pending_operation_type=getattr(existing, "pending_operation_type", None),
                 runner_generation=generation,
                 last_wakeup_at=getattr(existing, "last_wakeup_at", None),
+                sync_maintenance_in_progress=bool(getattr(existing, "sync_maintenance_in_progress", False)),
             )
             self._workers[normalized_task_id] = handle
             return True
@@ -2077,6 +2079,7 @@ class TaskManager(
                 if await self._handoff_active_serial_control_operation_from_runtime(task_id):
                     return
                 await asyncio.to_thread(self._touch_task_heartbeat, task_id)
+                await self._service_local_runtime_sync_maintenance(task_id)
                 handle.last_progress_at = _now()
                 failure_count = 0
             except asyncio.CancelledError:
@@ -2090,6 +2093,95 @@ class TaskManager(
                         handle.runner_task.cancel()
                     return
             await asyncio.sleep(interval_seconds)
+
+    async def _service_local_runtime_sync_maintenance(self, task_id: str) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        handle = self._runtime_handle(normalized_task_id)
+        if (
+            handle is None
+            or handle.done()
+            or handle.cancel_requested
+            or not handle.active_commit_succeeded
+            or not handle.lease_established
+            or handle.sync_maintenance_in_progress
+        ):
+            return False
+        consume_reason: str | None = None
+        due_sync_request = False
+        owner_signal_payload = await get_task_queue().consume_owner_signal(
+            str(self.instance_id or "").strip() or None,
+            normalized_task_id,
+            context="owner_signal_consume",
+        )
+        if owner_signal_payload:
+            consume_reason = str(owner_signal_payload.get("context") or "owner_signal").strip() or "owner_signal"
+        due_sync_request = await get_task_queue().has_due_task_sync_request(
+            normalized_task_id,
+            context="task_sync_due_check",
+        )
+        if not consume_reason and not due_sync_request:
+            return False
+        handle.sync_maintenance_in_progress = True
+        try:
+            processed = await self._drain_local_runtime_sync_queue_once(
+                normalized_task_id,
+                reason=consume_reason or "due_task_sync_request",
+                max_passes=5,
+            )
+            if processed:
+                logger.info(
+                    "binary-security local runtime sync maintenance processed queued sync requests: task_id=%s reason=%s",
+                    normalized_task_id,
+                    consume_reason or "due_task_sync_request",
+                )
+            return processed
+        finally:
+            handle.sync_maintenance_in_progress = False
+
+    async def _drain_local_runtime_sync_queue_once(
+        self,
+        task_id: str,
+        *,
+        reason: str,
+        max_passes: int = 5,
+    ) -> bool:
+        session = get_session_factory()()
+        processed = False
+        try:
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if task is None:
+                return False
+            if str(getattr(task, "dispatcher_instance_id", "") or "").strip() != str(self.instance_id or "").strip():
+                return False
+            lease = self._runtime_lease_for_task(session, task_id)
+            if not (
+                self._runtime_lease_is_active(lease)
+                and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+            ):
+                return False
+            passes = 0
+            while passes < max(1, int(max_passes or 1)):
+                drained = await self._drain_task_sync_queue(session, task)
+                if not drained:
+                    break
+                processed = True
+                passes += 1
+                session.expire_all()
+                task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+                if task is None:
+                    break
+            if processed:
+                logger.info(
+                    "binary-security local runtime sync maintenance drained task sync queue: task_id=%s reason=%s passes=%s",
+                    task_id,
+                    reason,
+                    passes,
+                )
+            return processed
+        finally:
+            session.close()
 
     async def _handoff_active_serial_control_operation_from_runtime(self, task_id: str) -> bool:
         normalized_task_id = str(task_id or "").strip()

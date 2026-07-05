@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime
 from typing import Any, Optional
 
 from redis.asyncio import Redis
@@ -152,6 +153,73 @@ class TaskQueue:
                 str(task_id or "").strip() or None,
                 str(self.config.redis_url or "").strip() or None,
                 queue_key or None,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+
+    async def push_owner_signal(
+        self,
+        owner_instance_id: str,
+        task_id: str,
+        *,
+        context: str = "owner_signal_enqueue",
+    ) -> None:
+        client = self._new_client(context=context)
+        normalized_owner = str(owner_instance_id or "").strip()
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_owner or not normalized_task_id:
+            return
+        signal_key = self._owner_signal_key(normalized_owner, normalized_task_id)
+        payload = json.dumps(
+            {
+                "owner_instance_id": normalized_owner,
+                "task_id": normalized_task_id,
+                "signaled_at": time.time(),
+                "context": str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        try:
+            await client.set(signal_key, payload, ex=300)
+        except Exception as exc:
+            logger.exception(
+                "binary-security owner signal push failed: context=%s owner_instance_id=%s task_id=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                normalized_owner,
+                normalized_task_id,
+                exc.__class__.__name__,
+                exc,
+            )
+            raise
+
+    async def consume_owner_signal(
+        self,
+        owner_instance_id: str,
+        task_id: str,
+        *,
+        context: str = "owner_signal_consume",
+    ) -> dict[str, Any] | None:
+        client = self._new_client(context=context)
+        normalized_owner = str(owner_instance_id or "").strip()
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_owner or not normalized_task_id:
+            return None
+        signal_key = self._owner_signal_key(normalized_owner, normalized_task_id)
+        try:
+            raw = await client.get(signal_key)
+            if raw is None:
+                return None
+            await client.delete(signal_key)
+            payload = json.loads(raw)
+            return payload if isinstance(payload, dict) else None
+        except Exception as exc:
+            logger.exception(
+                "binary-security owner signal consume failed: context=%s owner_instance_id=%s task_id=%s error_type=%s error=%s",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                normalized_owner,
+                normalized_task_id,
                 exc.__class__.__name__,
                 exc,
             )
@@ -453,6 +521,10 @@ class TaskQueue:
             "lock": f"{base}:repair_lock",
         }
 
+    def _owner_signal_key(self, owner_instance_id: str, task_id: str) -> str:
+        prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
+        return f"{prefix}:owner_signal:{str(owner_instance_id or '').strip()}:{str(task_id or '').strip()}"
+
     async def enqueue_task_sync_request(
         self,
         task_id: str,
@@ -610,6 +682,26 @@ class TaskQueue:
             logger.exception("binary-security task sync list failed: task_id=%s", normalized_task_id)
             raise
 
+    async def has_due_task_sync_request(
+        self,
+        task_id: str,
+        *,
+        now_epoch: float | None = None,
+        context: str = "task_sync_due_check",
+    ) -> bool:
+        client = self._new_client(context=context)
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        keys = self._task_sync_queue_keys(normalized_task_id)
+        threshold = float(now_epoch if now_epoch is not None else time.time())
+        try:
+            queue_item_ids = await client.zrangebyscore(keys["queue"], "-inf", threshold, start=0, num=1)
+        except Exception:
+            logger.exception("binary-security task sync due check failed: task_id=%s", normalized_task_id)
+            raise
+        return bool(queue_item_ids)
+
     async def acquire_task_sync_repair_lock(
         self,
         task_id: str,
@@ -656,7 +748,7 @@ class TaskQueue:
         raw = str(dict(entry or {}).get("next_retry_at") or dict(entry or {}).get("requested_at") or "").strip()
         if raw:
             try:
-                return max(0.0, time.mktime(time.strptime(raw.split(".")[0], "%Y-%m-%dT%H:%M:%S")))
+                return max(0.0, datetime.fromisoformat(raw).timestamp())
             except Exception:
                 pass
         return time.time()
