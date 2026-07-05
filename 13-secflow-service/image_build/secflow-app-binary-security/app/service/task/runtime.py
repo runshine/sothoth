@@ -2093,19 +2093,28 @@ class TaskRuntimeServiceMixin:
                     self._task_runtime_phase(task),
                     nonpending_takeover_decision.row_mirror_owner,
                 )
-            self._log_dispatch_claim_blocked(
-                task_id,
-                reason="task_status_not_pending_without_resumable_operation",
-                task=task,
-                current_operation=current_operation,
-            )
-            self._set_dispatch_claim_decision(
-                task_id=task_id,
-                claimed_task_id=None,
-                blocked_reason="task_status_not_pending_without_resumable_operation",
-                should_requeue=False,
-            )
-            return None
+                if current_status == "pending":
+                    has_active_operation = self._operation_allows_owner_claim(current_operation)
+                    operation_allows_runtime_resume = bool(
+                        has_active_operation and self._operation_allows_runtime_resume(current_operation)
+                    )
+                    operation_requires_runtime_handle = bool(
+                        has_active_operation and operation_allows_runtime_resume
+                    )
+                else:
+                    self._log_dispatch_claim_blocked(
+                        task_id,
+                        reason="task_status_not_pending_without_resumable_operation",
+                        task=task,
+                        current_operation=current_operation,
+                    )
+                    self._set_dispatch_claim_decision(
+                        task_id=task_id,
+                        claimed_task_id=None,
+                        blocked_reason="task_status_not_pending_without_resumable_operation",
+                        should_requeue=False,
+                    )
+                    return None
         if current_status in task_manager_module.TASK_TERMINAL_STATUSES and not operation_allows_runtime_resume and not has_active_operation:
             self._log_dispatch_claim_blocked(
                 task_id,

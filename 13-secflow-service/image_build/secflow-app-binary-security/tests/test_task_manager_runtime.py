@@ -1104,6 +1104,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             },
             manager._dispatch_claim_decision(),
         )
+        self.assertFalse(any(row.event_type == "dispatch_claim_dropped_after_pop" for row in db.events))
         event_types = [row.event_type for row in db.events]
         self.assertIn("parent_runtime_reopen_allowed_after_lease_expiry", event_types)
         self.assertTrue(
@@ -1146,6 +1147,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             },
             manager._dispatch_claim_decision(),
         )
+        self.assertFalse(any(row.event_type == "dispatch_claim_dropped_after_pop" for row in db.events))
         event_types = [row.event_type for row in db.events]
         self.assertTrue(
             "dispatch_claim_allowed_after_runtime_lease_expiry" in event_types
