@@ -1599,7 +1599,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 self.manager,
                 "_task_queue_state",
-                return_value=("db_pending_not_enqueued", "pending_task_not_present_in_redis_queue"),
+                return_value=("pending_owner_mismatch", "pending_task_already_has_active_owner_runtime"),
             ),
             patch.object(self.manager, "_task_row_owner_is_runtime_supported", return_value=False),
             patch.object(self.manager, "_task_has_healthy_active_owner_runtime", return_value=True),
@@ -1608,8 +1608,8 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], pushed)
         event_types = [row.event_type for row in db.events]
-        self.assertIn("pending_task_shared_dispatch_reenqueue_suppressed_active_owner", event_types)
         self.assertNotIn("pending_task_reenqueued_by_reconcile", event_types)
+        self.assertNotIn("pending_task_not_enqueued_detected", event_types)
 
     @unittest.skip("stale fake-db queue reconcile coverage is unstable in full-file runtime suite")
     async def test_reconcile_work_queues_releases_stale_pending_owner_before_reenqueue(self):

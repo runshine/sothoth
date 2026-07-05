@@ -2123,6 +2123,120 @@ class TaskReadModelServiceMixin:
             cleanup_state=self._build_cleanup_state(task),
         )
 
+    def _build_task_policy_snapshot(
+        self: TaskManager,
+        task,
+        *,
+        stage_sequence: list[str] | None = None,
+        effective_runtime_policy: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        from app.service import task_manager as task_manager_module
+
+        normalized_stage_sequence = list(stage_sequence or self._stage_sequence_for_task(task))
+        effective_policy = dict(effective_runtime_policy or self._effective_runtime_policy(task) or {})
+        task_type = self._task_type(task)
+        pipeline_profile = self._pipeline_profile(task)
+        pipeline_mode = str(effective_policy.get("pipeline_mode") or "barrier").strip() or "barrier"
+        stage_options = {
+            stage_name: {"enabled": dict(effective_policy.get("stage_options") or {}).get(stage_name, {}).get("enabled", True) is not False}
+            for stage_name in normalized_stage_sequence
+        }
+        stage_parallelism = {
+            stage_name: max(
+                1,
+                int(
+                    dict(effective_policy.get("stage_parallelism") or {}).get(
+                        stage_name,
+                        effective_policy.get("max_stage_parallelism") or 1,
+                    )
+                    or 1
+                ),
+            )
+            for stage_name in normalized_stage_sequence
+        }
+        partial_success_stage_advancement = {
+            stage_name: bool(
+                dict(effective_policy.get("partial_success_stage_advancement") or {}).get(stage_name, False)
+            )
+            for stage_name in normalized_stage_sequence
+            if stage_name
+        }
+        module_selection_mode = self._module_selection_mode(task)
+        module_risk_levels = task_manager_module._normalize_module_risk_levels(effective_policy.get("module_risk_levels"))
+        entry_selection_mode = self._entry_selection_mode(task)
+        entry_auto_selection_strategy = self._entry_auto_selection_strategy(task)
+        entry_auto_selection_top_n = self._entry_auto_selection_top_n(task)
+        is_binary_module = task_type == task_manager_module.TASK_TYPE_BINARY_MODULE
+        is_kg_source = pipeline_profile == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN
+        if is_kg_source:
+            entry_selection_mode = task_manager_module.ENTRY_SELECTION_MODE_AUTO
+            entry_auto_selection_strategy = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
+            entry_auto_selection_top_n = 0
+        if entry_selection_mode == task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM:
+            entry_display_mode = "manual_confirm"
+            entry_display_label = "人工确认"
+        elif entry_auto_selection_strategy == "top_n_per_module_by_confidence":
+            entry_display_mode = "top_n"
+            entry_display_label = f"自动 / 每模块 Top {entry_auto_selection_top_n}"
+        else:
+            entry_display_mode = "all"
+            entry_display_label = "自动 / 全部入口"
+
+        entry_strategy_applicable = "entry_analysis" in normalized_stage_sequence or "knowledge_graph_entry_fetch" in normalized_stage_sequence
+        module_strategy_applicable = task_type in {task_manager_module.TASK_TYPE_BINARY, task_manager_module.TASK_TYPE_SOURCE} and not is_kg_source
+        knowledge_graph_strategy_applicable = is_kg_source
+        display_sections = ["workflow", "stage_execution"]
+        if module_strategy_applicable:
+            display_sections.append("module_strategy")
+        if entry_strategy_applicable:
+            display_sections.append("entry_strategy")
+        if knowledge_graph_strategy_applicable:
+            display_sections.append("knowledge_graph_strategy")
+
+        return {
+            "workflow": {
+                "task_type": task_type,
+                "pipeline_profile": pipeline_profile,
+                "pipeline_mode": pipeline_mode,
+                "stage_sequence": normalized_stage_sequence,
+                "is_binary_module": is_binary_module,
+                "is_kg_source_vuln_scan": knowledge_graph_strategy_applicable,
+            },
+            "stage_execution": {
+                "stage_options": stage_options,
+                "stage_parallelism": stage_parallelism,
+                "max_stage_parallelism": max(stage_parallelism.values()) if stage_parallelism else 1,
+                "max_retries_per_item": int(effective_policy.get("max_retries_per_item", 0) or 0),
+                "automatic_child_retry_enabled": bool(effective_policy.get("automatic_child_retry_enabled", False)),
+                "continue_on_item_failure": bool(effective_policy.get("continue_on_item_failure", False)),
+                "partial_success_stage_advancement": partial_success_stage_advancement,
+            },
+            "module_strategy": {
+                "applicable": module_strategy_applicable,
+                "module_selection_mode": module_selection_mode,
+                "module_risk_levels": module_risk_levels,
+            },
+            "entry_strategy": {
+                "applicable": entry_strategy_applicable,
+                "entry_selection_mode": entry_selection_mode,
+                "entry_auto_selection_strategy": entry_auto_selection_strategy,
+                "entry_auto_selection_top_n": entry_auto_selection_top_n,
+                "display_mode": entry_display_mode,
+                "display_label": entry_display_label,
+            },
+            "knowledge_graph_strategy": {
+                "applicable": knowledge_graph_strategy_applicable,
+                "knowledge_graph_upload_id": str(effective_policy.get("knowledge_graph_upload_id") or "").strip() or None,
+                "knowledge_graph_db_name": str(effective_policy.get("knowledge_graph_db_name") or "").strip() or None,
+                "knowledge_graph_include_excluded": bool(effective_policy.get("knowledge_graph_include_excluded", False)),
+                "knowledge_graph_status_filter": str(effective_policy.get("knowledge_graph_status_filter") or "").strip() or None,
+                "knowledge_graph_kind": str(effective_policy.get("knowledge_graph_kind") or "").strip() or None,
+                "knowledge_graph_module": str(effective_policy.get("knowledge_graph_module") or "").strip() or None,
+                "entry_strategy_label": "自动 / 全部入口" if knowledge_graph_strategy_applicable else None,
+            },
+            "display_sections": display_sections,
+        }
+
     def _runtime_health_age_status(
         self: TaskManager,
         age_seconds: float | None,

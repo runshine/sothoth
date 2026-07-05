@@ -813,6 +813,10 @@ class TaskQueryServiceMixin:
                 has_root_task_key=bool(self._root_task_key_secret(ctx.task)),
                 task_key_snapshot=self._build_task_key_snapshot(db, ctx.task),
                 policy=self._effective_runtime_policy(ctx.task),
+                policy_snapshot=self._build_task_policy_snapshot(
+                    ctx.task,
+                    stage_sequence=ctx.stage_sequence,
+                ),
                 summary=self._task_summary_for_detail_response(ctx.task),
                 metrics=ctx.task.metrics,
                 item_stats=ctx.item_stats,

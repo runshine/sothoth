@@ -730,6 +730,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     workspace_root: str
     fileserver_subproject_name: Optional[str] = None
     policy: dict[str, Any] = Field(default_factory=dict)
+    policy_snapshot: dict[str, Any] = Field(default_factory=dict)
     summary: dict[str, Any] = Field(default_factory=dict)
     metrics: dict[str, Any] = Field(default_factory=dict)
     item_stats: dict[str, dict[str, int]] = Field(default_factory=dict)
