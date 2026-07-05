@@ -5374,6 +5374,51 @@ class TaskManager(
             )
             return True
         except Exception as exc:
+            missing_item_ids: list[str] = []
+            existing_item_ids: list[str] = []
+            if self._should_discard_terminal_task_sync_entry(db, task, exc, entry):
+                existing_item_ids, missing_item_ids = self._resolve_task_sync_entry_item_targets(db, task, entry)
+                self._record_event(
+                    db,
+                    task,
+                    "task_sync_request_discarded_after_terminal_error",
+                    "检测到无效的任务同步消息，已记录并丢弃，避免持续阻塞后续同步",
+                    level="warning",
+                    stage_name=stage_name,
+                    payload={
+                        "sync_kind": sync_kind,
+                        "queue_item_id": queue_item_id,
+                        "dedupe_key": dedupe_key,
+                        "item_ids": item_ids,
+                        "existing_item_ids": existing_item_ids,
+                        "missing_item_ids": missing_item_ids,
+                        "source": str(entry.get("source") or "").strip() or None,
+                        "reason": str(entry.get("reason") or "").strip() or None,
+                        "source_event_type": str(entry.get("source_event_type") or "").strip() or None,
+                        "attempts": int(entry.get("attempts") or 0),
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                        "disposition": "acked_and_discarded",
+                    },
+                )
+                db.commit()
+                await get_task_queue().ack_task_sync_request(
+                    task.id,
+                    queue_item_id=queue_item_id,
+                    dedupe_key=dedupe_key,
+                    context="task_sync_ack_terminal_discard",
+                )
+                logger.warning(
+                    "binary-security discarded terminal-invalid task sync request after recording task event: "
+                    "task_id=%s queue_item_id=%s stage_name=%s item_ids=%s error_type=%s error=%s",
+                    task.id,
+                    queue_item_id,
+                    stage_name,
+                    item_ids,
+                    exc.__class__.__name__,
+                    str(exc),
+                )
+                return True
             retry_seconds = max(5, min(60, 5 * (2 ** min(5, int(entry.get("attempts") or 0)))))
             retry_at = _now() + timedelta(seconds=retry_seconds)
             retry_entry = {
@@ -5445,6 +5490,46 @@ class TaskManager(
                     },
                 )
             raise
+
+    def _resolve_task_sync_entry_item_targets(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        entry: dict[str, Any],
+    ) -> tuple[list[str], list[str]]:
+        item_ids = [str(item_id).strip() for item_id in list(entry.get("item_ids") or []) if str(item_id).strip()]
+        if not item_ids:
+            return [], []
+        stage_name = str(entry.get("stage_name") or "").strip() or None
+        query = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.id.in_(item_ids),
+        )
+        if stage_name:
+            query = query.filter(BinarySecurityStageItem.stage_name == stage_name)
+        existing_item_ids = [
+            str(getattr(stage_item, "id", "") or "").strip()
+            for stage_item in query.all()
+            if str(getattr(stage_item, "id", "") or "").strip()
+        ]
+        existing_set = set(existing_item_ids)
+        missing_item_ids = [item_id for item_id in item_ids if item_id not in existing_set]
+        return existing_item_ids, missing_item_ids
+
+    def _should_discard_terminal_task_sync_entry(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        exc: Exception,
+        entry: dict[str, Any],
+    ) -> bool:
+        if not isinstance(exc, NotFoundError):
+            return False
+        item_ids = [str(item_id).strip() for item_id in list(entry.get("item_ids") or []) if str(item_id).strip()]
+        if not item_ids:
+            return False
+        existing_item_ids, _missing_item_ids = self._resolve_task_sync_entry_item_targets(db, task, entry)
+        return not existing_item_ids
 
     def _has_task_write_ownership(
         self,

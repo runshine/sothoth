@@ -330,6 +330,12 @@ class _FakeTaskSyncQueue:
         self.entries_by_task: dict[str, list[dict[str, object]]] = {}
         self.repair_locks: dict[str, str] = {}
         self.owner_signals: dict[tuple[str, str], dict[str, object]] = {}
+        self.pushed_tasks: list[dict[str, object]] = []
+        self.delete_tasks: list[dict[str, object]] = []
+        self.requeued_tasks: list[dict[str, object]] = []
+        self.requeued_delete_tasks: list[dict[str, object]] = []
+        self.ping_calls: list[str] = []
+        self.ready_wait_calls: list[str] = []
 
     async def queue_positions(self, queue_key: str, context: str = "test"):
         del queue_key, context
@@ -438,6 +444,34 @@ class _FakeTaskSyncQueue:
         del context
         return self.owner_signals.pop((str(owner_instance_id), str(task_id)), None)
 
+    async def push_task(self, task_id: str, *, context: str = "test"):
+        self.pushed_tasks.append({"task_id": str(task_id), "context": context})
+
+    async def push_delete_task(self, task_id: str, *, context: str = "test"):
+        self.delete_tasks.append({"task_id": str(task_id), "context": context})
+
+    async def force_requeue_task(self, task_id: str, *, context: str = "test"):
+        self.requeued_tasks.append({"task_id": str(task_id), "context": context})
+
+    async def force_requeue_delete_task(self, task_id: str, *, context: str = "test"):
+        self.requeued_delete_tasks.append({"task_id": str(task_id), "context": context})
+
+    async def pop_task(self, timeout_seconds: int | float, context: str = "test"):
+        del timeout_seconds, context
+        return None
+
+    async def pop_delete_task(self, timeout_seconds: int | float, context: str = "test"):
+        del timeout_seconds, context
+        return None
+
+    async def ping(self, *, context: str = "test"):
+        self.ping_calls.append(context)
+        return True
+
+    async def wait_until_ready(self, *, context: str = "test"):
+        self.ready_wait_calls.append(context)
+        return True
+
     async def acquire_task_sync_repair_lock(self, task_id: str, owner_token: str, *, ttl_seconds: int = 30, context: str = "test"):
         del ttl_seconds, context
         task_id = str(task_id)
@@ -481,6 +515,21 @@ class _FakeTaskSyncQueue:
             self.stage_runs.remove(obj)
         if obj in self.tasks:
             self.tasks.remove(obj)
+
+    def __getattr__(self, name):
+        raise AssertionError(f"unexpected fake task queue operation: {name}")
+
+
+class _TaskManagerQueuePatchedMixin:
+    def setUp(self):
+        super().setUp()
+        self.fake_task_queue = _FakeTaskSyncQueue()
+        self._original_get_task_queue = task_manager_module.get_task_queue
+        task_manager_module.get_task_queue = lambda: self.fake_task_queue
+
+    def tearDown(self):
+        task_manager_module.get_task_queue = self._original_get_task_queue
+        super().tearDown()
 
 
 class StatusMappingTests(unittest.TestCase):
@@ -1176,7 +1225,7 @@ class ArchiveReclaimTests(unittest.TestCase):
             self.manager._cleanup_downstream_refs = original_cleanup
 
         self.assertEqual(["system_analysis"], affected)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("system_analysis", task.current_stage)
         self.assertEqual({"system_analysis"}, {item.stage_name for item in db.stage_items})
         self.assertEqual({"system_analysis"}, {job.stage_name for job in db.archive_jobs})
@@ -1727,8 +1776,9 @@ class _AsyncDataflowVulnScanClientStub:
         return dict(result)
 
 
-class TaskManagerTests(unittest.TestCase):
+class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
     def setUp(self):
+        super().setUp()
         self.manager = TaskManager()
 
     def test_removed_compatibility_facade_is_no_longer_exposed(self):
@@ -4669,6 +4719,14 @@ class TaskManagerTests(unittest.TestCase):
                 self.manager._release_task_state_lease = original_release
 
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+            page = self.manager.get_task_stage_items_page(
+                db,
+                project_id="p1",
+                task_id="t1",
+                stage_name="dataflow_vuln_scan",
+                page=1,
+                per_page=10,
+            )
             observability = self.manager.get_orchestration_observability(db, project_id="p1", task_id="t1")
 
             self.assertEqual("processed", terminal_event.status)
@@ -4817,6 +4875,14 @@ class TaskManagerTests(unittest.TestCase):
                 self.manager._release_task_state_lease = original_release
 
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+            page = self.manager.get_task_stage_items_page(
+                db,
+                project_id="p1",
+                task_id="t1",
+                stage_name="dataflow_vuln_scan",
+                page=1,
+                per_page=10,
+            )
             observability = self.manager.get_orchestration_observability(db, project_id="p1", task_id="t1")
             workset = dict((task.summary or {}).get("runtime_workset") or {})
 
@@ -4826,7 +4892,7 @@ class TaskManagerTests(unittest.TestCase):
             self.assertEqual("downstream_missing", dataflow_item.status)
             self.assertEqual("downstream_missing", detail.stage_summaries[2].status)
             self.assertEqual("running", detail.status)
-            self.assertEqual("downstream_missing", detail.stage_items[0].abnormal_reason.code)
+            self.assertEqual("downstream_missing", page.items[0].abnormal_reason.code)
             self.assertIsInstance(detail.overview_nodes, list)
             self.assertFalse(detail.manual_operation_state["can_retry"])
             self.assertFalse(detail.manual_operation_state["can_retry_failed_items"])
@@ -4948,12 +5014,20 @@ class TaskManagerTests(unittest.TestCase):
                 self.manager._release_task_state_lease = original_release
 
             detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+            page = self.manager.get_task_stage_items_page(
+                db,
+                project_id="p1",
+                task_id="t1",
+                stage_name="dataflow_vuln_scan",
+                page=1,
+                per_page=10,
+            )
             workset = dict((task.summary or {}).get("runtime_workset") or {})
             self.assertEqual("running", task.status)
             self.assertEqual("failed", dataflow_item.status)
             self.assertEqual("failed", detail.stage_summaries[2].status)
             self.assertEqual("running", detail.status)
-            self.assertEqual("downstream_failed", detail.stage_items[0].abnormal_reason.code)
+            self.assertEqual("downstream_failed", page.items[0].abnormal_reason.code)
             self.assertFalse(detail.manual_operation_state["can_retry"])
             self.assertIn("pending_task_layer_reconcile", workset)
             self.assertEqual(
@@ -5293,6 +5367,22 @@ class TaskManagerTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], archive_jobs=[])
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
+        page = self.manager.get_task_stage_items_page(
+            db,
+            project_id="p1",
+            task_id="t1",
+            stage_name="entry_analysis",
+            page=1,
+            per_page=100,
+        )
+        page = self.manager.get_task_stage_items_page(
+            db,
+            project_id="p1",
+            task_id="t1",
+            stage_name="entry_analysis",
+            page=1,
+            per_page=100,
+        )
         self.assertEqual("top_n_per_module_by_confidence", detail.entry_auto_selection_strategy)
         self.assertEqual(3, detail.entry_auto_selection_top_n)
 
@@ -6631,7 +6721,7 @@ class TaskManagerTests(unittest.TestCase):
 
         self.assertEqual(105, detail.stage_items_total)
         self.assertTrue(detail.stage_items_truncated)
-        self.assertEqual(100, len(detail.stage_items))
+        self.assertEqual(100, len(page.items))
         entry_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "entry_analysis")
         self.assertEqual(105, entry_summary.total_items)
         self.assertEqual(60, entry_summary.success_items)
@@ -8277,8 +8367,9 @@ class TaskManagerTests(unittest.TestCase):
             )
 
 
-class BinaryToSourceClientTests(unittest.IsolatedAsyncioTestCase):
+class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        super().setUp()
         self.manager = TaskManager()
 
     def _finish_continue_prepare(self, db, task, target_stage: str) -> None:
@@ -37486,7 +37577,7 @@ def _test_dispatch_task_by_id_claims_ownerless_active_operation(self):
 
     self.assertEqual(task.id, claimed)
     self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
-    self.assertEqual("local-worker", task.dispatcher_instance_id)
+    self.assertIsNone(task.dispatcher_instance_id)
     self.assertIsNotNone(task.lease_expires_at)
 
 
@@ -37558,7 +37649,7 @@ def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     refreshed = manager._refresh_task_status_after_sync_early_return(db, task)
 
     self.assertTrue(refreshed)
-    self.assertEqual("dispatching", task.status)
+    self.assertEqual("pending", task.status)
     self.assertEqual("local-worker", task.dispatcher_instance_id)
     self.assertIsNone(task.dispatch_started_at)
     self.assertIsNone(task.lease_expires_at)
@@ -45803,6 +45894,11 @@ def _test_local_runtime_sync_maintenance_drains_due_task_sync_requests(self):
             patch.object(fake_queue, "consume_owner_signal", new=AsyncMock(return_value=None)),
             patch.object(fake_queue, "has_due_task_sync_request", new=AsyncMock(return_value=True)),
             patch.object(task_manager_module, "get_task_queue", return_value=fake_queue),
+            patch.object(
+                manager,
+                "_verify_local_runtime_lease_or_abort",
+                return_value=SimpleNamespace(should_continue=True),
+            ),
         ):
             processed = asyncio.run(manager._service_local_runtime_sync_maintenance(task.id))
         self.assertTrue(processed)
