@@ -38898,6 +38898,96 @@ def _test_persist_child_sync_observation_records_observation_persist_failed(self
     self.assertIn("persist boom", failed_events[-1].payload.get("persist_error", ""))
 
 
+def _test_persist_child_sync_observation_records_success_and_recovery_events(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(id="task-sync-recovery", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si-sync-recovery",
+        task_id="task-sync-recovery",
+        project_id="p1",
+        stage_run_id="sr-sync-recovery",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-sync-recovery",
+    )
+    item.result = {
+        "sync_status": "transport_error",
+        "downstream_status": "running",
+        "last_sync_error_type": "UpstreamError",
+        "last_sync_error_message": "boom",
+        "sync_observation": {
+            "sync_status": "transport_error",
+            "error_type": "UpstreamError",
+            "error_message": "boom",
+            "downstream_status": "running",
+            "mapped_status": "running",
+            "last_result": "error",
+            "last_error_at": (_now() - timedelta(minutes=1)).isoformat(),
+        },
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    ok = manager._persist_child_sync_observation(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        sync_status="synced",
+        synced_at=_now(),
+        error_message=None,
+        error_type=None,
+        status_raw="success",
+        mapped_status="success",
+        downstream_status="success",
+        state_applied=True,
+        last_sync_result="success",
+        clear_error_state=True,
+    )
+
+    self.assertTrue(ok)
+    sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
+    self.assertEqual(["succeeded", "error_recovered"], [row.event_type for row in sync_rows[-2:]])
+    self.assertEqual("synced", item.result.get("sync_status"))
+    self.assertIsNone(item.result.get("last_sync_error_type"))
+    self.assertIsNotNone(item.result.get("last_sync_success_at"))
+    self.assertFalse(manager._stage_item_has_active_sync_error(item))
+
+
+def _test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success(self):
+    manager = TaskManager()
+    item = BinarySecurityStageItem(
+        id="si-sync-view",
+        task_id="task-sync-view",
+        project_id="p1",
+        stage_run_id="sr-sync-view",
+        stage_name="entry_analysis",
+        item_key="IPSEC",
+        status="success",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-sync-view",
+    )
+    item.result = {
+        "sync_status": "synced",
+        "downstream_status": "success",
+        "last_sync_result": "success",
+        "last_sync_error_type": "UpstreamError",
+        "last_sync_error_message": "old boom",
+        "sync_observation": {
+            "sync_status": "synced",
+            "downstream_status": "success",
+            "mapped_status": "success",
+            "last_result": "success",
+            "error_type": "UpstreamError",
+            "error_message": "old boom",
+            "budget_exhausted": False,
+        },
+    }
+
+    self.assertFalse(manager._stage_item_has_active_sync_error(item))
+
+
 def _test_apply_child_state_with_savepoint_records_state_apply_failed(self):
     manager = TaskManager()
     task = BinarySecurityTask(id="task-6", project_id="p1", name="demo", status="running")
@@ -45833,6 +45923,8 @@ TaskManagerTests.test_record_downstream_sync_event_trims_each_item_bucket_indepe
 TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_item_id = _test_record_downstream_sync_event_uses_fallback_bucket_without_item_id
 TaskManagerTests.test_record_downstream_item_disposition_maps_create_and_retry_audit_events = _test_record_downstream_item_disposition_maps_create_and_retry_audit_events
 TaskManagerTests.test_downstream_create_task_records_requested_and_applied_sync_events = _test_downstream_create_task_records_requested_and_applied_sync_events
+TaskManagerTests.test_persist_child_sync_observation_records_success_and_recovery_events = _test_persist_child_sync_observation_records_success_and_recovery_events
+TaskManagerTests.test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success = _test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success
 TaskManagerTests.test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key = _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key
 TaskManagerTests.test_downstream_create_task_fails_when_gateway_rejects_work_key = _test_downstream_create_task_fails_when_gateway_rejects_work_key
 TaskManagerTests.test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized = _test_stage_dataflow_vuln_scan_blocks_until_entry_analysis_materialized

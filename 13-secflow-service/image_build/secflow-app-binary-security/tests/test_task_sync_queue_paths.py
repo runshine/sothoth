@@ -246,6 +246,136 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual(1, entries[0]["attempts"])
         self.assertEqual("boom", entries[0]["last_error"])
 
+    def test_reconcile_missing_task_sync_requests_requeues_due_db_fact(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-reconcile",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si-reconcile-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-reconcile-1",
+            stage_name="entry_analysis",
+            item_key="entry-a",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-reconcile-1",
+            result={},
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+        fake_queue = _FakeTaskSyncQueue()
+        original_get_queue = task_manager_module.get_task_queue
+        original_enqueue = manager._enqueue_task
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+            manager._enqueue_task = lambda *_args, **_kwargs: None
+            repaired = asyncio.run(manager._reconcile_missing_task_sync_requests(db, task))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            manager._enqueue_task = original_enqueue
+
+        self.assertEqual(1, repaired)
+        entries = fake_queue.entries_by_task[task.id]
+        self.assertEqual(1, len(entries))
+        self.assertEqual(["si-reconcile-1"], entries[0]["item_ids"])
+        self.assertEqual("downstream_status", entries[0]["sync_kind"])
+        self.assertIn("task_sync_request_reconcile_requeued", [event.event_type for event in db.events])
+
+    def test_drain_task_sync_queue_persists_db_retry_fact_when_retry_enqueue_fails(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-retry-db-fact",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            dispatcher_instance_id=manager.instance_id,
+            lease_expires_at=_now() + timedelta(minutes=5),
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si-retry-db-fact",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-retry-db-fact",
+            stage_name="entry_analysis",
+            item_key="entry-a",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-retry-db-fact",
+            result={},
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+        fake_queue = _FakeTaskSyncQueue()
+        fake_queue.entries_by_task[task.id] = [
+            {
+                "queue_item_id": "tsq-retry-db-fact",
+                "dedupe_key": "downstream_status:entry_analysis:si-retry-db-fact:*",
+                "sync_kind": "downstream_status",
+                "source": "test",
+                "reason": "retry",
+                "source_event_type": "downstream_status_observed",
+                "stage_name": "entry_analysis",
+                "item_ids": ["si-retry-db-fact"],
+                "archive_job_ids": [],
+                "force": False,
+                "requested_at": _now().isoformat(),
+                "last_requested_at": _now().isoformat(),
+                "next_retry_at": _now().isoformat(),
+                "attempts": 0,
+                "priority": 10,
+                "payload": {},
+            }
+        ]
+        original_get_queue = task_manager_module.get_task_queue
+        original_sync = manager.sync_downstream_status
+        original_repair = manager._repair_task_sync_queue_on_runtime_start
+        original_reconcile = manager._reconcile_missing_task_sync_requests
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+
+            async def _fake_sync(*_args, **_kwargs):
+                raise UpstreamError("retry db fact boom")
+
+            async def _broken_retry(*_args, **_kwargs):
+                raise RuntimeError("retry queue down")
+
+            manager.sync_downstream_status = _fake_sync
+            manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
+            manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
+            fake_queue.retry_task_sync_request = _broken_retry
+            with self.assertRaises(UpstreamError):
+                asyncio.run(manager._drain_task_sync_queue(db, task))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            manager.sync_downstream_status = original_sync
+            manager._repair_task_sync_queue_on_runtime_start = original_repair
+            manager._reconcile_missing_task_sync_requests = original_reconcile
+
+        sync_observation = dict(item.result.get("sync_observation") or {})
+        self.assertEqual("error", sync_observation.get("last_result"))
+        self.assertEqual("UpstreamError", sync_observation.get("error_type"))
+        self.assertIsNotNone(sync_observation.get("next_retry_at"))
+        self.assertFalse(bool(sync_observation.get("budget_exhausted")))
+        self.assertIn(
+            "task_sync_retry_enqueue_failed_but_db_retry_persisted",
+            [event.event_type for event in db.events],
+        )
+
     def test_migrate_legacy_pending_downstream_sync_to_redis_queue(self):
         manager = TaskManager()
         task = BinarySecurityTask(

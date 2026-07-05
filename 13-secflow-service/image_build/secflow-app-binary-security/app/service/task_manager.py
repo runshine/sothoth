@@ -4639,12 +4639,35 @@ class TaskManager(
             item_ids=entry.get("item_ids"),
             archive_job_ids=entry.get("archive_job_ids"),
         )
-        normalized_entry = await get_task_queue().enqueue_task_sync_request(
-            task.id,
-            entry,
-            dedupe_key=dedupe_key,
-            context="task_sync_enqueue",
-        )
+        try:
+            normalized_entry = await get_task_queue().enqueue_task_sync_request(
+                task.id,
+                entry,
+                dedupe_key=dedupe_key,
+                context="task_sync_enqueue",
+            )
+        except Exception as exc:
+            if db is not None:
+                self._record_event(
+                    db,
+                    task,
+                    "task_sync_enqueue_failed_but_db_fact_retained",
+                    "子任务同步请求入队失败，但 DB 中的同步事实仍保留，后续将自动补偿",
+                    level="warning",
+                    stage_name=entry.get("stage_name"),
+                    payload={
+                        "sync_kind": entry["sync_kind"],
+                        "reason": entry["reason"],
+                        "source": entry["source"],
+                        "source_event_type": entry.get("source_event_type"),
+                        "item_ids": list(entry.get("item_ids") or []),
+                        "archive_job_ids": list(entry.get("archive_job_ids") or []),
+                        "dedupe_key": dedupe_key,
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                    },
+                )
+            raise
         if self._should_enqueue_parent_dispatch_for_task_sync(
             db,
             task,
@@ -4653,6 +4676,98 @@ class TaskManager(
         ):
             self._enqueue_task(task.id)
         return normalized_entry
+
+    def _sync_request_entry_due(
+        self,
+        entry: dict[str, Any],
+        *,
+        now_value: datetime | None = None,
+    ) -> bool:
+        next_retry_at = self._parse_comparable_datetime(dict(entry or {}).get("next_retry_at"))
+        if next_retry_at is None:
+            return True
+        return next_retry_at <= (now_value or _now())
+
+    def _sync_request_blocked_by_budget_exhaustion(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        entry: dict[str, Any],
+    ) -> bool:
+        item_ids = [str(item_id).strip() for item_id in list(dict(entry or {}).get("item_ids") or []) if str(item_id).strip()]
+        if not item_ids:
+            return False
+        items = (
+            db.query(BinarySecurityStageItem)
+            .filter(
+                BinarySecurityStageItem.task_id == task.id,
+                BinarySecurityStageItem.id.in_(item_ids),
+            )
+            .all()
+        )
+        if not items:
+            return False
+        return all(self._stage_item_sync_error_budget_exhausted(item) for item in items)
+
+    async def _reconcile_missing_task_sync_requests(self, db: Session, task: BinarySecurityTask) -> int:
+        expected = self._build_expected_sync_requests_from_db(db, task)
+        if not expected:
+            return 0
+        existing = await get_task_queue().list_task_sync_requests(task.id, context="task_sync_reconcile_list")
+        existing_dedupe_keys = {
+            str(entry.get("dedupe_key") or "").strip()
+            for entry in existing
+            if str(entry.get("dedupe_key") or "").strip()
+        }
+        now_value = _now()
+        repaired = 0
+        for entry in expected:
+            dedupe_key = self._task_sync_request_dedupe_key(
+                sync_kind=str(entry.get("sync_kind") or "").strip(),
+                stage_name=entry.get("stage_name"),
+                item_ids=entry.get("item_ids"),
+                archive_job_ids=entry.get("archive_job_ids"),
+            )
+            if dedupe_key in existing_dedupe_keys:
+                continue
+            if not self._sync_request_entry_due(entry, now_value=now_value):
+                continue
+            if self._sync_request_blocked_by_budget_exhaustion(db, task, entry):
+                continue
+            await self._enqueue_task_sync_request(
+                task,
+                db=db,
+                sync_kind=str(entry.get("sync_kind") or "").strip(),
+                source="task_sync_reconcile",
+                reason=str(entry.get("reason") or "repair_missing_or_stale_sync_queue_entry").strip(),
+                stage_name=entry.get("stage_name"),
+                item_ids=list(entry.get("item_ids") or []),
+                archive_job_ids=list(entry.get("archive_job_ids") or []),
+                force=bool(entry.get("force")),
+                source_event_type=str(entry.get("source_event_type") or "task_sync_queue_repair").strip(),
+                payload={
+                    **dict(entry.get("payload") or {}),
+                    "repair_source": "task_sync_reconcile",
+                },
+                priority=int(entry.get("priority") or 100),
+            )
+            self._record_event(
+                db,
+                task,
+                "task_sync_request_reconcile_requeued",
+                "子任务同步请求缺失，已按 DB 事实重新补回队列",
+                stage_name=entry.get("stage_name"),
+                payload={
+                    "sync_kind": entry.get("sync_kind"),
+                    "reason": entry.get("reason"),
+                    "item_ids": list(entry.get("item_ids") or []),
+                    "archive_job_ids": list(entry.get("archive_job_ids") or []),
+                    "dedupe_key": dedupe_key,
+                },
+            )
+            repaired += 1
+            existing_dedupe_keys.add(dedupe_key)
+        return repaired
 
     def _build_expected_sync_requests_from_db(
         self,
@@ -4788,6 +4903,7 @@ class TaskManager(
 
     async def _drain_task_sync_queue(self, db: Session, task: BinarySecurityTask) -> bool:
         await self._repair_task_sync_queue_on_runtime_start(db, task)
+        await self._reconcile_missing_task_sync_requests(db, task)
         entry = await get_task_queue().pop_task_sync_request(task.id, context="task_sync_pop")
         if entry is None:
             return False
@@ -4833,13 +4949,75 @@ class TaskManager(
             return True
         except Exception as exc:
             retry_seconds = max(5, min(60, 5 * (2 ** min(5, int(entry.get("attempts") or 0)))))
+            retry_at = _now() + timedelta(seconds=retry_seconds)
             retry_entry = {
                 **dict(entry),
                 "attempts": int(entry.get("attempts") or 0) + 1,
                 "last_error": str(exc),
-                "next_retry_at": (_now() + timedelta(seconds=retry_seconds)).isoformat(),
+                "next_retry_at": retry_at.isoformat(),
             }
-            await get_task_queue().retry_task_sync_request(task.id, retry_entry, context="task_sync_retry")
+            try:
+                await get_task_queue().retry_task_sync_request(task.id, retry_entry, context="task_sync_retry")
+            except Exception as retry_exc:
+                item_ids = [str(item_id).strip() for item_id in list(retry_entry.get("item_ids") or []) if str(item_id).strip()]
+                stage_items: list[BinarySecurityStageItem] = []
+                if item_ids:
+                    stage_items = (
+                        db.query(BinarySecurityStageItem)
+                        .filter(
+                            BinarySecurityStageItem.task_id == task.id,
+                            BinarySecurityStageItem.id.in_(item_ids),
+                        )
+                        .all()
+                    )
+                sync_error_type = self._classify_downstream_sync_error(exc)
+                sync_error_message = str(exc)
+                for stage_item in stage_items:
+                    state = self._build_next_downstream_sync_failure_state(stage_item, observed_at=retry_at)
+                    self._persist_child_sync_observation(
+                        db,
+                        task=task,
+                        item=stage_item,
+                        change_source="task_sync_retry_enqueue_failed",
+                        sync_status="transport_error" if sync_error_type == "UpstreamError" else "observed",
+                        synced_at=retry_at,
+                        error_message=sync_error_message,
+                        error_type=sync_error_type,
+                        status_raw=self._stage_item_observed_downstream_status(stage_item),
+                        mapped_status=self._normalize_downstream_status(self._stage_item_observed_downstream_status(stage_item)),
+                        downstream_status=self._stage_item_observed_downstream_status(stage_item),
+                        state_applied=False,
+                        consecutive_error_count=state.consecutive_error_count,
+                        budget_exhausted=state.budget_exhausted,
+                        next_retry_at=state.next_retry_at,
+                        last_sync_result="error",
+                        extra_payload={
+                            "operation": "downstream_sync",
+                            "queue_item_id": queue_item_id,
+                            "retry_enqueue_error": str(retry_exc),
+                            "retry_enqueue_error_type": retry_exc.__class__.__name__,
+                            "retry_seconds": retry_seconds,
+                        },
+                    )
+                self._record_event(
+                    db,
+                    task,
+                    "task_sync_retry_enqueue_failed_but_db_retry_persisted",
+                    "子任务同步重试入队失败，但重试事实已写入 DB，后续将自动补偿",
+                    level="warning",
+                    stage_name=stage_name,
+                    payload={
+                        "sync_kind": sync_kind,
+                        "item_ids": item_ids,
+                        "queue_item_id": queue_item_id,
+                        "dedupe_key": dedupe_key,
+                        "next_retry_at": retry_entry.get("next_retry_at"),
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                        "retry_enqueue_error_type": retry_exc.__class__.__name__,
+                        "retry_enqueue_error": str(retry_exc),
+                    },
+                )
             raise
 
     def _has_task_write_ownership(
@@ -7026,6 +7204,11 @@ class TaskManager(
     ) -> bool:
         before_status = str(item.status or "").strip().lower() or None
         after_status = str(item.status or "").strip().lower() or None
+        previous_observation = self._stage_item_sync_observation(item)
+        previous_sync_status = self._stage_item_sync_status_value(item)
+        previous_error_type = self._string_or_none(previous_observation.get("error_type")) or self._string_or_none(dict(item.result or {}).get("last_sync_error_type"))
+        previous_error_message = self._string_or_none(previous_observation.get("error_message")) or self._string_or_none(dict(item.result or {}).get("last_sync_error_message"))
+        previous_active_error = self._stage_item_has_active_sync_error(item)
         if not self._child_sync_observation_would_change(
             item,
             sync_status=sync_status,
@@ -7044,6 +7227,8 @@ class TaskManager(
             sync_event_type = sync_status
         elif error_message or error_type:
             sync_event_type = "failed"
+        elif sync_status == "synced" and (last_sync_result or "").strip().lower() == "success":
+            sync_event_type = "succeeded"
         max_attempts = self._retryable_write_attempts()
         for attempt in range(max_attempts):
             try:
@@ -7091,6 +7276,27 @@ class TaskManager(
                             **(extra_payload or {}),
                         },
                     )
+                    current_active_error = self._stage_item_has_active_sync_error(item)
+                    if previous_active_error and not current_active_error and (last_sync_result or "").strip().lower() == "success":
+                        self._record_downstream_sync_event(
+                            db,
+                            task=task,
+                            item=item,
+                            stage_name=item.stage_name,
+                            operation=change_source or "downstream_sync",
+                            event_type="error_recovered",
+                            sync_status=sync_status,
+                            outcome="success",
+                            state_applied=state_applied,
+                            payload={
+                                "change_source": change_source,
+                                "previous_sync_status": previous_sync_status,
+                                "previous_error_type": previous_error_type,
+                                "previous_error_message": previous_error_message,
+                                "recovered_at": _isoformat_or_none(synced_at),
+                                **(extra_payload or {}),
+                            },
+                        )
                     db.flush()
                 return True
             except Exception as exc:
@@ -8692,6 +8898,10 @@ class TaskManager(
         sync_status = self._stage_item_sync_status_value(item)
         if sync_status in {"binding_mismatch", "binding_missing_during_recreate", "transport_error", "rate_limited"}:
             return True
+        if sync_status == "synced" and not self._stage_item_sync_error_budget_exhausted(item):
+            return False
+        if str(sync_observation.get("last_result") or result.get("last_sync_result") or "").strip().lower() == "success":
+            return False
         error_message = self._string_or_none(sync_observation.get("error_message")) or self._string_or_none(result.get("last_sync_error_message"))
         error_type = self._string_or_none(sync_observation.get("error_type")) or self._string_or_none(result.get("last_sync_error_type"))
         if not error_message and not error_type:
