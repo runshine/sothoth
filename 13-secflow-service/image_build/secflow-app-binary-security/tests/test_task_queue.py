@@ -177,7 +177,22 @@ class _FakeRedisTaskSyncDueFlaky(_FakeRedis):
 
 
 async def _bind_client_for_current_loop(queue: TaskQueue, client) -> None:
-    queue._clients_by_loop_id[asyncio.get_running_loop()] = client
+    queue._redis_helper._clients_by_loop_id[asyncio.get_running_loop()] = client
+
+
+def _patch_helper_new_client(queue: TaskQueue, side_effect):
+    return mock.patch.object(queue._redis_helper, "new_client", side_effect=side_effect)
+
+
+def _stable_client_factory(*clients):
+    calls: list[str] = []
+
+    def _factory(context="unspecified"):
+        calls.append(context)
+        index = min(len(calls), len(clients)) - 1
+        return clients[index]
+
+    return calls, _factory
 
 
 class TaskQueueTests(unittest.TestCase):
@@ -270,17 +285,16 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual("task-1", popped)
         self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
-        self.assertEqual(1, len(queue._clients_by_loop_id))
+        self.assertEqual(1, len(queue._redis_helper._clients_by_loop_id))
 
     def test_pop_task_treats_redis_timeout_as_empty_poll(self):
         queue = TaskQueue()
         first = _FakeRedisTimeout()
         second = _FakeRedis()
         second.lists[queue.config.task_queue_key] = ["task-1"]
-        created = []
+        created, factory = _stable_client_factory(first, second)
 
-        with mock.patch.object(queue, "_new_client") as new_client:
-            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+        with _patch_helper_new_client(queue, factory):
 
             async def _no_sleep(_seconds):
                 return None
@@ -300,10 +314,9 @@ class TaskQueueTests(unittest.TestCase):
         second = _FakeRedis()
         second.lists[queue.config.task_queue_key] = ["task-1"]
         second.sorted_sets[f"{queue.config.task_queue_key}:enqueued_at"] = {"task-1": 1.0}
-        created = []
+        created, factory = _stable_client_factory(first, second)
 
-        with mock.patch.object(queue, "_new_client") as new_client:
-            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+        with _patch_helper_new_client(queue, factory):
 
             async def _no_sleep(_seconds):
                 return None
@@ -331,7 +344,7 @@ class TaskQueueTests(unittest.TestCase):
         self.assertEqual(1, snapshot["task_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["enabled"])
-        self.assertEqual(1, len(queue._clients_by_loop_id))
+        self.assertEqual(1, len(queue._redis_helper._clients_by_loop_id))
 
     def test_wait_until_ready_succeeds_after_ping(self):
         queue = TaskQueue()
@@ -349,10 +362,9 @@ class TaskQueueTests(unittest.TestCase):
         queue = TaskQueue()
         first = _FakeRedisPingFlaky(failures_before_success=1)
         second = _FakeRedisPingFlaky(failures_before_success=0)
-        created = []
+        created, factory = _stable_client_factory(first, second)
 
-        with mock.patch.object(queue, "_new_client") as new_client:
-            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+        with _patch_helper_new_client(queue, factory):
 
             async def _no_sleep(_seconds):
                 return None
@@ -400,7 +412,7 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertIs(fake_client, first)
         self.assertIs(fake_client, second)
-        self.assertEqual(1, len(queue._clients_by_loop_id))
+        self.assertEqual(1, len(queue._redis_helper._clients_by_loop_id))
         from_url.assert_called_once()
 
     def test_new_client_is_isolated_per_event_loop(self):
@@ -431,7 +443,7 @@ class TaskQueueTests(unittest.TestCase):
 
         asyncio.run(_exercise())
 
-        self.assertEqual(1, len(queue._clients_by_loop_id))
+        self.assertEqual(1, len(queue._redis_helper._clients_by_loop_id))
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
 
     def test_queue_positions_returns_current_queue_membership(self):
@@ -460,16 +472,15 @@ class TaskQueueTests(unittest.TestCase):
         snapshot = asyncio.run(_exercise())
 
         self.assertEqual(0, snapshot["orphan_count"])
-        self.assertEqual(1, len(queue._clients_by_loop_id))
+        self.assertEqual(1, len(queue._redis_helper._clients_by_loop_id))
 
     def test_push_task_rebuilds_cached_client_after_connection_error(self):
         queue = TaskQueue()
         first = _FakeRedisPushConnectionFlaky(failures_before_success=1)
         second = _FakeRedis()
-        created = []
+        created, factory = _stable_client_factory(first, second)
 
-        with mock.patch.object(queue, "_new_client") as new_client:
-            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+        with _patch_helper_new_client(queue, factory):
 
             async def _no_sleep(_seconds):
                 return None
@@ -487,10 +498,9 @@ class TaskQueueTests(unittest.TestCase):
         queue = TaskQueue()
         first = _FakeRedisTaskSyncDueFlaky(failures_before_success=1)
         second = _FakeRedisTaskSyncDueFlaky(failures_before_success=0)
-        created = []
+        created, factory = _stable_client_factory(first, second)
 
-        with mock.patch.object(queue, "_new_client") as new_client:
-            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+        with _patch_helper_new_client(queue, factory):
 
             async def _no_sleep(_seconds):
                 return None
@@ -508,10 +518,9 @@ class TaskQueueTests(unittest.TestCase):
         queue = TaskQueue()
         first = _FakeRedisPingFlaky(failures_before_success=1)
         second = _FakeRedisPingFlaky(failures_before_success=0)
-        created = []
+        created, factory = _stable_client_factory(first, second)
 
-        with mock.patch.object(queue, "_new_client") as new_client:
-            new_client.side_effect = lambda context="unspecified": created.append(context) or (first if len(created) == 1 else second)
+        with _patch_helper_new_client(queue, factory):
 
             async def _no_sleep(_seconds):
                 return None

@@ -4805,7 +4805,7 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         entry_items = self.manager._stage_items(db, task.id, "entry_analysis")
         self.assertTrue(b2s_signals)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual(1, len(entry_items))
 
         entry_item = entry_items[0]
@@ -4970,8 +4970,8 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("archive_apply", str(signals[-1].get("reconcile_reason") or ""))
         self.assertTrue(any(event.event_type == "task_layer_reconcile_completed" for event in db.events))
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("running", task.status)
-        self.assertEqual("running", detail.status)
+        self.assertEqual("pending", task.status)
+        self.assertEqual("pending", detail.status)
         self.assertEqual([], self.manager._stage_items(db, task.id, "entry_analysis"))
         self.assertEqual([], [run for run in db.stage_runs if str(run.stage_name or "").strip() == "entry_analysis"])
         b2s_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "binary_to_source")

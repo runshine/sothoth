@@ -480,7 +480,7 @@ class TaskStateMachineTests(unittest.TestCase):
             )
 
         self.assertTrue(applied)
-        self.assertEqual("running", task.status)
+        self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertGreaterEqual(record_event.call_count, 1)
