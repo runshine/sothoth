@@ -199,6 +199,37 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             )
         )
 
+    def test_reclaim_stale_dispatching_single_task_locked_requeues_target(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-dispatching-single",
+            project_id="p1",
+            name="source",
+            status="dispatching",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="firmware_unpack",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            updated_at=_now() - timedelta(minutes=10),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], events=[], runtime_leases=[])
+
+        with (
+            patch.object(manager, "_task_has_active_cancel_operation", return_value=False),
+            patch.object(manager, "_task_runtime_transition_guard_active", return_value=False),
+            patch.object(manager, "_streaming_tail_active_context", return_value=(None, 0, False)),
+            patch.object(manager, "_current_stage_authoritative_failure_context", return_value=None),
+            patch.object(manager, "_earlier_stage_authoritative_failure_context", return_value=None),
+        ):
+            reclaimed = manager._reclaim_stale_dispatching_single_task_locked(db, task.id)
+
+        self.assertTrue(reclaimed)
+        self.assertEqual("pending", task.status)
+        self.assertTrue(any(event.event_type == "dispatch_reclaimed" for event in db.events))
+
     def test_reclaim_stale_running_skips_stale_row_when_runtime_lease_active(self):
         manager = TaskManager()
         task = BinarySecurityTask(

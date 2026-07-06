@@ -86,6 +86,53 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         ]
         self.assertTrue(reopen_events)
 
+    def test_requeue_orphaned_owned_execution_single_task_locked_recovers_target(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="t-single",
+            project_id="p1",
+            name="binary-module",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-single",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si-single",
+            task_id=task.id,
+            project_id="p1",
+            stage_run_id=stage_run.id,
+            stage_name="binary_to_source",
+            item_key="module1",
+            parent_key="module1",
+            status="failed",
+            downstream_service="binary_to_source",
+            downstream_task_id=None,
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+        with (
+            unittest.mock.patch.object(manager, "_task_runtime_transition_guard_active", return_value=False),
+            unittest.mock.patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True),
+        ):
+            reclaimed = manager._requeue_orphaned_owned_execution_single_task_locked(db, task.id)
+
+        self.assertTrue(reclaimed)
+        self.assertEqual("pending", task.status)
+        self.assertTrue(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+
     def test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"

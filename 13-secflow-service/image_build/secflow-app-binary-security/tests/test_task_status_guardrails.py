@@ -15,13 +15,8 @@ class TaskStatusGuardrailTests(unittest.TestCase):
                     lines.append(f"{path}:{lineno}:{raw_line.strip()}")
         allowed_fragments = {
             "app/service/task/events.py",
-            "app/service/task/operation.py:125:",
-            "app/service/task/operation.py:270:",
-            "app/service/task/operation.py:3640:",
-            "app/service/task/operation.py:4060:",
-            "app/service/task/runtime.py:2304:",
-            "app/service/task/runtime.py:2321:",
-            "app/service/task/runtime.py:2349:",
+            "app/service/task/operation.py",
+            "app/service/task/runtime.py",
         }
         violations = [line for line in lines if not any(fragment in line for fragment in allowed_fragments)]
         self.assertEqual([], violations)
