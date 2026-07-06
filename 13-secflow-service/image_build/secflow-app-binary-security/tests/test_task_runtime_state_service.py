@@ -1,5 +1,6 @@
 import unittest
 from datetime import timedelta
+from unittest.mock import patch
 
 from app.model import (
     BinarySecurityTask,
@@ -177,6 +178,51 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         event_types = [row.event_type for row in db.events]
         self.assertIn("runtime_lease_clear_deferred_by_lock", event_types)
         self.assertIn("owned_execution_reclaim_deferred_by_lock", event_types)
+
+    def test_repair_running_tasks_without_active_lease_uses_single_task_sessions_for_real_session_path(self):
+        class _CountingDb(_ModelAwareDb):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.commit_count = 0
+                self.rollback_count = 0
+
+            def commit(self):
+                self.commit_count += 1
+
+            def rollback(self):
+                self.rollback_count += 1
+                return None
+
+        task1 = self._task(id="task-1", current_stage="system_analysis")
+        task2 = self._task(id="task-2", current_stage="entry_analysis")
+        outer_db = _CountingDb(tasks=[task1, task2], runtime_leases=[], events=[])
+        task_db_1 = _CountingDb(tasks=[task1], runtime_leases=[], events=[])
+        task_db_2 = _CountingDb(tasks=[task2], runtime_leases=[], events=[])
+        session_sequence = [task_db_1, task_db_2]
+
+        def _next_session():
+            return session_sequence.pop(0)
+
+        calls: list[tuple[str, str]] = []
+
+        def _repair_single(session, task_id):
+            calls.append((task_id, getattr(session.tasks[0], "id", None)))
+            return task_id == "task-1"
+
+        with (
+            patch("app.service.task.runtime.Session", _CountingDb),
+            patch("app.service.task_manager.get_session_factory", return_value=_next_session),
+            patch.object(self.manager, "_running_without_active_lease_candidate_task_ids", return_value=["task-1", "task-2"]),
+            patch.object(self.manager, "_repair_running_lease_invariant_single_task_locked", side_effect=_repair_single),
+        ):
+            repaired = self.manager._repair_running_tasks_without_active_lease_locked(outer_db)
+
+        self.assertTrue(repaired)
+        self.assertEqual([("task-1", "task-1"), ("task-2", "task-2")], calls)
+        self.assertEqual(1, task_db_1.commit_count)
+        self.assertEqual(0, task_db_1.rollback_count)
+        self.assertEqual(0, task_db_2.commit_count)
+        self.assertEqual(1, task_db_2.rollback_count)
 
 
 if __name__ == "__main__":

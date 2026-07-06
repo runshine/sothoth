@@ -2243,15 +2243,6 @@ class TaskRuntimeStateServiceMixin:
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
-        task_query = db.query(task_manager_module.BinarySecurityTask).filter(
-            task_manager_module.BinarySecurityTask.id == str(getattr(task, "id", "") or "").strip()
-        )
-        with_for_update = getattr(task_query, "with_for_update", None)
-        if callable(with_for_update):
-            task_query = with_for_update()
-        locked_task = task_query.first()
-        if locked_task is not None:
-            task = locked_task
         if not self._running_task_requires_live_runtime_lease(db, task):
             return False
         snapshot = self._parent_runtime_ownership_snapshot(db, task)

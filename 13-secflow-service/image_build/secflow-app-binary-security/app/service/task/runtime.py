@@ -997,6 +997,20 @@ class TaskRuntimeServiceMixin:
             if str(task_id or "").strip()
         ]
 
+    def _running_without_active_lease_candidate_task_ids(self: TaskManager, db: Session) -> list[str]:
+        from app.service import task_manager as task_manager_module
+
+        rows = (
+            db.query(task_manager_module.BinarySecurityTask.id)
+            .filter(task_manager_module.BinarySecurityTask.status == "running")
+            .all()
+        )
+        return [
+            str(task_id or "").strip()
+            for (task_id,) in rows
+            if str(task_id or "").strip()
+        ]
+
     def _lock_task_row_by_id(self: TaskManager, db: Session, task_id: str):
         from app.service import task_manager as task_manager_module
 
@@ -1204,8 +1218,63 @@ class TaskRuntimeServiceMixin:
             )
         return True
 
+    def _repair_running_lease_invariant_single_task_locked(self: TaskManager, db: Session, task_id: str) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        task = self._lock_task_row_by_id(db, task_id)
+        if task is None:
+            return False
+        if (
+            self._task_has_active_cancel_operation(db, task)
+            or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING
+        ):
+            return False
+        changed = self._repair_running_lease_invariant(
+            db,
+            task,
+            reason="parent_reclaim_pass_running_without_active_lease",
+            stage_name=str(task.current_stage or "").strip() or None,
+            event_payload={"source": "parent_reclaim_pass"},
+        )
+        if changed:
+            db.flush()
+        return bool(changed)
+
     def _repair_running_tasks_without_active_lease_locked(self: TaskManager, db: Session) -> bool:
         from app.service import task_manager as task_manager_module
+
+        if isinstance(db, Session):
+            candidate_ids = self._running_without_active_lease_candidate_task_ids(db)
+            if not candidate_ids:
+                return False
+            session_factory = task_manager_module.get_session_factory()
+            repaired = False
+            for task_id in candidate_ids:
+                task_db = session_factory()
+                try:
+                    changed = self._repair_running_lease_invariant_single_task_locked(task_db, task_id)
+                    if changed:
+                        task_db.commit()
+                        repaired = True
+                    else:
+                        task_db.rollback()
+                except OperationalError as exc:
+                    task_db.rollback()
+                    if self._is_retryable_lock_error(exc):
+                        task_manager_module.logger.info(
+                            "binary-security running-without-active-lease repair deferred by lock conflict: task_id=%s error_type=%s error=%s",
+                            task_id,
+                            exc.__class__.__name__,
+                            exc,
+                        )
+                        continue
+                    raise
+                except Exception:
+                    task_db.rollback()
+                    raise
+                finally:
+                    task_db.close()
+            return repaired
 
         rows = (
             db.query(task_manager_module.BinarySecurityTask)
