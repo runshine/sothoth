@@ -135,11 +135,18 @@ class TaskRuntimeServiceMixin:
     ) -> None:
         from app.service import task_manager as task_manager_module
 
+        normalized_reason = str(reason or "").strip() or "unknown"
+        if normalized_reason in {
+            "active_nonpending_takeover_suppressed_active_lease",
+            "claim_takeover_gate_suppressed_active_lease",
+            "active_runtime_lease_present",
+        }:
+            return
         task_manager_module.logger.info(
             "binary-security dispatch claim blocked: task_id=%s reason=%s status=%s runtime_phase=%s "
             "current_operation_id=%s operation_type=%s operation_status=%s detail=%s",
             str(task_id or "").strip() or None,
-            str(reason or "").strip() or "unknown",
+            normalized_reason,
             str(getattr(task, "status", "") or "").strip() or None if task is not None else None,
             str(self._task_runtime_phase(task)) if task is not None else None,
             str(getattr(task, "current_operation_id", "") or "").strip() or None if task is not None else None,
@@ -159,6 +166,12 @@ class TaskRuntimeServiceMixin:
 
         normalized_task_id = str(task_id or "").strip()
         normalized_reason = str(reason or "").strip() or "dispatch_claim_not_acquired_drop"
+        if normalized_reason in {
+            "active_nonpending_takeover_suppressed_active_lease",
+            "claim_takeover_gate_suppressed_active_lease",
+            "active_runtime_lease_present",
+        }:
+            return
         if not normalized_task_id:
             return
         task = (
