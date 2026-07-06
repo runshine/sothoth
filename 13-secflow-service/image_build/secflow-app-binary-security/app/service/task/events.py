@@ -20,6 +20,15 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
+    def _defer_inline_event_trim_for_task(
+        self: TaskManager,
+        task: BinarySecurityTask | None,
+    ) -> bool:
+        if task is None:
+            return False
+        normalized_status = str(getattr(task, "status", "") or "").strip().lower()
+        return normalized_status in {"pending", "dispatching", "running", "cancelling"}
+
     def _suppress_event_trim_lock_error(
         self: TaskManager,
         exc: OperationalError,
@@ -266,7 +275,8 @@ class TaskEventServiceMixin:
             state_event=False,
         )
         db.add(event)
-        self._trim_task_timeline_events(db, task_id=task.id)
+        if not self._defer_inline_event_trim_for_task(task):
+            self._trim_task_timeline_events(db, task_id=task.id)
 
     def _sync_event_origin_value(self: TaskManager, payload: dict[str, Any] | None, key: str) -> str | None:
         origin = dict((payload or {}).get("event_origin") or {})
@@ -436,13 +446,14 @@ class TaskEventServiceMixin:
                 state_event=False,
             )
             db.add(row)
-            self._trim_stage_item_sync_events(
-                db,
-                task_id=task.id,
-                item_bucket_key=item_bucket_key,
-                keep_limit=20,
-            )
-            self._trim_task_sync_events(db, task_id=task.id)
+            if not self._defer_inline_event_trim_for_task(task):
+                self._trim_stage_item_sync_events(
+                    db,
+                    task_id=task.id,
+                    item_bucket_key=item_bucket_key,
+                    keep_limit=20,
+                )
+                self._trim_task_sync_events(db, task_id=task.id)
         except Exception:
             if hasattr(self, "_logger"):
                 self._logger.exception("record downstream sync event failed")

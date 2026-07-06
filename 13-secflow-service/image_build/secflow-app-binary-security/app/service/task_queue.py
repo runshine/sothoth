@@ -117,6 +117,10 @@ class RedisSelfHealingClientHelper:
 
     @staticmethod
     def is_retryable_connection_error(exc: Exception) -> bool:
+        if isinstance(exc, AttributeError):
+            message = str(exc or "").strip().lower()
+            if "writelines" in message or "nonetype" in message:
+                return True
         return isinstance(
             exc,
             (

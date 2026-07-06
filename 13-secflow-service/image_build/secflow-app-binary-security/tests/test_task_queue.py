@@ -173,6 +173,21 @@ class _FakeRedisPushConnectionFlaky(_FakeRedis):
         return None
 
 
+class _FakeRedisOwnerSignalAttributeError(_FakeRedis):
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+
+    async def set(self, key, value, ex=None, nx=False):
+        del ex, nx
+        del key, value
+        raise AttributeError("'NoneType' object has no attribute 'writelines'")
+
+    async def aclose(self):
+        self.closed = True
+        return None
+
+
 class _FakeRedisTaskSyncDueFlaky(_FakeRedis):
     def __init__(self, failures_before_success):
         super().__init__()
@@ -439,6 +454,26 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertTrue(first.closed)
         self.assertGreaterEqual(second.ping_calls, 1)
+
+    def test_push_owner_signal_rebuilds_after_retryable_attribute_error(self):
+        queue = TaskQueue()
+        first = _FakeRedisOwnerSignalAttributeError()
+        second = _FakeRedis()
+        created, factory = _stable_client_factory(first, second)
+
+        with _patch_helper_new_client(queue, factory):
+
+            async def _no_sleep(_seconds):
+                return None
+
+            with mock.patch("app.service.task_queue.asyncio.sleep", side_effect=_no_sleep):
+                async def _exercise():
+                    await queue.push_owner_signal("worker-a", "task-1", context="owner_signal_consume")
+
+                asyncio.run(_exercise())
+
+        self.assertTrue(first.closed)
+        self.assertIn(queue._owner_signal_key("worker-a", "task-1"), second.values)
 
     def test_wait_until_ready_times_out_when_ping_never_recovers(self):
         queue = TaskQueue()

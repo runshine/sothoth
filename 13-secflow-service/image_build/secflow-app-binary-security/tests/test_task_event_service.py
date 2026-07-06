@@ -52,7 +52,7 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             id="task-timeline-cap",
             project_id="p1",
             name="timeline-cap",
-            status="running",
+            status="failed",
             current_stage="system_analysis",
             task_type=TASK_TYPE_SOURCE,
             firmware_source="project_filesystem",
@@ -86,6 +86,45 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(10_000, len(db.events))
         self.assertFalse(any(event.id == "evt-00000" for event in db.events))
         self.assertTrue(any(event.event_type == "overflow" for event in db.events))
+
+    def test_record_event_skips_inline_trim_for_active_task(self):
+        task = BinarySecurityTask(
+            id="task-active-no-inline-trim",
+            project_id="p1",
+            name="timeline-active",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+        events = []
+        base_time = _now() - timedelta(seconds=10001)
+        for index in range(10_000):
+            event = BinarySecurityEvent(
+                id=f"evt-active-{index:05d}",
+                task_id=task.id,
+                project_id=task.project_id,
+                level="info",
+                event_type="seed",
+                message=f"seed-{index}",
+            )
+            event.created_at = base_time + timedelta(seconds=index)
+            events.append(event)
+        db = _ModelAwareDb(tasks=[task], events=events)
+
+        self.manager._record_event(
+            db,
+            task,
+            "active-overflow",
+            "active-overflow-event",
+            stage_name="system_analysis",
+        )
+
+        self.assertEqual(10_001, len(db.events))
+        self.assertTrue(any(event.event_type == "active-overflow" for event in db.events))
 
     def test_trim_task_timeline_events_suppresses_retryable_lock_error(self):
         task = BinarySecurityTask(
