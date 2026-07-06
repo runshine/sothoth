@@ -34,6 +34,14 @@ class TaskRuntimeStateServiceStructureTests(unittest.TestCase):
 class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
+        self._original_get_task_queue = task_manager_module.get_task_queue
+        from test_task_manager import _FakeTaskSyncQueue
+
+        self.fake_task_queue = _FakeTaskSyncQueue()
+        task_manager_module.get_task_queue = lambda: self.fake_task_queue
+
+    def tearDown(self):
+        task_manager_module.get_task_queue = self._original_get_task_queue
 
     def _task(self, **overrides):
         data = {
@@ -100,9 +108,6 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
-        enqueued: list[str] = []
-
-        self.manager._enqueue_task = lambda task_id: enqueued.append(task_id)
         repaired = self.manager._repair_running_lease_invariant(
             db,
             task,
@@ -114,7 +119,10 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
-        self.assertEqual(["task-1"], enqueued)
+        self.assertEqual(
+            [{"task_id": "task-1", "context": "owned_execution_release_for_takeover"}],
+            self.fake_task_queue.requeued_tasks,
+        )
         self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
 
     def test_repair_running_lease_invariant_keeps_tail_task_with_active_runtime_lease(self):
@@ -176,8 +184,8 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertFalse(repaired)
         self.assertEqual("running", task.status)
         event_types = [row.event_type for row in db.events]
-        self.assertIn("runtime_lease_clear_deferred_by_lock", event_types)
-        self.assertIn("owned_execution_reclaim_deferred_by_lock", event_types)
+        self.assertIn("parent_takeover_lock_acquired", event_types)
+        self.assertIn("parent_takeover_recovery_deferred_by_db_lock", event_types)
 
     def test_repair_running_tasks_without_active_lease_uses_single_task_sessions_for_real_session_path(self):
         class _CountingDb(_ModelAwareDb):

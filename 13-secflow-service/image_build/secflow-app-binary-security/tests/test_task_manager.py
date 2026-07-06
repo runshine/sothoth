@@ -360,6 +360,7 @@ class _FakeTaskSyncQueue:
     def __init__(self):
         self.entries_by_task: dict[str, list[dict[str, object]]] = {}
         self.repair_locks: dict[str, str] = {}
+        self.parent_takeover_locks: dict[str, str] = {}
         self.owner_signals: dict[tuple[str, str], dict[str, object]] = {}
         self.pushed_tasks: list[dict[str, object]] = []
         self.delete_tasks: list[dict[str, object]] = []
@@ -516,6 +517,22 @@ class _FakeTaskSyncQueue:
         task_id = str(task_id)
         if self.repair_locks.get(task_id) == str(owner_token):
             self.repair_locks.pop(task_id, None)
+
+    async def acquire_parent_takeover_lock(self, task_id: str, owner_token: str, *, ttl_seconds: int = 60, context: str = "test"):
+        del ttl_seconds, context
+        task_id = str(task_id)
+        if task_id in self.parent_takeover_locks:
+            return False
+        self.parent_takeover_locks[task_id] = str(owner_token)
+        return True
+
+    async def release_parent_takeover_lock(self, task_id: str, owner_token: str, *, context: str = "test"):
+        del context
+        task_id = str(task_id)
+        if self.parent_takeover_locks.get(task_id) != str(owner_token):
+            return False
+        self.parent_takeover_locks.pop(task_id, None)
+        return True
 
     def refresh(self, obj):
         return obj

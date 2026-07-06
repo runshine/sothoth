@@ -166,7 +166,7 @@ from app.service.fileserver import get_fileserver_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.state_event_inbox_metrics_snapshot import get_state_event_inbox_metrics_snapshot_store
 from app.service.readless_sync import ReadlessSyncStats, run_readless_sync_loop
-from app.service.task_queue import get_task_queue
+from app.service.task_queue import ParentTakeoverLock, get_task_queue
 from app.service.task.archive import TaskArchiveServiceMixin
 from app.service.task.contracts import TaskContractServiceMixin
 from app.service.task.control import TaskControlServiceMixin
@@ -702,6 +702,14 @@ class RuntimeLeaseClearResult:
     owner_instance_id: str | None = None
     task_id: str | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class ParentTakeoverAttemptResult:
+    acquired: bool
+    task_id: str
+    lock: ParentTakeoverLock | None = None
+    reason: str | None = None
 
 
 class TaskManager(
@@ -2971,22 +2979,96 @@ class TaskManager(
         normalized_context = str(context or "").strip() or "task_enqueue"
         if not normalized_task_id:
             return False
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return self._enqueue_task_and_wait_sync(
-                normalized_task_id,
-                context=normalized_context,
-                timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
-                force_requeue=True,
-            )
-        loop.create_task(
-            get_task_queue().force_requeue_task(
-                normalized_task_id,
-                context=normalized_context,
+        return bool(
+            self._run_async_blocking(
+                self._enqueue_task_and_wait(
+                    normalized_task_id,
+                    context=normalized_context,
+                    timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+                    force_requeue=True,
+                )
             )
         )
-        return True
+
+    def _run_async_blocking(self, coro):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return self._run_sync(coro)
+
+        result: dict[str, Any] = {}
+        error: dict[str, BaseException] = {}
+
+        def _runner() -> None:
+            try:
+                result["value"] = asyncio.run(coro)
+            except BaseException as exc:  # pragma: no cover - re-raised to caller
+                error["value"] = exc
+
+        thread = threading.Thread(target=_runner, name="binary-security-async-bridge", daemon=True)
+        thread.start()
+        thread.join()
+        if "value" in error:
+            raise error["value"]
+        return result.get("value")
+
+    def _parent_takeover_lock_ttl_seconds(self) -> int:
+        return 60
+
+    def _acquire_parent_takeover_lock(
+        self,
+        task_id: str,
+        *,
+        context: str,
+    ) -> ParentTakeoverAttemptResult:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return ParentTakeoverAttemptResult(acquired=False, task_id=normalized_task_id, reason="missing_task_id")
+        owner_token = f"{str(self.instance_id or '').strip() or 'unknown'}:{uuid.uuid4().hex}"
+        acquired = bool(
+            self._run_async_blocking(
+                get_task_queue().acquire_parent_takeover_lock(
+                    normalized_task_id,
+                    owner_token=owner_token,
+                    ttl_seconds=self._parent_takeover_lock_ttl_seconds(),
+                    context=context,
+                )
+            )
+        )
+        if not acquired:
+            return ParentTakeoverAttemptResult(
+                acquired=False,
+                task_id=normalized_task_id,
+                reason="deferred_by_takeover_lock",
+            )
+        return ParentTakeoverAttemptResult(
+            acquired=True,
+            task_id=normalized_task_id,
+            lock=ParentTakeoverLock(
+                task_id=normalized_task_id,
+                lock_token=owner_token,
+                ttl_seconds=self._parent_takeover_lock_ttl_seconds(),
+                instance_id=str(self.instance_id or "").strip() or None,
+            ),
+        )
+
+    def _release_parent_takeover_lock(
+        self,
+        lock: ParentTakeoverLock | None,
+        *,
+        context: str,
+    ) -> bool:
+        if lock is None:
+            return False
+        return bool(
+            self._run_async_blocking(
+                get_task_queue().release_parent_takeover_lock(
+                    lock.task_id,
+                    lock.lock_token,
+                    context=context,
+                )
+            )
+        )
 
     def _enqueue_task_with_context(self, task_id: str, *, context: str = "task_enqueue") -> None:
         normalized_task_id = str(task_id or "").strip()
@@ -4221,118 +4303,197 @@ class TaskManager(
                 stage_name=task.current_stage,
             )
             return False
-        previous_status = str(getattr(task, "status", "") or "").strip().lower()
-        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
-        if previous_status in {"running", "dispatching"}:
-            self._apply_release_for_takeover_main_state(
+        takeover_attempt = self._acquire_parent_takeover_lock(
+            task.id,
+            context="parent_runtime_release_for_takeover",
+        )
+        if not takeover_attempt.acquired:
+            self._record_event(
                 db,
                 task,
-                source="task_manager",
-                reason="检测到任务已无可用 runtime owner，已释放 owner 并回到可重新调度态等待新实例接管",
-                status="pending",
+                "parent_takeover_lock_deferred",
+                "检测到 stale parent recovery 竞争，当前实例未获得 takeover lock，本轮延后处理",
+                level="warning",
                 stage_name=task.current_stage,
-                finished_at=None,
-                last_error=None,
+                payload={
+                    "reason": reason,
+                    "task_id": str(task.id or "").strip() or None,
+                    "defer_reason": takeover_attempt.reason,
+                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=reason),
+                },
             )
-        elif previous_status == TASK_STATUS_CANCELLING:
-            self._apply_release_for_takeover_main_state(
-                db,
-                task,
-                source="task_manager",
-                reason="任务取消中但已无可用 runtime owner，保留取消状态并释放 owner",
-                status=TASK_STATUS_CANCELLING,
-                stage_name=task.current_stage,
-                finished_at=None,
-                last_error=None,
-                record_blocked_event=False,
-            )
-        observed_owner = str(decision.runtime_lease_owner or "").strip() or None
-        if observed_owner:
-            self._clear_runtime_lease(db, task.id, owner_instance_id=observed_owner)
-        reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
-            decision,
-            expired_message="父任务 authoritative runtime lease 已过期，允许释放任务 owner 并重新调度",
-            missing_message="父任务 authoritative runtime lease 已缺失，允许释放任务 owner 并重新调度",
-        )
-        self._record_parent_runtime_lease_decision(
-            db,
-            task,
-            event_type=reopen_event_type,
-            message=reopen_message,
-            decision=decision,
-            reason=reason,
-            stage_name=task.current_stage,
-            level="warning",
-        )
-        self._repair_active_operations_for_task(db, task)
-        requeue_succeeded = False
-        requeue_error: str | None = None
-        try:
-            requeue_succeeded = self._force_requeue_task_sync(
-                task.id,
-                context="owned_execution_release_for_takeover",
-            )
-        except Exception as exc:
-            requeue_error = str(exc)
-            requeue_succeeded = False
-        if not requeue_succeeded and not requeue_error:
-            requeue_error = "force_requeue_task_returned_false"
+            return False
         self._record_event(
             db,
             task,
-            "task_runtime_released_without_local_owner",
-            "检测到任务已无可用 runtime owner，但当前 Pod 没有本地执行句柄，已释放 owner 并等待重新调度",
-            level="warning",
+            "parent_takeover_lock_acquired",
+            "当前实例已获得 stale parent recovery takeover lock，开始执行 owner 纠偏",
+            level="info",
             stage_name=task.current_stage,
             payload={
                 "reason": reason,
-                "previous_status": previous_status,
-                "current_operation_id": current_operation_id,
-                "released_by_instance_id": str(self.instance_id or "").strip() or None,
-                "operation_runtime": self._operation_runtime_snapshot(active_operation),
-                "local_task_runtime_handle_alive": self._has_local_task_execution_owner(task.id),
-                "local_streaming_stage_worker_alive": self._task_has_active_streaming_stage_workers(task.id),
-                "active_runtime_lease_owner": active_runtime_lease_owner,
-                "force_requeue": requeue_succeeded,
-                "enqueue_context": "owned_execution_release_for_takeover",
+                "task_id": str(task.id or "").strip() or None,
+                "lock_ttl_seconds": takeover_attempt.lock.ttl_seconds if takeover_attempt.lock is not None else None,
+                "lock_instance_id": takeover_attempt.lock.instance_id if takeover_attempt.lock is not None else None,
             },
         )
-        if requeue_succeeded:
-            self._record_event(
-                db,
-                task,
-                "owned_execution_release_reenqueued_for_takeover",
-                "检测到父任务 lease 已失效，已释放 owner 并重新加入共享调度队列",
-                level="warning",
-                stage_name=task.current_stage,
-                payload={
-                    "previous_status": previous_status,
-                    "release_reason": reason,
-                    "runtime_lease_owner": active_runtime_lease_owner,
-                    "runtime_lease_expires_at": _already_isoformatted_datetime(snapshot.runtime_lease_expires_at),
-                    "force_requeue": True,
-                    "enqueue_context": "owned_execution_release_for_takeover",
-                },
-            )
-        else:
-            self._record_event(
-                db,
-                task,
-                "owned_execution_release_reenqueue_failed",
-                "父任务 owner 已释放，但重新加入共享调度队列失败，等待后续补偿修复",
-                level="warning",
-                stage_name=task.current_stage,
-                payload={
-                    "previous_status": previous_status,
-                    "release_reason": reason,
-                    "runtime_lease_owner": active_runtime_lease_owner,
-                    "runtime_lease_expires_at": _already_isoformatted_datetime(snapshot.runtime_lease_expires_at),
-                    "force_requeue": False,
-                    "enqueue_context": "owned_execution_release_for_takeover",
-                    "error": requeue_error,
-                },
-            )
-        return True
+        previous_status = str(getattr(task, "status", "") or "").strip().lower()
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
+        observed_owner = str(decision.runtime_lease_owner or "").strip() or None
+        with self._savepoint(db):
+            try:
+                refreshed_snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
+                refreshed_decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
+                if refreshed_snapshot.runtime_lease_active or not refreshed_decision.allowed:
+                    self._record_event(
+                        db,
+                        task,
+                        "parent_takeover_aborted_lease_recovered",
+                        "stale parent recovery 二次校验发现 authoritative owner 已恢复，本轮终止纠偏",
+                        level="info",
+                        stage_name=task.current_stage,
+                        payload={
+                            "reason": reason,
+                            "task_id": str(task.id or "").strip() or None,
+                            **self._parent_runtime_ownership_snapshot_payload(refreshed_snapshot, reason=reason),
+                        },
+                    )
+                    return False
+                clear_result = (
+                    self._clear_runtime_lease(
+                        db,
+                        task.id,
+                        owner_instance_id=observed_owner,
+                        swallow_lock_error=True,
+                    )
+                    if observed_owner
+                    else RuntimeLeaseClearResult(
+                        status="lease_missing",
+                        deleted_count=0,
+                        owner_instance_id=None,
+                        task_id=task.id,
+                    )
+                )
+                if clear_result.status == "lease_locked_retry_later":
+                    db.rollback()
+                    self._record_event(
+                        db,
+                        task,
+                        "parent_takeover_recovery_deferred_by_db_lock",
+                        "stale parent recovery 在清理 runtime lease 时遇到可重试 DB 锁冲突，本轮整体延后",
+                        level="warning",
+                        stage_name=task.current_stage,
+                        payload={
+                            "reason": reason,
+                            "task_id": str(task.id or "").strip() or None,
+                            "clear_status": clear_result.status,
+                            "clear_error_message": clear_result.error_message,
+                            "runtime_lease_owner": observed_owner,
+                        },
+                    )
+                    return False
+                if previous_status in {"running", "dispatching"}:
+                    self._apply_release_for_takeover_main_state(
+                        db,
+                        task,
+                        source="task_manager",
+                        reason="检测到任务已无可用 runtime owner，已释放 owner 并回到可重新调度态等待新实例接管",
+                        status="pending",
+                        stage_name=task.current_stage,
+                        finished_at=None,
+                        last_error=None,
+                    )
+                elif previous_status == TASK_STATUS_CANCELLING:
+                    self._apply_release_for_takeover_main_state(
+                        db,
+                        task,
+                        source="task_manager",
+                        reason="任务取消中但已无可用 runtime owner，保留取消状态并释放 owner",
+                        status=TASK_STATUS_CANCELLING,
+                        stage_name=task.current_stage,
+                        finished_at=None,
+                        last_error=None,
+                        record_blocked_event=False,
+                    )
+                task.tail_reconcile_state = "idle"
+                self._last_task_heartbeat_at.pop(task.id, None)
+                self._clear_task_abnormal_reason_snapshot(db, task)
+                reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
+                    refreshed_decision,
+                    expired_message="父任务 authoritative runtime lease 已过期，允许释放任务 owner 并重新调度",
+                    missing_message="父任务 authoritative runtime lease 已缺失，允许释放任务 owner 并重新调度",
+                )
+                self._record_parent_runtime_lease_decision(
+                    db,
+                    task,
+                    event_type=reopen_event_type,
+                    message=reopen_message,
+                    decision=refreshed_decision,
+                    reason=reason,
+                    stage_name=task.current_stage,
+                    level="warning",
+                )
+                self._repair_active_operations_for_task(db, task)
+                requeue_succeeded = self._force_requeue_task_sync(
+                    task.id,
+                    context="owned_execution_release_for_takeover",
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "task_runtime_released_without_local_owner",
+                    "检测到任务已无可用 runtime owner，已完成 stale owner 纠偏并重新加入共享调度队列",
+                    level="warning",
+                    stage_name=task.current_stage,
+                    payload={
+                        "reason": reason,
+                        "previous_status": previous_status,
+                        "current_operation_id": current_operation_id,
+                        "released_by_instance_id": str(self.instance_id or "").strip() or None,
+                        "operation_runtime": self._operation_runtime_snapshot(active_operation),
+                        "local_task_runtime_handle_alive": self._has_local_task_execution_owner(task.id),
+                        "local_streaming_stage_worker_alive": self._task_has_active_streaming_stage_workers(task.id),
+                        "active_runtime_lease_owner": active_runtime_lease_owner,
+                        "force_requeue": requeue_succeeded,
+                        "enqueue_context": "owned_execution_release_for_takeover",
+                    },
+                )
+                if requeue_succeeded:
+                    self._record_event(
+                        db,
+                        task,
+                        "parent_takeover_recovery_committed",
+                        "stale parent recovery 已完成提交，任务已同步补回共享调度队列",
+                        level="warning",
+                        stage_name=task.current_stage,
+                        payload={
+                            "reason": reason,
+                            "previous_status": previous_status,
+                            "runtime_lease_owner": active_runtime_lease_owner,
+                            "enqueue_context": "owned_execution_release_for_takeover",
+                        },
+                    )
+                else:
+                    self._record_event(
+                        db,
+                        task,
+                        "owned_execution_release_reenqueue_failed",
+                        "stale parent recovery 已完成 DB 修正，但重新加入共享调度队列失败，等待后续补偿修复",
+                        level="warning",
+                        stage_name=task.current_stage,
+                        payload={
+                            "reason": reason,
+                            "previous_status": previous_status,
+                            "runtime_lease_owner": active_runtime_lease_owner,
+                            "enqueue_context": "owned_execution_release_for_takeover",
+                        },
+                    )
+                return True
+            finally:
+                self._release_parent_takeover_lock(
+                    takeover_attempt.lock,
+                    context="parent_runtime_release_for_takeover",
+                )
 
     def _write_task_heartbeat(self, session: Session, task_id: str, *, now_value: datetime, source: str) -> bool:
         task = session.query(BinarySecurityTask).filter(

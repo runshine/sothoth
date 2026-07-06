@@ -24,7 +24,7 @@ from app.model import (
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import StaleTaskExecution, TaskManager, _now
 from app.service.task_queue import REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, REDIS_SOCKET_TIMEOUT_SECONDS, TaskQueue
-from test_task_manager import _ModelAwareDb
+from test_task_manager import _FakeTaskSyncQueue, _ModelAwareDb
 
 
 class TaskManagerRuntimeStatusTests(unittest.TestCase):
@@ -172,6 +172,16 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
 
 
 class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        super().setUp()
+        self.fake_task_queue = _FakeTaskSyncQueue()
+        self._get_task_queue_patch = patch("app.service.task_manager.get_task_queue", return_value=self.fake_task_queue)
+        self._get_task_queue_patch.start()
+
+    def tearDown(self):
+        self._get_task_queue_patch.stop()
+        super().tearDown()
+
     def _workspace_root(self, name: str) -> str:
         return f"/tmp/{name}"
 
@@ -632,6 +642,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         class _Queue:
             def __init__(self):
                 self._popped = False
+                self.parent_takeover_locks = {}
 
             async def pop_task(self, _timeout_seconds, context=None):
                 del context
@@ -643,6 +654,20 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
             async def force_requeue_task(self, task_id, *, context=None):
                 requeued.append((task_id, context))
+
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
 
         async def _reconcile(_db):
             return None
@@ -1397,7 +1422,15 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        super().setUp()
         self.manager = TaskManager()
+        self.fake_task_queue = _FakeTaskSyncQueue()
+        self._get_task_queue_patch = patch("app.service.task_manager.get_task_queue", return_value=self.fake_task_queue)
+        self._get_task_queue_patch.start()
+
+    def tearDown(self):
+        self._get_task_queue_patch.stop()
+        super().tearDown()
 
     def _workspace_root(self, name: str) -> str:
         return f"/tmp/{name}"
@@ -1521,6 +1554,9 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         reenqueued: list[tuple[str, str | None]] = []
 
         class _Queue:
+            def __init__(self):
+                self.parent_takeover_locks = {}
+
             async def queue_positions(self, _queue_key, *, context=None):
                 del _queue_key, context
                 return {}
@@ -1534,6 +1570,20 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             async def cleanup_dedupe_orphans(self, _queue_key):
                 del _queue_key
                 return {}
+
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
 
         self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
@@ -1585,6 +1635,9 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         pushed: list[tuple[str, str | None]] = []
 
         class _Queue:
+            def __init__(self):
+                self.parent_takeover_locks = {}
+
             async def queue_positions(self, _queue_key, *, context=None):
                 del _queue_key, context
                 return {}
@@ -1598,6 +1651,20 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             async def cleanup_dedupe_orphans(self, _queue_key):
                 del _queue_key
                 return {}
+
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
 
         self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
@@ -1636,6 +1703,9 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         pushed: list[tuple[str, str | None]] = []
 
         class _Queue:
+            def __init__(self):
+                self.parent_takeover_locks = {}
+
             async def queue_positions(self, _queue_key, *, context=None):
                 del _queue_key, context
                 return {}
@@ -1650,6 +1720,20 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
+
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1660,7 +1744,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.manager._reconcile_work_queues_once(db)
 
-        self.assertEqual([("task-running-stale-owner", "queue_reconcile_active_nonpending_reenqueue")], pushed)
+        self.assertEqual([("task-running-stale-owner", "owned_execution_release_for_takeover")], pushed)
         self.assertEqual("pending", task.status)
         self.assertIn("active_nonpending_stale_owner_reenqueued", [row.event_type for row in db.events])
 
@@ -1687,6 +1771,9 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         pushed: list[tuple[str, str | None]] = []
 
         class _Queue:
+            def __init__(self):
+                self.parent_takeover_locks = {}
+
             async def queue_positions(self, _queue_key, *, context=None):
                 del _queue_key, context
                 return {}
@@ -1700,6 +1787,20 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             async def cleanup_dedupe_orphans(self, _queue_key):
                 del _queue_key
                 return {}
+
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
 
         self.manager._last_queue_reconcile_at = None
 
@@ -1782,6 +1883,9 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         pushed: list[tuple[str, str | None]] = []
 
         class _Queue:
+            def __init__(self):
+                self.parent_takeover_locks = {}
+
             async def queue_positions(self, _queue_key, *, context=None):
                 del _queue_key, context
                 return {}
@@ -1796,6 +1900,20 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
+
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1807,7 +1925,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.manager._reconcile_work_queues_once(db)
 
-        self.assertEqual([("task-running-local-handle-no-lease", "queue_reconcile_active_nonpending_reenqueue")], pushed)
+        self.assertEqual([("task-running-local-handle-no-lease", "owned_execution_release_for_takeover")], pushed)
         self.assertEqual("pending", task.status)
         self.assertNotIn("active_nonpending_takeover_suppressed_local_runtime", [row.event_type for row in db.events])
 

@@ -131,7 +131,11 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", task.status)
-        self.assertTrue(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+        self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
+        self.assertEqual(
+            [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
+            self.fake_task_queue.requeued_tasks,
+        )
 
     def test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):
         manager = TaskManager()
@@ -211,7 +215,11 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         self.assertEqual([], db.runtime_leases)
         self.assertEqual("op-new", task.current_operation_id)
         self.assertEqual("superseded", older.status)
-        self.assertTrue(any(event.event_type == "owned_execution_release_reenqueued_for_takeover" for event in db.events))
+        self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
+        self.assertEqual(
+            [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
+            self.fake_task_queue.requeued_tasks,
+        )
 
     def test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease(self):
         manager = TaskManager()

@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
@@ -24,6 +25,14 @@ REDIS_BLOCKING_SOCKET_TIMEOUT_SECONDS: int | None = None
 DEFAULT_QUEUE_CONTEXT = "unspecified"
 REDIS_REBUILD_RETRY_MAX_SLEEP_SECONDS = 10
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 10
+
+
+@dataclass(frozen=True)
+class ParentTakeoverLock:
+    task_id: str
+    lock_token: str
+    ttl_seconds: int
+    instance_id: str | None = None
 
 
 class RedisSelfHealingClientHelper:
@@ -727,6 +736,64 @@ class TaskQueue:
     def _owner_signal_key(self, owner_instance_id: str, task_id: str) -> str:
         prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
         return f"{prefix}:owner_signal:{str(owner_instance_id or '').strip()}:{str(task_id or '').strip()}"
+
+    def _parent_takeover_lock_key(self, task_id: str) -> str:
+        prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
+        return f"{prefix}:parent_takeover_lock:{str(task_id or '').strip()}"
+
+    async def acquire_parent_takeover_lock(
+        self,
+        task_id: str,
+        *,
+        owner_token: str,
+        ttl_seconds: int = 60,
+        context: str = "parent_takeover_lock",
+    ) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner_token = str(owner_token or "").strip()
+        if not normalized_task_id or not normalized_owner_token:
+            return False
+        lock_key = self._parent_takeover_lock_key(normalized_task_id)
+        return bool(
+            await self._execute_with_client_rebuild_forever(
+                "acquire_parent_takeover_lock",
+                context=context,
+                fn=lambda client: client.set(
+                    lock_key,
+                    normalized_owner_token,
+                    ex=max(1, int(ttl_seconds or 60)),
+                    nx=True,
+                ),
+            )
+        )
+
+    async def release_parent_takeover_lock(
+        self,
+        task_id: str,
+        owner_token: str,
+        *,
+        context: str = "parent_takeover_unlock",
+    ) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner_token = str(owner_token or "").strip()
+        if not normalized_task_id or not normalized_owner_token:
+            return False
+        lock_key = self._parent_takeover_lock_key(normalized_task_id)
+
+        async def _release(client: Redis):
+            current = await client.get(lock_key)
+            if str(current or "").strip() != normalized_owner_token:
+                return False
+            await client.delete(lock_key)
+            return True
+
+        return bool(
+            await self._execute_with_client_rebuild_forever(
+                "release_parent_takeover_lock",
+                context=context,
+                fn=_release,
+            )
+        )
 
     async def enqueue_task_sync_request(
         self,

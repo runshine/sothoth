@@ -221,7 +221,32 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertEqual("pending", task.status)
         self.assertEqual("op-new", task.current_operation_id)
         self.assertEqual("superseded", older.status)
-        self.assertTrue(any(event.event_type == "owned_execution_release_reenqueued_for_takeover" for event in db.events))
+        self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
+        self.assertEqual(
+            [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
+            self.fake_task_queue.requeued_tasks,
+        )
+
+    def test_release_task_without_supported_runtime_owner_defers_when_takeover_lock_not_acquired(self):
+        self.manager.instance_id = "local-worker"
+        task = self._task(
+            id="task-release-owner-lock-deferred",
+            status="running",
+            current_stage="system_analysis",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[], runtime_leases=[], events=[])
+        self.fake_task_queue.parent_takeover_locks[task.id] = "other-worker:token"
+
+        released = self.manager._release_task_without_supported_runtime_owner(
+            db,
+            task,
+            reason="unit_test_takeover_lock_deferred",
+        )
+
+        self.assertFalse(released)
+        self.assertEqual("running", task.status)
+        self.assertTrue(any(event.event_type == "parent_takeover_lock_deferred" for event in db.events))
+        self.assertEqual([], self.fake_task_queue.requeued_tasks)
 
     def test_release_task_without_supported_runtime_owner_suppresses_release_with_active_runtime_lease_mismatch(self):
         self.manager.instance_id = "local-worker"
@@ -320,7 +345,11 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
 
         self.assertTrue(released)
         self.assertEqual("pending", task.status)
-        self.assertTrue(any(event.event_type == "owned_execution_release_reenqueued_for_takeover" for event in db.events))
+        self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
+        self.assertEqual(
+            [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
+            self.fake_task_queue.requeued_tasks,
+        )
 
     def test_release_task_without_supported_runtime_owner_ignores_missing_runtime_lease(self):
         self.manager.instance_id = "worker-new"
@@ -339,4 +368,8 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
 
         self.assertTrue(released)
         self.assertEqual("pending", task.status)
-        self.assertTrue(any(event.event_type == "owned_execution_release_reenqueued_for_takeover" for event in db.events))
+        self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
+        self.assertEqual(
+            [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
+            self.fake_task_queue.requeued_tasks,
+        )

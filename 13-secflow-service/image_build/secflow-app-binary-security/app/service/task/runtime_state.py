@@ -2241,8 +2241,6 @@ class TaskRuntimeStateServiceMixin:
         event_level: str = "warning",
         event_payload: dict[str, Any] | None = None,
     ) -> bool:
-        from app.service import task_manager as task_manager_module
-
         if not self._running_task_requires_live_runtime_lease(db, task):
             return False
         snapshot = self._parent_runtime_ownership_snapshot(db, task)
@@ -2276,98 +2274,26 @@ class TaskRuntimeStateServiceMixin:
                 stage_name=stage_name,
             )
             return False
-        lease = self._runtime_lease_for_task(db, task.id)
-        runtime_phase = self._task_runtime_phase(task)
-        runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
-        runtime_lease_expires_at = getattr(lease, "lease_expires_at", None) if lease is not None else None
-        next_stage_name = str(stage_name or task.current_stage or "").strip() or None
-        observed_owner = str(runtime_lease_owner or "").strip() or None
-        if observed_owner:
-            clear_result = self._clear_runtime_lease(
-                db,
-                task.id,
-                owner_instance_id=observed_owner,
-                swallow_lock_error=True,
-            )
-            if clear_result.status == "lease_locked_retry_later":
-                self._record_event(
-                    db,
-                    task,
-                    "runtime_lease_clear_deferred_by_lock",
-                    "runtime lease 清理遇到可重试锁冲突，当前轮延后 lease invariant 修复",
-                    level="warning",
-                    stage_name=next_stage_name,
-                    payload={
-                        "next_stage": next_stage_name,
-                        "reason": reason,
-                        "runtime_phase": runtime_phase,
-                        "runtime_lease_owner": observed_owner,
-                        "clear_status": clear_result.status,
-                        "clear_error_message": clear_result.error_message,
-                    },
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "owned_execution_reclaim_deferred_by_lock",
-                    "owned execution lease invariant 修复遇到可重试锁冲突，当前轮延后重试",
-                    level="warning",
-                    stage_name=next_stage_name,
-                    payload={
-                        "next_stage": next_stage_name,
-                        "reason": reason,
-                        "runtime_phase": runtime_phase,
-                        "runtime_lease_owner": observed_owner,
-                        "takeover_action": "defer_running_without_active_lease_repair",
-                    },
-                )
-                return False
-        self._apply_release_for_takeover_main_state(
+        released = self._release_task_without_supported_runtime_owner(
             db,
             task,
-            source="runtime_reclaim",
-            reason="检测到运行中任务缺少有效租约，重置为待执行",
-            status="pending",
-            stage_name=next_stage_name,
-            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            finished_at=None,
-            last_error=None,
-        )
-        task.tail_reconcile_state = "idle"
-        task.updated_at = task_manager_module._now()
-        self._last_task_heartbeat_at.pop(task.id, None)
-        self._clear_task_abnormal_reason_snapshot(db, task)
-        reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
-            decision,
-            expired_message="父任务 authoritative runtime lease 已过期，允许回收到待执行队列",
-            missing_message="父任务 authoritative runtime lease 已缺失，允许回收到待执行队列",
-        )
-        self._record_parent_runtime_lease_decision(
-            db,
-            task,
-            event_type=reopen_event_type,
-            message=reopen_message,
-            decision=decision,
+            active_operation=None,
             reason=reason,
-            stage_name=next_stage_name,
-            level="warning",
         )
+        if not released:
+            return False
         self._record_event(
             db,
             task,
             event_type,
-            "检测到 running 任务缺少有效租约，已重置为 pending 并重新排队等待 owner 接管",
+            "检测到 running 任务缺少有效租约，已完成 stale owner 纠偏并同步补回共享调度队列",
             level=event_level,
-            stage_name=next_stage_name,
+            stage_name=str(stage_name or task.current_stage or "").strip() or None,
             payload={
                 "reason": reason,
-                "runtime_phase": runtime_phase,
-                "previous_task_status": "running",
-                "runtime_lease_owner": runtime_lease_owner,
-                "runtime_lease_expires_at": runtime_lease_expires_at,
-                "repair_action": "pending_requeue_owned_execution",
+                "repair_action": "release_for_takeover_and_requeue",
+                "enqueue_context": "owned_execution_release_for_takeover",
                 **(event_payload or {}),
             },
         )
-        self._enqueue_task(task.id)
         return True

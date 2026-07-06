@@ -1038,8 +1038,6 @@ class TaskRuntimeServiceMixin:
         return task_query.first()
 
     def _requeue_orphaned_owned_execution_single_task_locked(self: TaskManager, db: Session, task_id: str) -> bool:
-        from app.service import task_manager as task_manager_module
-
         task = self._lock_task_row_by_id(db, task_id)
         if task is None:
             return False
@@ -1056,14 +1054,11 @@ class TaskRuntimeServiceMixin:
         if not self._should_requeue_for_owned_execution(db, task, next_stage=stage_name, next_stage_status="running"):
             return False
         changed = bool(
-            self._requeue_owned_execution_takeover(
+            self._release_task_without_supported_runtime_owner(
                 db,
                 task,
-                stage_name=stage_name,
+                active_operation=None,
                 reason="orphaned_owned_execution_without_active_holder",
-                event_type="owned_execution_takeover_requeued",
-                message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {stage_name}",
-                event_payload={"source": "parent_reclaim_pass"},
             )
         )
         if changed:
@@ -1784,12 +1779,11 @@ class TaskRuntimeServiceMixin:
                     reason="active_nonpending_runtime_lease_expired_reconcile",
                 )
                 if released:
-                    await queue.push_task(normalized_task_id, context="queue_reconcile_active_nonpending_reenqueue")
                     self._record_event(
                         db,
                         task,
                         "active_nonpending_stale_owner_reenqueued",
-                        "检测到 non-pending 任务 owner 已失活，已释放旧 owner 并重新注入共享调度队列",
+                        "检测到 non-pending 任务 owner 已失活，已释放旧 owner 并同步补回共享调度队列",
                         level="warning",
                         stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
                         payload={
@@ -1799,7 +1793,7 @@ class TaskRuntimeServiceMixin:
                             "runtime_lease_owner": takeover_decision.runtime_lease_owner,
                             "local_handle_alive": takeover_decision.local_handle_alive,
                             "reason": takeover_decision.decision_reason,
-                            "enqueue_context": "queue_reconcile_active_nonpending_reenqueue",
+                            "enqueue_context": "owned_execution_release_for_takeover",
                         },
                     )
                     continue
@@ -2292,19 +2286,13 @@ class TaskRuntimeServiceMixin:
                     and previous_runtime_lease_owner is None
                     and not nonpending_takeover_decision.runtime_lease_active
                 ):
-                    self._apply_release_for_takeover_main_state(
+                    released = self._release_task_without_supported_runtime_owner(
                         db,
                         task,
-                        source="runtime_worker",
-                        reason="检测到 non-pending 任务缺少有效 lease 且无旧 owner，已重置为待执行等待重新 claim",
-                        status="pending",
-                        stage_name=task.current_stage,
-                        finished_at=None,
-                        last_error=None,
+                        active_operation=current_operation,
+                        reason="dispatch_claim_after_runtime_lease_missing_without_owner",
                     )
-                    self._clear_runtime_lease(db, task.id)
-                    released = True
-                if not released and previous_runtime_lease_owner:
+                if not released:
                     self._log_dispatch_claim_blocked(
                         task_id,
                         reason="dispatch_claim_blocked_stale_owner_release_failed",

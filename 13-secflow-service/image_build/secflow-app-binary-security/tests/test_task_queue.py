@@ -13,6 +13,7 @@ class _FakeRedis:
         self.sets = {}
         self.lists = {}
         self.sorted_sets = {}
+        self.values = {}
         self.ping_calls = 0
 
     async def sadd(self, key, value):
@@ -54,6 +55,20 @@ class _FakeRedis:
 
     async def zscore(self, key, value):
         return (self.sorted_sets.get(key) or {}).get(value)
+
+    async def set(self, key, value, ex=None, nx=False):
+        del ex
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
+    async def get(self, key):
+        return self.values.get(key)
+
+    async def delete(self, key):
+        self.values.pop(key, None)
+        return 1
 
     async def lpos(self, key, value):
         values = self.lists.get(key) or []
@@ -233,6 +248,27 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
         self.assertEqual({"task-1"}, fake.sets[f"{queue.config.task_queue_key}:dedupe"])
+
+    def test_parent_takeover_lock_acquire_and_release(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            acquired = await queue.acquire_parent_takeover_lock("task-1", owner_token="owner-1", ttl_seconds=60)
+            duplicate = await queue.acquire_parent_takeover_lock("task-1", owner_token="owner-2", ttl_seconds=60)
+            released_mismatch = await queue.release_parent_takeover_lock("task-1", "owner-2")
+            released = await queue.release_parent_takeover_lock("task-1", "owner-1")
+            reacquired = await queue.acquire_parent_takeover_lock("task-1", owner_token="owner-3", ttl_seconds=60)
+            return acquired, duplicate, released_mismatch, released, reacquired
+
+        acquired, duplicate, released_mismatch, released, reacquired = asyncio.run(_exercise())
+
+        self.assertTrue(acquired)
+        self.assertFalse(duplicate)
+        self.assertFalse(released_mismatch)
+        self.assertTrue(released)
+        self.assertTrue(reacquired)
 
     def test_dedupe_orphans_reports_set_without_list(self):
         queue = TaskQueue()
