@@ -4,6 +4,7 @@ import unittest
 from app.model import (
     BinarySecurityTask,
     BinarySecurityTaskOperation,
+    BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_RUNTIME_PHASE_TERMINAL,
     TASK_TYPE_BINARY_MODULE,
@@ -28,10 +29,7 @@ def _source_task(*, task_id: str, operation_id: str, status: str) -> BinarySecur
         output_root="/tmp/out",
         workspace_root="/tmp/ws",
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-a",
     )
-    task.dispatch_started_at = _now()
-    task.lease_expires_at = _now()
     return task
 
 
@@ -49,10 +47,7 @@ def _binary_module_task(*, task_id: str, operation_id: str, status: str) -> Bina
         output_root="/tmp/out",
         workspace_root="/tmp/ws",
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-        dispatcher_instance_id="worker-a",
     )
-    task.dispatch_started_at = _now()
-    task.lease_expires_at = _now()
     task.summary = {
         "b2s_results": [
             {
@@ -115,7 +110,6 @@ class ControlOperationTerminalE2ETests(unittest.TestCase):
                 current_task.status = "cancelled"
                 current_task.runtime_phase = TASK_RUNTIME_PHASE_TERMINAL
                 current_task.current_operation_id = None
-                current_task.dispatcher_instance_id = None
                 current_operation.status = "succeeded"
                 current_operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
                 return {"operation_finalized": True, "task_status": "cancelled"}
@@ -128,8 +122,14 @@ class ControlOperationTerminalE2ETests(unittest.TestCase):
             self.assertEqual("cancelling", task.status)
             self.assertEqual(operation.id, task.current_operation_id)
 
-            task.dispatcher_instance_id = "worker-b"
-            task.lease_expires_at = _now()
+            db.runtime_leases = [
+                BinarySecurityTaskRuntimeLease(
+                    task_id=task.id,
+                    owner_instance_id="worker-b",
+                    heartbeat_at=_now(),
+                    lease_expires_at=_now(),
+                )
+            ]
             manager_b._prepare_cancel_task = _noop_prepare_cancel
             manager_b._write_task_metadata_async = _noop_write
             manager_b._run_task_operation_steps = _atomic_finalize_on_takeover
@@ -197,7 +197,6 @@ class ControlOperationTerminalE2ETests(unittest.TestCase):
                 current_task.status = "cancelled"
                 current_task.runtime_phase = TASK_RUNTIME_PHASE_TERMINAL
                 current_task.current_operation_id = None
-                current_task.dispatcher_instance_id = None
                 current_operation.status = "succeeded"
                 current_operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
                 return {"operation_finalized": True, "task_status": "cancelled"}
@@ -210,8 +209,14 @@ class ControlOperationTerminalE2ETests(unittest.TestCase):
             self.assertEqual("cancelling", task.status)
             self.assertEqual(operation.id, task.current_operation_id)
 
-            task.dispatcher_instance_id = "worker-b"
-            task.lease_expires_at = _now()
+            db.runtime_leases = [
+                BinarySecurityTaskRuntimeLease(
+                    task_id=task.id,
+                    owner_instance_id="worker-b",
+                    heartbeat_at=_now(),
+                    lease_expires_at=_now(),
+                )
+            ]
             manager_b._prepare_cancel_task = _noop_prepare_cancel
             manager_b._write_task_metadata_async = _noop_write
             manager_b._run_task_operation_steps = _atomic_finalize_on_takeover

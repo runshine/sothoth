@@ -34,7 +34,6 @@ def _binary_task(*, summary=None, policy_json=None) -> BinarySecurityTask:
         workspace_root=f"/tmp/bs-binary-ws-{task_suffix}",
         runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         started_at=_now(),
-        dispatcher_instance_id="worker-a",
     )
     task.summary = dict(summary or {})
     if policy_json is not None:
@@ -1460,9 +1459,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
             }
         )
         task.current_stage = "dataflow_vuln_scan"
-        task.dispatcher_instance_id = "worker-b"
-        task.dispatch_started_at = now
-        task.lease_expires_at = lease_until
         dataflow_run = BinarySecurityStageRun(
             id="sr-dataflow-binary-missing",
             task_id=task.id,
@@ -1568,8 +1564,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
         task.current_stage = "dataflow_vuln_scan"
-        task.dispatch_started_at = now
-        task.lease_expires_at = lease_until
         dataflow_run = BinarySecurityStageRun(
             id="sr-dataflow-binary-missing-owner",
             task_id=task.id,
@@ -1886,8 +1880,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
         task.current_stage = "entry_analysis"
-        task.dispatch_started_at = now
-        task.lease_expires_at = lease_until
         entry_run = BinarySecurityStageRun(
             id="sr-entry-binary-missing",
             task_id=task.id,
@@ -2636,7 +2628,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
 
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual("running", task.status)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertEqual("worker-b", db.runtime_leases[0].owner_instance_id)
         detail = recovering_manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
         self.assertEqual("running", detail.status)
         b2s_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "binary_to_source")
@@ -3284,7 +3276,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual([], queued)
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertTrue(any(lease.task_id == task.id and lease.owner_instance_id == "worker-a" for lease in db.runtime_leases))
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertEqual("entry extraction failed", task.last_error)
         self.assertNotIn("failure_code", dict(task.summary or {}))
@@ -3432,7 +3424,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("running", operation.status)
         self.assertEqual("failed", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("worker-b", task.dispatcher_instance_id)
+        self.assertTrue(any(lease.task_id == task.id and lease.owner_instance_id == "worker-b" for lease in db.runtime_leases))
         self.assertEqual("failed", detail.status)
         self.assertTrue(any(lease.task_id == task.id for lease in db.runtime_leases))
         event_types = [event.event_type for event in db.events]
@@ -4083,9 +4075,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         task.current_stage = "entry_analysis"
         task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
         task.current_operation_id = "op-force-reset-binary"
-        task.dispatcher_instance_id = "worker-a"
-        task.dispatch_started_at = now - timedelta(seconds=20)
-        task.lease_expires_at = now + timedelta(minutes=5)
         task.last_error = "entry extraction failed"
         firmware_run = BinarySecurityStageRun(
             id="sr-fw-force-reset-binary",
@@ -4178,9 +4167,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertIsNone(task.current_operation_id)
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
+        self.assertEqual("worker-a", db.runtime_leases[0].owner_instance_id)
         self.assertIsNone(task.last_error)
         self.assertEqual({}, dict((task.summary or {}).get("runtime_workset") or {}))
         self.assertNotIn("failure_code", dict(task.summary or {}))

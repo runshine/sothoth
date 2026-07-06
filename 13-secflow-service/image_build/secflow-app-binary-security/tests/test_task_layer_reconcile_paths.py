@@ -554,8 +554,6 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
             output_root="/o",
             workspace_root="/tmp",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id=self.manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=1),
         )
         run = BinarySecurityStageRun(
             id="sr-system-owner",

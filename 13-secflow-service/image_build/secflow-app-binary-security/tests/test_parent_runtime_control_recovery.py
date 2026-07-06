@@ -101,9 +101,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             output_root="/o",
             workspace_root="/tmp",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="stale-worker",
             current_operation_id="op-old",
-            lease_expires_at=_now() - timedelta(seconds=1),
         )
         stage_run = BinarySecurityStageRun(
             id="sr-owner-drift-restart",
@@ -163,17 +161,10 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
 
         self.assertTrue(released)
         self.assertEqual("pending", task.status)
+        self.assertEqual([], db.runtime_leases)
         self.assertEqual("op-new", task.current_operation_id)
         self.assertEqual("superseded", older.status)
-
-        manager._enqueue_task = lambda *_args, **_kwargs: None
-        claimed = manager._dispatch_task_by_id(db, task.id)
-
-        self.assertEqual(task.id, claimed)
-        self.assertEqual("dispatching", task.status)
-        self.assertEqual("local-worker", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
+        self.assertTrue(any(event.event_type == "owned_execution_release_reenqueued_for_takeover" for event in db.events))
 
     def test_requeue_orphaned_owned_execution_ignores_legacy_row_lease_without_runtime_lease(self):
         manager = TaskManager()
@@ -189,9 +180,6 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             output_root="/o",
             workspace_root="/tmp",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="stale-worker-pod",
-            dispatch_started_at=datetime.fromisoformat("2026-06-11T20:26:44"),
-            lease_expires_at=datetime.fromisoformat("2026-06-11T20:29:43"),
         )
         stage_run = BinarySecurityStageRun(
             id="sr1",
@@ -229,9 +217,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", task.status)
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
+        self.assertEqual([], db.runtime_leases)
         self.assertEqual(["t1"], queued)
         requeue_events = [event for event in db.events if event.event_type == "owned_execution_takeover_requeued"]
         self.assertTrue(requeue_events)
@@ -315,9 +301,6 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_path="/src",
             output_root="/output",
             workspace_root="/workspace",
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=_now() - timedelta(minutes=1),
-            lease_expires_at=_now() + timedelta(minutes=3),
         )
         operation = BinarySecurityTaskOperation(
             id="op-delete-blocked",
@@ -356,9 +339,6 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_path="/src",
             output_root="/output",
             workspace_root="/workspace",
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=_now() - timedelta(minutes=5),
-            lease_expires_at=_now() - timedelta(minutes=1),
         )
         operation = BinarySecurityTaskOperation(
             id="op-delete-stale-dispatcher",
@@ -373,11 +353,10 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         normalized = manager._normalize_delete_queue_task_state(db, task, active_operation=operation)
         decision = manager._can_consume_delete_queue_task(db, task, active_operation=operation)
 
-        self.assertTrue(bool(normalized.get("stale_owner_cleared")))
+        self.assertFalse(bool(normalized.get("stale_owner_cleared")))
         self.assertTrue(bool(normalized.get("runtime_phase_repaired")))
         self.assertTrue(decision.allowed)
         self.assertEqual("terminal_delete_takeover_without_runtime_lease", decision.reason_code)
-        self.assertIsNone(task.dispatcher_instance_id)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
 
     def test_consume_delete_queue_task_starts_orphan_delete_without_runtime_lease(self):
@@ -396,9 +375,6 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_path="/src",
             output_root="/output",
             workspace_root="/workspace",
-            dispatcher_instance_id=None,
-            dispatch_started_at=None,
-            lease_expires_at=None,
             cleanup_snapshot={},
         )
         operation = BinarySecurityTaskOperation(
@@ -426,9 +402,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             manager._prepare_delete_task = original_prepare_delete
 
         self.assertEqual(["task-delete-orphan-consume"], calls)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
+        self.assertEqual("worker-a", db.runtime_leases[0].owner_instance_id)
         event_types = [event.event_type for event in db.events]
         self.assertIn("task_delete_queue_consumption_started", event_types)
         self.assertNotIn("task_delete_queue_consumption_deferred_for_active_blocker", event_types)
@@ -449,9 +423,6 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_path="/src",
             output_root="/output",
             workspace_root="/workspace",
-            dispatcher_instance_id=None,
-            dispatch_started_at=None,
-            lease_expires_at=None,
             cleanup_snapshot={},
         )
         operation = BinarySecurityTaskOperation(
@@ -479,7 +450,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             manager._prepare_delete_task = original_prepare_delete
 
         self.assertEqual(["task-delete-terminal-consume"], calls)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
+        self.assertEqual("worker-a", db.runtime_leases[0].owner_instance_id)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         event_types = [event.event_type for event in db.events]
         self.assertIn("task_delete_queue_consumption_started", event_types)
@@ -501,9 +472,6 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_path="/src",
             output_root="/output",
             workspace_root="/workspace",
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=_now() - timedelta(minutes=8),
-            lease_expires_at=_now() - timedelta(minutes=3),
             cleanup_snapshot={},
         )
         operation = BinarySecurityTaskOperation(
@@ -530,12 +498,13 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             manager._prepare_delete_task = original_prepare_delete
 
         self.assertEqual(["task-delete-terminal-stale-owner-consume"], calls)
-        self.assertEqual("worker-b", task.dispatcher_instance_id)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        self.assertEqual("worker-b", db.runtime_leases[0].owner_instance_id)
         normalized_event = next(row for row in db.events if row.event_type == "delete_queue_task_state_normalized")
-        self.assertTrue(bool(dict(normalized_event.payload or {}).get("stale_owner_cleared")))
+        self.assertFalse(bool(dict(normalized_event.payload or {}).get("stale_owner_cleared")))
+        self.assertTrue(bool(dict(normalized_event.payload or {}).get("runtime_phase_repaired")))
         started_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_started")
-        self.assertTrue(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
+        self.assertFalse(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
 
 
 if __name__ == "__main__":

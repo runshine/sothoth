@@ -29,39 +29,36 @@ class ParentRuntimeTakeoverRequeueTests(unittest.IsolatedAsyncioTestCase):
             "task_type": TASK_TYPE_BINARY,
             "current_stage": "dataflow_vuln_scan",
             "runtime_phase": TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            "dispatcher_instance_id": "worker-a",
-            "dispatch_started_at": _now() - timedelta(minutes=10),
             "summary": {},
         }
         data.update(overrides)
         return BinarySecurityTask(**data)
 
-    def test_release_unsupported_task_row_owner_force_requeues_immediately(self):
+    def test_repair_running_lease_invariant_requeues_immediately_when_runtime_lease_missing(self):
         task = self._task()
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+        queued = []
 
         with (
-            patch.object(self.manager, "_enqueue_task_and_wait_sync", return_value=True) as enqueue_mock,
+            patch.object(self.manager, "_enqueue_task", lambda task_id: queued.append(task_id)),
             patch.object(self.manager, "_clear_runtime_lease") as clear_lease_mock,
         ):
-            released = self.manager._release_unsupported_task_row_owner(
+            repaired = self.manager._repair_running_lease_invariant(
                 db,
                 task,
                 reason="unit_test_release",
             )
 
-        self.assertTrue(released)
-        enqueue_mock.assert_called_once()
+        self.assertTrue(repaired)
+        self.assertEqual([task.id], queued)
         clear_lease_mock.assert_not_called()
         self.assertEqual("pending", task.status)
         event_types = [event.event_type for event in db.events]
-        self.assertIn("owned_execution_release_reenqueued_for_takeover", event_types)
+        self.assertIn("running_without_active_lease_requeued", event_types)
 
     async def test_released_parent_takeover_reconcile_requeues_pending_task_with_progress(self):
         task = self._task(
             status="pending",
-            dispatcher_instance_id=None,
-            dispatch_started_at=None,
             updated_at=_now() - timedelta(minutes=2),
         )
         run = BinarySecurityStageRun(
@@ -94,7 +91,6 @@ class ParentRuntimeTakeoverRequeueTests(unittest.IsolatedAsyncioTestCase):
     async def test_released_parent_takeover_reconcile_skips_stale_candidate_after_new_owner_claim(self):
         task = self._task(
             status="pending",
-            dispatcher_instance_id="worker-b",
             updated_at=_now() - timedelta(minutes=2),
         )
         lease = task_manager_module.BinarySecurityTaskRuntimeLease(

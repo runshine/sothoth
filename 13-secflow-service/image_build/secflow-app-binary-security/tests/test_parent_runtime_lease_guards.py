@@ -33,18 +33,15 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id=None,
-            dispatch_started_at=None,
-            lease_expires_at=now_value - timedelta(minutes=5),
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
 
         wrote = manager._write_task_heartbeat(db, task.id, now_value=now_value, source="unit_test")
 
         self.assertTrue(wrote)
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertEqual(now_value - timedelta(minutes=5), task.lease_expires_at)
+        self.assertFalse(hasattr(task, "dispatcher_instance_id"))
+        self.assertFalse(hasattr(task, "dispatch_started_at"))
+        self.assertFalse(hasattr(task, "lease_expires_at"))
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         lease = db.runtime_leases[0]
         self.assertEqual("worker-a", lease.owner_instance_id)
@@ -65,7 +62,6 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
         )
         now_value = _now()
         db = _AppendingModelAwareDb(
@@ -107,9 +103,6 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             id="task-3",
             project_id="p1",
             status="running",
-            dispatcher_instance_id="other-worker",
-            dispatch_started_at=now_value,
-            lease_expires_at=now_value + timedelta(seconds=5),
         )
         db = _AppendingModelAwareDb(tasks=[task])
         original_factory = task_manager_module.get_session_factory
@@ -124,10 +117,8 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
                 execution_token=None,
                 lease_owner_instance_id=manager.instance_id,
             )
-            original_lease = task.lease_expires_at
             manager._touch_task_heartbeat(task.id)
             self.assertEqual(0, len(db.runtime_leases))
-            self.assertEqual(original_lease, task.lease_expires_at)
         finally:
             task_manager_module.get_session_factory = original_factory
 
@@ -146,9 +137,6 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             output_root="/o",
             workspace_root="/w",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=now_value - timedelta(minutes=1),
-            lease_expires_at=now_value - timedelta(seconds=1),
             updated_at=now_value - timedelta(minutes=1),
         )
         expired_lease = BinarySecurityTaskRuntimeLease(
@@ -172,14 +160,12 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
         original_factory = task_manager_module.get_session_factory
         try:
             task_manager_module.get_session_factory = lambda: (lambda: db)
-            original_expiry = task.lease_expires_at
             manager._touch_task_heartbeat(task.id)
         finally:
             task_manager_module.get_session_factory = original_factory
             manager._release_task_execution_owner(task.id, "primary_task_worker")
             manager._workers.pop(task.id, None)
 
-        self.assertEqual(original_expiry, task.lease_expires_at)
         self.assertEqual(1, len(db.runtime_leases))
 
     def test_can_reopen_parent_task_after_missing_runtime_lease(self):
@@ -197,8 +183,6 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-old",
-            lease_expires_at=None,
         )
         db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[], events=[])
 
@@ -261,9 +245,6 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-stale",
-            dispatch_started_at=_now() - timedelta(minutes=10),
-            lease_expires_at=_now() - timedelta(minutes=5),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
@@ -279,7 +260,6 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
 
         self.assertFalse(reclaimed)
         self.assertEqual("dispatching", task.status)
-        self.assertEqual("worker-stale", task.dispatcher_instance_id)
         self.assertFalse(
             any(
                 event.event_type in {
@@ -304,11 +284,9 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-stale",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             policy_json='{"pipeline_mode": "mixed_streaming"}',
         )
-        task.dispatch_started_at = _now() - timedelta(minutes=10)
         task.updated_at = _now() - timedelta(minutes=10)
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -327,7 +305,6 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
 
         self.assertFalse(reclaimed)
         self.assertEqual("running", task.status)
-        self.assertEqual("worker-stale", task.dispatcher_instance_id)
         self.assertFalse(
             any(
                 event.event_type in {

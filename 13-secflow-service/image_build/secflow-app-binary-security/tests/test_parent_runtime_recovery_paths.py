@@ -35,8 +35,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             workspace_root="/w",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=now_value + timedelta(seconds=30),
             updated_at=now_value - timedelta(minutes=5),
         )
         item = BinarySecurityStageItem(
@@ -91,8 +89,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             workspace_root="/w",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=original_expiry,
             updated_at=started_at,
         )
         item = BinarySecurityStageItem(
@@ -132,7 +128,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             task_manager_module.get_session_factory = original_factory
             manager.cfg.scheduler.heartbeat_update_interval_seconds = original_interval
 
-        self.assertEqual(original_expiry, task.lease_expires_at)
         self.assertGreater(db.runtime_leases[0].lease_expires_at, original_expiry)
         self.assertGreater(task.updated_at, started_at)
 
@@ -150,9 +145,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             output_root="/o",
             workspace_root="/w",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id=manager.instance_id,
-            dispatch_started_at=now_value - timedelta(minutes=1),
-            lease_expires_at=now_value + timedelta(seconds=5),
             updated_at=now_value - timedelta(minutes=1),
         )
         lease = BinarySecurityTaskRuntimeLease(
@@ -180,7 +172,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             previous_expiry = db.runtime_leases[0].lease_expires_at
             manager._touch_task_heartbeat(task.id)
 
-        self.assertEqual(now_value + timedelta(seconds=5), task.lease_expires_at)
         self.assertGreater(db.runtime_leases[0].lease_expires_at, previous_expiry)
         self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
 
@@ -198,11 +189,8 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
-        task.dispatch_started_at = _now()
-        task.lease_expires_at = _now() + timedelta(seconds=120)
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id="worker-a",
@@ -261,9 +249,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
 
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertEqual("running", task.status)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
         self.assertEqual(1, len(db.runtime_leases))
         self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
         self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
@@ -282,11 +267,8 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
-        task.dispatch_started_at = _now()
-        task.lease_expires_at = _now() + timedelta(seconds=120)
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id="worker-a",
@@ -340,9 +322,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("system_analysis", task.current_stage)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
         self.assertEqual(1, len(db.runtime_leases))
         self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
         self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
@@ -360,10 +339,8 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="dead-worker",
             policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
         )
-        task.dispatch_started_at = _now() - timedelta(seconds=600)
         task.updated_at = _now() - timedelta(seconds=600)
         item = BinarySecurityStageItem(
             id="si-stale-tail",
@@ -406,9 +383,6 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         self.assertTrue(reclaimed)
         self.assertEqual("pending", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
         self.assertFalse(any(event.event_type == "main_state_write_blocked" for event in db.events))
 
 

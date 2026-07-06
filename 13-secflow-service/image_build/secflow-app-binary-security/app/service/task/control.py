@@ -1331,7 +1331,9 @@ class TaskControlServiceMixin:
                 payload={
                     "operation_id": operation.id,
                     "operation_type": task_manager_module.TASK_ACTION_CANCEL,
-                    "dispatcher_instance_id": str(getattr(task, "dispatcher_instance_id", "") or "").strip() or None,
+                    "runtime_lease_owner": str(
+                        getattr(self._runtime_lease_for_task(db, getattr(task, "id", None)), "owner_instance_id", "") or ""
+                    ).strip() or None,
                 },
             )
             db.commit()

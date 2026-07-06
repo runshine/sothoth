@@ -35,9 +35,6 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             "output_root": "/o",
             "workspace_root": "/w",
             "runtime_phase": TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            "dispatcher_instance_id": "worker-a",
-            "dispatch_started_at": _now() - timedelta(minutes=3),
-            "lease_expires_at": _now() - timedelta(seconds=10),
         }
         data.update(overrides)
         return BinarySecurityTask(**data)
@@ -45,7 +42,7 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
     def test_live_runtime_lease_row_mirror_drift_e2e(self):
         manager = TaskManager()
         manager.instance_id = "worker-b"
-        task = self._task(dispatcher_instance_id="worker-stale")
+        task = self._task()
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id="worker-live",
@@ -67,14 +64,12 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
         self.assertFalse(released)
         self.assertFalse(repaired)
         self.assertEqual("running", task.status)
-        self.assertEqual("worker-stale", task.dispatcher_instance_id)
-        event = next(row for row in db.events if row.event_type == "parent_runtime_reopen_suppressed_active_lease")
-        self.assertTrue(dict(event.payload or {}).get("row_mirror_drift"))
+        self.assertEqual("worker-live", db.runtime_leases[0].owner_instance_id)
 
     def test_observe_only_reconcile_without_owner_e2e(self):
         manager = TaskManager()
         manager.instance_id = "worker-b"
-        task = self._task(dispatcher_instance_id="worker-stale")
+        task = self._task()
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
         queued = []
         original_enqueue = manager._enqueue_task_with_context
@@ -101,10 +96,7 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
     def test_stale_shared_dispatch_signal_drop_e2e(self):
         manager = TaskManager()
         manager.instance_id = "worker-b"
-        task = self._task(
-            dispatcher_instance_id="worker-live",
-            lease_expires_at=_now() + timedelta(minutes=5),
-        )
+        task = self._task()
         task.summary = {
             "pending_shared_dispatch_signal": {
                 "signal_type": "task_layer_reconcile",
@@ -151,9 +143,6 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             firmware_path="/src",
             output_root="/output",
             workspace_root="/workspace",
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=_now() - timedelta(minutes=1),
-            lease_expires_at=_now() + timedelta(minutes=3),
             cleanup_snapshot={},
         )
         operation = BinarySecurityTaskOperation(
@@ -177,16 +166,12 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
         asyncio.run(manager._consume_delete_queue_task(db, task.id))
 
         self.assertEqual([task.id], requeued)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
         deferred = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_deferred_for_active_blocker")
         self.assertEqual("active_runtime_lease_blocks_delete_consume", (deferred.payload or {}).get("reason_code"))
 
         db.runtime_leases.clear()
         task.status = "failed"
         task.runtime_phase = TASK_RUNTIME_PHASE_TERMINAL
-        task.dispatcher_instance_id = None
-        task.dispatch_started_at = None
-        task.lease_expires_at = None
         started = []
 
         async def _fake_prepare_delete(_db_session, current_task):
@@ -200,7 +185,7 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             manager._prepare_delete_task = original_prepare_delete
 
         self.assertEqual([task.id], started)
-        self.assertEqual("worker-b", task.dispatcher_instance_id)
+        self.assertEqual("worker-b", db.runtime_leases[0].owner_instance_id)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertTrue(any(row.event_type == "task_delete_queue_consumption_started" for row in db.events))
 
@@ -210,9 +195,6 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             id="task-streaming-recover",
             status="dispatching",
             current_stage="entry_analysis",
-            dispatcher_instance_id="worker-z",
-            dispatch_started_at=_now() - timedelta(minutes=3),
-            lease_expires_at=_now() - timedelta(seconds=10),
             policy_json='{"pipeline_mode": "mixed_streaming"}',
         )
         system_run = BinarySecurityStageRun(
@@ -253,7 +235,6 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
 
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("worker-z", task.dispatcher_instance_id)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertEqual("idle", task.tail_reconcile_state)
         self.assertTrue(any(event.event_type == "streaming_parent_state_recovered" for event in db.events))
@@ -354,9 +335,6 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             id="task-firmware-failed",
             status="dispatching",
             current_stage="firmware_unpack",
-            dispatcher_instance_id="worker-z",
-            dispatch_started_at=_now() - timedelta(minutes=3),
-            lease_expires_at=_now() - timedelta(seconds=10),
             policy_json='{"pipeline_mode": "mixed_streaming"}',
         )
         firmware_run = BinarySecurityStageRun(
@@ -374,9 +352,6 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             manager._refresh_task_status_after_sync(db, task)
 
         self.assertEqual("failed", task.status)
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
         self.assertEqual("firmware_unpack", task.current_stage)
         self.assertIn("task_finalized_after_stage_failure", [event.event_type for event in db.events])
 
@@ -386,9 +361,6 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             id="task-firmware-owner-lost",
             status="dispatching",
             current_stage="firmware_unpack",
-            dispatcher_instance_id="worker-z",
-            dispatch_started_at=_now() - timedelta(minutes=3),
-            lease_expires_at=_now() - timedelta(seconds=10),
             policy_json='{"pipeline_mode": "mixed_streaming"}',
         )
         firmware_run = BinarySecurityStageRun(
@@ -429,6 +401,3 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
         self.assertEqual("running", task.status)
         self.assertEqual("firmware_unpack", task.current_stage)
         self.assertIsNone(task.finished_at)
-        self.assertEqual("worker-z", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)

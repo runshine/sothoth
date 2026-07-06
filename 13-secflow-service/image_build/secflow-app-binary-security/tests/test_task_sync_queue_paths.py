@@ -4,10 +4,19 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from app.model import BinarySecurityStageItem, BinarySecurityTask, TASK_TYPE_SOURCE
+from app.model import BinarySecurityStageItem, BinarySecurityTask, BinarySecurityTaskRuntimeLease, TASK_TYPE_SOURCE
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, UpstreamError, _now
 from test_task_manager import _AppendingModelAwareDb, _FakeTaskSyncQueue, _ModelAwareDb
+
+
+def _runtime_lease(task: BinarySecurityTask, owner: str, *, expires_at=None) -> BinarySecurityTaskRuntimeLease:
+    return BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id=owner,
+        heartbeat_at=_now(),
+        lease_expires_at=expires_at or (_now() + timedelta(minutes=5)),
+    )
 
 
 class TaskSyncQueuePathTests(unittest.TestCase):
@@ -99,8 +108,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             status="running",
             current_stage="dataflow_vuln_scan",
             runtime_phase="tail_reconciliation",
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
@@ -131,7 +138,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             },
             updated_at=_now() - timedelta(minutes=10),
         )
-        db = _ModelAwareDb(tasks=[task], stage_items=[entry_item], events=[])
+        db = _ModelAwareDb(tasks=[task], stage_items=[entry_item], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         original_get_queue = task_manager_module.get_task_queue
         original_enqueue = manager._enqueue_task
@@ -159,14 +166,12 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             task_type=TASK_TYPE_SOURCE,
             status="running",
             current_stage="entry_analysis",
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         fake_queue.entries_by_task[task.id] = [
             {
@@ -221,14 +226,12 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             task_type=TASK_TYPE_SOURCE,
             status="running",
             current_stage="entry_analysis",
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
         )
-        db = _ModelAwareDb(tasks=[task], events=[])
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         fake_queue.entries_by_task[task.id] = [
             {
@@ -282,14 +285,12 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             task_type=TASK_TYPE_SOURCE,
             status="running",
             current_stage="entry_analysis",
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], events=[])
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         fake_queue.entries_by_task[task.id] = [
             {
@@ -315,6 +316,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         original_sync = manager.sync_downstream_status
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         original_reconcile = manager._reconcile_missing_task_sync_requests
+        original_should_ack_stale = manager._should_ack_stale_task_sync_entry_without_retry
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
@@ -353,8 +355,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             task_type=TASK_TYPE_SOURCE,
             status="running",
             current_stage="entry_analysis",
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
@@ -372,7 +372,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             downstream_task_id="eat-existing",
             result={},
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[stage_item], events=[])
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[stage_item], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         fake_queue.entries_by_task[task.id] = [
             {
@@ -398,6 +398,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         original_sync = manager.sync_downstream_status
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         original_reconcile = manager._reconcile_missing_task_sync_requests
+        original_should_ack_stale = manager._should_ack_stale_task_sync_entry_without_retry
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
@@ -436,14 +437,12 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             task_type=TASK_TYPE_SOURCE,
             status="running",
             current_stage="entry_analysis",
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], events=[])
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         fake_queue.entries_by_task[task.id] = [
             {
@@ -562,8 +561,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             task_type=TASK_TYPE_SOURCE,
             status="running",
             current_stage="entry_analysis",
-            dispatcher_instance_id=manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
@@ -581,7 +578,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             downstream_task_id="eat-retry-db-fact",
             result={},
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         fake_queue.entries_by_task[task.id] = [
             {
@@ -775,3 +772,114 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual(task.id, refs[0]["task_id"])
         self.assertEqual("entry_analysis", refs[0]["stage_name"])
         self.assertEqual(["si-stale-entry"], refs[0]["item_ids"])
+
+    def test_drain_task_sync_queue_acks_stale_existing_items_without_retry(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-stale-existing",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_item = BinarySecurityStageItem(
+            id="si-stale-existing",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-stale-existing",
+            stage_name="entry_analysis",
+            item_key="entry-existing",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-existing",
+            result={
+                "sync_observation": {
+                    "sync_status": "synced",
+                    "downstream_status": "success",
+                    "mapped_status": "success",
+                }
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[stage_item], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
+        fake_queue = _FakeTaskSyncQueue()
+        fake_queue.entries_by_task[task.id] = [
+            {
+                "queue_item_id": "tsq-stale-existing",
+                "dedupe_key": "downstream_status:entry_analysis:si-stale-existing:*",
+                "sync_kind": "downstream_status",
+                "source": "runtime_start_repair",
+                "reason": "repair_missing_or_stale_sync_queue_entry",
+                "source_event_type": "task_sync_queue_repair",
+                "stage_name": "entry_analysis",
+                "item_ids": ["si-stale-existing"],
+                "archive_job_ids": [],
+                "force": False,
+                "requested_at": _now().isoformat(),
+                "last_requested_at": _now().isoformat(),
+                "next_retry_at": _now().isoformat(),
+                "attempts": 7,
+                "priority": 30,
+                "payload": {
+                    "observed_downstream_status": "success",
+                },
+            }
+        ]
+        acked: list[tuple[str, str, str | None, str | None]] = []
+        retried: list[dict[str, object]] = []
+        original_get_queue = task_manager_module.get_task_queue
+        original_sync = manager.sync_downstream_status
+        original_repair = manager._repair_task_sync_queue_on_runtime_start
+        original_reconcile = manager._reconcile_missing_task_sync_requests
+        original_should_ack_stale = manager._should_ack_stale_task_sync_entry_without_retry
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+
+            async def _fake_ack(task_id, *, queue_item_id, dedupe_key=None, context=""):
+                acked.append((task_id, queue_item_id, dedupe_key, context))
+                entries = fake_queue.entries_by_task.get(task_id, [])
+                fake_queue.entries_by_task[task_id] = [
+                    entry for entry in entries if entry.get("queue_item_id") != queue_item_id
+                ]
+
+            async def _fake_retry(task_id, entry, *, context=""):
+                retried.append({"task_id": task_id, "entry": dict(entry), "context": context})
+
+            fake_queue.ack_task_sync_request = _fake_ack
+            fake_queue.retry_task_sync_request = _fake_retry
+
+            async def _fake_sync(*_args, **_kwargs):
+                raise task_manager_module.NotFoundError("阶段子任务不存在")
+
+            manager.sync_downstream_status = _fake_sync
+            manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
+            manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
+            manager._should_ack_stale_task_sync_entry_without_retry = lambda *_args, **_kwargs: (
+                True,
+                ["si-stale-existing"],
+                [],
+            )
+
+            changed = asyncio.run(manager._drain_task_sync_queue(db, task))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            manager.sync_downstream_status = original_sync
+            manager._repair_task_sync_queue_on_runtime_start = original_repair
+            manager._reconcile_missing_task_sync_requests = original_reconcile
+            manager._should_ack_stale_task_sync_entry_without_retry = original_should_ack_stale
+
+        self.assertTrue(changed)
+        self.assertEqual([], fake_queue.entries_by_task[task.id])
+        self.assertEqual(
+            [("task-sync-stale-existing", "tsq-stale-existing", "downstream_status:entry_analysis:si-stale-existing:*", "task_sync_ack_stale_noop")],
+            acked,
+        )
+        self.assertEqual([], retried)
+        discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_as_stale_noop"]
+        self.assertEqual(1, len(discard_events))
+        self.assertEqual(["si-stale-existing"], discard_events[0].payload.get("existing_item_ids"))
+        self.assertEqual("acked_as_stale_noop", discard_events[0].payload.get("disposition"))

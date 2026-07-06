@@ -35,7 +35,6 @@ class OwnerSignalPathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-owner",
         )
         fake_queue = _FakeTaskSyncQueue()
         queued = []
@@ -116,7 +115,6 @@ class OwnerSignalPathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-owner",
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -163,7 +161,6 @@ class OwnerSignalPathTests(unittest.TestCase):
             workspace_root="/tmp/ws",
             status="cancelled",
             current_stage="firmware_unpack",
-            dispatcher_instance_id="worker-owner",
         )
         task.cleanup_snapshot = {
             "cleanup_partial_failed": True,
@@ -174,7 +171,12 @@ class OwnerSignalPathTests(unittest.TestCase):
                 {"service": "firmware_unpacker", "task_id": "fw-1", "stage_name": "firmware_unpack", "deferred": True}
             ],
         }
-        db = _AppendingModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-owner",
+            lease_expires_at=_now() + timedelta(seconds=120),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
         queued = []
         owner_signals = []
 
@@ -230,7 +232,6 @@ class OwnerSignalPathTests(unittest.TestCase):
             output_root="/o",
             workspace_root="/w",
             runtime_phase="tail_reconciliation",
-            dispatcher_instance_id="worker-owner",
         )
         task.policy = {
             "max_stage_parallelism": 4,
@@ -238,7 +239,12 @@ class OwnerSignalPathTests(unittest.TestCase):
             "continue_on_item_failure": True,
             "stage_parallelism": {"binary_to_source": 4, "entry_analysis": 4, "dataflow_vuln_scan": 4},
         }
-        db = _ModelAwareDb(tasks=[task])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-owner",
+            lease_expires_at=_now() + timedelta(seconds=120),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease])
         queued = []
         owner_signals = []
         original_enqueue = manager._enqueue_task

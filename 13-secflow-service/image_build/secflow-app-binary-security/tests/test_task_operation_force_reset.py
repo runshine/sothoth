@@ -31,9 +31,6 @@ class TaskOperationForceResetTests(unittest.TestCase):
             output_root="/o",
             workspace_root="/w",
             current_operation_id="op-force-reset",
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=_now(),
-            lease_expires_at=_now() + timedelta(seconds=120),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             last_error="stale owner",
             tail_reconcile_state="handoff_waiting",
@@ -100,9 +97,8 @@ class TaskOperationForceResetTests(unittest.TestCase):
         self.assertEqual([task.id], queued)
         self.assertEqual("running", task.status)
         self.assertEqual(response.operation_id, task.current_operation_id)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
+        self.assertEqual("worker-a", db.runtime_leases[0].owner_instance_id)
+        self.assertIsNotNone(db.runtime_leases[0].lease_expires_at)
         self.assertEqual(TASK_ACTION_CONTINUE, task.execution_mode)
         self.assertEqual("stale owner", task.last_error)
         self.assertEqual("handoff_waiting", task.tail_reconcile_state)

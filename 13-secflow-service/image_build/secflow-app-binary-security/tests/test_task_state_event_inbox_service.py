@@ -247,9 +247,6 @@ class TaskStateEventInboxServiceBehaviorTests(unittest.TestCase):
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
             firmware_path="/tmp/fw.bin",
-            dispatcher_instance_id="other-owner",
-            dispatch_started_at=_now(),
-            lease_expires_at=_now() + timedelta(minutes=1),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,

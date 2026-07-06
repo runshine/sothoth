@@ -5,7 +5,13 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask, TASK_TYPE_SOURCE
+from app.model import (
+    BinarySecurityStageItem,
+    BinarySecurityStageRun,
+    BinarySecurityTask,
+    BinarySecurityTaskRuntimeLease,
+    TASK_TYPE_SOURCE,
+)
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb, _now
@@ -23,8 +29,6 @@ class EntryAnalysisRuntimeObserveTests(unittest.TestCase):
             task_type=TASK_TYPE_SOURCE,
             status="running",
             current_stage="entry_analysis",
-            dispatcher_instance_id=self.manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
@@ -54,7 +58,12 @@ class EntryAnalysisRuntimeObserveTests(unittest.TestCase):
             downstream_service="entry_analyse",
             downstream_task_id="eat-existing",
         )
-        fake_session = _ModelAwareDb(stage_items=[item], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        fake_session = _ModelAwareDb(stage_items=[item], runtime_leases=[runtime_lease], events=[])
         module = {
             "module_key": "module-a",
             "module_name": "module-a",

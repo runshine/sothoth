@@ -3794,8 +3794,6 @@ class TaskManager(
     ) -> bool:
         snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
         active_runtime_lease_owner = snapshot.runtime_lease_owner if snapshot.runtime_lease_active else None
-        if active_runtime_lease_owner is None:
-            return False
         guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
         if guard.preserve and snapshot.supported_control_operation_active:
             self._record_event(
@@ -5242,13 +5240,106 @@ class TaskManager(
             existing_item_ids: list[str] = []
             should_discard_invalid_entry = False
             should_requeue_filtered_entry = False
+            should_ack_stale_entry = False
             if isinstance(exc, NotFoundError):
                 existing_item_ids, missing_item_ids = self._resolve_task_sync_entry_item_targets(db, task, entry)
                 should_discard_invalid_entry = bool(missing_item_ids)
                 should_requeue_filtered_entry = bool(existing_item_ids and missing_item_ids)
+                should_ack_stale_entry, existing_item_ids, missing_item_ids = self._should_ack_stale_task_sync_entry_without_retry(
+                    db,
+                    task,
+                    exc,
+                    entry,
+                )
             elif self._should_discard_terminal_task_sync_entry(db, task, exc, entry):
                 existing_item_ids, missing_item_ids = self._resolve_task_sync_entry_item_targets(db, task, entry)
                 should_discard_invalid_entry = True
+            if should_ack_stale_entry:
+                stale_stage_items: list[BinarySecurityStageItem] = []
+                if existing_item_ids:
+                    stale_stage_items = (
+                        db.query(BinarySecurityStageItem)
+                        .filter(
+                            BinarySecurityStageItem.task_id == task.id,
+                            BinarySecurityStageItem.id.in_(existing_item_ids),
+                        )
+                        .all()
+                    )
+                message = "检测到旧的任务同步消息命中的子任务当前已无需再次同步，已记录并丢弃当前消费"
+                for stage_item in stale_stage_items:
+                    self._record_downstream_sync_event(
+                        db,
+                        task=task,
+                        item=stage_item,
+                        stage_name=str(getattr(stage_item, "stage_name", "") or "").strip() or stage_name,
+                        operation=sync_kind,
+                        event_type="skipped",
+                        sync_status="skipped",
+                        outcome="stale_sync_request_discarded",
+                        state_applied=False,
+                        error_type="stale_sync_request",
+                        error_message=message,
+                        payload={
+                            "operation": sync_kind,
+                            "queue_item_id": queue_item_id,
+                            "dedupe_key": dedupe_key,
+                            "item_ids": item_ids,
+                            "existing_item_ids": existing_item_ids,
+                            "missing_item_ids": missing_item_ids,
+                            "source": str(entry.get("source") or "").strip() or None,
+                            "reason": str(entry.get("reason") or "").strip() or None,
+                            "source_event_type": str(entry.get("source_event_type") or "").strip() or None,
+                            "attempts": int(entry.get("attempts") or 0),
+                            "error_type": exc.__class__.__name__,
+                            "error": str(exc),
+                            "disposition": "acked_as_stale_noop",
+                            "item_status": str(getattr(stage_item, "status", "") or "").strip() or None,
+                            "downstream_service": str(getattr(stage_item, "downstream_service", "") or "").strip() or None,
+                            "downstream_task_id": str(getattr(stage_item, "downstream_task_id", "") or "").strip() or None,
+                        },
+                    )
+                self._record_event(
+                    db,
+                    task,
+                    "task_sync_request_discarded_as_stale_noop",
+                    message,
+                    level="warning",
+                    stage_name=stage_name,
+                    payload={
+                        "sync_kind": sync_kind,
+                        "queue_item_id": queue_item_id,
+                        "dedupe_key": dedupe_key,
+                        "item_ids": item_ids,
+                        "existing_item_ids": existing_item_ids,
+                        "missing_item_ids": missing_item_ids,
+                        "source": str(entry.get("source") or "").strip() or None,
+                        "reason": str(entry.get("reason") or "").strip() or None,
+                        "source_event_type": str(entry.get("source_event_type") or "").strip() or None,
+                        "attempts": int(entry.get("attempts") or 0),
+                        "error_type": exc.__class__.__name__,
+                        "error": str(exc),
+                        "disposition": "acked_as_stale_noop",
+                    },
+                )
+                db.commit()
+                await get_task_queue().ack_task_sync_request(
+                    task.id,
+                    queue_item_id=queue_item_id,
+                    dedupe_key=dedupe_key,
+                    context="task_sync_ack_stale_noop",
+                )
+                logger.warning(
+                    "binary-security discarded stale task sync request after recording noop task event: "
+                    "task_id=%s queue_item_id=%s stage_name=%s item_ids=%s existing_item_ids=%s error_type=%s error=%s",
+                    task.id,
+                    queue_item_id,
+                    stage_name,
+                    item_ids,
+                    existing_item_ids,
+                    exc.__class__.__name__,
+                    str(exc),
+                )
+                return True
             if should_discard_invalid_entry:
                 self._record_event(
                     db,
@@ -5435,6 +5526,31 @@ class TaskManager(
             return False
         existing_item_ids, _missing_item_ids = self._resolve_task_sync_entry_item_targets(db, task, entry)
         return not existing_item_ids
+
+    def _should_ack_stale_task_sync_entry_without_retry(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        exc: Exception,
+        entry: dict[str, Any],
+    ) -> tuple[bool, list[str], list[str]]:
+        if not isinstance(exc, NotFoundError):
+            return False, [], []
+        existing_item_ids, missing_item_ids = self._resolve_task_sync_entry_item_targets(db, task, entry)
+        if not existing_item_ids or missing_item_ids:
+            return False, existing_item_ids, missing_item_ids
+        stage_name = str(entry.get("stage_name") or "").strip() or None
+        force = bool(entry.get("force"))
+        for item in self._task_reconcile_candidate_items(
+            db,
+            task,
+            stage_name=stage_name,
+            force=force,
+        ):
+            item_id = str(getattr(item, "id", "") or "").strip()
+            if item_id and item_id in existing_item_ids:
+                return False, existing_item_ids, missing_item_ids
+        return True, existing_item_ids, missing_item_ids
 
     def _has_task_write_ownership(
         self,

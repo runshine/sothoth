@@ -111,10 +111,7 @@ class ParentTaskStateUpdateTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
         )
-        task.dispatch_started_at = now_value - timedelta(seconds=10)
-        task.lease_expires_at = now_value + timedelta(minutes=5)
         db = _ModelAwareDb(
             tasks=[task],
             runtime_leases=[
@@ -137,9 +134,7 @@ class ParentTaskStateUpdateTests(unittest.TestCase):
         )
 
         self.assertTrue(updated)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
-        self.assertIsNotNone(task.dispatch_started_at)
-        self.assertIsNotNone(task.lease_expires_at)
+        self.assertEqual("worker-a", db.runtime_leases[0].owner_instance_id)
         suppress_events = [
             event
             for event in db.events

@@ -96,9 +96,6 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         task = self._task(
             status="running",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=_now() - timedelta(minutes=5),
-            lease_expires_at=_now() - timedelta(minutes=1),
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
         enqueued: list[str] = []
@@ -115,9 +112,6 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
         self.assertEqual(["task-1"], enqueued)
         self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
 

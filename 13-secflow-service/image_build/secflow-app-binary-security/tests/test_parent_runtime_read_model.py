@@ -32,9 +32,7 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="remote-worker",
             current_operation_id="op-remote-archive-retry",
-            lease_expires_at=now_value + timedelta(seconds=120),
         )
         operation = BinarySecurityTaskOperation(
             id="op-remote-archive-retry",
@@ -56,7 +54,6 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
         supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
 
         self.assertTrue(supported)
-        self.assertEqual("remote-worker", task.dispatcher_instance_id)
 
     def test_task_has_supported_control_operation_runtime_uses_runtime_lease_for_archive_retry(self):
         manager = TaskManager()
@@ -73,9 +70,7 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="local-worker",
             current_operation_id="op-local-archive-retry",
-            lease_expires_at=now_value + timedelta(seconds=120),
         )
         operation = BinarySecurityTaskOperation(
             id="op-local-archive-retry",
@@ -117,9 +112,6 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="remote-worker",
-            dispatch_started_at=_now() - timedelta(minutes=5),
-            lease_expires_at=_now() - timedelta(minutes=4),
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
@@ -141,9 +133,6 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id=None,
-            dispatch_started_at=None,
-            lease_expires_at=None,
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
@@ -164,8 +153,6 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="remote-worker",
-            lease_expires_at=_now() + timedelta(minutes=2),
         )
 
         original_lease_is_active = manager._lease_is_active
@@ -190,8 +177,6 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="remote-worker",
-            lease_expires_at=_now() + timedelta(minutes=2),
         )
 
         original_lease_is_active = manager._lease_is_active
@@ -216,8 +201,6 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
             name="demo",
             status="running",
             firmware_path="/tmp/fw.bin",
-            dispatcher_instance_id="legacy-owner",
-            lease_expires_at=now_value + timedelta(seconds=10),
         )
         item = BinarySecurityStageItem(
             id="si-1",
@@ -257,17 +240,14 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
         self.assertEqual("timeout", response.last_sync_error_type)
         self.assertEqual("temporary timeout", response.last_sync_error_message)
 
-    def test_task_list_response_does_not_expose_legacy_task_row_as_runtime_lease(self):
+    def test_task_list_response_without_runtime_lease_exposes_no_owner(self):
         manager = TaskManager()
-        now_value = _now()
         task = BinarySecurityTask(
             id="task-lease-row-only",
             project_id="p1",
             name="demo",
             status="running",
             firmware_path="/tmp/fw.bin",
-            dispatcher_instance_id="row-owner-only",
-            lease_expires_at=now_value + timedelta(seconds=120),
         )
         db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[])
 

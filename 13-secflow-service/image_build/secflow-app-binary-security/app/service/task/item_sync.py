@@ -23,6 +23,41 @@ if TYPE_CHECKING:
 
 
 class TaskItemSyncServiceMixin:
+    def _task_reconcile_requested_items(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        stage_name: str | None = None,
+        item_id: str | None = None,
+        item_ids: list[str] | None = None,
+    ) -> tuple[list[BinarySecurityStageItem], list[str]]:
+        requested_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
+        single_item_id = str(item_id or "").strip()
+        if single_item_id:
+            requested_ids.append(single_item_id)
+        requested_ids = list(dict.fromkeys(requested_ids))
+        if not requested_ids:
+            return [], []
+        query = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.downstream_service.isnot(None),
+        )
+        if stage_name:
+            query = query.filter(BinarySecurityStageItem.stage_name == stage_name)
+        matched = {
+            str(current_item.id or "").strip(): current_item
+            for current_item in query.order_by(
+                BinarySecurityStageItem.updated_at.asc(),
+                BinarySecurityStageItem.created_at.asc(),
+                BinarySecurityStageItem.id.asc(),
+            ).all()
+            if str(current_item.id or "").strip()
+        }
+        ordered_items = [matched[current_id] for current_id in requested_ids if current_id in matched]
+        missing_item_ids = [current_id for current_id in requested_ids if current_id not in matched]
+        return ordered_items, missing_item_ids
+
     def _task_has_pending_cross_stage_downstream_sync(
         self: TaskManager,
         db: Session,
@@ -1402,18 +1437,28 @@ class TaskItemSyncServiceMixin:
             raise ValidationError(f"无效阶段: {stage_name}")
         if item_id and item_ids:
             raise ValidationError("item_id 与 item_ids 不能同时指定")
-        items = self._task_reconcile_candidate_items(
-            db,
-            task,
-            stage_name=stage_name,
-            item_id=item_id,
-            force=force,
-        )
+        requested_item_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
+        if str(item_id or "").strip():
+            requested_item_ids.append(str(item_id or "").strip())
+        requested_item_ids = list(dict.fromkeys(requested_item_ids))
         selected_by_item_ids = bool(item_ids)
-        if item_ids:
-            ordered_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
-            matched = {str(item.id): item for item in items if str(item.id or "").strip()}
-            items = [matched[current_id] for current_id in ordered_ids if current_id in matched]
+        missing_requested_item_ids: list[str] = []
+        if requested_item_ids:
+            items, missing_requested_item_ids = self._task_reconcile_requested_items(
+                db,
+                task,
+                stage_name=stage_name,
+                item_id=item_id,
+                item_ids=item_ids,
+            )
+        else:
+            items = self._task_reconcile_candidate_items(
+                db,
+                task,
+                stage_name=stage_name,
+                item_id=item_id,
+                force=force,
+            )
         scoped_retry_item_ids = getattr(task, "_retry_prepare_scoped_item_ids", None)
         scoped_retry_stage_name = str(getattr(task, "_retry_prepare_scoped_stage_name", "") or "").strip()
         if scoped_retry_item_ids and scoped_retry_stage_name:
@@ -1444,6 +1489,7 @@ class TaskItemSyncServiceMixin:
                     "force": force,
                     "batch_size": batch_size,
                     "candidate_item_count": len(items),
+                    "missing_requested_item_ids": missing_requested_item_ids or None,
                     "selected_stage_names": sorted({str(item.stage_name or "") for item in items if str(item.stage_name or "").strip()}),
                     "selected_items": len(items),
                 },
@@ -1464,6 +1510,7 @@ class TaskItemSyncServiceMixin:
                     "force": force,
                     "batch_size": batch_size,
                     "candidate_item_count": len(items),
+                    "missing_requested_item_ids": missing_requested_item_ids or None,
                     "selected_stage_names": sorted({str(item.stage_name or "") for item in items if str(item.stage_name or "").strip()}),
                     "selected_items": len(items),
                 },

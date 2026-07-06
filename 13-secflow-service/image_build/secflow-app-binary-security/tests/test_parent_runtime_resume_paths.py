@@ -202,8 +202,6 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-1",
-            lease_expires_at=now_value + timedelta(seconds=60),
         )
         operation = BinarySecurityTaskOperation(
             id="op1",
@@ -246,7 +244,7 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
         self.assertEqual([], applied)
         self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("worker-1", task.dispatcher_instance_id)
+        self.assertEqual("worker-1", db.runtime_leases[0].owner_instance_id)
         self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
         self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
 
@@ -264,9 +262,6 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             output_root="/o",
             workspace_root="/w",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-1",
-            dispatch_started_at=now_value - timedelta(seconds=10),
-            lease_expires_at=now_value + timedelta(seconds=60),
         )
         operation = BinarySecurityTaskOperation(
             id="op1",
@@ -301,7 +296,7 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             self.manager._should_auto_advance_to_stage = original_should_auto
 
         self.assertEqual("running", task.status)
-        self.assertEqual("worker-1", task.dispatcher_instance_id)
+        self.assertEqual("worker-1", db.runtime_leases[0].owner_instance_id)
         self.assertEqual([], queued)
         self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("requested")))
         self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
@@ -320,8 +315,6 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="test-worker",
-            lease_expires_at=now_value + timedelta(minutes=5),
         )
         operation = BinarySecurityTaskOperation(
             id="op-requeue",
@@ -388,8 +381,6 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="test-worker",
-            lease_expires_at=now_value + timedelta(minutes=5),
         )
         operation = BinarySecurityTaskOperation(
             id="op-hard-retry",
@@ -461,8 +452,6 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="other-worker",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         operation = BinarySecurityTaskOperation(
             id="op-requeue-blocked",
@@ -501,7 +490,7 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
         self.assertTrue(bool((operation.result_payload or {}).get("requeue", {}).get("in_place_runtime_resume")))
         self.assertFalse(bool((operation.result_payload or {}).get("requeue", {}).get("owner_release_and_requeue")))
         self.assertEqual("failed", task.status)
-        self.assertEqual("other-worker", task.dispatcher_instance_id)
+        self.assertEqual("other-worker", db.runtime_leases[0].owner_instance_id)
         self.assertTrue(any(lease.task_id == task.id for lease in db.runtime_leases))
         event_types = [event.event_type for event in db.events]
         self.assertIn("main_state_write_blocked", event_types)
@@ -681,7 +670,6 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             output_root="/o",
             workspace_root="/w",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-owner",
             current_operation_id="op-1",
         )
         operation = BinarySecurityTaskOperation(

@@ -162,9 +162,6 @@ class BinarySecurityTask(Base, JsonMixin):
     operation_lock_acquired_at = Column(DateTime, nullable=True)
     operation_lock_heartbeat_at = Column(DateTime, nullable=True)
     operation_lock_expires_at = Column(DateTime, nullable=True, index=True)
-    dispatcher_instance_id = Column(String(128), nullable=True, index=True)
-    dispatch_started_at = Column(DateTime, nullable=True, index=True)
-    lease_expires_at = Column(DateTime, nullable=True, index=True)
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=now_local, nullable=False)
@@ -764,18 +761,6 @@ def _ensure_compat_columns(engine) -> None:
         column_defs = {column["name"]: column for column in inspector.get_columns(task_table)}
         columns = set(column_defs)
         statements = []
-        if "dispatcher_instance_id" not in columns:
-            statements.append(
-                f"ALTER TABLE {task_table} ADD COLUMN dispatcher_instance_id VARCHAR(128) NULL"
-            )
-        if "dispatch_started_at" not in columns:
-            statements.append(
-                f"ALTER TABLE {task_table} ADD COLUMN dispatch_started_at DATETIME NULL"
-            )
-        if "lease_expires_at" not in columns:
-            statements.append(
-                f"ALTER TABLE {task_table} ADD COLUMN lease_expires_at DATETIME NULL"
-            )
         if "task_type" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN task_type VARCHAR(32) NOT NULL DEFAULT '{TASK_TYPE_BINARY}'"

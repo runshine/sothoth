@@ -90,7 +90,7 @@ class TaskStateMachineMixin:
             if current_stage and self._stage_has_active_archive_jobs(db, task, current_stage):
                 return True
             snapshot = snapshots_by_stage.get(current_stage) or {}
-            if bool(snapshot.get("has_unresolved_expected_outputs")):
+            if bool(snapshot.get("has_unresolved_expected_outputs")) and not bool(snapshot.get("is_terminal")):
                 return True
             return False
         return False

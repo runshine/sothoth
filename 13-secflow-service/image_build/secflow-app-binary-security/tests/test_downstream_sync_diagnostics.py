@@ -1,5 +1,7 @@
+import asyncio
 import unittest
 from datetime import timedelta
+from unittest.mock import patch
 
 from app.model import BinarySecurityStageItem, BinarySecurityTask, BinarySecurityTaskRuntimeLease
 from app.service.task_manager import TaskManager, UpstreamError, _now
@@ -19,8 +21,6 @@ class DownstreamSyncDiagnosticsTests(unittest.TestCase):
             status="running",
             current_stage="entry_analysis",
             runtime_phase="owned_execution",
-            dispatcher_instance_id=self.manager.instance_id,
-            lease_expires_at=_now() + timedelta(minutes=5),
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
@@ -87,7 +87,6 @@ class DownstreamSyncDiagnosticsTests(unittest.TestCase):
         self.assertTrue(payload.get("retryable_transport_error"))
         self.assertEqual("owned_execution", payload.get("runtime_phase"))
         self.assertEqual("running", payload.get("task_status"))
-        self.assertEqual(self.manager.instance_id, payload.get("dispatcher_instance_id"))
         self.assertTrue(payload.get("runtime_lease_active"))
         self.assertEqual(self.manager.instance_id, payload.get("runtime_lease_owner"))
         self.assertFalse(payload.get("local_handle_alive"))
@@ -101,6 +100,71 @@ class DownstreamSyncDiagnosticsTests(unittest.TestCase):
         self.assertEqual("entry_analyse", timeline_payload.get("downstream_service"))
         self.assertEqual("eat-diag-1", timeline_payload.get("downstream_task_id"))
         self.assertTrue(timeline_payload.get("runtime_lease_active"))
+
+    def test_sync_downstream_status_explicit_item_ids_bypass_candidate_prefilter(self):
+        task = BinarySecurityTask(
+            id="task-diag-2",
+            project_id="p1",
+            name="diag",
+            task_type="source",
+            status="running",
+            current_stage="entry_analysis",
+            runtime_phase="owned_execution",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si-diag-2",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-diag-2",
+            stage_name="entry_analysis",
+            item_key="entry-b",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-diag-2",
+            result={
+                "sync_observation": {
+                    "sync_status": "synced",
+                    "downstream_status": "success",
+                    "mapped_status": "success",
+                }
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+        async def _fake_fetch(_task, current_item, _token):
+            return {
+                "id": current_item.downstream_task_id,
+                "status": "success",
+                "parent_task_id": task.id,
+                "parent_stage_item_id": current_item.id,
+            }
+
+        with patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=_fake_fetch):
+            result = asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    stage_name="entry_analysis",
+                    item_ids=[item.id],
+                    force=False,
+                    token="token",
+                    record_request_event=True,
+                    apply_state=False,
+                )
+            )
+
+        self.assertEqual("ok", result.status)
+        requested_events = [event for event in db.events if event.event_type == "downstream_status_sync_requested"]
+        self.assertTrue(requested_events)
+        payload = dict(requested_events[-1].payload or {})
+        self.assertEqual([item.id], payload.get("item_ids"))
+        self.assertEqual(1, payload.get("candidate_item_count"))
+        self.assertIsNone(payload.get("missing_requested_item_ids"))
 
 
 if __name__ == "__main__":

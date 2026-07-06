@@ -29,7 +29,6 @@ class TaskArchiveServiceBehaviorTests(unittest.TestCase):
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
             firmware_path="/tmp/fw.bin",
-            dispatcher_instance_id="worker-a",
         )
         db = _ModelAwareDb(tasks=[task], events=[])
         enqueued: list[str] = []
@@ -41,9 +40,6 @@ class TaskArchiveServiceBehaviorTests(unittest.TestCase):
 
         self.assertEqual("pending", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
-        self.assertIsNone(task.dispatcher_instance_id)
-        self.assertIsNone(task.dispatch_started_at)
-        self.assertIsNone(task.lease_expires_at)
         self.assertEqual(["task-1"], enqueued)
         self.assertIn("task_archive_retry_requeued", [row.event_type for row in db.events])
 

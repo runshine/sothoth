@@ -37,7 +37,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="local-worker",
         )
         db = _ModelAwareDb(tasks=[task], operations=[])
         manager.instance_id = "local-worker"
@@ -73,7 +72,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="local-worker",
         )
         operation = BinarySecurityTaskOperation(
             id="op-duplicate",
@@ -128,7 +126,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="local-worker",
         )
         operation = BinarySecurityTaskOperation(
             id="op-delete-row-removed",
@@ -202,7 +199,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id=None,
         )
         operation = BinarySecurityTaskOperation(
             id="op-requeue",
@@ -285,7 +281,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
                     firmware_path="/src",
                     output_root="/o",
                     workspace_root="/w",
-                    dispatcher_instance_id=None,
                 )
                 operation = BinarySecurityTaskOperation(
                     id=f"op-{operation_type}",
@@ -353,10 +348,7 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
         )
-        task.dispatch_started_at = _now()
-        task.lease_expires_at = _now() + timedelta(seconds=120)
         operation = BinarySecurityTaskOperation(
             id="op-cancel-repair",
             task_id=task.id,
@@ -393,7 +385,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
         self.assertEqual("cancelled", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
         self.assertIsNone(task.current_operation_id)
-        self.assertIsNone(task.dispatcher_instance_id)
         self.assertEqual("succeeded", operation.status)
         self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
 
@@ -412,11 +403,8 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
-        task.dispatch_started_at = _now()
-        task.lease_expires_at = _now() + timedelta(seconds=120)
         operation = BinarySecurityTaskOperation(
             id="op-cancel-atomic",
             task_id=task.id,
@@ -478,7 +466,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         operation = BinarySecurityTaskOperation(
@@ -502,7 +489,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
                 current_task.status = "cancelled"
                 current_task.runtime_phase = TASK_RUNTIME_PHASE_TERMINAL
                 current_task.current_operation_id = None
-                current_task.dispatcher_instance_id = None
                 current_operation.status = "succeeded"
                 current_operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
                 current_operation.finished_at = _now()
@@ -542,7 +528,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         operation = BinarySecurityTaskOperation(
@@ -591,10 +576,7 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="worker-a",
         )
-        task.dispatch_started_at = _now()
-        task.lease_expires_at = _now() + timedelta(seconds=120)
         operation = BinarySecurityTaskOperation(
             id="op-cancel-retry",
             task_id=task.id,
@@ -648,8 +630,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="local-worker",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         operation = BinarySecurityTaskOperation(
             id="op-inline-requeue",
@@ -716,8 +696,6 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
-            dispatcher_instance_id="local-worker",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         operation = BinarySecurityTaskOperation(
             id="op-retry-failure",

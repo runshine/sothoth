@@ -33,7 +33,6 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
             "output_root": "/o",
             "workspace_root": "/tmp",
             "runtime_phase": TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            "dispatcher_instance_id": "worker-stale",
         }
         data.update(overrides)
         return BinarySecurityTask(**data)
@@ -73,7 +72,7 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
         self.assertEqual("runtime_lease_owner_missing_requires_shared_dispatch", payload.get("decision_reason"))
 
     def test_observe_only_reconcile_with_active_runtime_owner_uses_owner_inbox(self):
-        task = self._task(dispatcher_instance_id="worker-live")
+        task = self._task()
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id="worker-live",
@@ -109,7 +108,6 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
     def test_drop_unclaimed_dispatch_task_after_pop_records_complete_signal_metadata(self):
         task = self._task(
             current_stage="dataflow_vuln_scan",
-            dispatcher_instance_id="worker-owner",
         )
         task.summary = {
             "pending_shared_dispatch_signal": {
@@ -140,11 +138,10 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
         self.assertEqual("shared_dispatch_task_layer_reconcile_enqueue", payload.get("enqueue_context"))
         self.assertEqual("stage_worker_terminal_observed", payload.get("source_event_type"))
         self.assertEqual("worker-owner", payload.get("runtime_lease_owner"))
-        self.assertEqual("worker-owner", payload.get("row_mirror_owner"))
         self.assertTrue(payload.get("runtime_lease_active"))
 
     def test_task_layer_reconcile_delivery_decision_ignores_stale_dispatcher_without_runtime_lease(self):
-        task = self._task(dispatcher_instance_id="worker-stale")
+        task = self._task()
         db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[])
 
         decision = self.manager._task_layer_reconcile_delivery_decision(
@@ -163,9 +160,7 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
             id="task-missing-stage-terminal",
             current_stage="firmware_unpack",
             firmware_path="/fw.bin",
-            dispatcher_instance_id="worker-a",
         )
-        task.dispatch_started_at = _now()
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id="worker-a",
@@ -188,9 +183,7 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
             id="task-missing-stage-terminal-request",
             current_stage="firmware_unpack",
             firmware_path="/fw.bin",
-            dispatcher_instance_id="worker-a",
         )
-        task.dispatch_started_at = _now()
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id="worker-a",
@@ -229,9 +222,7 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
             id="task-archive-observe-only",
             current_stage="firmware_unpack",
             firmware_path="/fw.bin",
-            dispatcher_instance_id="worker-a",
         )
-        task.dispatch_started_at = _now()
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
             owner_instance_id="worker-a",

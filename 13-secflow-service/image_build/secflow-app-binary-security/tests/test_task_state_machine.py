@@ -902,7 +902,6 @@ class TaskStateMachineTests(unittest.TestCase):
             current_operation_id="op-old",
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
-            dispatcher_instance_id="worker-a",
         )
         operation = SimpleNamespace(
             id="op-cancel",
@@ -924,7 +923,6 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("cancel failed", task.last_error)
         self.assertEqual("op-cancel", task.current_operation_id)
         self.assertIsNotNone(task.finished_at)
-        self.assertIsNone(task.dispatcher_instance_id)
 
     def test_recover_failed_cancelled_task_state_blocks_non_owner(self):
         task = BinarySecurityTask(
@@ -964,7 +962,6 @@ class TaskStateMachineTests(unittest.TestCase):
             current_stage="system_analysis",
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
-            dispatcher_instance_id="worker-a",
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], events=[])
 
@@ -980,7 +977,6 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
         self.assertEqual("boom", task.last_error)
         self.assertIsNotNone(task.finished_at)
-        self.assertIsNone(task.dispatcher_instance_id)
 
     def test_finalize_task_after_authoritative_failure_blocks_non_owner(self):
         task = BinarySecurityTask(
@@ -991,7 +987,6 @@ class TaskStateMachineTests(unittest.TestCase):
             current_stage="system_analysis",
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
-            dispatcher_instance_id="worker-a",
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], events=[])
 
@@ -1014,7 +1009,6 @@ class TaskStateMachineTests(unittest.TestCase):
             name="task",
             status="cancelled",
             current_stage="entry_analysis",
-            dispatcher_instance_id="worker-a",
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
         )
@@ -1027,7 +1021,6 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("cancelled", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
         self.assertIsNotNone(task.finished_at)
-        self.assertIsNone(task.dispatcher_instance_id)
 
     def test_refresh_task_status_after_sync_early_return_terminalizes_cancel_failed_task_for_owner(self):
         task = BinarySecurityTask(
@@ -1037,7 +1030,6 @@ class TaskStateMachineTests(unittest.TestCase):
             status=task_manager_module.TASK_STATUS_CANCEL_FAILED,
             current_stage="entry_analysis",
             last_error="cancel failed",
-            dispatcher_instance_id="worker-a",
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
         )
@@ -1051,7 +1043,6 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
         self.assertEqual("cancel failed", task.last_error)
         self.assertIsNotNone(task.finished_at)
-        self.assertIsNone(task.dispatcher_instance_id)
 
     def test_refresh_task_status_after_sync_early_return_terminalizes_factless_failed_task_for_owner(self):
         task = BinarySecurityTask(
@@ -1061,7 +1052,6 @@ class TaskStateMachineTests(unittest.TestCase):
             status="failed",
             current_stage="entry_analysis",
             last_error="boom",
-            dispatcher_instance_id="worker-a",
             workspace_root="/tmp/ws",
             output_root="/tmp/out",
         )
@@ -1078,7 +1068,6 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
         self.assertEqual("boom", task.last_error)
         self.assertIsNotNone(task.finished_at)
-        self.assertIsNone(task.dispatcher_instance_id)
 
 
 if __name__ == "__main__":

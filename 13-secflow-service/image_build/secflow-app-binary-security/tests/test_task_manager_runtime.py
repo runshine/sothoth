@@ -40,7 +40,6 @@ class TaskManagerRuntimeStatusTests(unittest.TestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id=None,
         )
         task.policy = {"pipeline_mode": "mixed_streaming"}
 
@@ -391,15 +390,14 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         def _touch(task_id):
             self.assertEqual("task-1", task_id)
-            task.dispatcher_instance_id = "worker-a"
             task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            task.lease_expires_at = _now() + timedelta(minutes=5)
+            lease_expires_at = _now() + timedelta(minutes=5)
             db.runtime_leases.append(
                 BinarySecurityTaskRuntimeLease(
                     task_id=task.id,
                     owner_instance_id="worker-a",
                     heartbeat_at=_now(),
-                    lease_expires_at=task.lease_expires_at,
+                    lease_expires_at=lease_expires_at,
                 )
             )
 
@@ -408,12 +406,11 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(created)
         await asyncio.wait_for(started.wait(), timeout=1)
-        self.assertEqual("worker-a", task.dispatcher_instance_id)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         lease = next((row for row in db.runtime_leases if row.task_id == "task-1"), None)
         self.assertIsNotNone(lease)
         self.assertEqual("worker-a", lease.owner_instance_id)
-        self.assertIsNotNone(task.lease_expires_at)
+        self.assertIsNotNone(lease.lease_expires_at)
 
         handle = manager._workers.get("task-1")
         self.assertIsNotNone(handle)
@@ -435,8 +432,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -490,11 +485,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             current_operation_id="op-delete",
-            dispatch_started_at=_now(),
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         operation = BinarySecurityTaskOperation(
             id="op-delete",
@@ -722,7 +714,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
             runtime_phase="owned_execution",
-            dispatcher_instance_id="worker-a",
         )
         lease = BinarySecurityTaskRuntimeLease(
             task_id="task-1",
@@ -751,6 +742,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             drop_payload.get("dropped_message_type"),
             {
+                "owned_execution_takeover",
                 "task_layer_reconcile",
                 "non_pending_task_already_owned_by_supported_runtime",
             },
@@ -808,7 +800,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root=self._workspace_root("dispatch-forward-dispatching"),
             runtime_phase="owned_execution",
-            dispatcher_instance_id="worker-a",
         )
         lease = BinarySecurityTaskRuntimeLease(
             task_id="task-1",
@@ -879,7 +870,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
             runtime_phase="owned_execution",
-            dispatcher_instance_id="worker-old",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
 
@@ -1029,7 +1019,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
             runtime_phase="owned_execution",
-            dispatcher_instance_id="worker-a",
         )
         active_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -1066,7 +1055,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
             runtime_phase="owned_execution",
-            dispatcher_instance_id="worker-old",
         )
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -1084,9 +1072,9 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             {
                 "task_id": task.id,
                 "claimed_task_id": None,
-                "blocked_reason": "task_runtime_owner_handoff_cooldown",
+                "blocked_reason": "non_pending_task_already_owned_by_supported_runtime",
                 "should_requeue": False,
-                "cooldown_seconds": 15,
+                "cooldown_seconds": None,
             },
             manager._dispatch_claim_decision(),
         )
@@ -1104,7 +1092,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
             runtime_phase="owned_execution",
-            dispatcher_instance_id="worker-a",
         )
         active_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -1145,8 +1132,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws-expired-lease",
             runtime_phase="owned_execution",
-            dispatcher_instance_id="worker-old",
-            lease_expires_at=_now() - timedelta(minutes=1),
         )
         expired_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -1159,8 +1144,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         claimed = manager._dispatch_task_by_id(db, task.id)
 
         self.assertEqual(task.id, claimed)
-        self.assertEqual("worker-new", task.dispatcher_instance_id)
         self.assertEqual("dispatching", task.status)
+        self.assertEqual("worker-new", db.runtime_leases[0].owner_instance_id)
         self.assertEqual(
             {
                 "task_id": task.id,
@@ -1174,10 +1159,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(row.event_type == "dispatch_claim_dropped_after_pop" for row in db.events))
         event_types = [row.event_type for row in db.events]
         self.assertIn("parent_runtime_reopen_allowed_after_lease_expiry", event_types)
-        self.assertTrue(
-            "dispatch_claim_allowed_after_runtime_lease_expiry" in event_types
-            or "owned_execution_takeover_requeued" in event_types
-        )
+        self.assertIn("running_without_active_lease_requeued", event_types)
 
     def test_dispatch_task_by_id_reopens_running_ownerless_task_after_runtime_lease_expiry(self):
         manager = TaskManager()
@@ -1195,16 +1177,14 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws-ownerless-expired-lease",
             runtime_phase="owned_execution",
-            dispatcher_instance_id=None,
-            lease_expires_at=_now() - timedelta(minutes=1),
         )
         db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[])
 
         claimed = manager._dispatch_task_by_id(db, task.id)
 
         self.assertEqual(task.id, claimed)
-        self.assertEqual("worker-new", task.dispatcher_instance_id)
         self.assertEqual("dispatching", task.status)
+        self.assertEqual("worker-new", db.runtime_leases[0].owner_instance_id)
         self.assertEqual(
             {
                 "task_id": task.id,
@@ -1238,7 +1218,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws-ownerless-expired-lease-stale-op",
             runtime_phase="owned_execution",
-            dispatcher_instance_id=None,
             current_operation_id="op-old",
         )
         stage_run = BinarySecurityStageRun(
@@ -1281,8 +1260,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         claimed = manager._dispatch_task_by_id(db, task.id)
 
         self.assertEqual(task.id, claimed)
-        self.assertEqual("worker-new", task.dispatcher_instance_id)
         self.assertEqual("dispatching", task.status)
+        self.assertEqual("worker-new", db.runtime_leases[0].owner_instance_id)
         self.assertEqual(
             {
                 "task_id": task.id,
@@ -1313,8 +1292,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
             current_operation_id="op-delete",
         )
         task.cleanup_snapshot = {
@@ -1366,8 +1343,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() - timedelta(minutes=5),
             current_operation_id="op-delete",
         )
         task.cleanup_snapshot = {
@@ -1389,8 +1364,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         def _release(_db, release_task, *, active_operation=None, reason):
             del _db, active_operation
             released.append(reason)
-            release_task.dispatcher_instance_id = None
-            release_task.lease_expires_at = None
             return True
 
         async def _prepare(_db, _task):
@@ -1406,8 +1379,8 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], released)
         self.assertEqual([task.id], prepared)
         started_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_started")
-        self.assertTrue(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
-        self.assertEqual("worker-b", task.dispatcher_instance_id)
+        self.assertFalse(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
+        self.assertEqual("worker-b", db.runtime_leases[0].owner_instance_id)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
 
     @unittest.skip("stale fake-db queue reconcile coverage is unstable in full-file runtime suite")
@@ -1531,7 +1504,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root=self._workspace_root("reconcile-active-nonpending"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-stale",
         )
         expired_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -1569,7 +1541,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([("task-running-stale-owner", "queue_reconcile_active_nonpending_reenqueue")], pushed)
         self.assertEqual("pending", task.status)
-        self.assertIsNone(task.dispatcher_instance_id)
         self.assertIn("active_nonpending_stale_owner_reenqueued", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_suppresses_active_nonpending_takeover_while_runtime_lease_active(self):
@@ -1584,7 +1555,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root=self._workspace_root("reconcile-active-nonpending-active-lease"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-stale",
         )
         active_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -1621,7 +1591,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             await self.manager._reconcile_work_queues_once(db)
 
         self.assertEqual([], pushed)
-        self.assertEqual("worker-stale", task.dispatcher_instance_id)
+        self.assertEqual("worker-stale", db.runtime_leases[0].owner_instance_id)
         self.assertIn("active_nonpending_takeover_suppressed_active_lease", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_reenqueues_active_nonpending_when_only_local_handle_alive_but_lease_missing(self):
@@ -1636,9 +1606,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root=self._workspace_root("reconcile-local-handle-no-lease"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-local",
-            dispatch_started_at=_now() - timedelta(minutes=2),
-            lease_expires_at=_now() - timedelta(seconds=1),
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[], runtime_leases=[])
         pushed: list[tuple[str, str | None]] = []
@@ -1671,7 +1638,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([("task-running-local-handle-no-lease", "queue_reconcile_active_nonpending_reenqueue")], pushed)
         self.assertEqual("pending", task.status)
-        self.assertIsNone(task.dispatcher_instance_id)
         self.assertNotIn("active_nonpending_takeover_suppressed_local_runtime", [row.event_type for row in db.events])
 
     async def test_reconcile_work_queues_skips_stale_operation_row_without_current_operation_binding(self):
@@ -1686,7 +1652,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root=self._workspace_root("reconcile-stale-op-row"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-stale",
             current_operation_id=None,
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
@@ -1733,7 +1698,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root=self._workspace_root("reconcile-active-op-owned"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id="worker-owner",
             current_operation_id="op-1",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
@@ -1870,7 +1834,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
         pushed: list[tuple[str, str | None]] = []
@@ -1913,7 +1876,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-owner",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
         pushed: list[tuple[str, str | None]] = []
@@ -1967,7 +1929,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
             current_operation_id="op-1",
         )
         db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
@@ -2173,7 +2134,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root=self._workspace_root("reconcile-running-delete-hidden"),
             current_operation_id="op-delete",
-            dispatcher_instance_id=None,
             runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
         )
         task.cleanup_snapshot = {
@@ -2234,9 +2194,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            dispatch_started_at=_now() - timedelta(minutes=30),
-            lease_expires_at=_now() - timedelta(minutes=10),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         db = _ModelAwareDb(tasks=[task], events=[])
@@ -2303,8 +2260,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         older = BinarySecurityTaskOperation(
             id="op-old",
@@ -2359,8 +2314,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         task.summary = {
             "runtime_workset": {
@@ -2470,8 +2423,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         item = BinarySecurityStageItem(
             id="item-bind",
@@ -2516,8 +2467,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         task.summary = {
             "runtime_workset": {
@@ -2593,8 +2542,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
         )
         task.summary = {
             "runtime_workset": {
@@ -2661,9 +2608,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
-            dispatch_started_at=_now(),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -2724,9 +2668,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
-            dispatch_started_at=_now(),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -2800,9 +2741,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
-            dispatch_started_at=_now(),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -2878,9 +2816,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=_now() + timedelta(minutes=5),
-            dispatch_started_at=_now(),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -3353,19 +3288,25 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             firmware_path="/fw",
             output_root="/o",
             workspace_root="/tmp/ws",
-            dispatcher_instance_id="worker-a",
-            lease_expires_at=lease_expires_at,
             runtime_phase="tail_reconciliation",
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            heartbeat_at=_now(),
+            lease_expires_at=lease_expires_at,
         )
 
         class _TaskSession:
             def __init__(self):
                 self.task = task
+                self.runtime_lease = runtime_lease
                 self.commits = 0
                 self.rollbacks = 0
+                self._model = None
 
             def query(self, model):
-                del model
+                self._model = getattr(model, "__name__", None)
                 return self
 
             def filter(self, *args, **kwargs):
@@ -3373,6 +3314,8 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
                 return self
 
             def first(self):
+                if self._model == "BinarySecurityTaskRuntimeLease":
+                    return self.runtime_lease
                 return self.task
 
             def commit(self):
@@ -3961,7 +3904,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             output_root="/tmp/out",
             workspace_root="/tmp/ws",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            dispatcher_instance_id=manager.instance_id,
         )
         task.summary = {
             "entry_results": [],

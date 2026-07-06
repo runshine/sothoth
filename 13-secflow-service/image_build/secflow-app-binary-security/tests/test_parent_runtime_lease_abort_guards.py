@@ -23,8 +23,6 @@ class ParentRuntimeLeaseAbortGuardTests(unittest.IsolatedAsyncioTestCase):
             "task_type": TASK_TYPE_BINARY,
             "current_stage": "dataflow_vuln_scan",
             "runtime_phase": TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            "dispatcher_instance_id": "worker-a",
-            "dispatch_started_at": _now() - timedelta(minutes=2),
             "summary": {},
         }
         data.update(overrides)
