@@ -2229,6 +2229,14 @@ class TaskOperationServiceMixin:
             for item in running_items:
                 item.status = "cancelled"
                 item.finished_at = item.finished_at or task_manager_module._now()
+                self._clear_replacement_in_progress(item)
+                self._clear_stage_item_sync_observation_errors(item)
+                self._repair_stage_item_terminal_downstream_observation(
+                    db,
+                    task,
+                    item,
+                    reason="task_already_cancelled_normalized",
+                )
             active_stage_runs = db.query(task_manager_module.BinarySecurityStageRun).filter(
                 task_manager_module.BinarySecurityStageRun.task_id == task.id,
                 task_manager_module.BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),
@@ -2274,6 +2282,14 @@ class TaskOperationServiceMixin:
         for item in running_items:
             item.status = "cancelled"
             item.finished_at = task_manager_module._now()
+            self._clear_replacement_in_progress(item)
+            self._clear_stage_item_sync_observation_errors(item)
+            self._repair_stage_item_terminal_downstream_observation(
+                db,
+                task,
+                item,
+                reason="task_cancelled",
+            )
         active_stage_runs = db.query(task_manager_module.BinarySecurityStageRun).filter(
             task_manager_module.BinarySecurityStageRun.task_id == task.id,
             task_manager_module.BinarySecurityStageRun.status.in_(["pending", "dispatching", "queued", "running"]),

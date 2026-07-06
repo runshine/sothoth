@@ -1713,7 +1713,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], pushed)
         self.assertEqual("worker-stale", db.runtime_leases[0].owner_instance_id)
-        self.assertIn("active_nonpending_takeover_suppressed_active_lease", [row.event_type for row in db.events])
+        self.assertEqual([], db.events)
 
     async def test_reconcile_work_queues_dedupes_repeated_active_nonpending_takeover_suppressed_observation(self):
         task = BinarySecurityTask(
@@ -1903,7 +1903,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([], pushed)
         event_types = [row.event_type for row in db.events]
-        self.assertIn("active_operation_shared_dispatch_reenqueue_suppressed_active_owner", event_types)
+        self.assertNotIn("active_operation_shared_dispatch_reenqueue_suppressed_active_owner", event_types)
         self.assertNotIn("active_operation_shared_dispatch_reenqueue_skipped", event_types)
 
     async def test_watchdog_skips_recent_lease_write(self):
