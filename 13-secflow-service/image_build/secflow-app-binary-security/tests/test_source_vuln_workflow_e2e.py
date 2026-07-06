@@ -2059,6 +2059,94 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         )
         self.assertTrue(any(event.event_type == "entry_selection_confirmed" for event in db.events))
 
+    def test_source_workflow_e2e_cancel_running_entry_analysis_cancels_source_child_and_runner(self):
+        task = _source_task(summary={"input_dir": "/tmp/source-project"})
+        task.status = "running"
+        task.current_stage = "entry_analysis"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-cancel-source-e2e",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+            started_at=_now(),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-cancel-source-e2e",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-cancel-source-e2e",
+        )
+        entry_item.input_ref = {
+            "module_key": "mod-a",
+            "module_name": "mod-a",
+            "source_dir": "/tmp/source-project/mod-a",
+            "source_root": "/tmp/source-project",
+            "source_root_path": "/tmp/source-project",
+            "module_dir": "/tmp/source-project/mod-a",
+            "files_list": "/tmp/source-project/mod-a/files.list",
+        }
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run],
+            stage_items=[entry_item],
+            archive_jobs=[],
+            events=[],
+        )
+        cancelled_children: list[str] = []
+        cancelled_ref_batches: list[list[dict[str, str]]] = []
+        local_cancel_requests: list[tuple[str, bool]] = []
+
+        async def _fake_cancel_downstream(item, _token):
+            cancelled_children.append(str(item.downstream_task_id or ""))
+
+        async def _fake_cancel_downstream_refs(_db, _task, refs, _token):
+            cancelled_ref_batches.append([dict(ref) for ref in refs])
+            return len(list(refs))
+
+        async def _fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
+            local_cancel_requests.append((task_id, wait_for_runner))
+
+        original_write = self.manager._write_task_metadata_async
+        original_cancel_item = self.manager._cancel_downstream
+        original_cancel_refs = self.manager._cancel_downstream_refs
+        original_request_local_cancel = self.manager._request_local_worker_cancel
+        try:
+            self.manager._write_task_metadata_async = _fake_request_local_worker_cancel  # placeholder overridden below
+            self.manager._cancel_downstream = _fake_cancel_downstream
+            self.manager._cancel_downstream_refs = _fake_cancel_downstream_refs
+            self.manager._request_local_worker_cancel = _fake_request_local_worker_cancel
+
+            async def _noop_write(*_args, **_kwargs):
+                return None
+
+            self.manager._write_task_metadata_async = _noop_write
+            cancelled_stages = asyncio.run(self.manager._prepare_cancel_task(db, task))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+            self.manager._cancel_downstream = original_cancel_item
+            self.manager._cancel_downstream_refs = original_cancel_refs
+            self.manager._request_local_worker_cancel = original_request_local_cancel
+
+        detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        self.assertEqual(["entry_analysis"], cancelled_stages)
+        self.assertEqual("cancelling", task.status)
+        self.assertEqual("cancelled", entry_item.status)
+        self.assertEqual("cancelled", entry_run.status)
+        self.assertEqual(["ea-cancel-source-e2e"], cancelled_children)
+        self.assertEqual([(task.id, False)], local_cancel_requests)
+        self.assertTrue(cancelled_ref_batches)
+        self.assertEqual("cancelling", detail.status)
+        self.assertTrue(any(event.event_type == "task_cancelling" for event in db.events))
+
     def test_source_workflow_e2e_entry_failure_finalizes_parent_failed(self):
         task = _source_task(
             summary={

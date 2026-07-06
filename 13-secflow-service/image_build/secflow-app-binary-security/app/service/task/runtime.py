@@ -3283,6 +3283,7 @@ class TaskRuntimeServiceMixin:
                 execution_gate_db.close()
             while await self._run_task_runtime_signals(task_id):
                 pass
+            self._mark_runtime_handle_runner_progress(task_id)
             await self._execute_task(task_id)
             while True:
                 runtime_db = session_factory()
@@ -3612,6 +3613,9 @@ class TaskRuntimeServiceMixin:
             if stage_retry_mode:
                 start_index = min(start_index, target_stage_index)
             for stage_name in stage_sequence[start_index:]:
+                if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_stage_loop"):
+                    return
+                self._mark_runtime_handle_runner_progress(task_id)
                 if stage_retry_mode and stage_sequence.index(stage_name) < target_stage_index:
                     continue
                 if hasattr(db, "refresh"):
@@ -3650,6 +3654,8 @@ class TaskRuntimeServiceMixin:
                         stage_name,
                         str(getattr(task, "current_stage", "") or "").strip() or None,
                     )
+                    if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_entry_analysis_barrier_blocked"):
+                        return
                     break
                 if not self._stage_enabled(task, stage_name):
                     stage_run = self._ensure_stage_run(db, task, stage_name)
@@ -3713,6 +3719,8 @@ class TaskRuntimeServiceMixin:
                         blocked_reason,
                         str(stage_gate.get("stage_status") or "").strip() or None,
                     )
+                    if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_stage_start_gate_blocked"):
+                        return
                     break
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 if stage_name == "entry_analysis":

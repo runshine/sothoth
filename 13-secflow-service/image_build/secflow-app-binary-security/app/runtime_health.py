@@ -100,13 +100,18 @@ def _owner_readiness() -> tuple[bool, dict[str, Any]]:
     required_loops = tuple()
     missing = [loop_name for loop_name in required_loops if not _loop_ready(loop_name, runtime)]
     lease_capable = bool(runtime.get("lease_auditor_active"))
-    return running and not missing and lease_capable, {
+    lease_watchdog_alive = bool(runtime.get("lease_watchdog_alive"))
+    lease_watchdog_stale = bool(runtime.get("lease_watchdog_stale"))
+    return running and not missing and lease_capable and lease_watchdog_alive and not lease_watchdog_stale, {
         "enabled": True,
         "running": running,
         "loops": loops,
         "loop_details": loop_details,
         "missing_loops": missing,
         "lease_auditor_active": lease_capable,
+        "lease_watchdog_alive": lease_watchdog_alive,
+        "lease_watchdog_stale": lease_watchdog_stale,
+        "event_loop_lag_seconds": runtime.get("event_loop_lag_seconds"),
     }
 
 
@@ -149,6 +154,9 @@ def collect_probe_snapshot() -> dict[str, object]:
         "last_error": startup.get("startup_error"),
         "liveness_ok": liveness_ok,
         "readiness_ok": readiness_ok,
+        "lease_watchdog_alive": runtime.get("lease_watchdog_alive"),
+        "lease_watchdog_stale": runtime.get("lease_watchdog_stale"),
+        "event_loop_lag_seconds": runtime.get("event_loop_lag_seconds"),
         "reason": None if readiness_ok else (startup.get("startup_error") or "runtime checks not ready"),
         "checks": checks,
         "runtime": runtime,

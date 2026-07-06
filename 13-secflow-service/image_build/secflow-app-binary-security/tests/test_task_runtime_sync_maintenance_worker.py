@@ -18,11 +18,11 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
 
-    async def test_task_heartbeat_does_not_invoke_sync_maintenance(self):
+    async def test_task_heartbeat_does_not_invoke_sync_maintenance_or_write_lease(self):
         manager = TaskManager()
         manager._running = True
         manager.instance_id = "worker-a"
-        touched = asyncio.Event()
+        verify_calls: list[str] = []
         handle = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
             runner_task=asyncio.current_task(),
@@ -39,24 +39,25 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             manager._running = False
             return False
 
-        def _touch(_task_id):
-            touched.set()
+        def _verify(_task_id, source):
+            verify_calls.append(source)
+            return task_manager_module._RuntimeLeaseOwnershipDecision(
+                should_continue=True,
+                runtime_lease_present=True,
+                runtime_lease_active=True,
+                runtime_lease_owner="worker-a",
+                local_handle_alive=True,
+            )
 
         manager._handoff_active_serial_control_operation_from_runtime = _handoff
-        manager._touch_task_heartbeat = _touch
         manager._service_local_runtime_sync_maintenance = AsyncMock()
-        manager._verify_local_runtime_lease_or_abort = lambda *_args, **_kwargs: task_manager_module._RuntimeLeaseOwnershipDecision(
-            should_continue=True,
-            runtime_lease_present=True,
-            runtime_lease_active=True,
-            runtime_lease_owner="worker-a",
-            local_handle_alive=True,
-        )
+        manager._verify_local_runtime_lease_or_abort = _verify
+        manager._touch_task_heartbeat = lambda *_args, **_kwargs: self.fail("heartbeat should not write lease directly")
 
         with patch("app.service.task_manager.asyncio.sleep", new=AsyncMock()) as sleep_mock:
             await manager._run_task_heartbeat("task-1")
 
-        self.assertTrue(touched.is_set())
+        self.assertEqual(["heartbeat_verify"], verify_calls)
         manager._service_local_runtime_sync_maintenance.assert_not_awaited()
         sleep_mock.assert_awaited()
 

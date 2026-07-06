@@ -5,14 +5,41 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_serializer
 
 from app.model import PIPELINE_PROFILE_DEFAULT, STAGE_SEQUENCE, TASK_TYPE_BINARY
 from app.time_utils import isoformat_local
 
 
 class BinarySecurityBaseModel(BaseModel):
-    model_config = ConfigDict(json_encoders={datetime: isoformat_local})
+    model_config = ConfigDict()
+
+    @field_serializer("*", when_used="json-unless-none", check_fields=False)
+    def _serialize_datetime_fields(self, value: Any):
+        if isinstance(value, datetime):
+            return isoformat_local(value)
+        return value
+
+    @classmethod
+    def _normalize_json_datetimes(cls, value: Any) -> Any:
+        if isinstance(value, datetime):
+            return isoformat_local(value)
+        if isinstance(value, list):
+            return [cls._normalize_json_datetimes(item) for item in value]
+        if isinstance(value, dict):
+            return {
+                key: cls._normalize_json_datetimes(item)
+                for key, item in value.items()
+            }
+        return value
+
+    def model_dump(self, *args, **kwargs):
+        if kwargs.get("mode") == "json":
+            json_kwargs = dict(kwargs)
+            json_kwargs["mode"] = "python"
+            payload = super().model_dump(*args, **json_kwargs)
+            return self._normalize_json_datetimes(payload)
+        return super().model_dump(*args, **kwargs)
 
 
 class TokenUser(BinarySecurityBaseModel):

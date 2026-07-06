@@ -227,6 +227,8 @@ class TaskLifecycleServiceMixin:
             "archive_dispatch": self._loop_runtime_detail("archive_dispatch", self._archive_loop_task),
             "stage_item_dispatch": self._loop_runtime_detail("stage_item_dispatch", self._stage_item_loop_task),
         }
+        watchdog = self._lease_watchdog_status_snapshot()
+        event_loop_lag = self._event_loop_lag_snapshot()
         return {
             "running": self._running,
             "loops": {
@@ -245,6 +247,17 @@ class TaskLifecycleServiceMixin:
                 "archive_workers": len([task for task in self._archive_workers if not task.done()]),
             },
             "lease_auditor_active": bool(self._runtime_lease_capable()),
+            "lease_watchdog_alive": bool(watchdog.get("alive")),
+            "lease_watchdog_last_tick_at": watchdog.get("last_tick_at"),
+            "lease_watchdog_last_success_at": watchdog.get("last_success_at"),
+            "lease_watchdog_stall_seconds": watchdog.get("stall_seconds"),
+            "lease_watchdog_stale": bool(watchdog.get("stale")),
+            "event_loop_lag_seconds": event_loop_lag.get("lag_seconds"),
+            "event_loop_last_tick_at": event_loop_lag.get("last_tick_at"),
+            "diagnostics": {
+                "lease_watchdog": watchdog,
+                "event_loop": event_loop_lag,
+            },
         }
 
     def _collect_runtime_metrics_snapshot_sync(self: TaskManager) -> dict[str, int]:

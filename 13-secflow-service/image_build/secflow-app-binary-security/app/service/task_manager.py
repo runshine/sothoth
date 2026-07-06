@@ -669,6 +669,9 @@ class TaskRuntimeHandle:
     release_reason: str | None = None
     last_runner_exit_at: datetime | None = None
     last_lease_refresh_at: datetime | None = None
+    last_lease_verify_at: datetime | None = None
+    last_sync_maintenance_progress_at: datetime | None = None
+    last_runner_progress_at: datetime | None = None
     takeover_observed: bool = False
     control_wakeup_requested: bool = False
     control_wakeup_reason: str | None = None
@@ -760,6 +763,18 @@ class TaskManager(
         self._readonly_projection_cache: dict[tuple[str, str, str], tuple[float, Any]] = {}
         self._readonly_projection_cache_lock = threading.Lock()
         self._loop_heartbeats: dict[str, datetime] = {}
+        self._runtime_loop: asyncio.AbstractEventLoop | None = None
+        self._lease_watchdog_thread: threading.Thread | None = None
+        self._lease_watchdog_stop_event = threading.Event()
+        self._lease_watchdog_state_lock = threading.Lock()
+        self._lease_watchdog_last_tick_at: datetime | None = None
+        self._lease_watchdog_last_success_at: datetime | None = None
+        self._lease_watchdog_last_error: str | None = None
+        self._event_loop_lag_monitor_task: asyncio.Task | None = None
+        self._event_loop_last_tick_at: datetime | None = None
+        self._event_loop_last_lag_seconds: float = 0.0
+        self._event_loop_stall_threshold_seconds = 5.0
+        self._event_loop_last_stall_at: datetime | None = None
         self._last_stale_operation_requeue_at: datetime | None = None
         self._last_stage_item_sync_reconcile_at: datetime | None = None
         self._non_owner_claim_log_state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -1651,6 +1666,7 @@ class TaskManager(
             logger.info("binary-security task manager start skipped: already_running=true")
             return
         self._running = True
+        self._runtime_loop = asyncio.get_running_loop()
         observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
         role = self._service_role()
         run_worker_loops = role in {"", "all", "worker"}
@@ -1680,6 +1696,12 @@ class TaskManager(
                 await self._seed_work_queues()
                 logger.info("binary-security task manager seeded work queues")
                 logger.info("binary-security task manager starting dispatch loops")
+                self._lease_watchdog_stop_event.clear()
+                self._event_loop_lag_monitor_task = asyncio.create_task(
+                    self._run_event_loop_lag_monitor(),
+                    name="binary-security-event-loop-lag-monitor",
+                )
+                self._start_runtime_lease_watchdog()
                 self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
                 self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
                 self._delete_loop_task = asyncio.create_task(self._delete_dispatch_loop(), name="binary-security-delete-dispatcher")
@@ -1704,12 +1726,16 @@ class TaskManager(
 
     async def stop(self) -> None:
         self._running = False
+        self._lease_watchdog_stop_event.set()
         await self._cancel_loop_task(self._loop_task)
         await self._cancel_loop_task(self._archive_loop_task)
         await self._cancel_loop_task(self._delete_loop_task)
         await self._cancel_loop_task(self._stage_item_loop_task)
         await self._cancel_loop_task(self._state_event_inbox_loop_task)
         await self._cancel_loop_task(self._state_event_inbox_metrics_loop_task)
+        await self._cancel_loop_task(self._event_loop_lag_monitor_task)
+        self._event_loop_lag_monitor_task = None
+        await asyncio.to_thread(self._stop_runtime_lease_watchdog)
         archive_active = list(self._archive_workers)
         for task in archive_active:
             task.cancel()
@@ -1743,7 +1769,164 @@ class TaskManager(
         with self._task_execution_owner_lock:
             self._task_execution_owners.clear()
         self._last_task_heartbeat_at.clear()
+        self._runtime_loop = None
         observe_worker_counts(task_workers=0, operation_workers=0, archive_workers=0, task_heartbeat_workers=0)
+
+    def _start_runtime_lease_watchdog(self) -> None:
+        thread = self._lease_watchdog_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._lease_watchdog_stop_event.clear()
+        self._lease_watchdog_thread = threading.Thread(
+            target=self._run_runtime_lease_watchdog,
+            name="binary-security-runtime-lease-watchdog",
+            daemon=True,
+        )
+        self._lease_watchdog_thread.start()
+
+    def _stop_runtime_lease_watchdog(self) -> None:
+        self._lease_watchdog_stop_event.set()
+        thread = self._lease_watchdog_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(1.0, float(self._runtime_watchdog_interval_seconds() * 2)))
+        self._lease_watchdog_thread = None
+
+    def _watchdog_runtime_handle_snapshot(self) -> list[TaskRuntimeHandle]:
+        for _ in range(3):
+            try:
+                return [
+                    handle
+                    for handle in list(self._workers.values())
+                    if not handle.done() and not handle.release_requested and bool(handle.owner_active)
+                ]
+            except RuntimeError:
+                time.sleep(0.01)
+        return []
+
+    def _watchdog_should_keep_runtime_lease(self, db: Session, task: BinarySecurityTask | None, handle: TaskRuntimeHandle | None) -> bool:
+        del db
+        if task is None or handle is None:
+            return False
+        if handle.cancel_requested or handle.release_requested or handle.takeover_observed:
+            return False
+        if str(getattr(task, "status", "") or "").strip().lower() in TASK_TERMINAL_STATUSES:
+            return False
+        return True
+
+    def _record_watchdog_runtime_stall_before_abort(
+        self,
+        task_id: str,
+        *,
+        decision: "_RuntimeLeaseOwnershipDecision",
+        source: str,
+    ) -> None:
+        handle = self._runtime_handle(task_id)
+        if handle is None or handle.last_lease_refresh_at is None:
+            return
+        max_stall_seconds = float(self._runtime_watchdog_interval_seconds() * 2)
+        stalled_seconds = max(0.0, (_now() - handle.last_lease_refresh_at).total_seconds())
+        if stalled_seconds <= max_stall_seconds:
+            return
+        db = get_session_factory()()
+        try:
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if task is None:
+                return
+            self._record_event(
+                db,
+                task,
+                "runtime_lease_refresh_stalled_before_abort",
+                "本地 runtime lease 刷新长时间停滞后检测到 owner 已失租",
+                level="warning",
+                stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "task_id": task_id,
+                    "source": str(source or "").strip() or None,
+                    "runtime_lease_owner": decision.runtime_lease_owner,
+                    "runtime_lease_expires_at": _isoformat_or_none(decision.runtime_lease_expires_at),
+                    "last_lease_refresh_at": _isoformat_or_none(handle.last_lease_refresh_at),
+                    "stalled_seconds": stalled_seconds,
+                    "abort_reason": decision.abort_reason,
+                },
+            )
+            db.commit()
+        finally:
+            db.close()
+
+    def _run_runtime_lease_watchdog(self) -> None:
+        logger.info("binary-security runtime lease watchdog started")
+        interval_seconds = self._runtime_watchdog_interval_seconds()
+        try:
+            while self._running and not self._lease_watchdog_stop_event.is_set():
+                tick_at = _now()
+                with self._lease_watchdog_state_lock:
+                    self._lease_watchdog_last_tick_at = tick_at
+                handles = self._watchdog_runtime_handle_snapshot()
+                for handle in handles:
+                    task_id = str(getattr(handle, "task_id", "") or "").strip()
+                    if not task_id:
+                        continue
+                    db = get_session_factory()()
+                    try:
+                        task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+                        if not self._watchdog_should_keep_runtime_lease(db, task, handle):
+                            continue
+                        decision = self._assert_active_runtime_lease_owner(
+                            db,
+                            task_id,
+                            expected_owner=str(self.instance_id or "").strip() or None,
+                            allow_retryable_read_error=True,
+                        )
+                        self._mark_runtime_handle_lease_verify(task_id, verified_at=tick_at)
+                        if self._should_abort_local_runtime_after_lease_loss(decision):
+                            self._record_watchdog_runtime_stall_before_abort(
+                                task_id,
+                                decision=decision,
+                                source="runtime_lease_watchdog",
+                            )
+                            self._verify_local_runtime_lease_or_abort(task_id, "runtime_lease_watchdog")
+                            continue
+                        self._write_task_heartbeat(db, task_id, now_value=tick_at, source="watchdog")
+                    except StaleTaskExecution:
+                        self._verify_local_runtime_lease_or_abort(task_id, "runtime_lease_watchdog")
+                    except Exception:
+                        logger.exception(
+                            "binary-security runtime lease watchdog failed: task_id=%s",
+                            task_id,
+                        )
+                        with self._lease_watchdog_state_lock:
+                            self._lease_watchdog_last_error = f"task:{task_id}"
+                    else:
+                        with self._lease_watchdog_state_lock:
+                            self._lease_watchdog_last_success_at = tick_at
+                            self._lease_watchdog_last_error = None
+                    finally:
+                        db.close()
+                if not handles:
+                    with self._lease_watchdog_state_lock:
+                        self._lease_watchdog_last_success_at = tick_at
+                        self._lease_watchdog_last_error = None
+                self._lease_watchdog_stop_event.wait(interval_seconds)
+        finally:
+            logger.info("binary-security runtime lease watchdog stopped")
+
+    async def _run_event_loop_lag_monitor(self) -> None:
+        interval_seconds = 1.0
+        expected_at = time.monotonic()
+        while self._running:
+            await asyncio.sleep(interval_seconds)
+            now_monotonic = time.monotonic()
+            lag_seconds = max(0.0, now_monotonic - expected_at - interval_seconds)
+            expected_at = now_monotonic
+            self._event_loop_last_tick_at = _now()
+            self._event_loop_last_lag_seconds = lag_seconds
+            if lag_seconds > self._event_loop_stall_threshold_seconds:
+                self._event_loop_last_stall_at = self._event_loop_last_tick_at
+                logger.warning(
+                    "binary-security event loop stall detected: lag_seconds=%.3f threshold_seconds=%.3f",
+                    lag_seconds,
+                    self._event_loop_stall_threshold_seconds,
+                )
 
     def _release_owned_runtime_leases_on_shutdown(self, task_ids: list[str]) -> None:
         """优雅退出时释放本实例持有的 runtime_lease。
@@ -1812,6 +1995,101 @@ class TaskManager(
 
     def _runtime_handle(self, task_id: str) -> TaskRuntimeHandle | None:
         return self._workers.get(str(task_id or "").strip())
+
+    def _mark_runtime_handle_runner_progress(self, task_id: str, *, progress_at: datetime | None = None) -> None:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return
+        now_value = progress_at or _now()
+        handle.last_runner_progress_at = now_value
+        handle.last_progress_at = now_value
+
+    def _mark_runtime_handle_sync_progress(self, task_id: str, *, progress_at: datetime | None = None) -> None:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return
+        now_value = progress_at or _now()
+        handle.last_sync_maintenance_progress_at = now_value
+        handle.last_progress_at = now_value
+
+    def _mark_runtime_handle_lease_verify(self, task_id: str, *, verified_at: datetime | None = None) -> None:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return
+        handle.last_lease_verify_at = verified_at or _now()
+
+    def _runtime_watchdog_interval_seconds(self) -> int:
+        heartbeat_interval = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
+        return max(1, min(5, heartbeat_interval))
+
+    def _lease_watchdog_alive(self) -> bool:
+        thread = self._lease_watchdog_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def _lease_watchdog_status_snapshot(self) -> dict[str, Any]:
+        now_value = _now()
+        with self._lease_watchdog_state_lock:
+            last_tick_at = self._lease_watchdog_last_tick_at
+            last_success_at = self._lease_watchdog_last_success_at
+            last_error = self._lease_watchdog_last_error
+        stall_seconds = (
+            max(0.0, (now_value - last_tick_at).total_seconds())
+            if last_tick_at is not None
+            else None
+        )
+        return {
+            "alive": self._lease_watchdog_alive(),
+            "last_tick_at": last_tick_at,
+            "last_success_at": last_success_at,
+            "stall_seconds": stall_seconds,
+            "stale": bool(stall_seconds is not None and stall_seconds > float(self._runtime_watchdog_interval_seconds() * 2)),
+            "last_error": last_error,
+        }
+
+    def _event_loop_lag_snapshot(self) -> dict[str, Any]:
+        now_value = _now()
+        last_tick_at = self._event_loop_last_tick_at
+        observed_gap = (
+            max(0.0, (now_value - last_tick_at).total_seconds())
+            if last_tick_at is not None
+            else None
+        )
+        current_lag_seconds = max(
+            float(self._event_loop_last_lag_seconds or 0.0),
+            max(0.0, (observed_gap or 0.0) - 1.0),
+        )
+        return {
+            "last_tick_at": last_tick_at,
+            "lag_seconds": current_lag_seconds,
+            "last_stall_at": self._event_loop_last_stall_at,
+        }
+
+    def _request_runtime_handle_abort(self, task_id: str, *, reason: str | None = None) -> None:
+        normalized_task_id = str(task_id or "").strip()
+        handle = self._runtime_handle(normalized_task_id)
+        if handle is None:
+            return
+        handle.cancel_requested = True
+        handle.cancel_requested_reason = str(reason or "").strip() or handle.cancel_requested_reason
+        loop = self._runtime_loop
+
+        def _cancel() -> None:
+            current_handle = self._runtime_handle(normalized_task_id)
+            if current_handle is None:
+                return
+            current_handle.cancel_requested = True
+            current_handle.cancel_requested_reason = str(reason or "").strip() or current_handle.cancel_requested_reason
+            if current_handle.runner_task is not None and not current_handle.runner_task.done():
+                current_handle.runner_task.cancel()
+            if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
+                current_handle.heartbeat_task.cancel()
+            if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
+                current_handle.sync_maintenance_task.cancel()
+
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(_cancel)
+            return
+        _cancel()
 
     def _mark_runner_exited_keep_owner(
         self,
@@ -2065,14 +2343,14 @@ class TaskManager(
             try:
                 if await self._handoff_active_serial_control_operation_from_runtime(task_id):
                     return
-                await asyncio.to_thread(self._touch_task_heartbeat, task_id)
                 ownership_decision = await asyncio.to_thread(
                     self._verify_local_runtime_lease_or_abort,
                     task_id,
-                    "heartbeat_after_touch",
+                    "heartbeat_verify",
                 )
                 if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
                     return
+                self._mark_runtime_handle_lease_verify(task_id)
                 handle.last_progress_at = _now()
                 failure_count = 0
             except asyncio.CancelledError:
@@ -2117,7 +2395,7 @@ class TaskManager(
                 try:
                     processed = await self._service_local_runtime_sync_maintenance(task_id)
                     if processed:
-                        handle.last_progress_at = _now()
+                        self._mark_runtime_handle_sync_progress(task_id)
                 except asyncio.CancelledError:
                     raise
                 except StaleTaskExecution:
@@ -2157,12 +2435,13 @@ class TaskManager(
         finally:
             session.close()
         if not self._should_abort_local_runtime_after_lease_loss(decision):
+            self._mark_runtime_handle_lease_verify(normalized_task_id)
             return decision
+        self._request_runtime_handle_abort(
+            normalized_task_id,
+            reason=decision.abort_reason,
+        )
         handle = self._runtime_handle(normalized_task_id)
-        if handle is not None:
-            handle.cancel_requested = True
-            if handle.runner_task is not None and not handle.runner_task.done():
-                handle.runner_task.cancel()
         event_type = (
             "runtime_lease_verification_failed_local_execution_aborted"
             if decision.abort_reason == "runtime_lease_verification_failed"
@@ -2193,12 +2472,28 @@ class TaskManager(
                         "abort_reason": decision.abort_reason,
                         "verification_error": decision.verification_error,
                         "source": str(source or "").strip() or None,
+                        "runner_done": None if handle is None else bool(handle.runner_task.done()),
+                        "heartbeat_done": None if handle is None or handle.heartbeat_task is None else bool(handle.heartbeat_task.done()),
+                        "sync_maintenance_done": None if handle is None or handle.sync_maintenance_task is None else bool(handle.sync_maintenance_task.done()),
+                        "watchdog_thread_alive": self._lease_watchdog_alive(),
                     },
                 )
                 db.commit()
         finally:
             db.close()
         return decision
+
+    async def _abort_local_runtime_if_lease_lost(
+        self,
+        task_id: str,
+        source: str,
+    ) -> bool:
+        decision = await asyncio.to_thread(
+            self._verify_local_runtime_lease_or_abort,
+            task_id,
+            source,
+        )
+        return self._should_abort_local_runtime_after_lease_loss(decision)
 
     async def _service_local_runtime_sync_maintenance(self, task_id: str) -> bool:
         normalized_task_id = str(task_id or "").strip()
@@ -2402,6 +2697,11 @@ class TaskManager(
         if task is None:
             return True
         delete_in_progress = self._is_task_delete_in_progress(task)
+        if (
+            not delete_in_progress
+            and os.getenv("BINARY_SECURITY_DISABLE_WORKSPACE_DELETE_GUARD_DB_LOOKUP") == "1"
+        ):
+            return True
         if not delete_in_progress:
             task_id = str(getattr(task, "id", "") or "").strip()
             project_id = str(getattr(task, "project_id", "") or "").strip()

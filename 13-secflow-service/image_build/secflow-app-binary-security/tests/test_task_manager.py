@@ -42361,6 +42361,147 @@ def _test_confirm_entry_selection_updates_task(self):
     self.assertEqual(1, detail.selected_entry_count)
 
 
+def _test_confirm_entry_selection_requires_pending_confirmation_status(self):
+    task = BinarySecurityTask(
+        id="t-entry-status-1",
+        project_id="p1",
+        name="task",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "entry_results": [
+            {
+                "module_key": "m1",
+                "module_name": "module1",
+                "entries": [
+                    {"entry_key": "e1", "function_name": "f1"},
+                ],
+            }
+        ],
+        "entry_selection": {
+            "mode": "manual_confirm",
+            "status": "waiting_confirmation",
+            "candidate_entries": [
+                {"entry_key": "e1", "function_name": "f1"},
+            ],
+            "selected_entry_keys": [],
+            "selected_entries": [],
+            "confirmed_at": None,
+        },
+    }
+    task.policy = {"entry_selection_mode": "manual_confirm"}
+
+    class _TaskDb(_FakeDb):
+        def __init__(self, task_row):
+            super().__init__([task_row])
+            self.task_row = task_row
+
+        def query(self, model, *args, **kwargs):
+            class _Query(_FakeQuery):
+                def filter(self, *args, **kwargs):
+                    return self
+            if getattr(model, "__name__", "") == "BinarySecurityTask":
+                return _Query([self.task_row])
+            return _Query([])
+
+    db = _TaskDb(task)
+
+    with self.assertRaises(ValidationError):
+        self.manager.confirm_entry_selection(
+            db,
+            project_id="p1",
+            task_id="t-entry-status-1",
+            selected_entry_keys=["e1"],
+        )
+
+
+def _test_confirm_entry_selection_rejects_unknown_keys_and_deduplicates_inputs(self):
+    task = BinarySecurityTask(
+        id="t-entry-dup-1",
+        project_id="p1",
+        name="task",
+        task_type=TASK_TYPE_SOURCE,
+        status="pending_entry_confirmation",
+        current_stage="entry_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    task.summary = {
+        "entry_results": [
+            {
+                "module_key": "m1",
+                "module_name": "module1",
+                "entries": [
+                    {"entry_key": "e1", "function_name": "f1"},
+                    {"entry_key": "e2", "function_name": "f2"},
+                ],
+            }
+        ],
+        "entry_selection": {
+            "mode": "manual_confirm",
+            "status": "waiting_confirmation",
+            "candidate_entries": [
+                {"entry_key": "e1", "function_name": "f1"},
+                {"entry_key": "e2", "function_name": "f2"},
+            ],
+            "selected_entry_keys": [],
+            "selected_entries": [],
+            "confirmed_at": None,
+        },
+    }
+    task.policy = {"entry_selection_mode": "manual_confirm"}
+
+    class _TaskDb(_FakeDb):
+        def __init__(self, task_row):
+            super().__init__([task_row])
+            self.task_row = task_row
+
+        def query(self, model, *args, **kwargs):
+            class _Query(_FakeQuery):
+                def filter(self, *args, **kwargs):
+                    return self
+                def order_by(self, *args, **kwargs):
+                    return self
+            if getattr(model, "__name__", "") == "BinarySecurityTask":
+                return _Query([self.task_row])
+            if getattr(model, "__name__", "") == "BinarySecurityStageRun":
+                return _Query([])
+            return _Query([])
+
+    db = _TaskDb(task)
+    original_write = self.manager._write_task_metadata
+    self.manager._write_task_metadata = lambda *args, **kwargs: None
+    try:
+        with self.assertRaises(ValidationError):
+            self.manager.confirm_entry_selection(
+                db,
+                project_id="p1",
+                task_id="t-entry-dup-1",
+                selected_entry_keys=["e2", "missing-entry"],
+            )
+
+        detail = self.manager.confirm_entry_selection(
+            db,
+            project_id="p1",
+            task_id="t-entry-dup-1",
+            selected_entry_keys=["e2", "e2", "  ", "e1"],
+        )
+    finally:
+        self.manager._write_task_metadata = original_write
+
+    self.assertEqual(["e2", "e1"], task.summary["entry_selection"]["selected_entry_keys"])
+    self.assertEqual(["e1", "e2"], [row["entry_key"] for row in task.summary["entry_selection"]["selected_entries"]])
+    self.assertEqual(2, detail.selected_entry_count)
+
+
 def _test_stage_entry_analysis_manual_confirm_sets_pending_entry_confirmation(self):
     task = BinarySecurityTask(
         id="t-entry-2",
@@ -45764,6 +45905,8 @@ TaskManagerTests.test_local_runtime_sync_maintenance_consumes_owner_signal = _te
 TaskManagerTests.test_task_sync_entry_score_respects_timezone_iso_retry_at = _test_task_sync_entry_score_respects_timezone_iso_retry_at
 TaskManagerTests.test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp = _test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp
 TaskManagerTests.test_fake_task_sync_queue_has_due_request_respects_future_retry_at = _test_fake_task_sync_queue_has_due_request_respects_future_retry_at
+TaskManagerTests.test_confirm_entry_selection_requires_pending_confirmation_status = _test_confirm_entry_selection_requires_pending_confirmation_status
+TaskManagerTests.test_confirm_entry_selection_rejects_unknown_keys_and_deduplicates_inputs = _test_confirm_entry_selection_rejects_unknown_keys_and_deduplicates_inputs
 TaskManagerTests.test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled = _test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled
 TaskManagerTests.test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled = _test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled
 TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state = _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state

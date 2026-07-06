@@ -979,8 +979,25 @@ class TaskControlServiceMixin:
         task = self._task_or_404(db, project_id, task_id)
         if self._entry_selection_mode(task) != task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM:
             raise ValidationError("当前任务不需要手动确认入口")
+        if str(task.status or "").strip() != task_manager_module.TASK_STATUS_PENDING_ENTRY_CONFIRMATION:
+            raise ValidationError("当前任务不处于待确认入口状态")
         candidate_entries = self._entry_candidates(task)
-        selected_keys = [str(key or "").strip() for key in list(selected_entry_keys or []) if str(key or "").strip()]
+        candidate_key_set = {
+            str(entry.get("entry_key") or "").strip()
+            for entry in candidate_entries
+            if str(entry.get("entry_key") or "").strip()
+        }
+        selected_keys: list[str] = []
+        seen_selected_keys: set[str] = set()
+        for key in list(selected_entry_keys or []):
+            normalized = str(key or "").strip()
+            if not normalized or normalized in seen_selected_keys:
+                continue
+            seen_selected_keys.add(normalized)
+            selected_keys.append(normalized)
+        unknown_keys = [key for key in selected_keys if key not in candidate_key_set]
+        if unknown_keys:
+            raise ValidationError(f"存在无效入口选择: {', '.join(unknown_keys)}")
         selected_key_set = set(selected_keys)
         selected_entries = [
             dict(entry)
