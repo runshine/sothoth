@@ -1718,9 +1718,20 @@ class TaskRuntimeStateServiceMixin:
         event_level: str = "warning",
         event_payload: dict[str, Any] | None = None,
         preserve_active_state: bool = False,
-    ) -> None:
+    ) -> bool:
         if bool(getattr(task, "_owned_execution_requeue_emitted", False)):
-            return
+            return False
+        from app.service import task_manager as task_manager_module
+
+        task_query = db.query(task_manager_module.BinarySecurityTask).filter(
+            task_manager_module.BinarySecurityTask.id == str(getattr(task, "id", "") or "").strip()
+        )
+        with_for_update = getattr(task_query, "with_for_update", None)
+        if callable(with_for_update):
+            task_query = with_for_update()
+        locked_task = task_query.first()
+        if locked_task is not None:
+            task = locked_task
         snapshot = self._parent_runtime_ownership_snapshot(db, task)
         preserve_guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
         decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
@@ -1760,7 +1771,7 @@ class TaskRuntimeStateServiceMixin:
                     reason=reason,
                     stage_name=stage_name,
                 )
-                return
+                return False
             self._record_parent_runtime_lease_decision(
                 db,
                 task,
@@ -1779,12 +1790,53 @@ class TaskRuntimeStateServiceMixin:
                 reason=reason,
                 stage_name=stage_name,
             )
-            return
+            return False
         setattr(task, "_owned_execution_requeue_emitted", True)
         event_stage_name = str(getattr(task, "_preferred_requeue_event_stage_name", "") or "").strip() or (stage_name or task.current_stage)
         if hasattr(task, "_preferred_requeue_event_stage_name"):
             setattr(task, "_preferred_requeue_event_stage_name", None)
         next_stage_name = str(stage_name or task.current_stage or "").strip() or None
+        observed_owner = str(decision.runtime_lease_owner or "").strip() or None
+        if observed_owner:
+            clear_result = self._clear_runtime_lease(
+                db,
+                task.id,
+                owner_instance_id=observed_owner,
+                swallow_lock_error=True,
+            )
+            if clear_result.status == "lease_locked_retry_later":
+                setattr(task, "_owned_execution_requeue_emitted", False)
+                self._record_event(
+                    db,
+                    task,
+                    "runtime_lease_clear_deferred_by_lock",
+                    "runtime lease 清理遇到可重试锁冲突，当前轮延后接管重排队",
+                    level="warning",
+                    stage_name=event_stage_name,
+                    payload={
+                        "next_stage": next_stage_name,
+                        "reason": reason,
+                        "takeover_action": "requeue_owned_execution",
+                        "runtime_lease_owner": observed_owner,
+                        "clear_status": clear_result.status,
+                        "clear_error_message": clear_result.error_message,
+                    },
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "owned_execution_reclaim_deferred_by_lock",
+                    "owned execution 接管修复遇到可重试锁冲突，当前轮延后重试",
+                    level="warning",
+                    stage_name=event_stage_name,
+                    payload={
+                        "next_stage": next_stage_name,
+                        "reason": reason,
+                        "runtime_lease_owner": observed_owner,
+                        "takeover_action": "defer_requeue_owned_execution",
+                    },
+                )
+                return False
         self._apply_release_for_takeover_main_state(
             db,
             task,
@@ -1797,9 +1849,6 @@ class TaskRuntimeStateServiceMixin:
             last_error=None,
         )
         task.tail_reconcile_state = "idle"
-        observed_owner = str(decision.runtime_lease_owner or "").strip() or None
-        if observed_owner:
-            self._clear_runtime_lease(db, task.id, owner_instance_id=observed_owner)
         self._last_task_heartbeat_at.pop(task.id, None)
         reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
             decision,
@@ -1858,6 +1907,7 @@ class TaskRuntimeStateServiceMixin:
             },
         )
         self._enqueue_task_with_context(task.id, context="shared_dispatch_owned_execution_takeover_enqueue")
+        return True
 
     def _signal_owned_execution_takeover(
         self: TaskManager,

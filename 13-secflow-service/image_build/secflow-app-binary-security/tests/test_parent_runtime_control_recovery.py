@@ -506,6 +506,84 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         started_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_started")
         self.assertFalse(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
 
+    def test_requeue_owned_execution_takeover_defers_when_runtime_lease_clear_hits_lock_conflict(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="t-lock",
+            project_id="p1",
+            name="binary-module",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-lock",
+            task_id="t-lock",
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si-lock",
+            task_id="t-lock",
+            project_id="p1",
+            stage_run_id="sr-lock",
+            stage_name="binary_to_source",
+            item_key="module1",
+            parent_key="module1",
+            status="failed",
+            downstream_service="binary_to_source",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-stale",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() - timedelta(seconds=5),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[stage_run],
+            stage_items=[item],
+            runtime_leases=[lease],
+            events=[],
+        )
+        queued = []
+        original_clear = manager._clear_runtime_lease
+        original_enqueue = manager._enqueue_task_with_context
+
+        def _defer_clear(*_args, **_kwargs):
+            return task_manager_module.RuntimeLeaseClearResult(
+                status="lease_locked_retry_later",
+                task_id=task.id,
+                owner_instance_id="worker-stale",
+                error_message="deadlock",
+            )
+
+        manager._clear_runtime_lease = _defer_clear
+        manager._enqueue_task_with_context = lambda task_id, **_kwargs: queued.append(task_id)
+        try:
+            with (
+                unittest.mock.patch.object(manager, "_task_runtime_transition_guard_active", return_value=False),
+                unittest.mock.patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True),
+            ):
+                reclaimed = manager._requeue_orphaned_owned_execution_locked(db)
+        finally:
+            manager._clear_runtime_lease = original_clear
+            manager._enqueue_task_with_context = original_enqueue
+
+        self.assertFalse(reclaimed)
+        self.assertEqual("running", task.status)
+        self.assertEqual([], queued)
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("runtime_lease_clear_deferred_by_lock", event_types)
+        self.assertIn("owned_execution_reclaim_deferred_by_lock", event_types)
+
 
 if __name__ == "__main__":
     unittest.main()

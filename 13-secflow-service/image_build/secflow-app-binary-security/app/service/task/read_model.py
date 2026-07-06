@@ -2621,6 +2621,28 @@ class TaskReadModelServiceMixin:
         never_synced_item_count = int(ctx.never_synced_item_count or 0) if ctx is not None else 0
         stale_synced_item_count = int(ctx.stale_synced_item_count or 0) if ctx is not None else 0
         active_operation = self._active_operation(db, task.id)
+        latest_lock_conflict_event = next(
+            (
+                event
+                for event in sorted(
+                    [
+                        event
+                        for event in db.query(task_manager_module.BinarySecurityEvent)
+                        .filter(task_manager_module.BinarySecurityEvent.task_id == task.id)
+                        .all()
+                        if str(getattr(event, "event_type", "") or "").strip()
+                        in {
+                            "dispatch_claim_deferred_by_lock",
+                            "owned_execution_reclaim_deferred_by_lock",
+                            "runtime_lease_clear_deferred_by_lock",
+                        }
+                    ],
+                    key=lambda row: getattr(row, "created_at", None) or task_shared._now(),
+                    reverse=True,
+                )
+            ),
+            None,
+        )
         lease_owner, lease_expires_at, lease_source, lease_pod_uid, lease_boot_id, lease_generation = self._task_runtime_lease_view(db, task)
         del lease_pod_uid, lease_boot_id, lease_generation
         local_worker = self._workers.get(task.id)
@@ -2742,6 +2764,8 @@ class TaskReadModelServiceMixin:
                         ("tail_stage_name", tail_stage_name),
                         ("tail_active_item_count", tail_active_item_count),
                         ("tail_has_downstream_refs", tail_has_downstream_refs),
+                        ("latest_lock_conflict_type", latest_lock_conflict_event.event_type if latest_lock_conflict_event is not None else None),
+                        ("latest_lock_conflict_at", latest_lock_conflict_event.created_at if latest_lock_conflict_event is not None else None),
                     ],
                 )
             )
@@ -2985,6 +3009,8 @@ class TaskReadModelServiceMixin:
                         ("lease_expires_at", lease_expires_at),
                         ("local_owner_count", owner_count),
                         ("tail_active_item_count", tail_active_item_count),
+                        ("latest_lock_conflict_type", latest_lock_conflict_event.event_type if latest_lock_conflict_event is not None else None),
+                        ("latest_lock_conflict_at", latest_lock_conflict_event.created_at if latest_lock_conflict_event is not None else None),
                     ],
                 )
             )

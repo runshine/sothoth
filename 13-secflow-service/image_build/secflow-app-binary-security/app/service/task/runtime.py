@@ -1125,6 +1125,42 @@ class TaskRuntimeServiceMixin:
                 with suppress(Exception):
                     db.close()
 
+    def _record_dispatch_lock_conflict_after_rollback(
+        self: TaskManager,
+        db: Session,
+        task_id: str,
+        *,
+        event_type: str,
+        message: str,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        try:
+            task = (
+                db.query(task_manager_module.BinarySecurityTask)
+                .filter(task_manager_module.BinarySecurityTask.id == task_id)
+                .first()
+            )
+            if task is None:
+                return
+            self._record_event(
+                db,
+                task,
+                event_type,
+                message,
+                level="warning",
+                stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "task_id": str(task_id or "").strip() or None,
+                    **dict(payload or {}),
+                },
+            )
+            db.commit()
+        except Exception:
+            with suppress(Exception):
+                db.rollback()
+
     def _active_dispatch_count(self: TaskManager, db: Session) -> int:
         from app.service import task_manager as task_manager_module
 
@@ -1693,9 +1729,13 @@ class TaskRuntimeServiceMixin:
                 should_requeue=True,
             )
             return None
-        task = db.query(task_manager_module.BinarySecurityTask).filter(
+        task_query = db.query(task_manager_module.BinarySecurityTask).filter(
             task_manager_module.BinarySecurityTask.id == task_id
-        ).first()
+        )
+        with_for_update = getattr(task_query, "with_for_update", None)
+        if callable(with_for_update):
+            task_query = with_for_update()
+        task = task_query.first()
         if task is None:
             self._log_dispatch_claim_blocked(task_id, reason="task_row_missing")
             self._set_dispatch_claim_decision(
@@ -2242,22 +2282,28 @@ class TaskRuntimeServiceMixin:
         next_task_status = "dispatching"
         if has_active_operation and active_operation_type == task_manager_module.TASK_ACTION_CANCEL:
             next_task_status = task_manager_module.TASK_STATUS_CANCELLING
-        updated = (
-            db.query(task_manager_module.BinarySecurityTask)
-            .filter(
-                task_manager_module.BinarySecurityTask.id == task_id,
-                self._lease_filter_available(),
-            )
-            .update(
-                {
-                    task_manager_module.BinarySecurityTask.status: next_task_status,
-                    task_manager_module.BinarySecurityTask.runtime_phase: task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-                    task_manager_module.BinarySecurityTask.updated_at: started_at,
-                },
-                synchronize_session=False,
-            )
-        )
-        if updated:
+        try:
+            active_runtime_lease = self._runtime_lease_for_task(db, task_id)
+            if self._runtime_lease_is_active(active_runtime_lease):
+                self._log_dispatch_claim_blocked(
+                    task_id,
+                    reason="active_runtime_lease_present",
+                    task=task,
+                    current_operation=current_operation,
+                )
+                self._set_dispatch_claim_decision(
+                    task_id=task_id,
+                    claimed_task_id=None,
+                    blocked_reason="active_runtime_lease_present",
+                    should_requeue=False,
+                )
+                return None
+            previous_status_value = task.status
+            previous_runtime_phase_value = getattr(task, "runtime_phase", None)
+            previous_updated_at_value = getattr(task, "updated_at", None)
+            task.status = next_task_status
+            task.runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
+            task.updated_at = started_at
             self._clear_pending_shared_dispatch_signal(task)
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
             db.commit()
@@ -2268,6 +2314,54 @@ class TaskRuntimeServiceMixin:
                 should_requeue=False,
             )
             return task_id
+        except OperationalError as exc:
+            if not self._is_retryable_lock_error(exc):
+                raise
+            db.rollback()
+            task.status = previous_status_value
+            task.runtime_phase = previous_runtime_phase_value
+            task.updated_at = previous_updated_at_value
+            self._record_dispatch_lock_conflict_after_rollback(
+                db,
+                task_id,
+                event_type="dispatch_claim_deferred_by_lock",
+                message="dispatch claim 遇到可重试锁冲突，当前轮延后重试",
+                payload={
+                    "reason": "claim_lock_conflict_retry_later",
+                    "runtime_phase": self._task_runtime_phase(task),
+                },
+            )
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="claim_lock_conflict_retry_later",
+                task=task,
+                current_operation=current_operation,
+            )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="claim_lock_conflict_retry_later",
+                should_requeue=True,
+            )
+            return None
+        except task_manager_module.StaleTaskExecution:
+            db.rollback()
+            task.status = previous_status_value
+            task.runtime_phase = previous_runtime_phase_value
+            task.updated_at = previous_updated_at_value
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="claim_runtime_lease_owner_changed",
+                task=task,
+                current_operation=current_operation,
+            )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="claim_runtime_lease_owner_changed",
+                should_requeue=True,
+            )
+            return None
         self._log_dispatch_claim_blocked(
             task_id,
             reason="claim_update_filter_rejected_row",
@@ -2424,8 +2518,11 @@ class TaskRuntimeServiceMixin:
                 task_manager_module.BinarySecurityTask.runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 task_manager_module.BinarySecurityTask.status.in_(["pending", "running"]),
             )
-            .all()
         )
+        with_for_update = getattr(rows, "with_for_update", None)
+        if callable(with_for_update):
+            rows = with_for_update()
+        rows = rows.all()
         if not rows:
             return False
         changed = False
@@ -2442,7 +2539,8 @@ class TaskRuntimeServiceMixin:
                 continue
             if not self._should_requeue_for_owned_execution(db, task, next_stage=stage_name, next_stage_status="running"):
                 continue
-            self._requeue_owned_execution_takeover(
+            changed = bool(
+                self._requeue_owned_execution_takeover(
                 db,
                 task,
                 stage_name=stage_name,
@@ -2450,8 +2548,8 @@ class TaskRuntimeServiceMixin:
                 event_type="owned_execution_takeover_requeued",
                 message=f"检测到执行接管悬空，已重新排队等待 worker 接管: {stage_name}",
                 event_payload={"source": "parent_reclaim_pass"},
-            )
-            changed = True
+                )
+            ) or changed
         if changed:
             db.flush()
         return changed
