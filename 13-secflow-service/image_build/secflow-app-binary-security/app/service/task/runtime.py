@@ -3578,6 +3578,7 @@ class TaskRuntimeServiceMixin:
             )
             operation_passes = 0
             while await self._run_current_task_operation(task_id):
+                db.close()
                 operation_passes += 1
                 task_manager_module.logger.info(
                     "binary-security run_task consumed task operation pass: task_id=%s passes=%s",
@@ -3618,6 +3619,7 @@ class TaskRuntimeServiceMixin:
                     allow_retryable_read_error=True,
                 )
                 if self._should_abort_local_runtime_after_lease_loss(lease_decision):
+                    execution_gate_db.close()
                     await asyncio.to_thread(
                         self._verify_local_runtime_lease_or_abort,
                         task_id,
@@ -3645,11 +3647,15 @@ class TaskRuntimeServiceMixin:
                     return
             finally:
                 execution_gate_db.close()
+            db.close()
             while await self._run_task_runtime_signals(task_id):
+                db.close()
                 pass
             self._mark_runtime_handle_runner_progress(task_id)
+            db.close()
             await self._execute_task(task_id)
             while True:
+                db.close()
                 runtime_db = session_factory()
                 try:
                     task_after_execute = (
@@ -3689,8 +3695,10 @@ class TaskRuntimeServiceMixin:
                         break
                 finally:
                     runtime_db.close()
+                db.close()
                 await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
                 while await self._run_task_runtime_signals(task_id):
+                    db.close()
                     pass
                 runtime_db = session_factory()
                 try:

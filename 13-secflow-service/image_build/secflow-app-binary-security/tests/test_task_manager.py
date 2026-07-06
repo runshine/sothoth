@@ -1528,6 +1528,16 @@ class _AppendingModelAwareDb(_ModelAwareDb):
         return None
 
 
+class _CloseTrackingDb(_AppendingModelAwareDb):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+        return None
+
+
 class _FlakyCommitDb(_AppendingModelAwareDb):
     def __init__(self, *, fail_commits=0, fail_flushes=0, error_factory=None, **kwargs):
         super().__init__(**kwargs)
@@ -25994,6 +26004,55 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual(1, summary["pending_count"])
         self.assertEqual(0, summary["success_count"])
 
+    def test_stage_system_analysis_closes_db_before_stage_pool_wait(self):
+        task = BinarySecurityTask(
+            id="t-close-before-stage-pool",
+            project_id="p1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-close-before-stage-pool",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="running",
+        )
+        db = _CloseTrackingDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        original_prepare = self.manager._prepare_stage_items_for_execution
+        original_inputs = self.manager._system_analysis_inputs
+        original_run = self.manager._run_stage_pool
+        self.manager._system_analysis_inputs = lambda *_args, **_kwargs: [{"firmware_key": "source_project"}]
+        self.manager._prepare_stage_items_for_execution = lambda *_args, **_kwargs: None
+
+        async def fake_run_stage_pool(*_args, **_kwargs):
+            self.assertGreaterEqual(db.close_calls, 1)
+            return [{
+                "status": "pending",
+                "item": {"firmware_key": "source_project"},
+                "deferred_mode": "redispatch",
+            }]
+
+        self.manager._run_stage_pool = fake_run_stage_pool
+        try:
+            status, summary = asyncio.run(self.manager._stage_system_analysis(db, task, stage_run, token=None))
+        finally:
+            self.manager._prepare_stage_items_for_execution = original_prepare
+            self.manager._system_analysis_inputs = original_inputs
+            self.manager._run_stage_pool = original_run
+
+        self.assertEqual("pending", status)
+        self.assertEqual(1, summary["pending_count"])
+        self.assertGreaterEqual(db.close_calls, 1)
+
     def test_refresh_system_analysis_stage_from_synced_items_marks_business_failure_when_no_candidate_modules(self):
         with tempfile.TemporaryDirectory() as tmp:
             workspace = Path(tmp)
@@ -42413,6 +42472,63 @@ def _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consu
     self.assertEqual([task_manager_module.TASK_STATUS_CANCELLING], run_statuses)
 
 
+def _test_run_task_closes_primary_db_before_runtime_waits(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    task = BinarySecurityTask(
+        id="task-close-before-runtime-waits",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    runtime_lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+        owner_instance_id="worker-a",
+        owner_started_at=_now(),
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _CloseTrackingDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+
+    original_factory = task_manager_module.get_session_factory
+    original_execute = manager._execute_task
+    original_run_current_task_operation = manager._run_current_task_operation
+    original_run_task_runtime_signals = manager._run_task_runtime_signals
+    try:
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+
+        async def _fake_execute(_task_id: str):
+            self.assertGreaterEqual(db.close_calls, 2)
+            task.status = "success"
+            return None
+
+        async def _fake_run_current_task_operation(_task_id: str) -> bool:
+            return False
+
+        async def _fake_run_task_runtime_signals(_task_id: str) -> bool:
+            self.assertGreaterEqual(db.close_calls, 1)
+            return False
+
+        manager._execute_task = _fake_execute
+        manager._run_current_task_operation = _fake_run_current_task_operation
+        manager._run_task_runtime_signals = _fake_run_task_runtime_signals
+        asyncio.run(manager._run_task(task.id))
+    finally:
+        task_manager_module.get_session_factory = original_factory
+        manager._execute_task = original_execute
+        manager._run_current_task_operation = original_run_current_task_operation
+        manager._run_task_runtime_signals = original_run_task_runtime_signals
+
+    self.assertGreaterEqual(db.close_calls, 2)
+
+
 def _test_confirm_entry_selection_updates_task(self):
     task = BinarySecurityTask(
         id="t-entry-1",
@@ -46040,6 +46156,7 @@ TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without
 TaskManagerTests.test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty = _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty
 TaskManagerTests.test_build_task_runtime_health_includes_latest_lock_conflict_evidence = _test_build_task_runtime_health_includes_latest_lock_conflict_evidence
 TaskManagerTests.test_dispatch_task_by_id_requeues_on_retryable_lock_conflict = _test_dispatch_task_by_id_requeues_on_retryable_lock_conflict
+TaskManagerTests.test_run_task_closes_primary_db_before_runtime_waits = _test_run_task_closes_primary_db_before_runtime_waits
 
 
 if __name__ == "__main__":

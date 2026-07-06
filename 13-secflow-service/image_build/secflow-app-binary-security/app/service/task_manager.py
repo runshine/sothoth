@@ -13481,6 +13481,7 @@ class TaskManager(
         )
         if executable_inputs is None:
             executable_inputs = input_files
+        db.close()
         results = await self._run_stage_pool(
             task,
             executable_inputs,
@@ -13522,6 +13523,7 @@ class TaskManager(
         )
         if executable_inputs is None:
             executable_inputs = system_inputs
+        db.close()
         results = await self._run_stage_pool(
             task,
             executable_inputs,
@@ -13603,6 +13605,7 @@ class TaskManager(
         )
         if executable_inputs is None:
             executable_inputs = modules
+        db.close()
         results = await self._run_stage_pool(
             task,
             executable_inputs,
@@ -13652,6 +13655,7 @@ class TaskManager(
         )
         if executable_inputs is None:
             executable_inputs = b2s_success
+        db.close()
         results = await self._run_stage_pool(
             task,
             executable_inputs,
@@ -13708,6 +13712,7 @@ class TaskManager(
         try:
             while True:
                 attempt += 1
+                db.close()
                 entries, meta = await self._fetch_knowledge_graph_entry_results(task)
                 if entries or previous_entries or attempt >= max_attempts:
                     break
@@ -13730,6 +13735,7 @@ class TaskManager(
                     },
                 )
                 if retry_interval_seconds > 0:
+                    db.close()
                     await asyncio.sleep(retry_interval_seconds)
         except Exception as exc:
             self._record_event(
@@ -14217,6 +14223,7 @@ class TaskManager(
         )
         if executable_inputs is None:
             executable_inputs = entries
+        db.close()
         results = await self._run_stage_pool(
             task,
             executable_inputs,
