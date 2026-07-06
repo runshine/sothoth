@@ -680,6 +680,60 @@ class TaskItemSyncServiceMixin:
             return True
         return (current_now - last_attempt_at).total_seconds() >= self._stage_item_sync_stale_seconds()
 
+    def _item_waiting_for_initial_dataflow_binding(self: TaskManager, item: BinarySecurityStageItem) -> bool:
+        if str(item.downstream_service or "").strip() != "dataflow_vuln_scan":
+            return False
+        if str(item.downstream_task_id or "").strip():
+            return False
+        if normalize_stage_name(item.stage_name) != "dataflow_vuln_scan":
+            return False
+        item_status = str(item.status or "").strip().lower()
+        if item_status not in {"pending", "queued", "running", "dispatching"}:
+            return False
+        return True
+
+    def _repair_false_not_started_binding_mismatch(self: TaskManager, item: BinarySecurityStageItem) -> bool:
+        if not self._item_waiting_for_initial_dataflow_binding(item):
+            return False
+        result = self._load_stage_item_result_payload(item)
+        latest_binding_mismatch = dict(result.get("latest_binding_mismatch") or {})
+        sync_observation = dict(result.get("sync_observation") or {})
+        top_level_sync_status = self._string_or_none(result.get("sync_status"))
+        latest_reason = self._string_or_none(latest_binding_mismatch.get("reason_code"))
+        observed_error_type = (
+            self._string_or_none(sync_observation.get("error_type"))
+            or self._string_or_none(result.get("last_sync_error_type"))
+        )
+        if (
+            top_level_sync_status != "binding_mismatch"
+            and top_level_sync_status != "transport_error"
+            and latest_reason != "missing_bound_downstream_task_id"
+            and observed_error_type != "missing_bound_downstream_task_id"
+        ):
+            return False
+        repaired_result = dict(result)
+        repaired_result.pop("latest_binding_mismatch", None)
+        if top_level_sync_status in {"binding_mismatch", "transport_error"}:
+            normalized_sync_status = self._string_or_none(sync_observation.get("sync_status"))
+            if normalized_sync_status:
+                repaired_result["sync_status"] = normalized_sync_status
+            else:
+                repaired_result.pop("sync_status", None)
+        repaired_result["last_sync_error_at"] = None
+        repaired_result["last_sync_error_message"] = None
+        repaired_result["last_sync_error_type"] = None
+        repaired_result["consecutive_sync_error_count"] = 0
+        repaired_result["sync_error_budget_exhausted"] = False
+        repaired_result["next_sync_retry_at"] = None
+        if self._string_or_none(sync_observation.get("error_type")) == "missing_bound_downstream_task_id":
+            for key in ("error_message", "error_type", "http_status", "last_error_at", "next_retry_at"):
+                sync_observation.pop(key, None)
+            sync_observation["consecutive_error_count"] = 0
+            sync_observation["budget_exhausted"] = False
+            repaired_result["sync_observation"] = sync_observation
+        item.result = repaired_result
+        return True
+
     def _item_needs_initial_downstream_sync(self: TaskManager, item: BinarySecurityStageItem) -> bool:
         sync_status = self._stage_item_sync_status_value(item)
         if sync_status in {None, "", "pending", "transport_error"}:
@@ -1528,6 +1582,26 @@ class TaskItemSyncServiceMixin:
         auth_token = token or self._service_token()
         ready_items: list[BinarySecurityStageItem] = []
         for item in items:
+            repaired_false_mismatch = self._repair_false_not_started_binding_mismatch(item)
+            if self._item_waiting_for_initial_dataflow_binding(item):
+                if repaired_false_mismatch:
+                    self._record_event(
+                        db,
+                        task,
+                        "downstream_binding_waiting_state_restored",
+                        "dataflow 阶段项仍在等待编排器创建 child，已清理误写的同步异常状态",
+                        level="info",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "item_id": str(item.id or "").strip() or None,
+                            "item_key": str(item.item_key or "").strip() or None,
+                            "downstream_service": str(item.downstream_service or "").strip() or None,
+                            "binding_state": self._downstream_binding_state(item),
+                        },
+                    )
+                skipped_count += 1
+                continue
             if self._item_needs_downstream_binding_reconcile(item):
                 skipped_count += 1
                 binding_payload = {

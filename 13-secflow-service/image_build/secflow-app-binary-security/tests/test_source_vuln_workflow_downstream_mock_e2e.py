@@ -547,6 +547,140 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
         self.assertEqual("failed", item.status)
         self.assertEqual(3, len(db.archive_jobs))
 
+    def test_source_workflow_mock_e2e_dataflow_create_transport_error_defers_without_child_binding(self):
+        tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
+        with tmpdir:
+            request = httpx.Request("POST", "http://dfa/api/app/dataflow-vuln-scan/tasks")
+            downstream.queue_override(
+                "POST",
+                "/api/app/dataflow-vuln-scan/tasks",
+                httpx.ConnectError("All connection attempts failed", request=request),
+            )
+            with self._patched_runtime(db, queue, http_client):
+                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
+                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
+                entry_result = asyncio.run(
+                    self.manager._run_entry_item(
+                        task,
+                        entry_run,
+                        dict((system_result.get("item") or {}).get("modules")[0]),
+                        token="mock-token",
+                    )
+                )
+                dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
+                result = asyncio.run(
+                    self.manager._run_dataflow_item(
+                        task,
+                        dataflow_run,
+                        dict((entry_result.get("item") or {}).get("entries")[0]),
+                        token="mock-token",
+                    )
+                )
+                item = self.manager._stage_items(db, task.id, "dataflow_vuln_scan")[0]
+
+        self.assertEqual("pending", result["status"])
+        self.assertEqual("pending", item.status)
+        self.assertFalse(bool(item.downstream_task_id))
+        self.assertIn("无法连接下游服务", str(result.get("error") or ""))
+        self.assertEqual(2, len(db.archive_jobs))
+
+    def test_source_workflow_mock_e2e_dataflow_poll_transport_error_recovers_and_succeeds(self):
+        tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
+        with tmpdir:
+            request = httpx.Request("GET", "http://dfa/api/app/dataflow-vuln-scan/tasks/dfa-3")
+            downstream.queue_override(
+                "GET",
+                "/api/app/dataflow-vuln-scan/tasks/dfa-3",
+                httpx.RemoteProtocolError("Server disconnected without sending a response", request=request),
+            )
+            with self._patched_runtime(db, queue, http_client):
+                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
+                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
+                entry_result = asyncio.run(
+                    self.manager._run_entry_item(
+                        task,
+                        entry_run,
+                        dict((system_result.get("item") or {}).get("modules")[0]),
+                        token="mock-token",
+                    )
+                )
+                dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
+                result = asyncio.run(
+                    self.manager._run_dataflow_item(
+                        task,
+                        dataflow_run,
+                        dict((entry_result.get("item") or {}).get("entries")[0]),
+                        token="mock-token",
+                    )
+                )
+
+        self.assertEqual("success", result["status"])
+        self.assertGreaterEqual(len([row for row in downstream.calls if row["path"] == "/api/app/dataflow-vuln-scan/tasks/dfa-3"]), 2)
+
+    def test_source_workflow_mock_e2e_dataflow_authoritative_child_404_becomes_downstream_missing(self):
+        tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
+        with tmpdir:
+            with self._patched_runtime(db, queue, http_client):
+                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
+                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
+                entry_result = asyncio.run(
+                    self.manager._run_entry_item(
+                        task,
+                        entry_run,
+                        dict((system_result.get("item") or {}).get("modules")[0]),
+                        token="mock-token",
+                    )
+                )
+                dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
+                entry_payload = dict((entry_result.get("item") or {}).get("entries")[0])
+                created_item = self.manager._upsert_stage_item(
+                    db,
+                    task=task,
+                    stage_run=dataflow_run,
+                    stage_name="dataflow_vuln_scan",
+                    item_key=str(entry_payload.get("entry_key") or ""),
+                    item_name=str(entry_payload.get("function_name") or ""),
+                    parent_key=str(entry_payload.get("module_key") or ""),
+                    downstream_service="dataflow_vuln_scan",
+                    input_ref=dict(entry_payload),
+                    retrying=False,
+                    auto_retrying=False,
+                )
+                created_item.downstream_task_id = "dfa-404"
+                downstream.queue_override(
+                    "GET",
+                    "/api/app/dataflow-vuln-scan/tasks/dfa-404",
+                    httpx.Response(
+                        200,
+                        json={"task_id": "dfa-404", "status": "running", "analysis_status": "running"},
+                        request=httpx.Request("GET", "http://dfa/api/app/dataflow-vuln-scan/tasks/dfa-404"),
+                    ),
+                )
+                downstream.queue_override(
+                    "GET",
+                    "/api/app/dataflow-vuln-scan/tasks/dfa-404",
+                    httpx.Response(
+                        404,
+                        json={"detail": "missing"},
+                        request=httpx.Request("GET", "http://dfa/api/app/dataflow-vuln-scan/tasks/dfa-404"),
+                    ),
+                )
+                result = asyncio.run(
+                    self.manager._run_dataflow_item(
+                        task,
+                        dataflow_run,
+                        dict(entry_payload),
+                        token="mock-token",
+                    )
+                )
+
+        self.assertEqual("downstream_missing", result["status"])
+        self.assertEqual("downstream_missing", created_item.status)
+        self.assertEqual(3, len(db.archive_jobs))
+
     def test_source_workflow_mock_e2e_archive_blocked_when_downstream_output_missing(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
         with tmpdir:

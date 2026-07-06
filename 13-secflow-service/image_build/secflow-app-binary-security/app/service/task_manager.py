@@ -1797,7 +1797,7 @@ class TaskManager(
                 return [
                     handle
                     for handle in list(self._workers.values())
-                    if not handle.done() and not handle.release_requested and bool(handle.owner_active)
+                    if not handle.done() and not handle.cancel_requested and not handle.release_requested and bool(handle.owner_active)
                 ]
             except RuntimeError:
                 time.sleep(0.01)
@@ -2081,10 +2081,12 @@ class TaskManager(
             current_handle.cancel_requested_reason = str(reason or "").strip() or current_handle.cancel_requested_reason
             if current_handle.runner_task is not None and not current_handle.runner_task.done():
                 current_handle.runner_task.cancel()
-            if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
-                current_handle.heartbeat_task.cancel()
-            if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
-                current_handle.sync_maintenance_task.cancel()
+            heartbeat_task = getattr(current_handle, "heartbeat_task", None)
+            if heartbeat_task is not None and not heartbeat_task.done():
+                heartbeat_task.cancel()
+            sync_maintenance_task = getattr(current_handle, "sync_maintenance_task", None)
+            if sync_maintenance_task is not None and not sync_maintenance_task.done():
+                sync_maintenance_task.cancel()
 
         if loop is not None and loop.is_running():
             loop.call_soon_threadsafe(_cancel)
@@ -2473,8 +2475,8 @@ class TaskManager(
                         "verification_error": decision.verification_error,
                         "source": str(source or "").strip() or None,
                         "runner_done": None if handle is None else bool(handle.runner_task.done()),
-                        "heartbeat_done": None if handle is None or handle.heartbeat_task is None else bool(handle.heartbeat_task.done()),
-                        "sync_maintenance_done": None if handle is None or handle.sync_maintenance_task is None else bool(handle.sync_maintenance_task.done()),
+                        "heartbeat_done": None if handle is None or getattr(handle, "heartbeat_task", None) is None else bool(handle.heartbeat_task.done()),
+                        "sync_maintenance_done": None if handle is None or getattr(handle, "sync_maintenance_task", None) is None else bool(handle.sync_maintenance_task.done()),
                         "watchdog_thread_alive": self._lease_watchdog_alive(),
                     },
                 )
@@ -7631,7 +7633,7 @@ class TaskManager(
         if binding_state in {"creating", "create_retrying", "create_failed"}:
             return True
         sync_status = self._stage_item_sync_status_value(item)
-        return sync_status == "transport_error"
+        return sync_status == "transport_error" and binding_state != "not_started"
 
     def _preserve_child_result_metadata(self, result: dict[str, Any] | None) -> dict[str, Any]:
         current_result = dict(result or {})

@@ -15,6 +15,9 @@ class RuntimeHealthTests(unittest.TestCase):
                 "legacy_state_event_inbox_metrics": {"alive": False, "stale": False},
             },
             "lease_auditor_active": True,
+            "lease_watchdog_alive": True,
+            "lease_watchdog_stale": False,
+            "event_loop_lag_seconds": 0.0,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
@@ -35,6 +38,9 @@ class RuntimeHealthTests(unittest.TestCase):
                 "legacy_state_event_inbox_metrics": {"alive": True, "stale": False},
             },
             "lease_auditor_active": True,
+            "lease_watchdog_alive": True,
+            "lease_watchdog_stale": False,
+            "event_loop_lag_seconds": 0.0,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
@@ -51,6 +57,9 @@ class RuntimeHealthTests(unittest.TestCase):
             "loops": {},
             "loop_details": {},
             "lease_auditor_active": True,
+            "lease_watchdog_alive": True,
+            "lease_watchdog_stale": False,
+            "event_loop_lag_seconds": 0.0,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
@@ -71,6 +80,9 @@ class RuntimeHealthTests(unittest.TestCase):
                 "legacy_state_event_inbox_metrics": {"alive": True, "stale": False},
             },
             "lease_auditor_active": False,
+            "lease_watchdog_alive": True,
+            "lease_watchdog_stale": False,
+            "event_loop_lag_seconds": 0.0,
         }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
@@ -104,8 +116,34 @@ class RuntimeHealthTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(["archive_dispatch"], detail["missing_loops"])
 
+    def test_owner_readiness_rejects_stalled_event_loop(self):
+        fake_runtime = {
+            "running": True,
+            "loops": {},
+            "loop_details": {},
+            "lease_auditor_active": True,
+            "lease_watchdog_alive": True,
+            "lease_watchdog_stale": False,
+            "event_loop_lag_seconds": 8.0,
+        }
+        with patch("app.runtime_health.get_config") as mock_get_config, patch(
+            "app.runtime_health.get_task_manager"
+        ) as mock_get_task_manager:
+            mock_get_config.return_value.scheduler.enabled = True
+            mock_get_task_manager.return_value.runtime_status.return_value = fake_runtime
+            ok, detail = runtime_health._owner_readiness()
+        self.assertFalse(ok)
+        self.assertTrue(detail["event_loop_stalled"])
+
     def test_collect_probe_snapshot_contains_startup_phase_and_last_error(self):
-        fake_runtime = {"running": False, "loops": {}, "loop_details": {}}
+        fake_runtime = {
+            "running": False,
+            "loops": {},
+            "loop_details": {},
+            "lease_watchdog_alive": False,
+            "lease_watchdog_stale": False,
+            "event_loop_lag_seconds": 0.0,
+        }
         with patch("app.runtime_health.get_config") as mock_get_config, patch(
             "app.runtime_health.get_task_manager"
         ) as mock_get_task_manager, patch(

@@ -1946,7 +1946,9 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
                 cleanup_snapshot={"delete_in_progress": True},
             )
             original_get_session_factory = task_manager_module.get_session_factory
+            original_guard_env = os.environ.get("BINARY_SECURITY_DISABLE_WORKSPACE_DELETE_GUARD_DB_LOOKUP")
             try:
+                os.environ.pop("BINARY_SECURITY_DISABLE_WORKSPACE_DELETE_GUARD_DB_LOOKUP", None)
                 task_manager_module.get_session_factory = lambda: (lambda: _ModelAwareDb(tasks=[authoritative_task]))
                 self.manager._write_task_metadata(
                     stale_task,
@@ -1955,6 +1957,10 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
                 )
             finally:
                 task_manager_module.get_session_factory = original_get_session_factory
+                if original_guard_env is None:
+                    os.environ.pop("BINARY_SECURITY_DISABLE_WORKSPACE_DELETE_GUARD_DB_LOOKUP", None)
+                else:
+                    os.environ["BINARY_SECURITY_DISABLE_WORKSPACE_DELETE_GUARD_DB_LOOKUP"] = original_guard_env
 
             self.assertFalse((Path(tmp) / "input" / "task-metadata.json").exists())
 
@@ -21064,7 +21070,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("si-old", mismatch_events[-1].payload.get("observed_parent_stage_item_id"))
         self.assertEqual(0, resp.synced_downstream_count)
 
-    def test_sync_downstream_status_missing_bound_child_records_binding_mismatch(self):
+    def test_sync_downstream_status_missing_bound_child_without_task_id_waits_for_normal_progress(self):
         task = BinarySecurityTask(
             id="s1",
             project_id="p1",
@@ -21098,8 +21104,10 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             downstream_service="dataflow_vuln_scan",
             downstream_task_id=None,
             result={
+                "downstream_binding": {
+                    "state": "create_failed",
+                },
                 "sync_observation": {
-                    "binding_state": "create_failed",
                     "sync_status": "transport_error",
                 }
             },
@@ -21143,13 +21151,192 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.manager._enqueue_task = original_enqueue
 
         self.assertEqual(0, resp.synced_downstream_count)
-        mismatch_events = [event for event in db.events if event.event_type == "downstream_binding_missing"]
-        self.assertTrue(mismatch_events)
-        self.assertEqual("missing_bound_downstream_task_id", mismatch_events[-1].payload.get("reason_code"))
+        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertFalse(any(event.event_type == "downstream_binding_missing" for event in db.events))
         sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
-        self.assertTrue(sync_rows)
-        self.assertEqual("binding_mismatch", sync_rows[-1].sync_status)
-        self.assertEqual("missing_bound_downstream_task_id", sync_rows[-1].payload.get("reason_code"))
+        self.assertFalse(any(row.sync_status in {"binding_mismatch", "transport_error"} for row in sync_rows))
+
+    def test_sync_downstream_status_waiting_not_started_dataflow_item_does_not_raise_binding_mismatch(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            parent_key="module-1",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id=None,
+            result={
+                "sync_status": "binding_mismatch",
+                "last_sync_error_type": "missing_bound_downstream_task_id",
+                "latest_binding_mismatch": {
+                    "reason_code": "missing_bound_downstream_task_id",
+                },
+                "sync_observation": {
+                    "sync_status": "observation_gap_detected",
+                    "error_type": "missing_bound_downstream_task_id",
+                    "last_result": "observation_gap_detected",
+                },
+            },
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[run],
+            stage_items=[item],
+            runtime_leases=[
+                BinarySecurityTaskRuntimeLease(
+                    task_id=task.id,
+                    owner_instance_id=self.manager.instance_id,
+                    heartbeat_at=_now(),
+                    lease_expires_at=_now() + timedelta(minutes=1),
+                )
+            ],
+            events=[],
+        )
+
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+                resp = asyncio.run(
+                    self.manager.sync_downstream_status(
+                        db,
+                        project_id="p1",
+                        task_id="s1",
+                        stage_name="dataflow_vuln_scan",
+                        apply_state=True,
+                    )
+                )
+        finally:
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(0, resp.binding_mismatch_count)
+        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertFalse(any(event.event_type == "downstream_binding_missing" for event in db.events))
+        repaired = self.manager._load_stage_item_result_payload(item)
+        self.assertEqual("observation_gap_detected", repaired.get("sync_status"))
+        self.assertNotIn("latest_binding_mismatch", repaired)
+        self.assertIsNone(repaired.get("last_sync_error_type"))
+
+    def test_sync_downstream_status_waiting_not_started_dataflow_item_clears_false_transport_error(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            parent_key="module-1",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id=None,
+            result={
+                "sync_status": "transport_error",
+                "last_sync_error_type": "missing_bound_downstream_task_id",
+                "last_sync_error_message": "缺少下游任务ID",
+                "sync_observation": {
+                    "sync_status": "observation_gap_detected",
+                    "error_type": "missing_bound_downstream_task_id",
+                    "error_message": "缺少下游任务ID",
+                    "last_result": "observation_gap_detected",
+                },
+            },
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[run],
+            stage_items=[item],
+            runtime_leases=[
+                BinarySecurityTaskRuntimeLease(
+                    task_id=task.id,
+                    owner_instance_id=self.manager.instance_id,
+                    heartbeat_at=_now(),
+                    lease_expires_at=_now() + timedelta(minutes=1),
+                )
+            ],
+            events=[],
+        )
+
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            with patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+                resp = asyncio.run(
+                    self.manager.sync_downstream_status(
+                        db,
+                        project_id="p1",
+                        task_id="s1",
+                        stage_name="dataflow_vuln_scan",
+                        apply_state=True,
+                    )
+                )
+        finally:
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        self.assertEqual(0, resp.binding_mismatch_count)
+        self.assertEqual(1, resp.skipped_downstream_count)
+        repaired = self.manager._load_stage_item_result_payload(item)
+        self.assertEqual("observation_gap_detected", repaired.get("sync_status"))
+        self.assertIsNone(repaired.get("last_sync_error_type"))
+        self.assertIsNone(repaired.get("last_sync_error_message"))
 
     def test_sync_downstream_status_applies_dataflow_authoritative_intermediate_state_when_apply_enabled(self):
         task = BinarySecurityTask(
@@ -27097,13 +27284,17 @@ def _test_confirm_module_selection_updates_task(self):
             return _Query([])
 
     db = _TaskDb(task)
+    original_write = self.manager._write_task_metadata
     self.manager._write_task_metadata = lambda *args, **kwargs: None
-    detail = self.manager.confirm_module_selection(
-        db,
-        project_id="p1",
-        task_id="t1",
-        selected_module_keys=["m2"],
-    )
+    try:
+        detail = self.manager.confirm_module_selection(
+            db,
+            project_id="p1",
+            task_id="t1",
+            selected_module_keys=["m2"],
+        )
+    finally:
+        self.manager._write_task_metadata = original_write
 
     self.assertIn(task.status, {"pending", "running"})
     self.assertEqual("entry_analysis", task.current_stage)
@@ -42346,13 +42537,17 @@ def _test_confirm_entry_selection_updates_task(self):
             return _Query([])
 
     db = _TaskDb(task)
+    original_write = self.manager._write_task_metadata
     self.manager._write_task_metadata = lambda *args, **kwargs: None
-    detail = self.manager.confirm_entry_selection(
-        db,
-        project_id="p1",
-        task_id="t-entry-1",
-        selected_entry_keys=["e2"],
-    )
+    try:
+        detail = self.manager.confirm_entry_selection(
+            db,
+            project_id="p1",
+            task_id="t-entry-1",
+            selected_entry_keys=["e2"],
+        )
+    finally:
+        self.manager._write_task_metadata = original_write
 
     self.assertEqual("pending", task.status)
     self.assertEqual("entry_analysis", task.current_stage)

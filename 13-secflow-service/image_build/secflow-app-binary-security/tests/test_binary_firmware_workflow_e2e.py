@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from app.service import task_manager as task_manager_module
 from app.exception import NotFoundError
 from app.model import (
     BinarySecurityArchiveJob,
@@ -2432,6 +2433,95 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(task.status, detail_after.status)
         self.assertTrue(any(event.event_type == "entry_selection_confirmed" for event in db.events))
 
+    def test_binary_firmware_workflow_e2e_cancel_running_entry_analysis_cancels_firmware_child_and_runner(self):
+        task = _binary_task(summary={"input_path": "/tmp/fw.bin"})
+        task.status = "running"
+        task.current_stage = "entry_analysis"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-cancel-binary-e2e",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=4,
+            status="running",
+            started_at=_now(),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-cancel-binary-e2e",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="fw-1",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-cancel-binary-e2e",
+        )
+        entry_item.input_ref = {
+            "module_key": "mod-a",
+            "module_name": "mod-a",
+            "firmware_key": "fw-1",
+            "firmware_name": "fw.bin",
+            "source_dir": "/tmp/archive/fw-1/mod-a",
+            "source_root": "/tmp/archive/fw-1",
+            "source_root_path": "/tmp/archive/fw-1",
+            "module_dir": "/tmp/archive/fw-1/mod-a",
+            "files_list": "/tmp/archive/fw-1/mod-a/files.list",
+        }
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run],
+            stage_items=[entry_item],
+            archive_jobs=[],
+            events=[],
+        )
+        cancelled_children: list[str] = []
+        cancelled_ref_batches: list[list[dict[str, str]]] = []
+        local_cancel_requests: list[tuple[str, bool]] = []
+
+        async def _fake_cancel_downstream(item, _token):
+            cancelled_children.append(str(item.downstream_task_id or ""))
+
+        async def _fake_cancel_downstream_refs(_db, _task, refs, _token):
+            cancelled_ref_batches.append([dict(ref) for ref in refs])
+            return len(list(refs))
+
+        async def _fake_request_local_worker_cancel(task_id: str, *, wait_for_runner: bool):
+            local_cancel_requests.append((task_id, wait_for_runner))
+
+        original_write = self.manager._write_task_metadata_async
+        original_cancel_item = self.manager._cancel_downstream
+        original_cancel_refs = self.manager._cancel_downstream_refs
+        original_request_local_cancel = self.manager._request_local_worker_cancel
+        try:
+            self.manager._cancel_downstream = _fake_cancel_downstream
+            self.manager._cancel_downstream_refs = _fake_cancel_downstream_refs
+            self.manager._request_local_worker_cancel = _fake_request_local_worker_cancel
+
+            async def _noop_write(*_args, **_kwargs):
+                return None
+
+            self.manager._write_task_metadata_async = _noop_write
+            cancelled_stages = asyncio.run(self.manager._prepare_cancel_task(db, task))
+        finally:
+            self.manager._write_task_metadata_async = original_write
+            self.manager._cancel_downstream = original_cancel_item
+            self.manager._cancel_downstream_refs = original_cancel_refs
+            self.manager._request_local_worker_cancel = original_request_local_cancel
+
+        detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        self.assertEqual(["entry_analysis"], cancelled_stages)
+        self.assertEqual("cancelling", task.status)
+        self.assertEqual("cancelled", entry_item.status)
+        self.assertEqual("cancelled", entry_run.status)
+        self.assertEqual(["ea-cancel-binary-e2e"], cancelled_children)
+        self.assertEqual([(task.id, False)], local_cancel_requests)
+        self.assertTrue(cancelled_ref_batches)
+        self.assertEqual("cancelling", detail.status)
+        self.assertTrue(any(event.event_type == "task_cancelling" for event in db.events))
+
     def test_binary_firmware_workflow_e2e_entry_archive_without_entries_finishes_without_dataflow(self):
         task = _binary_task(
             summary={
@@ -4273,6 +4363,75 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertIn("task_force_reset_to_pending", event_types)
         self.assertIn("operation_step_started", event_types)
         self.assertIn("operation_step_succeeded", event_types)
+
+    def test_binary_firmware_workflow_e2e_delete_force_delete_fallback(self):
+        task = _binary_task(summary={"input_path": "/tmp/fw.bin"})
+        task.status = "running"
+        task.current_stage = "dataflow_vuln_scan"
+        task.current_operation_id = "op-delete-binary-fallback"
+        operation = BinarySecurityTaskOperation(
+            id="op-delete-binary-fallback",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            target_stage="dataflow_vuln_scan",
+            status="queued",
+            request_payload={"force": False, "force_delete": False},
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], runtime_leases=[])
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+
+        original_factory = task_manager_module.get_session_factory
+        original_wait = manager._wait_for_task_workspace_quiesce
+        original_cleanup = manager._cleanup_task_workspace
+        original_archive_cleanup = manager._delete_archive_children_for_stages
+        original_stage_item_cleanup = manager._delete_stage_items_for_stages
+        original_stage_run_cleanup = manager._delete_stage_run_rows
+        original_state_event_cleanup = manager._delete_task_state_event_rows
+        original_release_runtime = manager._release_task_delete_runtime_state
+        original_cancel_local = manager._request_local_worker_cancel
+        original_ensure = manager._ensure_task_write_ownership
+        try:
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+
+            async def _wait_true(_db, _task):
+                return True
+
+            async def _cleanup_force_fallback(_task, *, token=None):
+                del token
+                return "recreated_during_delete"
+
+            async def _cancel_local(*_args, **_kwargs):
+                return None
+
+            manager._wait_for_task_workspace_quiesce = _wait_true
+            manager._cleanup_task_workspace = _cleanup_force_fallback
+            manager._delete_archive_children_for_stages = lambda *_args, **_kwargs: 0
+            manager._delete_stage_items_for_stages = lambda *_args, **_kwargs: 0
+            manager._delete_stage_run_rows = lambda *_args, **_kwargs: 0
+            manager._delete_task_state_event_rows = lambda *_args, **_kwargs: 0
+            manager._release_task_delete_runtime_state = lambda *_args, **_kwargs: None
+            manager._request_local_worker_cancel = _cancel_local
+            manager._ensure_task_write_ownership = lambda *args, **kwargs: None
+
+            changed = asyncio.run(manager._run_current_task_operation(task.id))
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            manager._wait_for_task_workspace_quiesce = original_wait
+            manager._cleanup_task_workspace = original_cleanup
+            manager._delete_archive_children_for_stages = original_archive_cleanup
+            manager._delete_stage_items_for_stages = original_stage_item_cleanup
+            manager._delete_stage_run_rows = original_stage_run_cleanup
+            manager._delete_task_state_event_rows = original_state_event_cleanup
+            manager._release_task_delete_runtime_state = original_release_runtime
+            manager._request_local_worker_cancel = original_cancel_local
+            manager._ensure_task_write_ownership = original_ensure
+
+        self.assertTrue(changed)
+        self.assertFalse(any(row.id == task.id for row in db.tasks))
+        self.assertEqual("succeeded", operation.status)
+        self.assertEqual(task_manager_module.TASK_OPERATION_STEP_SUCCEEDED, operation.current_step)
 
     def test_binary_firmware_workflow_e2e_system_archive_does_not_trigger_repair_for_unmaterialized_descendants(self):
         task = _binary_task(policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}))

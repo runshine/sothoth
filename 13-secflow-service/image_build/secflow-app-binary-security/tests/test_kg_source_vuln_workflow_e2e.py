@@ -610,6 +610,136 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
         self.assertIn("streaming_stage_item_observation_gap_detected", [event.event_type for event in db.added])
 
+    def test_kg_source_vuln_workflow_e2e_dataflow_downstream_missing_recovers_on_next_owner_prepare(self):
+        entry = {
+            "entry_key": "src-1",
+            "module_key": "knowledge-graph-source-project",
+            "module_name": "source-project",
+            "function_name": "sink",
+        }
+        task = self._kg_fetch_task("/tmp/kg-missing-owner")
+        task.current_stage = "dataflow_vuln_scan"
+        task.summary = {
+            **(task.summary or {}),
+            "entry_results": [
+                {
+                    "module_key": "knowledge-graph-source-project",
+                    "module_name": "source-project",
+                    "module_kind": "knowledge_graph_module",
+                    "source_stage": "knowledge_graph_entry_fetch",
+                    "execution_epoch": 0,
+                    "completion_state": "success",
+                    "completion_ready": True,
+                    "entries": [dict(entry)],
+                    "entry_count": 1,
+                }
+            ],
+        }
+        dataflow_run = BinarySecurityStageRun(
+            id="sr-kg-dataflow-missing-owner",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="running",
+        )
+        dataflow_item = BinarySecurityStageItem(
+            id="si-kg-dataflow-missing-owner",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="src-1",
+            item_name="sink",
+            parent_key="knowledge-graph-source-project",
+            item_identity_key="src-1::knowledge-graph-source-project",
+            status="downstream_missing",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="df-missing-owner",
+            error_message="下游子任务不存在",
+            result={
+                "downstream_status": "downstream_missing",
+                "sync_observation": {
+                    "sync_status": "synced",
+                    "error_type": "not_found",
+                    "error_message": "下游子任务不存在",
+                    "consecutive_error_count": 20,
+                    "budget_exhausted": True,
+                },
+            },
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id="worker-a",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[dataflow_run],
+            stage_items=[dataflow_item],
+            runtime_leases=[runtime_lease],
+            events=[],
+        )
+
+        async def _raise_not_found(_task, _item, _token):
+            raise NotFoundError("downstream task not found")
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+        try:
+            self.manager._fetch_downstream_task_payload = _raise_not_found
+            self.manager._write_task_metadata_async = _noop_write
+            self.manager._enqueue_task = lambda *_args, **_kwargs: None
+            asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    stage_name="dataflow_vuln_scan",
+                    apply_state=True,
+                    force=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        dataflow_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan")
+        self.assertEqual("running", task.status)
+        self.assertEqual("downstream_missing", dataflow_item.status)
+        self.assertEqual("downstream_missing", dataflow_summary.status)
+        self.assertEqual(1, dataflow_summary.downstream_missing_items)
+        observation = dict((dataflow_item.result or {}).get("sync_observation") or {})
+        self.assertEqual("not_found", observation.get("error_type"))
+        self.assertIn("streaming_stage_item_observation_gap_detected", [event.event_type for event in db.added])
+
+        executable = self.manager._prepare_stage_items_for_execution(
+            db,
+            task=task,
+            stage_run=dataflow_run,
+            inputs=[dict(entry)],
+            downstream_service="dataflow_vuln_scan",
+            identity=lambda current: (
+                current["entry_key"],
+                current["function_name"],
+                current.get("module_key"),
+                current,
+            ),
+            output_ref=lambda _current: {},
+        )
+
+        self.assertEqual([], executable)
+        self.assertEqual("downstream_missing", dataflow_item.status)
+        self.assertEqual("df-missing-owner", dataflow_item.downstream_task_id)
+
     def test_kg_source_workflow_e2e_force_reset_to_pending_clears_control_state_and_requeues(self):
         now = _now()
         task = self._kg_fetch_task("/tmp/kg-force-reset")

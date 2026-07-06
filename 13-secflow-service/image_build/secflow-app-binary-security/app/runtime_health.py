@@ -102,7 +102,9 @@ def _owner_readiness() -> tuple[bool, dict[str, Any]]:
     lease_capable = bool(runtime.get("lease_auditor_active"))
     lease_watchdog_alive = bool(runtime.get("lease_watchdog_alive"))
     lease_watchdog_stale = bool(runtime.get("lease_watchdog_stale"))
-    return running and not missing and lease_capable and lease_watchdog_alive and not lease_watchdog_stale, {
+    event_loop_lag_seconds = float(runtime.get("event_loop_lag_seconds") or 0.0)
+    event_loop_stalled = event_loop_lag_seconds > 5.0
+    return running and not missing and lease_capable and lease_watchdog_alive and not lease_watchdog_stale and not event_loop_stalled, {
         "enabled": True,
         "running": running,
         "loops": loops,
@@ -111,7 +113,8 @@ def _owner_readiness() -> tuple[bool, dict[str, Any]]:
         "lease_auditor_active": lease_capable,
         "lease_watchdog_alive": lease_watchdog_alive,
         "lease_watchdog_stale": lease_watchdog_stale,
-        "event_loop_lag_seconds": runtime.get("event_loop_lag_seconds"),
+        "event_loop_lag_seconds": event_loop_lag_seconds,
+        "event_loop_stalled": event_loop_stalled,
     }
 
 
