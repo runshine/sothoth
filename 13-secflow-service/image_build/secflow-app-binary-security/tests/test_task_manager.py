@@ -37107,6 +37107,42 @@ def _test_build_task_runtime_health_marks_fake_local_owner_unhealthy(self):
     self.assertEqual("idle", snapshot_cards["local_task_runtime"]["status"])
 
 
+def _test_build_task_runtime_health_includes_latest_lock_conflict_evidence(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    now_value = _now()
+    task = BinarySecurityTask(
+        id="task-lock-evidence",
+        project_id="p1",
+        name="source",
+        status="dispatching",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    event = BinarySecurityEvent(
+        task_id=task.id,
+        stage_name="system_analysis",
+        event_type="dispatch_claim_deferred_by_lock",
+        message="dispatch claim 遇到可重试锁冲突，当前轮延后重试",
+        level="warning",
+        created_at=now_value,
+    )
+    db = _ModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[], events=[event])
+
+    health = manager._build_task_runtime_health(db, task)
+    units = {unit["unit_key"]: unit for unit in health["units"]}
+    worker_evidence = {row["label"]: row["value"] for row in units["task_worker"]["evidence"]}
+    heartbeat_evidence = {row["label"]: row["value"] for row in units["task_heartbeat"]["evidence"]}
+
+    self.assertEqual("dispatch_claim_deferred_by_lock", worker_evidence["latest_lock_conflict_type"])
+    self.assertEqual(task_manager_module._isoformat_or_none(now_value), worker_evidence["latest_lock_conflict_at"])
+    self.assertEqual("dispatch_claim_deferred_by_lock", heartbeat_evidence["latest_lock_conflict_type"])
+
+
 def _test_dispatch_task_by_id_claims_ownerless_active_operation(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
@@ -37174,6 +37210,42 @@ def _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_han
     self.assertEqual("local-worker", db.runtime_leases[0].owner_instance_id)
     self.assertEqual(operation.id, task.current_operation_id)
     self.assertIsNotNone(db.runtime_leases[0].lease_expires_at)
+
+
+def _test_dispatch_task_by_id_requeues_on_retryable_lock_conflict(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-claim-lock",
+        project_id="p1",
+        name="source",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+    original_upsert = manager._upsert_runtime_lease
+
+    def _raise_deadlock(*_args, **_kwargs):
+        raise _deadlock_operational_error()
+
+    manager._upsert_runtime_lease = _raise_deadlock
+    try:
+        claimed = manager._dispatch_task_by_id(db, task.id)
+    finally:
+        manager._upsert_runtime_lease = original_upsert
+
+    self.assertIsNone(claimed)
+    self.assertEqual("pending", task.status)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("dispatch_claim_deferred_by_lock", event_types)
+    decision = manager._dispatch_claim_decision() or {}
+    self.assertEqual("claim_lock_conflict_retry_later", decision.get("blocked_reason"))
+    self.assertTrue(bool(decision.get("should_requeue")))
 
 
 def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
@@ -45696,6 +45768,8 @@ TaskManagerTests.test_sync_downstream_status_does_not_auto_recover_failed_datafl
 TaskManagerTests.test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled = _test_sync_downstream_status_recovers_failed_dataflow_item_when_manual_apply_enabled
 TaskManagerTests.test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state = _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state
 TaskManagerTests.test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty = _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty
+TaskManagerTests.test_build_task_runtime_health_includes_latest_lock_conflict_evidence = _test_build_task_runtime_health_includes_latest_lock_conflict_evidence
+TaskManagerTests.test_dispatch_task_by_id_requeues_on_retryable_lock_conflict = _test_dispatch_task_by_id_requeues_on_retryable_lock_conflict
 
 
 if __name__ == "__main__":
