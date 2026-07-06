@@ -10924,6 +10924,45 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("failed", task.status)
         self.assertEqual("system_analysis", task.current_stage)
 
+    def test_source_no_candidate_modules_terminal_fact_falls_back_to_stage_run_summary(self):
+        task = BinarySecurityTask(
+            id="t-stage-summary-fallback",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        task.metrics = {}
+        stage_run = BinarySecurityStageRun(
+            id="sr-stage-summary-fallback",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+            output_summary={
+                "failure_code": "no_candidate_modules",
+                "failure_category": "business",
+                "failure_message": "系统分析已完成，但未发现匹配所选风险等级的风险模块",
+                "module_count": 1,
+                "candidate_module_count": 0,
+                "selected_module_count": 0,
+                "candidate_modules": [],
+                "selected_modules": [],
+                "status_synced": True,
+                "sync_status": "success",
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[])
+
+        self.assertTrue(self.manager._source_workflow_no_candidate_modules_terminal_fact(db, task))
+
     def test_refresh_task_status_after_sync_preserves_transient_failed_stage_requeue(self):
         task = BinarySecurityTask(
             id="t1",

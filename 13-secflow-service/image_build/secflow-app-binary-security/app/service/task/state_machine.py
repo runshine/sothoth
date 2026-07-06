@@ -2067,10 +2067,38 @@ class TaskStateMachineMixin:
         failure_code = str(summary.get("failure_code") or "").strip()
         selected_modules = list(summary.get("selected_modules") or []) if isinstance(summary.get("selected_modules"), list) else []
         candidate_modules = list(summary.get("candidate_modules") or []) if isinstance(summary.get("candidate_modules"), list) else []
+        if (
+            failure_code != NO_CANDIDATE_MODULES_FAILURE_CODE
+            or int(metrics.get("selected_module_count") or 0) != 0
+            or int(metrics.get("candidate_module_count") or 0) != 0
+            or selected_modules
+            or candidate_modules
+        ):
+            stage_run = (
+                db.query(BinarySecurityStageRun)
+                .filter(
+                    BinarySecurityStageRun.task_id == task.id,
+                    BinarySecurityStageRun.stage_name == "system_analysis",
+                )
+                .first()
+            )
+            stage_summary = (
+                dict(getattr(stage_run, "output_summary", None) or {})
+                if stage_run is not None
+                else {}
+            )
+            failure_code = str(stage_summary.get("failure_code") or failure_code or "").strip()
+            selected_count = int(stage_summary.get("selected_module_count", metrics.get("selected_module_count", 0)) or 0)
+            candidate_count = int(stage_summary.get("candidate_module_count", metrics.get("candidate_module_count", 0)) or 0)
+            selected_modules = list(stage_summary.get("selected_modules") or selected_modules) if isinstance(stage_summary.get("selected_modules"), list) else selected_modules
+            candidate_modules = list(stage_summary.get("candidate_modules") or candidate_modules) if isinstance(stage_summary.get("candidate_modules"), list) else candidate_modules
+        else:
+            selected_count = int(metrics.get("selected_module_count") or 0)
+            candidate_count = int(metrics.get("candidate_module_count") or 0)
         return (
             failure_code == NO_CANDIDATE_MODULES_FAILURE_CODE
-            and int(metrics.get("selected_module_count") or 0) == 0
-            and int(metrics.get("candidate_module_count") or 0) == 0
+            and selected_count == 0
+            and candidate_count == 0
             and not selected_modules
             and not candidate_modules
         )
