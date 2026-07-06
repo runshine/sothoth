@@ -11365,6 +11365,9 @@ class TaskManager(
         summary = dict(task.summary or {})
         if normalize_stage_name(stage_name) == "knowledge_graph_entry_fetch":
             return
+        if normalize_stage_name(stage_name) == "firmware_unpack" and not summary.get("input_files"):
+            self._repair_firmware_unpack_inputs_from_workspace(task)
+            summary = dict(task.summary or {})
         if stage_name in {"binary_to_source", "entry_analysis"} and not summary.get("selected_modules"):
             self._refresh_system_analysis_stage_from_synced_items(db, task)
             summary = dict(task.summary or {})
@@ -11843,6 +11846,93 @@ class TaskManager(
                 return "入口分析尚未产出可用入口结果，不能继续数据流漏洞挖掘阶段"
             return None
         return None
+
+    def _should_terminalize_blocked_stage_input(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        blocked_reason: str | None,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        reason = str(blocked_reason or "").strip()
+        if not normalized_stage or not reason:
+            return False
+        if normalized_stage == "firmware_unpack":
+            self._ensure_stage_inputs_available(db, task, normalized_stage)
+            return not bool(list((task.summary or {}).get("input_files") or []))
+        return False
+
+    def _repair_firmware_unpack_inputs_from_workspace(self, task: BinarySecurityTask) -> bool:
+        if self._task_type(task) != TASK_TYPE_BINARY:
+            return False
+        summary = dict(task.summary or {})
+        if list(summary.get("input_files") or []):
+            return False
+        input_dir = self._task_input_dir(task)
+        metadata_path = Path(str(summary.get("input_manifest_path") or input_dir / "task-metadata.json")).resolve()
+        recovered_inputs: list[dict[str, Any]] = []
+        metadata_payload: dict[str, Any] = {}
+        try:
+            if metadata_path.is_file():
+                raw = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    metadata_payload = raw
+        except Exception:
+            metadata_payload = {}
+        for current in list(metadata_payload.get("input_files") or []):
+            if not isinstance(current, dict):
+                continue
+            row = dict(current)
+            filename = str(row.get("filename") or row.get("relative_path") or "").strip()
+            if not filename:
+                continue
+            relative_path = str(row.get("relative_path") or filename).strip().replace("\\", "/")
+            local_path = input_dir / relative_path
+            if not local_path.is_file():
+                continue
+            recovered_inputs.append(
+                {
+                    **row,
+                    "filename": filename,
+                    "relative_path": relative_path,
+                    "firmware_key": str(row.get("firmware_key") or _slug(Path(filename).stem or filename)).strip(),
+                    "uploaded": True if row.get("uploaded") is None else row.get("uploaded"),
+                    "size": int(row.get("size") or local_path.stat().st_size),
+                    "path": str(row.get("path") or f"{summary.get('input_dir') or str(input_dir)}/{relative_path}"),
+                }
+            )
+        if not recovered_inputs and input_dir.is_dir():
+            for local_path in sorted(current for current in input_dir.rglob("*") if current.is_file() and current.name != "task-metadata.json"):
+                relative_path = str(local_path.relative_to(input_dir)).replace("\\", "/")
+                filename = local_path.name
+                recovered_inputs.append(
+                    {
+                        "filename": filename,
+                        "relative_path": relative_path,
+                        "firmware_key": _slug(Path(filename).stem or filename),
+                        "uploaded": True,
+                        "size": int(local_path.stat().st_size),
+                        "path": f"{summary.get('input_dir') or str(input_dir)}/{relative_path}",
+                    }
+                )
+        if not recovered_inputs:
+            return False
+        task.summary = {
+            **summary,
+            "input_files": recovered_inputs,
+            "input_dir": str(summary.get("input_dir") or input_dir),
+            "input_manifest_path": str(summary.get("input_manifest_path") or input_dir / "task-metadata.json"),
+        }
+        task.metrics = {
+            **dict(task.metrics or {}),
+            "input_file_count": len(recovered_inputs),
+            "uploaded_file_count": len(recovered_inputs),
+            "firmware_item_count": len(recovered_inputs),
+            "input_total_bytes": int(sum(int(item.get("size") or 0) for item in recovered_inputs)),
+        }
+        return True
 
     def _streaming_tail_auto_progressing(self, db: Session, task: BinarySecurityTask) -> bool:
         if not self._streaming_mode_enabled(task):

@@ -3558,12 +3558,35 @@ class TaskRuntimeServiceMixin:
                         stage_name,
                         allow_entry_rebuild=False,
                     )
+                    blocked_reason = str(stage_gate.get("blocked_reason") or "").strip() or None
+                    if self._should_terminalize_blocked_stage_input(
+                        db,
+                        task,
+                        stage_name,
+                        blocked_reason=blocked_reason,
+                    ):
+                        failure_ctx = {
+                            "stage_name": stage_name,
+                            "stage_run": stage_gate.get("stage_run"),
+                            "failure_code": "missing_stage_inputs",
+                            "failure_category": "invalid_task_input",
+                            "failure_message": blocked_reason,
+                        }
+                        self._finalize_task_after_authoritative_failure(
+                            db,
+                            task,
+                            failure_ctx=failure_ctx,
+                            previous_status=str(task.status or "").strip() or None,
+                            event_type="stage_missing_inputs_terminalized",
+                        )
+                        db.commit()
+                        return
                     task_manager_module.logger.info(
                         "binary-security execute_task paused before stage worker start because stage start gate is blocked: "
                         "task_id=%s stage=%s blocked_reason=%s stage_status=%s",
                         task.id,
                         stage_name,
-                        str(stage_gate.get("blocked_reason") or "").strip() or None,
+                        blocked_reason,
                         str(stage_gate.get("stage_status") or "").strip() or None,
                     )
                     break

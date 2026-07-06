@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from sqlalchemy.sql import operators
 
@@ -83,6 +84,36 @@ class FirmwareUnpackStageHandlerTests(unittest.TestCase):
         task.summary = {}
 
         self.assertEqual("缺少输入文件", self.handler.continue_stage_input_error(self.manager, _ModelAwareDb(tasks=[task]), task))
+
+    def test_repair_firmware_unpack_inputs_from_workspace_recovers_from_metadata(self):
+        workspace_root = Path("/tmp/ws-recover-meta").resolve()
+        input_dir = workspace_root / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        firmware_path = input_dir / "fw.bin"
+        firmware_path.write_bytes(b"binary")
+        (input_dir / "task-metadata.json").write_text(
+            '{"input_files":[{"filename":"fw.bin","relative_path":"fw.bin","firmware_key":"fw","path":"%s/fw.bin"}]}' % str(input_dir),
+            encoding="utf-8",
+        )
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_BINARY,
+            workspace_root=str(workspace_root),
+            output_root="/tmp/out",
+        )
+        task.summary = {"input_dir": str(input_dir), "input_manifest_path": str(input_dir / "task-metadata.json")}
+
+        try:
+            changed = self.manager._repair_firmware_unpack_inputs_from_workspace(task)
+        finally:
+            import shutil
+            shutil.rmtree(workspace_root, ignore_errors=True)
+
+        self.assertTrue(changed)
+        self.assertEqual(1, len(task.summary.get("input_files") or []))
+        self.assertEqual("fw.bin", task.summary["input_files"][0]["filename"])
 
     def test_archive_signature_uses_system_analysis_inputs(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", task_type=TASK_TYPE_BINARY, workspace_root="/tmp/ws", output_root="/tmp/out")

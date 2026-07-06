@@ -1,7 +1,9 @@
 import asyncio
+import json
 import unittest
 from datetime import timedelta, datetime
 from contextlib import suppress
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -4113,6 +4115,118 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             (task.id, "entry_analysis", "entry_analysis_pending_archive", "running"),
             gate_calls[0].args[1:5],
         )
+
+    def test_execute_task_terminalizes_when_firmware_unpack_inputs_are_truly_missing(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-firmware-input-missing",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="firmware_unpack",
+            task_type=TASK_TYPE_BINARY,
+            firmware_path="/tmp/fw.bin",
+            firmware_source="project_filesystem",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-missing-fw-input",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(manager, "_service_token", return_value=None),
+            patch.object(manager, "_bind_execution_token"),
+            patch.object(manager, "_stage_sequence_for_task", return_value=["firmware_unpack"]),
+            patch.object(manager, "_missing_entry_results_failure_context", return_value=None),
+            patch.object(manager, "_record_event"),
+            patch.object(manager, "_write_task_metadata_async", new=_noop_write),
+        ):
+            asyncio.run(manager._execute_task(task.id))
+
+        self.assertEqual("failed", task.status)
+        self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+        self.assertEqual("缺少输入文件", task.last_error)
+
+    def test_execute_task_repairs_firmware_unpack_inputs_from_metadata_before_terminalizing(self):
+        manager = TaskManager()
+        workspace_root = Path("/tmp/ws-repair-fw-input")
+        input_dir = workspace_root / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        firmware_path = input_dir / "fw.bin"
+        firmware_path.write_bytes(b"binary")
+        (input_dir / "task-metadata.json").write_text(
+            json.dumps(
+                {
+                    "input_files": [
+                        {
+                            "filename": "fw.bin",
+                            "relative_path": "fw.bin",
+                            "firmware_key": "fw",
+                            "path": f"{input_dir}/fw.bin",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        task = BinarySecurityTask(
+            id="task-firmware-input-repair",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="firmware_unpack",
+            task_type=TASK_TYPE_BINARY,
+            firmware_path=str(firmware_path),
+            firmware_source="project_filesystem",
+            output_root="/tmp/out",
+            workspace_root=str(workspace_root),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        task.summary = {
+            "input_dir": str(input_dir),
+            "input_manifest_path": str(input_dir / "task-metadata.json"),
+            "input_files": [],
+        }
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        try:
+            with (
+                patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+                patch.object(manager, "_service_token", return_value=None),
+                patch.object(manager, "_bind_execution_token"),
+                patch.object(manager, "_stage_sequence_for_task", return_value=["firmware_unpack"]),
+                patch.object(manager, "_missing_entry_results_failure_context", return_value=None),
+                patch.object(manager, "_stage_firmware_unpack", new=AsyncMock(return_value=("success", {"firmware_unpack_results": []}))),
+                patch.object(manager, "_record_event"),
+                patch.object(manager, "_write_task_metadata_async", new=_noop_write),
+            ):
+                asyncio.run(manager._execute_task(task.id))
+        finally:
+            import shutil
+            shutil.rmtree(workspace_root, ignore_errors=True)
+
+        self.assertNotEqual("failed", task.status)
+        self.assertEqual(1, len(task.summary.get("input_files") or []))
+        self.assertEqual("fw.bin", task.summary["input_files"][0]["filename"])
 
 
 if __name__ == "__main__":
