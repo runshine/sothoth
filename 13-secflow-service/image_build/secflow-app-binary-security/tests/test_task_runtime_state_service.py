@@ -8,6 +8,7 @@ from app.model import (
     TASK_RUNTIME_PHASE_TERMINAL,
     TASK_TYPE_BINARY,
 )
+from app.service import task_manager as task_manager_module
 from app.service.task.runtime_state import TaskRuntimeStateServiceMixin
 from app.service.task_manager import TaskManager, _now
 from test_task_manager import _ModelAwareDb
@@ -138,6 +139,44 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertFalse(repaired)
         self.assertEqual("running", task.status)
         self.assertEqual([], db.events)
+
+    def test_repair_running_lease_invariant_defers_when_runtime_lease_clear_hits_lock_conflict(self):
+        task = self._task(
+            status="running",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+        original_clear = self.manager._clear_runtime_lease
+
+        def _defer_clear(*_args, **_kwargs):
+            return task_manager_module.RuntimeLeaseClearResult(
+                status="lease_locked_retry_later",
+                task_id=task.id,
+                owner_instance_id="worker-a",
+                error_message="deadlock",
+            )
+
+        self.manager._clear_runtime_lease = _defer_clear
+        try:
+            repaired = self.manager._repair_running_lease_invariant(
+                db,
+                task,
+                reason="unit_test_lock_conflict",
+                stage_name="system_analysis",
+            )
+        finally:
+            self.manager._clear_runtime_lease = original_clear
+
+        self.assertFalse(repaired)
+        self.assertEqual("running", task.status)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("runtime_lease_clear_deferred_by_lock", event_types)
+        self.assertIn("owned_execution_reclaim_deferred_by_lock", event_types)
 
 
 if __name__ == "__main__":

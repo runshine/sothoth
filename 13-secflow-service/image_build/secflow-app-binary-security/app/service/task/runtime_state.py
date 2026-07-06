@@ -2243,6 +2243,15 @@ class TaskRuntimeStateServiceMixin:
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
+        task_query = db.query(task_manager_module.BinarySecurityTask).filter(
+            task_manager_module.BinarySecurityTask.id == str(getattr(task, "id", "") or "").strip()
+        )
+        with_for_update = getattr(task_query, "with_for_update", None)
+        if callable(with_for_update):
+            task_query = with_for_update()
+        locked_task = task_query.first()
+        if locked_task is not None:
+            task = locked_task
         if not self._running_task_requires_live_runtime_lease(db, task):
             return False
         snapshot = self._parent_runtime_ownership_snapshot(db, task)
@@ -2281,6 +2290,47 @@ class TaskRuntimeStateServiceMixin:
         runtime_lease_owner = str(getattr(lease, "owner_instance_id", "") or "").strip() or None
         runtime_lease_expires_at = getattr(lease, "lease_expires_at", None) if lease is not None else None
         next_stage_name = str(stage_name or task.current_stage or "").strip() or None
+        observed_owner = str(runtime_lease_owner or "").strip() or None
+        if observed_owner:
+            clear_result = self._clear_runtime_lease(
+                db,
+                task.id,
+                owner_instance_id=observed_owner,
+                swallow_lock_error=True,
+            )
+            if clear_result.status == "lease_locked_retry_later":
+                self._record_event(
+                    db,
+                    task,
+                    "runtime_lease_clear_deferred_by_lock",
+                    "runtime lease 清理遇到可重试锁冲突，当前轮延后 lease invariant 修复",
+                    level="warning",
+                    stage_name=next_stage_name,
+                    payload={
+                        "next_stage": next_stage_name,
+                        "reason": reason,
+                        "runtime_phase": runtime_phase,
+                        "runtime_lease_owner": observed_owner,
+                        "clear_status": clear_result.status,
+                        "clear_error_message": clear_result.error_message,
+                    },
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "owned_execution_reclaim_deferred_by_lock",
+                    "owned execution lease invariant 修复遇到可重试锁冲突，当前轮延后重试",
+                    level="warning",
+                    stage_name=next_stage_name,
+                    payload={
+                        "next_stage": next_stage_name,
+                        "reason": reason,
+                        "runtime_phase": runtime_phase,
+                        "runtime_lease_owner": observed_owner,
+                        "takeover_action": "defer_running_without_active_lease_repair",
+                    },
+                )
+                return False
         self._apply_release_for_takeover_main_state(
             db,
             task,
@@ -2294,9 +2344,6 @@ class TaskRuntimeStateServiceMixin:
         )
         task.tail_reconcile_state = "idle"
         task.updated_at = task_manager_module._now()
-        observed_owner = str(runtime_lease_owner or "").strip() or None
-        if observed_owner:
-            self._clear_runtime_lease(db, task.id, owner_instance_id=observed_owner)
         self._last_task_heartbeat_at.pop(task.id, None)
         self._clear_task_abnormal_reason_snapshot(db, task)
         reopen_event_type, reopen_message = self._parent_runtime_reopen_allowed_event(
