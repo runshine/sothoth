@@ -206,7 +206,17 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
         stage_run.counts = manager._stage_counts(db, stage_run)
         stage_run.last_error = failed[0].get("error") if failed and status == "failed" else None
         if no_candidate_modules:
-            task.last_error = None
+            failure = task_shared._no_candidate_modules_failure()
+            task.last_error = str(failure.get("failure_message") or "").strip() or None
+            summary.update(
+                {
+                    "failure_code": failure.get("failure_code"),
+                    "failure_category": failure.get("failure_category"),
+                    "failure_message": failure.get("failure_message"),
+                    "error": failure.get("error"),
+                }
+            )
+            task.summary = summary
             manager._record_event(
                 db,
                 task,
@@ -236,6 +246,7 @@ class SystemAnalysisStageHandler(BinarySecurityStageHandler):
                 "low_risk_module_count": module_metrics["low_risk_module_count"],
                 "candidate_module_count": len(candidate_modules),
                 "selected_module_count": len(selected_modules),
+                **(task_shared._no_candidate_modules_failure() if no_candidate_modules else {}),
                 "status_synced": True,
                 "sync_status": stage_run.status,
                 "error": stage_run.last_error,

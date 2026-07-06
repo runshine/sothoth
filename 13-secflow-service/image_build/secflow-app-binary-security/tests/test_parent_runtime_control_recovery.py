@@ -1,4 +1,6 @@
 import asyncio
+import shutil
+import tempfile
 import unittest
 from datetime import datetime, timedelta
 
@@ -21,6 +23,17 @@ from test_task_manager import _AppendingModelAwareDb, _ModelAwareDb, _TaskManage
 class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
+        self._tmpdirs: list[str] = []
+
+    def tearDown(self):
+        for path in reversed(self._tmpdirs):
+            shutil.rmtree(path, ignore_errors=True)
+        super().tearDown()
+
+    def _workspace_root(self, prefix: str) -> str:
+        path = tempfile.mkdtemp(prefix=f"binary-security-{prefix}-")
+        self._tmpdirs.append(path)
+        return path
 
     def test_requeue_orphaned_owned_execution_locked_recovers_orphan(self):
         manager = TaskManager()
@@ -34,7 +47,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
-            workspace_root="/tmp",
+            workspace_root=self._workspace_root("requeue-orphaned"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         stage_run = BinarySecurityStageRun(
@@ -98,7 +111,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
-            workspace_root="/tmp",
+            workspace_root=self._workspace_root("single-recover"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         stage_run = BinarySecurityStageRun(
@@ -132,10 +145,68 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         self.assertTrue(reclaimed)
         self.assertEqual("pending", task.status)
         self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
+        self.assertTrue(
+            bool(dict(getattr(task, "summary", None) or {}).get("parent_takeover_pending_claim", {}).get("active"))
+        )
         self.assertEqual(
             [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
             self.fake_task_queue.requeued_tasks,
         )
+
+    def test_requeue_orphaned_owned_execution_single_task_locked_skips_pending_claim_waiting_task(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="t-skip-pending-claim",
+            project_id="p1",
+            name="binary-module",
+            status="pending",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root=self._workspace_root("single-skip"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            summary={
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": _now().isoformat(),
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                }
+            },
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-skip-pending-claim",
+            task_id=task.id,
+            project_id="p1",
+            stage_name="binary_to_source",
+            sequence_no=1,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si-skip-pending-claim",
+            task_id=task.id,
+            project_id="p1",
+            stage_run_id=stage_run.id,
+            stage_name="binary_to_source",
+            item_key="module1",
+            parent_key="module1",
+            status="failed",
+            downstream_service="binary_to_source",
+            downstream_task_id=None,
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+        with (
+            unittest.mock.patch.object(manager, "_task_runtime_transition_guard_active", return_value=False),
+            unittest.mock.patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True),
+        ):
+            reclaimed = manager._requeue_orphaned_owned_execution_single_task_locked(db, task.id)
+
+        self.assertFalse(reclaimed)
+        self.assertEqual("pending", task.status)
+        self.assertEqual([], self.fake_task_queue.requeued_tasks)
+        self.assertFalse(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
 
     def test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):
         manager = TaskManager()
@@ -150,7 +221,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
-            workspace_root="/tmp",
+            workspace_root=self._workspace_root("owner-drift"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             current_operation_id="op-old",
         )
@@ -233,7 +304,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
-            workspace_root="/tmp",
+            workspace_root=self._workspace_root("legacy-row-lease"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         stage_run = BinarySecurityStageRun(
@@ -289,7 +360,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
-            workspace_root="/tmp",
+            workspace_root=self._workspace_root("transition-guard"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
             summary={
                 "runtime_transition_guard": {
@@ -573,7 +644,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
-            workspace_root="/tmp",
+            workspace_root=self._workspace_root("lock-deferred"),
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         stage_run = BinarySecurityStageRun(

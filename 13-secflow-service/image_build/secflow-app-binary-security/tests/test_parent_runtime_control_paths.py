@@ -12,13 +12,19 @@ from app.model import (
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import StaleTaskExecution, TaskManager, _now
-from test_task_manager import _ModelAwareDb
+from test_task_manager import _FakeTaskSyncQueue, _ModelAwareDb
 
 
 class ParentRuntimeControlPathTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
         self.manager.instance_id = "worker-local"
+        self.fake_task_queue = _FakeTaskSyncQueue()
+        self._original_get_task_queue = task_manager_module.get_task_queue
+        task_manager_module.get_task_queue = lambda: self.fake_task_queue
+
+    def tearDown(self):
+        task_manager_module.get_task_queue = self._original_get_task_queue
 
     def _task(self, **overrides):
         data = {
@@ -263,7 +269,8 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease])
         manager._enqueue_task = lambda task_id: None
 
-        claimed = manager._dispatch_task_by_id(db, task.id)
+        with unittest.mock.patch.object(manager, "_run_parent_reclaim_pass", return_value=(False,) * 8):
+            claimed = manager._dispatch_task_by_id(db, task.id)
 
         self.assertIsNone(claimed)
         self.assertEqual("running", task.status)
@@ -288,6 +295,13 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
             output_root="/o",
             workspace_root="/w",
             current_operation_id="op-retry",
+            summary={
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": _now().isoformat(),
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                }
+            },
         )
         task.cleanup_snapshot = {
             "delete_queued": True,
@@ -311,6 +325,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         self.assertFalse(task.cleanup_snapshot.get("delete_queued"))
         self.assertFalse(task.cleanup_snapshot.get("delete_in_progress"))
         self.assertEqual("local-worker", db.runtime_leases[0].owner_instance_id)
+        self.assertNotIn("parent_takeover_pending_claim", dict(getattr(task, "summary", None) or {}))
         self.assertTrue(any(event.event_type == "stale_delete_queue_hidden_state_cleared" for event in db.events))
 
     def test_dispatch_task_by_id_keeps_hidden_when_active_delete_queue_operation_exists(self):

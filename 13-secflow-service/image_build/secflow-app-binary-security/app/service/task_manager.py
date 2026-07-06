@@ -4438,6 +4438,15 @@ class TaskManager(
                     task.id,
                     context="owned_execution_release_for_takeover",
                 )
+                summary = dict(getattr(task, "summary", None) or {})
+                summary["parent_takeover_pending_claim"] = {
+                    "active": True,
+                    "released_at": _isoformat_or_none(_now()),
+                    "released_by_instance_id": str(self.instance_id or "").strip() or None,
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                    "requeue_succeeded": bool(requeue_succeeded),
+                }
+                task.summary = summary
                 self._record_event(
                     db,
                     task,

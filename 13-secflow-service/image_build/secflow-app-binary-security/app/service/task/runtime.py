@@ -46,6 +46,22 @@ class TaskRuntimeServiceMixin:
         raw = summary.get("dispatch_claim_cooldown")
         return dict(raw) if isinstance(raw, dict) else {}
 
+    def _parent_takeover_pending_claim_snapshot(self: TaskManager, task) -> dict[str, object]:
+        summary = dict(getattr(task, "summary", None) or {})
+        raw = summary.get("parent_takeover_pending_claim")
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def _parent_takeover_pending_claim_active(self: TaskManager, task) -> bool:
+        snapshot = self._parent_takeover_pending_claim_snapshot(task)
+        return bool(snapshot.get("active"))
+
+    def _clear_parent_takeover_pending_claim(self: TaskManager, task) -> None:
+        summary = dict(getattr(task, "summary", None) or {})
+        if "parent_takeover_pending_claim" not in summary:
+            return
+        summary.pop("parent_takeover_pending_claim", None)
+        task.summary = summary
+
     def _dispatch_claim_cooldown_active(self: TaskManager, task) -> bool:
         from app.service import task_manager as task_manager_module
 
@@ -1062,6 +1078,8 @@ class TaskRuntimeServiceMixin:
         if self._task_runtime_transition_guard_active(task):
             return False
         if str(task.status or "").strip() == "dispatching":
+            return False
+        if self._parent_takeover_pending_claim_active(task):
             return False
         lease = self._runtime_lease_for_task(db, task.id)
         if self._runtime_lease_is_active(lease):
@@ -2534,6 +2552,7 @@ class TaskRuntimeServiceMixin:
             task.status = next_task_status
             task.runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
             task.updated_at = started_at
+            self._clear_parent_takeover_pending_claim(task)
             self._clear_pending_shared_dispatch_signal(task)
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
             db.commit()
