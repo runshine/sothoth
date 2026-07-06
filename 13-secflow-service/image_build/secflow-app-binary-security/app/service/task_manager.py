@@ -12785,7 +12785,7 @@ class TaskManager(
                 now_value = _now()
                 should_log_wait = (
                     last_wait_log_at is None
-                    or (now_value - last_wait_log_at).total_seconds() >= max(30, self._downstream_child_sync_interval_seconds() * 6)
+                    or (now_value - last_wait_log_at).total_seconds() >= max(30, min(60, self._downstream_child_sync_interval_seconds()))
                 )
                 if should_log_wait:
                     logger.info(
