@@ -12754,6 +12754,9 @@ class TaskManager(
         await self._ensure_task_execution_current_async(task)
 
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
+        poll_started_at = _now()
+        last_wait_log_at: datetime | None = None
+        poll_count = 0
         while True:
             try:
                 await self._ensure_task_execution_current_async(task)
@@ -12761,6 +12764,7 @@ class TaskManager(
                 await self._touch_task_heartbeat_async(task.id)
                 payload = await fetcher()
                 await self._ensure_task_execution_current_async(task)
+                poll_count += 1
                 status = str(payload.get("status") or "").lower()
                 if status in success_statuses:
                     return "success", payload
@@ -12778,6 +12782,30 @@ class TaskManager(
                         item_id=item.id,
                         payload=dict(payload),
                     )
+                now_value = _now()
+                should_log_wait = (
+                    last_wait_log_at is None
+                    or (now_value - last_wait_log_at).total_seconds() >= max(30, self._downstream_child_sync_interval_seconds() * 6)
+                )
+                if should_log_wait:
+                    logger.info(
+                        "binary-security downstream poll waiting: task_id=%s stage=%s item_id=%s item_key=%s downstream_task_id=%s downstream_status=%s poll_count=%s waited_seconds=%s",
+                        task.id,
+                        str(getattr(item, "stage_name", "") or getattr(task, "current_stage", "") or "").strip() or None,
+                        str(getattr(item, "id", "") or "").strip() or None,
+                        str(getattr(item, "item_key", "") or "").strip() or None,
+                        str(
+                            payload.get("task_id")
+                            or payload.get("id")
+                            or getattr(item, "downstream_task_id", None)
+                            or ""
+                        ).strip()
+                        or None,
+                        status or None,
+                        poll_count,
+                        max(0, int((now_value - poll_started_at).total_seconds())),
+                    )
+                    last_wait_log_at = now_value
                 if await self._is_task_cancelled_async(task.id):
                     if item and item.downstream_task_id:
                         await self._cancel_downstream(item, self._service_token())

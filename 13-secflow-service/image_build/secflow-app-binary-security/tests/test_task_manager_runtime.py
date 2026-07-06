@@ -3628,6 +3628,68 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["task-1", "task-1"], operation_passes)
         self.assertEqual(["fetch"], fetch_calls)
 
+    async def test_poll_until_terminal_logs_waiting_progress_for_long_running_child(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1", current_stage="dataflow_vuln_scan")
+        item = type(
+            "Item",
+            (),
+            {
+                "id": "item-1",
+                "item_key": "entry-1",
+                "stage_name": "dataflow_vuln_scan",
+                "downstream_task_id": "child-1",
+            },
+        )()
+        fetch_calls = 0
+
+        async def _ensure(_task):
+            return None
+
+        async def _touch(_task_id):
+            return None
+
+        async def _cancelled(_task_id):
+            return False
+
+        async def _fetch():
+            nonlocal fetch_calls
+            fetch_calls += 1
+            if fetch_calls == 1:
+                return {"status": "running", "task_id": "child-1"}
+            return {"status": "success", "task_id": "child-1"}
+
+        manager._ensure_task_execution_current_async = _ensure
+        manager._touch_task_heartbeat_async = _touch
+        manager._is_task_cancelled_async = _cancelled
+        manager._run_current_task_operation = _cancelled
+        manager._refresh_polled_child_sync_snapshot = lambda **_kwargs: None
+
+        with (
+            patch("app.service.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)),
+            patch("app.service.task_manager.logger.info") as info_log,
+        ):
+            status, payload = await manager._poll_until_terminal(
+                _fetch,
+                success_statuses={"success"},
+                failure_statuses={"failed", "cancelled"},
+                task=task,
+                item=item,
+            )
+
+        self.assertEqual("success", status)
+        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
+        waiting_calls = [
+            call
+            for call in info_log.call_args_list
+            if call.args and call.args[0] == "binary-security downstream poll waiting: task_id=%s stage=%s item_id=%s item_key=%s downstream_task_id=%s downstream_status=%s poll_count=%s waited_seconds=%s"
+        ]
+        self.assertEqual(1, len(waiting_calls))
+        self.assertEqual(
+            ("task-1", "dataflow_vuln_scan", "item-1", "entry-1", "child-1", "running", 1),
+            waiting_calls[0].args[1:8],
+        )
+
     async def test_poll_until_terminal_treats_completed_limited_as_success(self):
         manager = TaskManager()
         task = BinarySecurityTask(id="task-1", project_id="project-1")
