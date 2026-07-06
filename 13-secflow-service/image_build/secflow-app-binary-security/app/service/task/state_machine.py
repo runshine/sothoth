@@ -54,6 +54,8 @@ class TaskStateMachineMixin:
     ) -> bool:
         from app.service import task_manager as task_manager_module
 
+        if self._source_workflow_no_candidate_modules_terminal_fact(db, task):
+            return False
         active_statuses = {"pending", "queued", "dispatching", "running", "applying", "reconciling"}
         runs = list(stage_runs or db.query(BinarySecurityStageRun).filter(BinarySecurityStageRun.task_id == task.id).all())
         items = list(stage_items or db.query(BinarySecurityStageItem).filter(BinarySecurityStageItem.task_id == task.id).all())

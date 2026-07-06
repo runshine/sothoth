@@ -4183,17 +4183,25 @@ class TaskRuntimeServiceMixin:
     async def _run_stage_item_by_id(self: TaskManager, item_id: str) -> None:
         from app.service import task_manager as task_manager_module
 
-        db = task_manager_module.get_session_factory()()
+        session_factory = task_manager_module.get_session_factory()
+        db = session_factory()
         owner_task_id: str | None = None
         owner_kind = f"streaming_stage_item:{item_id}"
+        task_id: str | None = None
+        stage_name: str | None = None
+        payload: dict[str, object] = {}
+        task_snapshot = None
+        stage_run = None
         try:
             item = db.query(task_manager_module.BinarySecurityStageItem).filter(
                 task_manager_module.BinarySecurityStageItem.id == item_id
             ).first()
             if item is None:
                 return
+            task_id = str(getattr(item, "task_id", "") or "").strip() or None
+            stage_name = str(getattr(item, "stage_name", "") or "").strip() or None
             task = db.query(task_manager_module.BinarySecurityTask).filter(
-                task_manager_module.BinarySecurityTask.id == item.task_id
+                task_manager_module.BinarySecurityTask.id == task_id
             ).first()
             if task is None or not self._streaming_mode_enabled(task):
                 return
@@ -4210,76 +4218,89 @@ class TaskRuntimeServiceMixin:
             self._register_task_execution_owner(owner_task_id, owner_kind)
             await self._ensure_task_execution_current_async(task)
             stage_run = self._ensure_stage_run(db, task, item.stage_name)
-            db.commit()
             payload = dict(item.input_ref or {})
+            task_snapshot = task
+            db.commit()
+            db.close()
+            db = None
             token = self._service_token()
-            if item.stage_name == "entry_analysis":
-                await self._run_entry_item(task, stage_run, payload, token, False)
-            elif task_manager_module.normalize_stage_name(item.stage_name) == "dataflow_vuln_scan":
-                await self._run_dataflow_item(task, stage_run, payload, token, False)
-            elif task_manager_module.normalize_stage_name(item.stage_name) == "dataflow_vuln_scan":
-                await self._run_dataflow_item(task, stage_run, payload, token, False)
-            await self._sync_streaming_task_tail_state(task.id)
+            if stage_name == "entry_analysis":
+                await self._run_entry_item(task_snapshot, stage_run, payload, token, False)
+            elif task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan":
+                await self._run_dataflow_item(task_snapshot, stage_run, payload, token, False)
+            elif task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan":
+                await self._run_dataflow_item(task_snapshot, stage_run, payload, token, False)
+            await self._sync_streaming_task_tail_state(task_snapshot.id)
         except task_manager_module.StaleTaskExecution:
-            db.rollback()
+            if db is not None:
+                db.rollback()
             return
         except Exception as exc:
-            item = db.query(task_manager_module.BinarySecurityStageItem).filter(
-                task_manager_module.BinarySecurityStageItem.id == item_id
-            ).first()
-            task = (
-                db.query(task_manager_module.BinarySecurityTask).filter(
-                    task_manager_module.BinarySecurityTask.id == item.task_id
+            if db is not None:
+                db.rollback()
+                db.close()
+                db = None
+            recovery_db = session_factory()
+            try:
+                item = recovery_db.query(task_manager_module.BinarySecurityStageItem).filter(
+                    task_manager_module.BinarySecurityStageItem.id == item_id
                 ).first()
-                if item is not None else None
-            )
-            if item is not None and str(item.status or "").strip().lower() == "dispatching":
-                retryable_transport = self._is_retryable_downstream_transport_error(exc)
-                recoverable = retryable_transport or self._is_recoverable_orchestration_error(exc)
-                item.status = "queued" if recoverable else "pending"
-                item.error_message = str(exc)
-                item.finished_at = None
-                if recoverable:
-                    state = self._build_next_stage_item_orchestration_failure_state(item)
-                    self._mark_stage_item_orchestration_observation(
-                        item,
-                        source="streaming_stage_worker",
-                        observed_at=task_manager_module._now(),
-                        error_message=str(exc),
-                        error_type=self._classify_orchestration_error(exc),
-                        last_result="error",
-                        consecutive_error_count=state.consecutive_error_count,
-                        budget_exhausted=state.budget_exhausted,
-                        next_retry_at=state.next_retry_at,
-                    )
-                db.commit()
-                if task is not None:
-                    self._record_event(
-                        db,
-                        task,
-                        "streaming_stage_item_requeued_after_worker_error",
-                        f"流式阶段子任务执行异常，已重新排队: {item.stage_name}:{item.item_key}",
-                        level="warning",
-                        stage_name=item.stage_name,
-                        item=item,
-                        payload={
-                            "error": str(exc),
-                            "retryable_transport": retryable_transport,
-                            "recoverable_orchestration": recoverable,
-                            "error_type": self._classify_orchestration_error(exc),
-                            "next_retry_at": task_manager_module._isoformat_or_none(
-                                self._stage_item_next_orchestration_retry_at_value(item)
-                            ),
-                            "budget_exhausted": self._stage_item_orchestration_error_budget_exhausted(item),
-                            "requeued_status": item.status,
-                        },
-                    )
-                    db.commit()
+                task = (
+                    recovery_db.query(task_manager_module.BinarySecurityTask).filter(
+                        task_manager_module.BinarySecurityTask.id == item.task_id
+                    ).first()
+                    if item is not None else None
+                )
+                if item is not None and str(item.status or "").strip().lower() == "dispatching":
+                    retryable_transport = self._is_retryable_downstream_transport_error(exc)
+                    recoverable = retryable_transport or self._is_recoverable_orchestration_error(exc)
+                    item.status = "queued" if recoverable else "pending"
+                    item.error_message = str(exc)
+                    item.finished_at = None
+                    if recoverable:
+                        state = self._build_next_stage_item_orchestration_failure_state(item)
+                        self._mark_stage_item_orchestration_observation(
+                            item,
+                            source="streaming_stage_worker",
+                            observed_at=task_manager_module._now(),
+                            error_message=str(exc),
+                            error_type=self._classify_orchestration_error(exc),
+                            last_result="error",
+                            consecutive_error_count=state.consecutive_error_count,
+                            budget_exhausted=state.budget_exhausted,
+                            next_retry_at=state.next_retry_at,
+                        )
+                    recovery_db.commit()
+                    if task is not None:
+                        self._record_event(
+                            recovery_db,
+                            task,
+                            "streaming_stage_item_requeued_after_worker_error",
+                            f"流式阶段子任务执行异常，已重新排队: {item.stage_name}:{item.item_key}",
+                            level="warning",
+                            stage_name=item.stage_name,
+                            item=item,
+                            payload={
+                                "error": str(exc),
+                                "retryable_transport": retryable_transport,
+                                "recoverable_orchestration": recoverable,
+                                "error_type": self._classify_orchestration_error(exc),
+                                "next_retry_at": task_manager_module._isoformat_or_none(
+                                    self._stage_item_next_orchestration_retry_at_value(item)
+                                ),
+                                "budget_exhausted": self._stage_item_orchestration_error_budget_exhausted(item),
+                                "requeued_status": item.status,
+                            },
+                        )
+                        recovery_db.commit()
+            finally:
+                recovery_db.close()
             task_manager_module.logger.exception("binary-security streaming stage item worker failed: item_id=%s", item_id)
         finally:
             if owner_task_id:
                 self._release_task_execution_owner(owner_task_id, owner_kind)
-            db.close()
+            if db is not None:
+                db.close()
             async with self._stage_item_worker_lock:
                 self._stage_item_workers.pop(item_id, None)
 
