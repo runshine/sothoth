@@ -3887,9 +3887,9 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
 
         self.assertEqual([], claimed)
         self.assertEqual("pending", item.status)
-        self.assertTrue(any(event.event_type == "streaming_stage_item_claim_skipped_non_owner" for event in db.events))
+        self.assertEqual([], db.events)
 
-    def test_claim_streaming_stage_items_deduplicates_non_owner_skip_events_for_same_stage(self):
+    def test_claim_streaming_stage_items_prefilters_to_local_runtime_lease_tasks(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         now = _now()
         task = BinarySecurityTask(
@@ -3944,9 +3944,8 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         claimed = self.manager._claim_streaming_stage_items(db)
 
         self.assertEqual([], claimed)
-        events = [event for event in db.added if isinstance(event, BinarySecurityEvent) and event.event_type == "streaming_stage_item_claim_skipped_non_owner"]
-        self.assertEqual(1, len(events))
-        self.assertEqual("流式阶段子任务 claim 被非 owner pod 拦截，等待当前执行实例消费: entry_analysis", events[0].message)
+        self.assertEqual([], [event for event in db.added if isinstance(event, BinarySecurityEvent)])
+        self.assertEqual(["BinarySecurityTaskRuntimeLease"], db.queried_models[:1])
 
     def test_claim_streaming_stage_items_returns_empty_on_retryable_lock_conflict(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"

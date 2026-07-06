@@ -2263,10 +2263,23 @@ class TaskRuntimeServiceMixin:
 
         claimed_ids: list[str] = []
         claimed_counts_by_stage: dict[tuple[str, str], int] = {}
-        seen_non_owner_skip_keys: set[tuple[str, str, str, str]] = set()
+        local_owner = str(self.instance_id or "").strip()
+        owned_task_ids = [
+            str(getattr(lease, "task_id", "") or "").strip()
+            for lease in db.query(task_manager_module.BinarySecurityTaskRuntimeLease).all()
+            if str(getattr(lease, "owner_instance_id", "") or "").strip() == local_owner
+            and self._runtime_lease_is_active(lease)
+        ]
+        owned_task_ids = [task_id for task_id in owned_task_ids if task_id]
+        if not owned_task_ids:
+            return []
         pending_items = (
             db.query(task_manager_module.BinarySecurityStageItem)
-            .filter(task_manager_module.BinarySecurityStageItem.status.in_(["pending", "queued"]))
+            .filter(
+                task_manager_module.BinarySecurityStageItem.task_id.in_(owned_task_ids),
+                task_manager_module.BinarySecurityStageItem.status.in_(["pending", "queued"]),
+                task_manager_module.BinarySecurityStageItem.stage_name.in_(list(task_manager_module.STREAMING_TAIL_STAGES)),
+            )
             .order_by(
                 task_manager_module.BinarySecurityStageItem.created_at.asc(),
                 task_manager_module.BinarySecurityStageItem.id.asc(),
@@ -2274,8 +2287,6 @@ class TaskRuntimeServiceMixin:
             .all()
         )
         for item in pending_items:
-            if item.stage_name not in task_manager_module.STREAMING_TAIL_STAGES:
-                continue
             try:
                 task = db.query(task_manager_module.BinarySecurityTask).filter(
                     task_manager_module.BinarySecurityTask.id == item.task_id
@@ -2301,25 +2312,12 @@ class TaskRuntimeServiceMixin:
             ownership_snapshot = self._parent_runtime_ownership_snapshot(db, task)
             if not (
                 ownership_snapshot.runtime_lease_active
-                and ownership_snapshot.runtime_lease_owner == str(self.instance_id or "").strip()
+                and ownership_snapshot.runtime_lease_owner == local_owner
             ):
-                skip_key = (
-                    str(task.id or ""),
-                    str(item.stage_name or ""),
-                    str(ownership_snapshot.runtime_lease_owner or ""),
-                    str(self.instance_id or "").strip(),
-                )
-                self._record_non_owner_streaming_claim_skip(
-                    db,
-                    task,
-                    item,
-                    emit_event=skip_key not in seen_non_owner_skip_keys,
-                )
-                seen_non_owner_skip_keys.add(skip_key)
                 continue
             if not (
                 (
-                    ownership_snapshot.runtime_lease_owner == str(self.instance_id or "").strip()
+                    ownership_snapshot.runtime_lease_owner == local_owner
                     and ownership_snapshot.runtime_lease_active
                 )
                 or self._has_local_runtime_owner_fast_path(task, db=db)

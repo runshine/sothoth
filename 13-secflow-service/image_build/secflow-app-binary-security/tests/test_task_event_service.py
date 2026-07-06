@@ -17,6 +17,9 @@ class TaskEventServiceStructureTests(unittest.TestCase):
         self.assertIs(TaskManager._prepare_event_payload_for_db, TaskEventServiceMixin._prepare_event_payload_for_db)
         self.assertIs(TaskManager._load_externalized_event_payload, TaskEventServiceMixin._load_externalized_event_payload)
 
+    def test_binary_security_event_allows_idempotent_concurrent_deletes(self):
+        self.assertEqual({"confirm_deleted_rows": False}, getattr(BinarySecurityEvent, "__mapper_args__", {}))
+
 
 class TaskEventServiceBehaviorTests(unittest.TestCase):
     def setUp(self):

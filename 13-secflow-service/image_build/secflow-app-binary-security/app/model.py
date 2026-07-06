@@ -399,6 +399,7 @@ class BinarySecurityStageItem(Base, JsonMixin):
 
 class BinarySecurityEvent(Base, JsonMixin):
     __tablename__ = "secflow_binary_security_event"
+    __mapper_args__ = {"confirm_deleted_rows": False}
 
     id = Column(String(48), primary_key=True)
     task_id = Column(String(32), nullable=False, index=True)
