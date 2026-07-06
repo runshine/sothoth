@@ -3519,6 +3519,13 @@ class TaskRuntimeServiceMixin:
                     and self._source_entry_analysis_barrier_enabled(task)
                     and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
                 ):
+                    task_manager_module.logger.info(
+                        "binary-security execute_task paused before downstream polling because entry-analysis archive barrier is not satisfied: "
+                        "task_id=%s stage=%s current_stage=%s",
+                        task.id,
+                        stage_name,
+                        str(getattr(task, "current_stage", "") or "").strip() or None,
+                    )
                     break
                 if not self._stage_enabled(task, stage_name):
                     stage_run = self._ensure_stage_run(db, task, stage_name)
@@ -3545,6 +3552,20 @@ class TaskRuntimeServiceMixin:
                     db.commit()
                     continue
                 if not self._stage_start_ready(db, task, stage_name, allow_rebuild=False):
+                    stage_gate = self._evaluate_stage_start_gate(
+                        db,
+                        task,
+                        stage_name,
+                        allow_entry_rebuild=False,
+                    )
+                    task_manager_module.logger.info(
+                        "binary-security execute_task paused before stage worker start because stage start gate is blocked: "
+                        "task_id=%s stage=%s blocked_reason=%s stage_status=%s",
+                        task.id,
+                        stage_name,
+                        str(stage_gate.get("blocked_reason") or "").strip() or None,
+                        str(stage_gate.get("stage_status") or "").strip() or None,
+                    )
                     break
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 if stage_name == "entry_analysis":

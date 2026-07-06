@@ -4005,6 +4005,115 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("running", task.status)
 
+    def test_execute_task_logs_when_entry_analysis_archive_barrier_blocks_dataflow_start(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-dataflow-barrier-log",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_path="/tmp/fw.bin",
+            firmware_source="project_filesystem",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(manager, "_service_token", return_value=None),
+            patch.object(manager, "_bind_execution_token"),
+            patch.object(manager, "_stage_sequence_for_task", return_value=["dataflow_vuln_scan"]),
+            patch.object(manager, "_missing_entry_results_failure_context", return_value=None),
+            patch.object(manager, "_source_entry_analysis_barrier_enabled", return_value=True),
+            patch.object(manager, "_stage_has_archived_success_progress", return_value=False),
+            patch.object(manager, "_record_event"),
+            patch.object(manager, "_write_task_metadata_async", new=_noop_write),
+            patch("app.service.task_manager.logger.info") as info_log,
+        ):
+            asyncio.run(manager._execute_task(task.id))
+
+        barrier_calls = [
+            call
+            for call in info_log.call_args_list
+            if call.args
+            and call.args[0]
+            == "binary-security execute_task paused before downstream polling because entry-analysis archive barrier is not satisfied: task_id=%s stage=%s current_stage=%s"
+        ]
+        self.assertEqual(1, len(barrier_calls))
+        self.assertEqual((task.id, "dataflow_vuln_scan", "entry_analysis"), barrier_calls[0].args[1:4])
+
+    def test_execute_task_logs_when_stage_start_gate_blocks_stage_worker_start(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-stage-gate-log",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_path="/tmp/fw.bin",
+            firmware_source="project_filesystem",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(manager, "_service_token", return_value=None),
+            patch.object(manager, "_bind_execution_token"),
+            patch.object(manager, "_stage_sequence_for_task", return_value=["entry_analysis"]),
+            patch.object(manager, "_missing_entry_results_failure_context", return_value=None),
+            patch.object(manager, "_source_entry_analysis_barrier_enabled", return_value=False),
+            patch.object(manager, "_stage_enabled", return_value=True),
+            patch.object(manager, "_stage_start_ready", return_value=False),
+            patch.object(
+                manager,
+                "_evaluate_stage_start_gate",
+                return_value={"blocked_reason": "entry_analysis_pending_archive", "stage_status": "running"},
+            ),
+            patch.object(manager, "_record_event"),
+            patch.object(manager, "_write_task_metadata_async", new=_noop_write),
+            patch("app.service.task_manager.logger.info") as info_log,
+        ):
+            asyncio.run(manager._execute_task(task.id))
+
+        gate_calls = [
+            call
+            for call in info_log.call_args_list
+            if call.args
+            and call.args[0]
+            == "binary-security execute_task paused before stage worker start because stage start gate is blocked: task_id=%s stage=%s blocked_reason=%s stage_status=%s"
+        ]
+        self.assertEqual(1, len(gate_calls))
+        self.assertEqual(
+            (task.id, "entry_analysis", "entry_analysis_pending_archive", "running"),
+            gate_calls[0].args[1:5],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
