@@ -10968,7 +10968,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertTrue(changed)
         self.assertEqual("failed", task.status)
         self.assertEqual(["t1"], queued)
-        self.assertIn("task_row_owner_released_without_local_runtime", events)
+        self.assertIn("task_runtime_released_without_local_owner", events)
         self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
         self.assertEqual("running", operation.status)
 
@@ -11009,7 +11009,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertTrue(changed)
         self.assertEqual("pending", task.status)
         self.assertEqual(["t1"], queued)
-        self.assertIn("task_row_owner_released_without_local_runtime", events)
+        self.assertIn("task_runtime_released_without_local_owner", events)
         self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
         self.assertEqual([], cleared_leases)
 
@@ -11050,7 +11050,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertTrue(changed)
         self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
         self.assertEqual(["t1"], queued)
-        self.assertIn("task_row_owner_released_without_local_runtime", events)
+        self.assertIn("task_runtime_released_without_local_owner", events)
         self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
         self.assertEqual([], cleared_leases)
 
@@ -11102,9 +11102,9 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
         self.assertEqual([], queued)
         self.assertIn("control_operation_reclaim_deferred_for_supported_runtime", events)
-        self.assertNotIn("task_row_owner_released_without_local_runtime", events)
+        self.assertNotIn("task_runtime_released_without_local_owner", events)
 
-    def test_task_row_owner_is_runtime_supported_accepts_active_delete_with_runtime_lease(self):
+    def test_task_has_supported_runtime_owner_accepts_active_delete_with_runtime_lease(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -11142,7 +11142,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease])
         self.manager.instance_id = "local-worker"
-        supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        supported = self.manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
         self.assertTrue(supported)
 
@@ -11174,7 +11174,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         self.assertFalse(active)
 
-    def test_task_row_owner_is_runtime_supported_rejects_active_operation_without_owner_support(self):
+    def test_task_has_supported_runtime_owner_rejects_active_operation_without_owner_support(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -11198,11 +11198,11 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
         self.manager.instance_id = "new-worker"
 
-        supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        supported = self.manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
         self.assertFalse(supported)
 
-    def test_task_row_owner_is_runtime_supported_rejects_pending_active_operation_without_owner(self):
+    def test_task_has_supported_runtime_owner_rejects_pending_active_operation_without_owner(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -11226,11 +11226,11 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
 
-        supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        supported = self.manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
         self.assertFalse(supported)
 
-    def test_task_row_owner_is_runtime_supported_rejects_running_task_without_owner_lease_or_local_handle(self):
+    def test_task_has_supported_runtime_owner_rejects_running_task_without_owner_lease_or_local_handle(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -11245,11 +11245,11 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
-        supported = self.manager._task_row_owner_is_runtime_supported(db, task)
+        supported = self.manager._task_has_supported_runtime_owner(db, task)
 
         self.assertFalse(supported)
 
-    def test_task_row_owner_is_runtime_supported_accepts_active_cancel_finalize_with_runtime_lease(self):
+    def test_task_has_supported_runtime_owner_accepts_active_cancel_finalize_with_runtime_lease(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -11287,7 +11287,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease])
         self.manager.instance_id = "local-worker"
-        supported = self.manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        supported = self.manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
         self.assertTrue(supported)
 
@@ -11343,7 +11343,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         self.assertTrue(active)
 
-    def test_release_unsupported_task_row_owner_noops_when_no_owner_metadata_exists(self):
+    def test_release_task_without_supported_runtime_owner_noops_when_no_owner_metadata_exists(self):
         task = BinarySecurityTask(
             id="t1",
             project_id="p1",
@@ -11372,7 +11372,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.manager._record_event = lambda *args, **kwargs: events.append(args[2])
         self.manager._clear_runtime_lease = lambda db_arg, task_id, owner_instance_id=None: cleared_leases.append((task_id, owner_instance_id))
 
-        changed = self.manager._release_unsupported_task_row_owner(
+        changed = self.manager._release_task_without_supported_runtime_owner(
             db,
             task,
             active_operation=operation,
@@ -11381,7 +11381,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         self.assertTrue(changed)
         self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
-        self.assertIn("task_row_owner_released_without_local_runtime", events)
+        self.assertIn("task_runtime_released_without_local_owner", events)
         self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
         self.assertEqual([], cleared_leases)
 
@@ -27833,8 +27833,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/w",
         )
-        task.dispatch_started_at = _now()
-        task.updated_at = task.dispatch_started_at - timedelta(seconds=360)
+        task.updated_at = _now() - timedelta(seconds=360)
         stage_run = BinarySecurityStageRun(
             id="sr1",
             task_id="task1",
@@ -28037,7 +28036,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 output_root="/o",
                 workspace_root=tmp,
             )
-            task.dispatch_started_at = _now()
             stage_run = BinarySecurityStageRun(
                 id="sr1",
                 task_id="task1",
@@ -28547,7 +28545,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             workspace_root="/w",
         )
 
-        with patch.object(self.manager, "_task_row_owner_is_runtime_supported", return_value=True):
+        with patch.object(self.manager, "_task_has_supported_runtime_owner", return_value=True):
             queue_state, recoverable_reason = self.manager._task_queue_state(
                 task,
                 {"pending_positions": {}, "last_reconcile_at": None},
@@ -28933,7 +28931,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         original_execute_task = self.manager._execute_task
 
         async def fake_execute_task(task_id: str):
-            task.dispatch_started_at = original_token + timedelta(seconds=1)
             raise RuntimeError("stale worker boom")
 
         task_manager_module.get_session_factory = lambda: (lambda: db)
@@ -28999,8 +28996,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             output_root="/o",
             workspace_root="/w",
         )
-        task.dispatch_started_at = _now()
-        task.lease_expires_at = task.dispatch_started_at + timedelta(seconds=30)
         operation = BinarySecurityTaskOperation(
             id="op1",
             task_id=task.id,
@@ -29137,7 +29132,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 return SimpleNamespace(
                     id="task-1",
                     status="running",
-                    dispatcher_instance_id=manager.instance_id,
+                    runtime_lease_owner=manager.instance_id,
                     finished_at=None,
                 )
 
@@ -37089,7 +37084,7 @@ def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, manager._task_runtime_phase(task))
     self.assertEqual(operation.id, task.current_operation_id)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("task_row_owner_released_without_local_runtime", event_types)
+    self.assertIn("task_runtime_released_without_local_owner", event_types)
     self.assertIn("owned_execution_release_reenqueued_for_takeover", event_types)
 
 
@@ -37258,7 +37253,7 @@ def _test_dispatch_task_by_id_keeps_hidden_when_active_delete_queue_operation_ex
     self.assertFalse(any(event.event_type == "stale_delete_queue_hidden_state_cleared" for event in db.events))
 
 
-def _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches(self):
+def _test_task_supported_runtime_owner_keeps_remote_owner_when_active_runtime_lease_matches(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     now_value = _now()
@@ -37292,13 +37287,13 @@ def _test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtim
     )
     db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease])
 
-    supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+    supported = manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
     self.assertTrue(supported)
     self.assertEqual("dispatching", task.status)
 
 
-def _test_task_row_owner_runtime_supported_rejects_recent_remote_dispatch_without_runtime_lease(self):
+def _test_task_supported_runtime_owner_rejects_recent_remote_dispatch_without_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     now_value = _now()
@@ -37316,12 +37311,12 @@ def _test_task_row_owner_runtime_supported_rejects_recent_remote_dispatch_withou
     )
     db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
-    supported = manager._task_row_owner_is_runtime_supported(db, task)
+    supported = manager._task_has_supported_runtime_owner(db, task)
 
     self.assertFalse(supported)
 
 
-def _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease(self):
+def _test_task_supported_runtime_owner_rejects_stale_remote_dispatch_without_runtime_lease(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     now_value = _now()
@@ -37339,12 +37334,12 @@ def _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without
     )
     db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
-    supported = manager._task_row_owner_is_runtime_supported(db, task)
+    supported = manager._task_has_supported_runtime_owner(db, task)
 
     self.assertFalse(supported)
 
 
-def _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel(self):
+def _test_task_supported_runtime_owner_does_not_require_runtime_handle_for_queued_cancel(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
     task = BinarySecurityTask(
@@ -37370,7 +37365,7 @@ def _test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_q
     )
     db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
 
-    supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+    supported = manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
     self.assertFalse(supported)
 
@@ -37990,7 +37985,7 @@ def _test_get_timeline_compresses_repeated_owned_execution_takeover_requeued_eve
     payload = {
         "takeover_action": "requeue_owned_execution",
         "takeover_reason": "refresh_task_status_no_active_owner",
-        "dispatcher_instance_id": "worker-a",
+        "runtime_lease_owner": "worker-a",
         "task_execution_token": "2026-06-13T11:15:13",
     }
     event1 = BinarySecurityEvent(
@@ -38095,7 +38090,7 @@ def _test_record_event_skips_duplicate_owned_execution_takeover_requeued_events(
         payload={
             "takeover_action": "requeue_owned_execution",
             "takeover_reason": "refresh_task_status_no_active_owner",
-            "dispatcher_instance_id": "worker-a",
+            "runtime_lease_owner": "worker-a",
             "task_execution_token": "2026-06-13T11:15:13",
         },
     )
@@ -38112,7 +38107,7 @@ def _test_record_event_skips_duplicate_owned_execution_takeover_requeued_events(
         payload={
             "takeover_action": "requeue_owned_execution",
             "takeover_reason": "refresh_task_status_no_active_owner",
-            "dispatcher_instance_id": "worker-a",
+            "runtime_lease_owner": "worker-a",
             "task_execution_token": "2026-06-13T11:15:13",
         },
     )
@@ -45015,8 +45010,8 @@ TaskManagerTests.test_reset_task_for_hard_restart_preserves_runtime_task_keys = 
 TaskManagerTests.test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key = _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key
 TaskManagerTests.test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks = _test_get_task_detail_falls_back_schedule_user_task_id_for_schedule_dispatch_tasks
 TaskManagerTests.test_get_task_detail_does_not_fallback_schedule_user_task_id_for_non_schedule_tasks = _test_get_task_detail_does_not_fallback_schedule_user_task_id_for_non_schedule_tasks
-TaskManagerTests.test_task_row_owner_runtime_supported_rejects_recent_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_rejects_recent_remote_dispatch_without_runtime_lease
-TaskManagerTests.test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease = _test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease
+TaskManagerTests.test_task_supported_runtime_owner_rejects_recent_remote_dispatch_without_runtime_lease = _test_task_supported_runtime_owner_rejects_recent_remote_dispatch_without_runtime_lease
+TaskManagerTests.test_task_supported_runtime_owner_rejects_stale_remote_dispatch_without_runtime_lease = _test_task_supported_runtime_owner_rejects_stale_remote_dispatch_without_runtime_lease
 TaskManagerTests.test_upsert_runtime_lease_recovers_from_duplicate_insert_race = _test_upsert_runtime_lease_recovers_from_duplicate_insert_race
 TaskManagerTests.test_stage_sequence_uses_pipeline_profile_for_source_kg_scan = _test_stage_sequence_uses_pipeline_profile_for_source_kg_scan
 TaskManagerTests.test_virtual_archive_stage_status_delegates_to_handler = _test_virtual_archive_stage_status_delegates_to_handler

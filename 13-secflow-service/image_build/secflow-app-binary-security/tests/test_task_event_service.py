@@ -100,7 +100,7 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             payload={
                 "takeover_action": "requeue_owned_execution",
                 "takeover_reason": "refresh_task_status_no_active_owner",
-                "dispatcher_instance_id": "worker-a",
+                "runtime_lease_owner": "worker-a",
                 "task_execution_token": "2026-06-13T11:15:13",
             },
         )
@@ -117,7 +117,7 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             payload={
                 "takeover_action": "requeue_owned_execution",
                 "takeover_reason": "refresh_task_status_no_active_owner",
-                "dispatcher_instance_id": "worker-a",
+                "runtime_lease_owner": "worker-a",
                 "task_execution_token": "2026-06-13T11:15:13",
             },
         )

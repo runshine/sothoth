@@ -3145,9 +3145,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         task.status = "failed"
         task.current_stage = "entry_analysis"
         task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
-        task.dispatcher_instance_id = "worker-a"
-        task.dispatch_started_at = now - timedelta(seconds=15)
-        task.lease_expires_at = now + timedelta(minutes=5)
         task.last_error = "entry extraction failed"
         firmware_run = BinarySecurityStageRun(
             id="sr-fw-retry-entry-binary",
@@ -3320,9 +3317,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         task.status = "failed"
         task.current_stage = "entry_analysis"
         task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
-        task.dispatcher_instance_id = "worker-b"
-        task.dispatch_started_at = now - timedelta(seconds=15)
-        task.lease_expires_at = now + timedelta(minutes=5)
         task.last_error = "entry extraction failed"
         firmware_run = BinarySecurityStageRun(
             id="sr-fw-retry-entry-binary-blocked",

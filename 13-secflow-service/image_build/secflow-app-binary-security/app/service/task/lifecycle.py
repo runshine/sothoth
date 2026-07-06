@@ -83,9 +83,9 @@ class TaskLifecycleServiceMixin:
                     },
                 )
                 continue
-            if self._task_row_owner_is_runtime_supported(db, task, active_operation=operation):
+            if self._task_has_supported_runtime_owner(db, task, active_operation=operation):
                 continue
-            released = self._release_unsupported_task_row_owner(
+            released = self._release_task_without_supported_runtime_owner(
                 db,
                 task,
                 active_operation=operation,

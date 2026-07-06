@@ -91,7 +91,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
 
         self.assertTrue(self.manager._can_finalize_requeue_applied_operation_inline(db, task, operation))
 
-    def test_reduce_state_event_does_not_treat_row_mirror_only_owner_as_foreign_owner(self):
+    def test_reduce_state_event_does_not_treat_runtime_lease_only_owner_as_foreign_owner(self):
         task = self._task()
         event = BinarySecurityStateEvent(
             id="evt-1",
@@ -131,7 +131,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         self.assertFalse(bool(payload.get("runtime_lease_active")))
         self.assertIsNone(payload.get("runtime_lease_owner"))
 
-    def test_task_needs_downstream_reconcile_allows_row_mirror_only_running_task(self):
+    def test_task_needs_downstream_reconcile_allows_runtime_lease_only_running_task(self):
         task = self._task(updated_at=_now() - timedelta(minutes=5))
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], stage_items=[])
 
@@ -167,7 +167,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         self.assertEqual(1, reclaimed)
         self.assertEqual("pending", job.archive_status)
 
-    def test_has_task_write_ownership_prefers_runtime_lease_owner_over_row_mirror(self):
+    def test_has_task_write_ownership_prefers_runtime_lease_owner_over_runtime_lease_mirror(self):
         self.manager.instance_id = "worker-live"
         task = self._task()
         lease = BinarySecurityTaskRuntimeLease(
@@ -181,7 +181,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
 
         self.assertTrue(self.manager._has_task_write_ownership(task, db=db))
 
-    def test_ensure_owned_execution_current_prefers_runtime_lease_owner_over_row_mirror(self):
+    def test_ensure_owned_execution_current_prefers_runtime_lease_owner_over_runtime_lease_mirror(self):
         self.manager.instance_id = "worker-live"
         task = self._task()
         lease = BinarySecurityTaskRuntimeLease(
@@ -354,7 +354,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         self.assertEqual("op-delete-active", task.current_operation_id)
         self.assertFalse(any(event.event_type == "stale_delete_queue_hidden_state_cleared" for event in db.events))
 
-    def test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches(self):
+    def test_task_supported_runtime_owner_keeps_remote_owner_when_active_runtime_lease_matches(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"
         now_value = _now()
@@ -388,12 +388,12 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease])
 
-        supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        supported = manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
         self.assertTrue(supported)
         self.assertEqual("dispatching", task.status)
 
-    def test_task_row_owner_runtime_supported_rejects_recent_remote_dispatch_without_runtime_lease(self):
+    def test_task_supported_runtime_owner_rejects_recent_remote_dispatch_without_runtime_lease(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"
         task = BinarySecurityTask(
@@ -410,11 +410,11 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
-        supported = manager._task_row_owner_is_runtime_supported(db, task)
+        supported = manager._task_has_supported_runtime_owner(db, task)
 
         self.assertFalse(supported)
 
-    def test_task_row_owner_runtime_supported_rejects_stale_remote_dispatch_without_runtime_lease(self):
+    def test_task_supported_runtime_owner_rejects_stale_remote_dispatch_without_runtime_lease(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"
         task = BinarySecurityTask(
@@ -431,11 +431,11 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
-        supported = manager._task_row_owner_is_runtime_supported(db, task)
+        supported = manager._task_has_supported_runtime_owner(db, task)
 
         self.assertFalse(supported)
 
-    def test_task_row_owner_runtime_supported_does_not_require_runtime_handle_for_queued_cancel(self):
+    def test_task_supported_runtime_owner_does_not_require_runtime_handle_for_queued_cancel(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"
         task = BinarySecurityTask(
@@ -461,7 +461,7 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[])
 
-        supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        supported = manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
         self.assertFalse(supported)
 

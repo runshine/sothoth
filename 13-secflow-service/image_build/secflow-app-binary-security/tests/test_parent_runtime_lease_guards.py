@@ -17,7 +17,7 @@ from test_task_manager import _AppendingModelAwareDb, _ModelAwareDb
 
 
 class ParentRuntimeLeaseGuardTests(unittest.TestCase):
-    def test_write_task_heartbeat_refreshes_runtime_lease_without_touching_task_row_mirror(self):
+    def test_write_task_heartbeat_refreshes_runtime_lease_without_touching_runtime_lease_mirror(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         now_value = _now()

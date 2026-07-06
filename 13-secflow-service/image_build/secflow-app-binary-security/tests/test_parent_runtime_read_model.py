@@ -17,7 +17,7 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
 
-    def test_task_row_owner_runtime_supported_keeps_remote_owner_when_active_runtime_lease_matches_for_archive_retry(self):
+    def test_task_supported_runtime_owner_keeps_remote_owner_when_active_runtime_lease_matches_for_archive_retry(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"
         now_value = _now()
@@ -51,7 +51,7 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease])
 
-        supported = manager._task_row_owner_is_runtime_supported(db, task, active_operation=operation)
+        supported = manager._task_has_supported_runtime_owner(db, task, active_operation=operation)
 
         self.assertTrue(supported)
 
@@ -98,7 +98,7 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
 
         self.assertTrue(supported)
 
-    def test_task_row_owner_runtime_supported_rejects_stale_owner_without_runtime_lease_outside_running_status(self):
+    def test_task_supported_runtime_owner_rejects_stale_owner_without_runtime_lease_outside_running_status(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"
         task = BinarySecurityTask(
@@ -115,11 +115,11 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
-        supported = manager._task_row_owner_is_runtime_supported(db, task)
+        supported = manager._task_has_supported_runtime_owner(db, task)
 
         self.assertFalse(supported)
 
-    def test_task_row_owner_runtime_supported_rejects_running_task_without_owner_lease_or_local_handle(self):
+    def test_task_supported_runtime_owner_rejects_running_task_without_owner_lease_or_local_handle(self):
         manager = TaskManager()
         manager.instance_id = "local-worker"
         task = BinarySecurityTask(
@@ -136,7 +136,7 @@ class ParentRuntimeReadModelTests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[])
 
-        supported = manager._task_row_owner_is_runtime_supported(db, task)
+        supported = manager._task_has_supported_runtime_owner(db, task)
 
         self.assertFalse(supported)
 

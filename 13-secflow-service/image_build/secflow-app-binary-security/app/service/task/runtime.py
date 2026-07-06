@@ -1280,7 +1280,7 @@ class TaskRuntimeServiceMixin:
                         runtime_lease_owner
                         or str(getattr(task, "current_operation_id", "") or "").strip()
                     ):
-                        released = self._release_unsupported_task_row_owner(
+                        released = self._release_task_without_supported_runtime_owner(
                             db,
                             task,
                             reason="pending_task_not_enqueued_reconcile",
@@ -1423,10 +1423,10 @@ class TaskRuntimeServiceMixin:
                     },
                 )
                 continue
-            if self._task_row_owner_is_runtime_supported(db, task):
+            if self._task_has_supported_runtime_owner(db, task):
                 continue
             if takeover_decision.allow_reenqueue:
-                released = self._release_unsupported_task_row_owner(
+                released = self._release_task_without_supported_runtime_owner(
                     db,
                     task,
                     active_operation=active_delete_operation,
@@ -1740,7 +1740,7 @@ class TaskRuntimeServiceMixin:
         local_handle_done = bool(local_handle.done()) if local_handle is not None else False
         local_handle_cancel_requested = bool(getattr(local_handle, "cancel_requested", False)) if local_handle is not None else False
         same_owner_active_lease = bool(
-            self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
+            self._task_has_supported_runtime_owner(db, task, active_operation=current_operation)
         )
         if owner_guarded_control_operation and same_owner_active_lease:
             if local_handle_present and not local_handle_done and not local_handle_cancel_requested:
@@ -1807,7 +1807,7 @@ class TaskRuntimeServiceMixin:
                     should_requeue=False,
                 )
                 return None
-        if operation_requires_runtime_handle and self._release_unsupported_task_row_owner(
+        if operation_requires_runtime_handle and self._release_task_without_supported_runtime_owner(
             db,
             task,
             active_operation=current_operation,
@@ -1822,12 +1822,12 @@ class TaskRuntimeServiceMixin:
                 current_operation=current_operation,
             )
             return None
-        if owner_guarded_control_operation and not self._task_row_owner_is_runtime_supported(
+        if owner_guarded_control_operation and not self._task_has_supported_runtime_owner(
             db,
             task,
             active_operation=current_operation,
         ):
-            self._release_unsupported_task_row_owner(
+            self._release_task_without_supported_runtime_owner(
                 db,
                 task,
                 active_operation=current_operation,
@@ -1862,7 +1862,7 @@ class TaskRuntimeServiceMixin:
                     str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
                     runtime_lease_owner,
                 )
-            if operation_requires_runtime_handle and not self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation):
+            if operation_requires_runtime_handle and not self._task_has_supported_runtime_owner(db, task, active_operation=current_operation):
                 task_manager_module.logger.warning(
                     "binary-security dispatch observed active owner inbox work but task row owner is unsupported and will be reclaimed: "
                     "task_id=%s status=%s runtime_phase=%s current_operation_id=%s operation_status=%s runtime_lease_owner=%s",
@@ -1873,7 +1873,7 @@ class TaskRuntimeServiceMixin:
                     str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
                     runtime_lease_owner,
                 )
-                if self._release_unsupported_task_row_owner(
+                if self._release_task_without_supported_runtime_owner(
                     db,
                     task,
                     active_operation=current_operation,
@@ -1890,7 +1890,7 @@ class TaskRuntimeServiceMixin:
                     return None
         if (
             current_status != "pending"
-            and self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation)
+            and self._task_has_supported_runtime_owner(db, task, active_operation=current_operation)
             and not owner_guarded_control_operation
         ):
             self._log_dispatch_claim_blocked(
@@ -1914,7 +1914,7 @@ class TaskRuntimeServiceMixin:
                 active_operation=current_operation,
             )
         if has_active_operation and not operation_allows_runtime_resume:
-            if self._task_row_owner_is_runtime_supported(db, task, active_operation=current_operation):
+            if self._task_has_supported_runtime_owner(db, task, active_operation=current_operation):
                 self._log_dispatch_claim_blocked(
                     task_id,
                     reason="active_operation_blocks_runtime_resume_but_same_owner_supported",
@@ -1996,7 +1996,7 @@ class TaskRuntimeServiceMixin:
                 return None
             if nonpending_takeover_decision.allow_claim:
                 previous_runtime_lease_owner = nonpending_takeover_decision.runtime_lease_owner
-                released = self._release_unsupported_task_row_owner(
+                released = self._release_task_without_supported_runtime_owner(
                     db,
                     task,
                     active_operation=current_operation,
@@ -3048,7 +3048,7 @@ class TaskRuntimeServiceMixin:
                 task,
                 "task_dispatched",
                 f"任务由实例 {self.instance_id} 启动执行",
-                payload={"dispatcher_instance_id": self.instance_id},
+                payload={"runtime_lease_owner": self.instance_id},
             )
             async with self._worker_lock:
                 handle = self._workers.get(task.id)
@@ -3075,7 +3075,7 @@ class TaskRuntimeServiceMixin:
                     "新的 worker 已接管流式尾段父任务，继续执行下游状态对账与阶段收口",
                     stage_name=active_stage_name or task.current_stage,
                     payload={
-                        "dispatcher_instance_id": self.instance_id,
+                        "runtime_lease_owner": self.instance_id,
                         "active_stage_name": active_stage_name or task.current_stage,
                         "active_item_count": active_item_count,
                         "has_downstream_refs": has_downstream_refs,
@@ -3200,7 +3200,7 @@ class TaskRuntimeServiceMixin:
                                 "runtime_transition_guard_cleared",
                                 "阶段切换保护窗口已在权威阶段上下文建立后关闭",
                                 stage_name=task_after_execute.current_stage,
-                                payload={"dispatcher_instance_id": self.instance_id},
+                                payload={"runtime_lease_owner": self.instance_id},
                             )
                             runtime_db.commit()
                         should_remain_active = True
@@ -3242,7 +3242,7 @@ class TaskRuntimeServiceMixin:
                                 "runtime_transition_guard_cleared",
                                 "阶段切换保护窗口已在权威阶段上下文建立后关闭",
                                 stage_name=task_after_signals.current_stage,
-                                payload={"dispatcher_instance_id": self.instance_id},
+                                payload={"runtime_lease_owner": self.instance_id},
                             )
                             runtime_db.commit()
                         continue
@@ -3325,7 +3325,7 @@ class TaskRuntimeServiceMixin:
                         reason="dispatching_active_commit_failed_without_runtime_lease",
                         message="owner active commit 失败，任务已重新排队等待新的 worker 接管",
                         event_payload={
-                            "dispatcher_instance_id": self.instance_id,
+                            "runtime_lease_owner": self.instance_id,
                             "execution_token": execution_token,
                             "error": str(exc),
                         },
@@ -3345,7 +3345,7 @@ class TaskRuntimeServiceMixin:
                     db,
                     task,
                     error_message=str(exc),
-                    dispatcher_instance_id=self.instance_id,
+                    runtime_lease_owner=self.instance_id,
                     execution_token=execution_token or current_token,
                     state_event_id=None,
                     source_event_type="runtime_worker_exception",
@@ -3375,7 +3375,7 @@ class TaskRuntimeServiceMixin:
                 if (
                     task is not None
                     and not has_local_runtime_holder
-                    and self._task_row_owner_is_runtime_supported(cleanup_db, task)
+                    and self._task_has_supported_runtime_owner(cleanup_db, task)
                     and str(task.status or "").strip().lower() not in task_manager_module.TASK_TERMINAL_STATUSES
                 ):
                     active_operation = self._task_active_operation(cleanup_db, task)

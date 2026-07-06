@@ -1371,7 +1371,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             return None
 
         self.manager.instance_id = "worker-b"
-        self.manager._release_unsupported_task_row_owner = _release
+        self.manager._release_task_without_supported_runtime_owner = _release
         self.manager._prepare_delete_task = _prepare
 
         await self.manager._consume_delete_queue_task(db, task.id)
@@ -1414,7 +1414,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1478,7 +1478,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1672,7 +1672,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1718,7 +1718,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1771,7 +1771,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             calls.append(("orphan_reconcile", None))
             return 1
 
-        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
 
         with (
@@ -1814,7 +1814,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 del _queue_key
                 return {}
 
-        self.manager._task_row_owner_is_runtime_supported = lambda *_args, **_kwargs: False
+        self.manager._task_has_supported_runtime_owner = lambda *_args, **_kwargs: False
         self.manager._last_queue_reconcile_at = None
 
         with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
@@ -1857,7 +1857,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
-            patch.object(self.manager, "_task_row_owner_is_runtime_supported", return_value=True),
+            patch.object(self.manager, "_task_has_supported_runtime_owner", return_value=True),
         ):
             await self.manager._reconcile_work_queues(db)
 
@@ -1907,7 +1907,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
                 "_task_queue_state",
                 return_value=("pending_owner_mismatch", "pending_task_already_has_active_owner_runtime"),
             ),
-            patch.object(self.manager, "_task_row_owner_is_runtime_supported", return_value=False),
+            patch.object(self.manager, "_task_has_supported_runtime_owner", return_value=False),
             patch.object(self.manager, "_task_has_healthy_active_owner_runtime", return_value=True),
         ):
             await self.manager._reconcile_work_queues_once(db)
@@ -1953,8 +1953,6 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         def _release(_db, _task, *, active_operation=None, reason):
             del _db, active_operation
             release_calls.append(reason)
-            _task.dispatcher_instance_id = None
-            _task.lease_expires_at = None
             _task.current_operation_id = None
             return True
 
@@ -1963,7 +1961,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
             patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
-            patch.object(self.manager, "_release_unsupported_task_row_owner", side_effect=_release),
+            patch.object(self.manager, "_release_task_without_supported_runtime_owner", side_effect=_release),
             patch.object(self.manager, "_queue_reconcile_task_rows", return_value=[task]),
             patch.object(self.manager, "_queue_reconcile_operation_rows", return_value=[]),
             patch.object(self.manager, "_ensure_delete_queue_signal", AsyncMock(return_value=False)),

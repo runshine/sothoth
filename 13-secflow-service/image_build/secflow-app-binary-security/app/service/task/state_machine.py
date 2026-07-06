@@ -3562,7 +3562,7 @@ class TaskStateMachineMixin:
             )
             return True
         if active_operation is not None:
-            if self._release_unsupported_task_row_owner(
+            if self._release_task_without_supported_runtime_owner(
                 db,
                 task,
                 active_operation=active_operation,

@@ -49,7 +49,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertTrue(snapshot.runtime_lease_active)
         self.assertEqual("worker-live", snapshot.runtime_lease_owner)
 
-    def test_release_unsupported_task_row_owner_keeps_running_task_when_runtime_lease_active(self):
+    def test_release_task_without_supported_runtime_owner_keeps_running_task_when_runtime_lease_active(self):
         task = self._task()
         lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -58,7 +58,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
 
-        changed = self.manager._release_unsupported_task_row_owner(
+        changed = self.manager._release_task_without_supported_runtime_owner(
             db,
             task,
             reason="unit_test_runtime_lease_active",
@@ -180,7 +180,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertEqual("dispatching", task.status)
         self.assertEqual("local-worker", db.runtime_leases[0].owner_instance_id)
 
-    def test_release_unsupported_task_row_owner_suppresses_release_without_expired_runtime_lease(self):
+    def test_release_task_without_supported_runtime_owner_suppresses_release_without_expired_runtime_lease(self):
         self.manager.instance_id = "local-worker"
         task = self._task(
             id="task-release-owner-repair-op",
@@ -210,7 +210,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         )
         db = _ModelAwareDb(tasks=[task], operations=[older, newer], runtime_leases=[], events=[])
 
-        released = self.manager._release_unsupported_task_row_owner(
+        released = self.manager._release_task_without_supported_runtime_owner(
             db,
             task,
             active_operation=older,
@@ -223,7 +223,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertEqual("superseded", older.status)
         self.assertTrue(any(event.event_type == "owned_execution_release_reenqueued_for_takeover" for event in db.events))
 
-    def test_release_unsupported_task_row_owner_suppresses_release_with_active_runtime_lease_mismatch(self):
+    def test_release_task_without_supported_runtime_owner_suppresses_release_with_active_runtime_lease_mismatch(self):
         self.manager.instance_id = "local-worker"
         task = self._task(
             id="task-release-owner-active-runtime",
@@ -238,7 +238,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         )
         db = _ModelAwareDb(tasks=[task], operations=[], runtime_leases=[runtime_lease], events=[])
 
-        released = self.manager._release_unsupported_task_row_owner(
+        released = self.manager._release_task_without_supported_runtime_owner(
             db,
             task,
             reason="unit_test_active_runtime_lease_mismatch",
@@ -297,7 +297,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertEqual("pending", task.status)
         self.assertTrue(any(event.event_type == "parent_runtime_reopen_allowed_after_lease_expiry" for event in db.events))
 
-    def test_release_unsupported_task_row_owner_ignores_expired_runtime_lease(self):
+    def test_release_task_without_supported_runtime_owner_ignores_expired_runtime_lease(self):
         self.manager.instance_id = "worker-new"
         task = self._task(
             id="task-running-release-expired",
@@ -312,7 +312,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[expired_lease], events=[])
 
-        released = self.manager._release_unsupported_task_row_owner(
+        released = self.manager._release_task_without_supported_runtime_owner(
             db,
             task,
             reason="unit_test_release_running_to_pending_after_lease_expiry",
@@ -322,7 +322,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertEqual("pending", task.status)
         self.assertTrue(any(event.event_type == "owned_execution_release_reenqueued_for_takeover" for event in db.events))
 
-    def test_release_unsupported_task_row_owner_ignores_missing_runtime_lease(self):
+    def test_release_task_without_supported_runtime_owner_ignores_missing_runtime_lease(self):
         self.manager.instance_id = "worker-new"
         task = self._task(
             id="task-running-release-missing",
@@ -331,7 +331,7 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
 
-        released = self.manager._release_unsupported_task_row_owner(
+        released = self.manager._release_task_without_supported_runtime_owner(
             db,
             task,
             reason="unit_test_release_running_to_pending_after_lease_missing",

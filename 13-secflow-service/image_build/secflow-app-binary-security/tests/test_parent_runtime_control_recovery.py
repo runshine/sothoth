@@ -152,7 +152,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             events=[],
         )
 
-        released = manager._release_unsupported_task_row_owner(
+        released = manager._release_task_without_supported_runtime_owner(
             db,
             task,
             active_operation=older,

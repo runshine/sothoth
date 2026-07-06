@@ -3444,19 +3444,13 @@ class TaskManager(
             return "active_with_runtime_lease"
         return "started_but_not_committed"
 
-    def _local_runtime_handle_protects_dispatching_reclaim(
-        self,
-        task_id: str,
-        *,
-        dispatch_started_at: datetime | None,
-    ) -> bool:
+    def _local_runtime_handle_protects_dispatching_reclaim(self, task_id: str) -> bool:
         handle = self._workers.get(str(task_id or "").strip())
         if handle is None or handle.done() or handle.cancel_requested:
             return False
         if handle.active_commit_succeeded and handle.lease_established:
             return True
-        reference_time = dispatch_started_at or handle.claimed_at
-        elapsed_seconds = _elapsed_seconds_since(reference_time)
+        elapsed_seconds = _elapsed_seconds_since(handle.claimed_at)
         startup_window_seconds = max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
         return elapsed_seconds is not None and elapsed_seconds <= startup_window_seconds
 
@@ -3671,17 +3665,7 @@ class TaskManager(
         finally:
             session.close()
 
-    def _task_row_owner_is_supported_locally(
-        self,
-        task: BinarySecurityTask | None,
-        *,
-        active_operation=None,
-    ) -> bool:
-        if task is None:
-            return False
-        return self._task_owner_runtime_supported_locally(task, active_operation=active_operation)
-
-    def _task_row_owner_is_runtime_supported(
+    def _task_has_supported_runtime_owner(
         self,
         db: Session,
         task: BinarySecurityTask | None,
@@ -3784,7 +3768,7 @@ class TaskManager(
             return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING} or bool(force)
         return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING, "failed"} or bool(force)
 
-    def _release_unsupported_task_row_owner(
+    def _release_task_without_supported_runtime_owner(
         self,
         db: Session,
         task: BinarySecurityTask,
@@ -3812,7 +3796,7 @@ class TaskManager(
                 },
             )
             return False
-        if self._task_row_owner_is_runtime_supported(db, task, active_operation=active_operation):
+        if self._task_has_supported_runtime_owner(db, task, active_operation=active_operation):
             return False
         if guard.preserve:
             self._record_event(
@@ -3847,7 +3831,7 @@ class TaskManager(
                 db,
                 task,
                 source="task_manager",
-                reason="检测到任务 owner 元数据漂移，已释放 owner 并回到可重新调度态等待新实例接管",
+                reason="检测到任务已无可用 runtime owner，已释放 owner 并回到可重新调度态等待新实例接管",
                 status="pending",
                 stage_name=task.current_stage,
                 finished_at=None,
@@ -3858,7 +3842,7 @@ class TaskManager(
                 db,
                 task,
                 source="task_manager",
-                reason="任务取消中但 owner 元数据漂移，保留取消状态并释放 owner",
+                reason="任务取消中但已无可用 runtime owner，保留取消状态并释放 owner",
                 status=TASK_STATUS_CANCELLING,
                 stage_name=task.current_stage,
                 finished_at=None,
@@ -3899,8 +3883,8 @@ class TaskManager(
         self._record_event(
             db,
             task,
-            "task_row_owner_released_without_local_runtime",
-            "检测到任务 owner 元数据漂移，但当前 Pod 没有本地执行句柄，已释放 owner 并等待重新调度",
+            "task_runtime_released_without_local_owner",
+            "检测到任务已无可用 runtime owner，但当前 Pod 没有本地执行句柄，已释放 owner 并等待重新调度",
             level="warning",
             stage_name=task.current_stage,
             payload={

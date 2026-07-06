@@ -39,7 +39,7 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
         data.update(overrides)
         return BinarySecurityTask(**data)
 
-    def test_live_runtime_lease_row_mirror_drift_e2e(self):
+    def test_live_runtime_lease_runtime_lease_drift_e2e(self):
         manager = TaskManager()
         manager.instance_id = "worker-b"
         task = self._task()
@@ -50,15 +50,15 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
 
-        released = manager._release_unsupported_task_row_owner(
+        released = manager._release_task_without_supported_runtime_owner(
             db,
             task,
-            reason="row_mirror_drift_e2e",
+            reason="runtime_lease_drift_e2e",
         )
         repaired = manager._repair_running_lease_invariant(
             db,
             task,
-            reason="row_mirror_drift_e2e",
+            reason="runtime_lease_drift_e2e",
         )
 
         self.assertFalse(released)
