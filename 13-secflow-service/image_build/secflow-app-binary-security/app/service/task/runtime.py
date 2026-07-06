@@ -1888,17 +1888,21 @@ class TaskRuntimeServiceMixin:
             try:
                 with task_manager_module.observe_scheduler_loop("stage_item_dispatch"):
                     self._mark_loop_heartbeat("stage_item_dispatch")
-                    claimed_ids = self._claim_streaming_stage_items(db)
-                    if claimed_ids:
+                    available_slots = self._available_stage_item_worker_slots()
+                    claimed_by_task = self._claim_streaming_stage_items(db, max_task_batches=available_slots)
+                    if claimed_by_task:
                         async with self._stage_item_worker_lock:
-                            for item_id in claimed_ids:
-                                existing = self._stage_item_workers.get(item_id)
-                                if existing is not None and not existing.done():
+                            for claimed_task_id, item_ids in claimed_by_task.items():
+                                existing_batch = self._stage_item_batch_workers.get(claimed_task_id)
+                                if existing_batch is not None and not existing_batch.done():
                                     continue
-                                self._stage_item_workers[item_id] = asyncio.create_task(
-                                    self._run_stage_item_by_id(item_id),
-                                    name=f"binary-security-stage-item-{item_id}",
+                                batch_task = asyncio.create_task(
+                                    self._run_stage_item_batch(claimed_task_id, item_ids),
+                                    name=f"binary-security-stage-item-batch-{claimed_task_id}",
                                 )
+                                self._stage_item_batch_workers[claimed_task_id] = batch_task
+                                for item_id in item_ids:
+                                    self._stage_item_workers[item_id] = batch_task
                     await self._observe_runtime_metrics(db)
                     self._mark_loop_heartbeat("stage_item_dispatch")
             except asyncio.CancelledError:
@@ -1911,6 +1915,26 @@ class TaskRuntimeServiceMixin:
                 with suppress(Exception):
                     db.close()
             await asyncio.sleep(max(1, int(self.cfg.scheduler.stage_poll_interval_seconds or 5)))
+
+    def _available_stage_item_worker_slots(self: TaskManager) -> int:
+        active_workers = sum(
+            1
+            for worker in self._stage_item_batch_workers.values()
+            if worker is not None and not worker.done()
+        )
+        return max(0, int(self._max_stage_item_worker_count) - active_workers)
+
+    async def _run_stage_item_batch(self: TaskManager, task_id: str, item_ids: list[str]) -> None:
+        try:
+            for item_id in item_ids:
+                await self._run_stage_item_by_id(item_id)
+        finally:
+            async with self._stage_item_worker_lock:
+                self._stage_item_batch_workers.pop(task_id, None)
+                for item_id in item_ids:
+                    current = self._stage_item_workers.get(item_id)
+                    if current is not None and current.done():
+                        self._stage_item_workers.pop(item_id, None)
 
     def _dispatch_once(self: TaskManager, db: Session) -> list[str]:
         (
@@ -2679,10 +2703,15 @@ class TaskRuntimeServiceMixin:
         )
         return None
 
-    def _claim_streaming_stage_items(self: TaskManager, db: Session) -> list[str]:
+    def _claim_streaming_stage_items(
+        self: TaskManager,
+        db: Session,
+        *,
+        max_task_batches: int | None = None,
+    ) -> dict[str, list[str]]:
         from app.service import task_manager as task_manager_module
 
-        claimed_ids: list[str] = []
+        claimed_ids_by_task: dict[str, list[str]] = {}
         claimed_counts_by_stage: dict[tuple[str, str], int] = {}
         local_owner = str(self.instance_id or "").strip()
         owned_task_ids = [
@@ -2693,7 +2722,7 @@ class TaskRuntimeServiceMixin:
         ]
         owned_task_ids = [task_id for task_id in owned_task_ids if task_id]
         if not owned_task_ids:
-            return []
+            return {}
         pending_items = (
             db.query(task_manager_module.BinarySecurityStageItem)
             .filter(
@@ -2707,7 +2736,17 @@ class TaskRuntimeServiceMixin:
             )
             .all()
         )
+        claimed_task_ids: set[str] = set()
+        claimed_task_batches = 0
         for item in pending_items:
+            normalized_task_id = str(getattr(item, "task_id", "") or "").strip()
+            if (
+                max_task_batches is not None
+                and max_task_batches > 0
+                and normalized_task_id not in claimed_task_ids
+                and claimed_task_batches >= max_task_batches
+            ):
+                continue
             try:
                 task = db.query(task_manager_module.BinarySecurityTask).filter(
                     task_manager_module.BinarySecurityTask.id == item.task_id
@@ -2801,9 +2840,12 @@ class TaskRuntimeServiceMixin:
                 )
                 continue
             if updated:
-                claimed_ids.append(item.id)
+                if normalized_task_id and normalized_task_id not in claimed_task_ids:
+                    claimed_task_ids.add(normalized_task_id)
+                    claimed_task_batches += 1
+                claimed_ids_by_task.setdefault(normalized_task_id, []).append(item.id)
                 claimed_counts_by_stage[throttle_key] = claimed_counts_by_stage.get(throttle_key, 0) + 1
-        if claimed_ids:
+        if claimed_ids_by_task:
             try:
                 db.commit()
             except OperationalError as exc:
@@ -2811,11 +2853,11 @@ class TaskRuntimeServiceMixin:
                     raise
                 db.rollback()
                 task_manager_module.logger.warning(
-                    "binary-security streaming stage item claim commit skipped by retryable lock conflict: item_ids=%s",
-                    claimed_ids,
+                    "binary-security streaming stage item claim commit skipped by retryable lock conflict: task_ids=%s",
+                    sorted(claimed_ids_by_task.keys()),
                 )
-                return []
-        return claimed_ids
+                return {}
+        return claimed_ids_by_task
 
     def _requeue_orphaned_owned_execution_locked(self: TaskManager, db: Session) -> bool:
         from app.service import task_manager as task_manager_module
@@ -4280,6 +4322,27 @@ class TaskRuntimeServiceMixin:
                         )
                     recovery_db.commit()
                     if task is not None:
+                        classified_error_type = self._classify_orchestration_error(exc)
+                        if classified_error_type == "db_connection_lost":
+                            self._record_event(
+                                recovery_db,
+                                task,
+                                "streaming_stage_item_db_pool_timeout_requeued",
+                                f"流式阶段子任务命中数据库连接池超限，已退避并重新排队: {item.stage_name}:{item.item_key}",
+                                level="warning",
+                                stage_name=item.stage_name,
+                                item=item,
+                                payload={
+                                    "error": str(exc),
+                                    "error_type": classified_error_type,
+                                    "db_pool_timeout": True,
+                                    "next_retry_at": task_manager_module._isoformat_or_none(
+                                        self._stage_item_next_orchestration_retry_at_value(item)
+                                    ),
+                                    "budget_exhausted": self._stage_item_orchestration_error_budget_exhausted(item),
+                                    "requeued_status": item.status,
+                                },
+                            )
                         self._record_event(
                             recovery_db,
                             task,
@@ -4292,7 +4355,8 @@ class TaskRuntimeServiceMixin:
                                 "error": str(exc),
                                 "retryable_transport": retryable_transport,
                                 "recoverable_orchestration": recoverable,
-                                "error_type": self._classify_orchestration_error(exc),
+                                "error_type": classified_error_type,
+                                "db_pool_timeout": bool(classified_error_type == "db_connection_lost"),
                                 "next_retry_at": task_manager_module._isoformat_or_none(
                                     self._stage_item_next_orchestration_retry_at_value(item)
                                 ),
@@ -4392,6 +4456,20 @@ class TaskRuntimeServiceMixin:
         Path = task_manager_module.Path
 
         session = get_session_factory()()
+        item = None
+        session = self._enable_task_scoped_session_commit_retry(
+            session,
+            task,
+            event_type="task_stage_item_db_pool_timeout_waiting",
+            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
+            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
+            item_getter=lambda: item,
+            extra_payload_getter=lambda: {
+                "batch_writeback": False,
+                "stage_item_runner": "firmware_unpack",
+                "task_id": str(task.id or "").strip() or None,
+            },
+        )
         try:
             firmware_key = input_file["firmware_key"]
             input_path = Path(str(input_file.get("path") or Path(task.workspace_root) / "input" / input_file["filename"]))
@@ -4736,6 +4814,20 @@ class TaskRuntimeServiceMixin:
         )
 
         session = get_session_factory()()
+        item = None
+        session = self._enable_task_scoped_session_commit_retry(
+            session,
+            task,
+            event_type="task_stage_item_db_pool_timeout_waiting",
+            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
+            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
+            item_getter=lambda: item,
+            extra_payload_getter=lambda: {
+                "batch_writeback": False,
+                "stage_item_runner": "system_analysis",
+                "task_id": str(task.id or "").strip() or None,
+            },
+        )
         try:
             item = self._upsert_stage_item(
                 session,
@@ -5004,6 +5096,20 @@ class TaskRuntimeServiceMixin:
         Path = task_manager_module.Path
 
         session = get_session_factory()()
+        item = None
+        session = self._enable_task_scoped_session_commit_retry(
+            session,
+            task,
+            event_type="task_stage_item_db_pool_timeout_waiting",
+            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
+            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
+            item_getter=lambda: item,
+            extra_payload_getter=lambda: {
+                "batch_writeback": False,
+                "stage_item_runner": "binary_to_source",
+                "task_id": str(task.id or "").strip() or None,
+            },
+        )
         try:
             entry_input = self._normalize_entry_analysis_module_input(task, module)
             item = self._upsert_stage_item(
@@ -5344,6 +5450,20 @@ class TaskRuntimeServiceMixin:
         )
 
         session = get_session_factory()()
+        item = None
+        session = self._enable_task_scoped_session_commit_retry(
+            session,
+            task,
+            event_type="task_stage_item_db_pool_timeout_waiting",
+            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
+            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
+            item_getter=lambda: item,
+            extra_payload_getter=lambda: {
+                "batch_writeback": False,
+                "stage_item_runner": "entry_analysis",
+                "task_id": str(task.id or "").strip() or None,
+            },
+        )
         try:
             entry_input = self._normalize_entry_analysis_module_input(task, module)
             item = self._upsert_stage_item(
@@ -5638,6 +5758,20 @@ class TaskRuntimeServiceMixin:
         )
 
         session = get_session_factory()()
+        item = None
+        session = self._enable_task_scoped_session_commit_retry(
+            session,
+            task,
+            event_type="task_stage_item_db_pool_timeout_waiting",
+            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
+            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
+            item_getter=lambda: item,
+            extra_payload_getter=lambda: {
+                "batch_writeback": False,
+                "stage_item_runner": "dataflow_vuln_scan",
+                "task_id": str(task.id or "").strip() or None,
+            },
+        )
         try:
             try:
                 entry = self._validate_entry_output_contract(entry)

@@ -1067,7 +1067,17 @@ class TaskReadModelServiceMixin:
             if summary_key == "vuln_results":
                 next_summary["dataflow_results"] = list(normalized_success)
             task.summary = next_summary
-            db.commit()
+            self._commit_with_db_pool_retry_forever(
+                db,
+                task,
+                event_type="task_batch_stage_writeback_db_pool_timeout_waiting",
+                message="单任务阶段批量写回命中数据库连接池超限，已等待并退避后重试",
+                extra_payload={
+                    "batch_writeback": True,
+                    "summary_key": summary_key,
+                    "aggregate_status": "archive_blocked",
+                },
+            )
             return "success", summary
         failed_all = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "failed"]
         downstream_missing_all = [self._lightweight_stage_failure(result) for result in results if result.get("status") == "downstream_missing"]
@@ -1134,7 +1144,17 @@ class TaskReadModelServiceMixin:
         if summary_key == "vuln_results":
             next_summary["dataflow_results"] = list(normalized_success)
         task.summary = next_summary
-        db.commit()
+        self._commit_with_db_pool_retry_forever(
+            db,
+            task,
+            event_type="task_batch_stage_writeback_db_pool_timeout_waiting",
+            message="单任务阶段批量写回命中数据库连接池超限，已等待并退避后重试",
+            extra_payload={
+                "batch_writeback": True,
+                "summary_key": summary_key,
+                "aggregate_status": status,
+            },
+        )
         return status, summary
 
     def _compact_stage_success_items(self: TaskManager, summary_key: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:

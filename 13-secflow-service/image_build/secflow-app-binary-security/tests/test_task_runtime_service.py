@@ -156,7 +156,7 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
 
         claimed = self.manager._claim_streaming_stage_items(db)
 
-        self.assertEqual(["si-entry"], claimed)
+        self.assertEqual({"t1": ["si-entry"]}, claimed)
         self.assertEqual("dispatching", item.status)
 
     def test_run_b2s_item_success_keeps_entry_descriptor_contract_compatible(self):

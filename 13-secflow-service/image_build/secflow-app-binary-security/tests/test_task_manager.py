@@ -3835,7 +3835,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
 
         claimed = self.manager._claim_streaming_stage_items(db)
 
-        self.assertEqual(["si-entry"], claimed)
+        self.assertEqual({"t1": ["si-entry"]}, claimed)
         self.assertEqual("dispatching", item.status)
         self.assertIsNotNone(item.started_at)
 
@@ -3879,7 +3879,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
 
         claimed = self.manager._claim_streaming_stage_items(db)
 
-        self.assertEqual(["si-vuln"], claimed)
+        self.assertEqual({"t1": ["si-vuln"]}, claimed)
         self.assertEqual("dispatching", item.status)
         self.assertIsNotNone(item.started_at)
 
@@ -3923,7 +3923,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
 
         claimed = self.manager._claim_streaming_stage_items(db)
 
-        self.assertEqual([], claimed)
+        self.assertEqual({}, claimed)
         self.assertEqual("pending", item.status)
         self.assertEqual([], db.events)
 
@@ -3981,7 +3981,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
 
         claimed = self.manager._claim_streaming_stage_items(db)
 
-        self.assertEqual([], claimed)
+        self.assertEqual({}, claimed)
         self.assertEqual([], [event for event in db.added if isinstance(event, BinarySecurityEvent)])
         self.assertEqual(["BinarySecurityTaskRuntimeLease"], db.queried_models[:1])
 
@@ -4054,7 +4054,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
 
         claimed = self.manager._claim_streaming_stage_items(db)
 
-        self.assertEqual([], claimed)
+        self.assertEqual({}, claimed)
         self.assertEqual("pending", item.status)
         self.assertGreaterEqual(db.rollback_calls, 1)
 
@@ -9484,6 +9484,61 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         )
         self.assertEqual(1, db.commits)
 
+    def test_aggregate_stage_items_retries_commit_forever_after_db_pool_timeout(self):
+        task = BinarySecurityTask(
+            id="t-batch-writeback",
+            project_id="p1",
+            name="n",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        task.summary = {}
+        db = _FlakyCommitDb(
+            fail_commits=2,
+            error_factory=lambda: task_manager_module.SATimeoutError(
+                "QueuePool limit of size 50 overflow 10 reached, connection timed out, timeout 30.00"
+            ),
+            tasks=[task],
+            events=[],
+        )
+
+        with patch("app.service.task_manager.time.sleep", return_value=None):
+            status, summary = self.manager._aggregate_stage_items(
+                db,
+                task,
+                results=[
+                    {
+                        "status": "success",
+                        "item": {
+                            "firmware_key": "fw1",
+                            "firmware_name": "fw.bin",
+                            "filename": "fw.bin",
+                            "unpacked_root": "/tmp/unpacked",
+                            "source_root": "/tmp/unpacked",
+                            "module_key": "m1",
+                            "module_name": "openssl",
+                            "module_dir": "/tmp/unpacked/modules/openssl",
+                            "source_dir": "/tmp/archive/openssl",
+                        },
+                    },
+                ],
+                summary_key="b2s_results",
+            )
+
+        self.assertEqual("success", status)
+        self.assertEqual(1, summary["success_count"])
+        self.assertGreaterEqual(db.commit_calls, 3)
+        timeout_events = [
+            event for event in db.events
+            if getattr(event, "event_type", None) == "task_batch_stage_writeback_db_pool_timeout_waiting"
+        ]
+        self.assertTrue(timeout_events)
+        self.assertTrue(all(bool(event.payload.get("db_pool_timeout")) for event in timeout_events))
+
     def test_aggregate_stage_items_marks_downstream_missing_as_failed(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="n", status="running", task_type=TASK_TYPE_BINARY, firmware_source="project_filesystem", firmware_path="/fw", output_root="/o", workspace_root="/w")
         task.summary = {}
@@ -12291,7 +12346,40 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         claimed = self.manager._claim_streaming_stage_items(db)
 
-        self.assertEqual(["si-vuln-1"], claimed)
+        self.assertEqual({"t1": ["si-vuln-1"]}, claimed)
+
+    def test_available_stage_item_worker_slots_respects_local_active_workers(self):
+        manager = TaskManager()
+        manager._max_stage_item_worker_count = 2
+
+        async def _pending():
+            await asyncio.sleep(3600)
+
+        async def _done():
+            return None
+
+        async def _assert_slots():
+            pending1 = asyncio.create_task(_pending())
+            pending2 = asyncio.create_task(_pending())
+            finished = asyncio.create_task(_done())
+            await finished
+            manager._stage_item_batch_workers = {
+                "task-1": pending1,
+                "task-2": pending2,
+                "task-3": finished,
+            }
+            try:
+                self.assertEqual(0, manager._available_stage_item_worker_slots())
+                pending2.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pending2
+                self.assertEqual(1, manager._available_stage_item_worker_slots())
+            finally:
+                pending1.cancel()
+                with suppress(asyncio.CancelledError):
+                    await pending1
+
+        asyncio.run(_assert_slots())
 
     def test_update_task_policy_merges_fields_and_records_event(self):
         task = BinarySecurityTask(
@@ -22251,6 +22339,112 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
         self.assertFalse(skipped_events)
 
+    def test_sync_downstream_status_retries_batch_commit_forever_after_db_pool_timeout(self):
+        task = BinarySecurityTask(
+            id="s1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/tmp",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="s1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="s1",
+            project_id="p1",
+            stage_run_id="sr1",
+            stage_name="entry_analysis",
+            item_key="m1",
+            parent_key="source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+            result={
+                "downstream_binding": {
+                    "task_id": "eat_1",
+                    "status": "running",
+                    "bound_at": (_now() - timedelta(hours=2)).isoformat(),
+                },
+                "downstream_status": "running",
+                "sync_observation": {
+                    "sync_status": "synced",
+                    "downstream_status": "running",
+                    "mapped_status": "running",
+                    "last_result": "success",
+                    "last_attempt_at": (_now() - timedelta(hours=1)).isoformat(),
+                },
+            },
+        )
+
+        class _SyncFlakyCommitDb(_AppendingModelAwareDb):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.commit_calls = 0
+
+            def commit(self):
+                self.commit_calls += 1
+                if self.commit_calls <= 2:
+                    raise task_manager_module.SATimeoutError(
+                        "QueuePool limit of size 50 overflow 10 reached, connection timed out, timeout 30.00"
+                    )
+                return None
+
+        db = _SyncFlakyCommitDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_run_task_layer = self.manager._run_task_layer_reconcile_signal
+
+        async def _fetch(_task, _item, _token):
+            return {"status": "success", "parent_stage_item_id": "si1", "task_id": "eat_1"}
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        async def _noop_reconcile(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._run_task_layer_reconcile_signal = _noop_reconcile
+        try:
+            with patch("app.service.task_manager.time.sleep", return_value=None):
+                resp = asyncio.run(
+                    self.manager.sync_downstream_status(
+                        db,
+                        project_id="p1",
+                        task_id="s1",
+                        stage_name="entry_analysis",
+                        apply_state=True,
+                    )
+                )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._run_task_layer_reconcile_signal = original_run_task_layer
+
+        self.assertIsNotNone(resp)
+        self.assertGreaterEqual(db.commit_calls, 3)
+        timeout_events = [
+            event for event in db.events
+            if event.event_type == "task_batch_sync_db_pool_timeout_waiting"
+        ]
+        self.assertTrue(timeout_events)
+        self.assertTrue(all(bool(event.payload.get("db_pool_timeout")) for event in timeout_events))
+
     def test_sync_downstream_status_intermediate_blocked_records_reason_code(self):
         task = BinarySecurityTask(
             id="s1",
@@ -28782,6 +28976,64 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("queued", item.status)
         self.assertIn("temporary downstream error", item.error_message or "")
         self.assertTrue(any(event.event_type == "streaming_stage_item_requeued_after_worker_error" for event in fake_session.events))
+
+    def test_run_stage_item_by_id_requeues_dispatching_item_after_db_pool_timeout(self):
+        task = BinarySecurityTask(
+            id="task-pool-timeout",
+            project_id="p1",
+            name="n",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw.bin",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr-pool-timeout",
+            task_id="task-pool-timeout",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=5,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si-pool-timeout",
+            task_id="task-pool-timeout",
+            project_id="p1",
+            stage_run_id="sr-pool-timeout",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="handle_req",
+            parent_key="module-1",
+            item_identity_key="entry-1::module-1",
+            status="dispatching",
+            downstream_service="dataflow_vuln_scan",
+            input_ref={"entry_key": "entry-1", "module_key": "module-1"},
+        )
+        fake_session = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], events=[])
+
+        async def _raise_pool_timeout(*args, **kwargs):
+            del args, kwargs
+            raise task_manager_module.SATimeoutError("QueuePool limit of size 50 overflow 10 reached, connection timed out, timeout 30.00")
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_ensure_stage_run", return_value=stage_run),
+            patch.object(self.manager, "_run_vuln_item", side_effect=_raise_pool_timeout),
+        ):
+            asyncio.run(self.manager._run_stage_item_by_id("si-pool-timeout"))
+
+        self.assertEqual("queued", item.status)
+        self.assertIn("QueuePool limit", item.error_message or "")
+        event = next(event for event in fake_session.events if event.event_type == "streaming_stage_item_requeued_after_worker_error")
+        self.assertEqual("db_connection_lost", event.payload.get("error_type"))
+        self.assertTrue(bool(event.payload.get("db_pool_timeout")))
+        timeline_event = next(event for event in fake_session.events if event.event_type == "streaming_stage_item_db_pool_timeout_requeued")
+        self.assertTrue(bool(timeline_event.payload.get("db_pool_timeout")))
+        self.assertEqual("queued", timeline_event.payload.get("requeued_status"))
 
     def test_task_queue_state_marks_pending_without_queue_membership(self):
         task = BinarySecurityTask(

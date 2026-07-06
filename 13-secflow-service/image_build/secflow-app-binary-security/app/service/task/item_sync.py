@@ -2899,7 +2899,24 @@ class TaskItemSyncServiceMixin:
                     },
                 )
             await self._write_task_metadata_async(task, Path(task.workspace_root) / "input" / "task-metadata.json", status=task.status)
-        db.commit()
+        self._commit_with_db_pool_retry_forever(
+            db,
+            task,
+            event_type="task_batch_sync_db_pool_timeout_waiting",
+            message="单任务批量同步写回命中数据库连接池超限，已等待并退避后重试",
+            stage_name=stage_name,
+            extra_payload={
+                "batch_writeback": True,
+                "sync_operation": "downstream_status",
+                "touched_stages": sorted(
+                    {
+                        str(current_stage or "").strip()
+                        for current_stage in touched_stages
+                        if str(current_stage or "").strip()
+                    }
+                ),
+            },
+        )
         response_synced_count = synced_count if apply_state else min(synced_count, len(touched_stages))
         return BinarySecurityActionResponse(
             task_id=task.id,

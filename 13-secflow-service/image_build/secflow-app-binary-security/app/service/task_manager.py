@@ -756,6 +756,7 @@ class TaskManager(
         self._workers: dict[str, TaskRuntimeHandle] = {}
         self._operation_workers: dict[str, asyncio.Task] = {}
         self._stage_item_workers: dict[str, asyncio.Task] = {}
+        self._stage_item_batch_workers: dict[str, asyncio.Task] = {}
         self._archive_workers: set[asyncio.Task] = set()
         self._worker_lock = asyncio.Lock()
         self._operation_worker_lock = asyncio.Lock()
@@ -778,6 +779,15 @@ class TaskManager(
         self._lease_watchdog_last_tick_at: datetime | None = None
         self._lease_watchdog_last_success_at: datetime | None = None
         self._lease_watchdog_last_error: str | None = None
+        self._max_stage_item_worker_count = max(
+            1,
+            int(
+                min(
+                    getattr(self.cfg.scheduler, "downstream_action_concurrency", 8) or 8,
+                    getattr(self.cfg.runtime_policy, "max_stage_parallelism", 4) or 4,
+                )
+            ),
+        )
         self._event_loop_lag_monitor_task: asyncio.Task | None = None
         self._event_loop_last_tick_at: datetime | None = None
         self._event_loop_last_lag_seconds: float = 0.0
@@ -6550,6 +6560,166 @@ class TaskManager(
             session.close()
         except Exception:
             logger.debug("binary-security ignored session close failure before async wait", exc_info=True)
+
+    def _is_db_pool_timeout_error(self, exc: Exception) -> bool:
+        if isinstance(exc, SATimeoutError):
+            return True
+        lowered = str(exc or "").strip().lower()
+        return "queuepool limit" in lowered or "connection timed out" in lowered
+
+    def _db_pool_timeout_backoff_seconds(self, attempt: int) -> int:
+        if attempt <= 1:
+            return 1
+        if attempt == 2:
+            return 2
+        if attempt == 3:
+            return 5
+        return 10
+
+    def _record_db_pool_timeout_waiting_event(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        event_type: str,
+        message: str,
+        attempt: int,
+        error: Exception,
+        stage_name: str | None = None,
+        item: BinarySecurityStageItem | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        retry_delay_seconds = self._db_pool_timeout_backoff_seconds(attempt)
+        payload = {
+            "db_pool_timeout": True,
+            "attempt": max(1, int(attempt)),
+            "retry_delay_seconds": retry_delay_seconds,
+            "error_type": self._classify_downstream_sync_error(error),
+            "error": str(error),
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            level="warning",
+            stage_name=stage_name,
+            item=item,
+            payload=payload,
+        )
+
+    def _commit_with_db_pool_retry_forever(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        event_type: str,
+        message: str,
+        stage_name: str | None = None,
+        item: BinarySecurityStageItem | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> None:
+        attempt = 0
+        while True:
+            try:
+                db.commit()
+                return
+            except Exception as exc:
+                if not self._is_db_pool_timeout_error(exc):
+                    raise
+                attempt += 1
+                try:
+                    self._record_db_pool_timeout_waiting_event(
+                        db,
+                        task,
+                        event_type=event_type,
+                        message=message,
+                        attempt=attempt,
+                        error=exc,
+                        stage_name=stage_name,
+                        item=item,
+                        extra_payload=extra_payload,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    try:
+                        self._record_event(
+                            db,
+                            task,
+                            event_type,
+                            message,
+                            level="warning",
+                            stage_name=stage_name,
+                            item=item,
+                            payload={
+                                "db_pool_timeout": True,
+                                "attempt": max(1, int(attempt)),
+                                "retry_delay_seconds": self._db_pool_timeout_backoff_seconds(attempt),
+                                "error_type": self._classify_downstream_sync_error(exc),
+                                "error": str(exc),
+                                **dict(extra_payload or {}),
+                            },
+                        )
+                        db.commit()
+                    except Exception:
+                        db.rollback()
+                time.sleep(self._db_pool_timeout_backoff_seconds(attempt))
+
+    def _enable_task_scoped_session_commit_retry(
+        self,
+        session: Session,
+        task: BinarySecurityTask,
+        *,
+        event_type: str,
+        message: str,
+        stage_name_getter: Callable[[], str | None] | None = None,
+        item_getter: Callable[[], BinarySecurityStageItem | None] | None = None,
+        extra_payload_getter: Callable[[], dict[str, Any] | None] | None = None,
+    ) -> Session:
+        original_commit = getattr(session, "commit", None)
+        if original_commit is None or getattr(session, "_binary_security_commit_retry_wrapped", False):
+            return session
+
+        def _wrapped_commit() -> None:
+            attempt = 0
+            while True:
+                try:
+                    original_commit()
+                    return
+                except Exception as exc:
+                    if not self._is_db_pool_timeout_error(exc):
+                        raise
+                    attempt += 1
+                    current_item = item_getter() if item_getter is not None else None
+                    current_stage_name = (
+                        stage_name_getter()
+                        if stage_name_getter is not None
+                        else str(getattr(current_item, "stage_name", "") or "").strip() or None
+                    )
+                    extra_payload = dict(extra_payload_getter() or {}) if extra_payload_getter is not None else {}
+                    try:
+                        self._record_db_pool_timeout_waiting_event(
+                            session,
+                            task,
+                            event_type=event_type,
+                            message=message,
+                            attempt=attempt,
+                            error=exc,
+                            stage_name=current_stage_name,
+                            item=current_item,
+                            extra_payload=extra_payload,
+                        )
+                        original_commit()
+                    except Exception:
+                        session.rollback()
+                    time.sleep(self._db_pool_timeout_backoff_seconds(attempt))
+
+        session.commit = _wrapped_commit  # type: ignore[method-assign]
+        setattr(session, "_binary_security_commit_retry_wrapped", True)
+        return session
 
     def _module_selection_mode(self, task: BinarySecurityTask) -> str:
         mode = str((task.policy or {}).get("module_selection_mode") or MODULE_SELECTION_MODE_AUTO).strip()
