@@ -1,8 +1,11 @@
 import asyncio
 import json
+import tempfile
 import unittest
 import uuid
-from unittest.mock import patch
+from datetime import timedelta
+from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 from app.exception import NotFoundError
 from app.model import (
@@ -13,6 +16,7 @@ from app.model import (
     BinarySecurityTaskOperation,
     BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    TASK_RUNTIME_PHASE_TERMINAL,
     TASK_TYPE_BINARY,
 )
 from app.service.task_manager import TaskManager, _now
@@ -756,6 +760,101 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual([], self.manager._system_analysis_inputs(task, db=db))
         self.assertEqual([], self.manager._stage_items(db, task.id, "system_analysis"))
         self.assertEqual("firmware_unpack", task.current_stage)
+
+    def test_binary_firmware_workflow_e2e_repairs_firmware_unpack_inputs_from_metadata_before_stage_start(self):
+        with tempfile.TemporaryDirectory(prefix="bs-fw-input-repair-") as tmp:
+            input_dir = Path(tmp) / "input"
+            input_dir.mkdir(parents=True, exist_ok=True)
+            firmware_path = input_dir / "fw.bin"
+            firmware_path.write_bytes(b"binary")
+            (input_dir / "task-metadata.json").write_text(
+                json.dumps(
+                    {
+                        "input_files": [
+                            {
+                                "filename": "fw.bin",
+                                "relative_path": "fw.bin",
+                                "firmware_key": "fw-1",
+                                "path": f"{input_dir}/fw.bin",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            task = _binary_task(
+                summary={
+                    "input_dir": str(input_dir),
+                    "input_manifest_path": str(input_dir / "task-metadata.json"),
+                    "input_files": [],
+                },
+            )
+            task.workspace_root = tmp
+            task.firmware_path = str(input_dir)
+            runtime_lease = BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                owner_instance_id=self.manager.instance_id,
+                lease_expires_at=_now() + timedelta(minutes=5),
+            )
+            db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+
+            async def _noop_write(*_args, **_kwargs):
+                return None
+
+            with (
+                patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+                patch.object(self.manager, "_service_token", return_value=None),
+                patch.object(self.manager, "_bind_execution_token"),
+                patch.object(self.manager, "_stage_sequence_for_task", return_value=["firmware_unpack"]),
+                patch.object(self.manager, "_missing_entry_results_failure_context", return_value=None),
+                patch.object(
+                    self.manager,
+                    "_stage_firmware_unpack",
+                    new=AsyncMock(return_value=("success", {"firmware_unpack_results": [{"firmware_key": "fw-1"}]})),
+                ),
+                patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
+            ):
+                asyncio.run(self.manager._execute_task(task.id))
+
+            self.assertEqual(1, len((task.summary or {}).get("input_files") or []))
+            self.assertEqual("fw.bin", task.summary["input_files"][0]["filename"])
+            self.assertNotEqual("failed", task.status)
+
+    def test_binary_firmware_workflow_e2e_terminalizes_when_firmware_inputs_are_truly_missing(self):
+        with tempfile.TemporaryDirectory(prefix="bs-fw-input-missing-") as tmp:
+            task = _binary_task(
+                summary={
+                    "input_dir": str(Path(tmp) / "input"),
+                    "input_manifest_path": str(Path(tmp) / "input" / "task-metadata.json"),
+                    "input_files": [],
+                },
+            )
+            task.workspace_root = tmp
+            task.firmware_path = str(Path(tmp) / "input")
+            runtime_lease = BinarySecurityTaskRuntimeLease(
+                task_id=task.id,
+                owner_instance_id=self.manager.instance_id,
+                lease_expires_at=_now() + timedelta(minutes=5),
+            )
+            db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+
+            async def _noop_write(*_args, **_kwargs):
+                return None
+
+            with (
+                patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+                patch.object(self.manager, "_service_token", return_value=None),
+                patch.object(self.manager, "_bind_execution_token"),
+                patch.object(self.manager, "_stage_sequence_for_task", return_value=["firmware_unpack"]),
+                patch.object(self.manager, "_missing_entry_results_failure_context", return_value=None),
+                patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
+            ):
+                asyncio.run(self.manager._execute_task(task.id))
+
+            self.assertEqual("failed", task.status)
+            self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+            self.assertEqual("缺少输入文件", task.last_error)
+            self.assertTrue(any(event.event_type == "authoritative_failure_finalize_started" for event in db.events))
 
     def test_binary_firmware_workflow_e2e_binary_to_source_success_without_archive_does_not_start_entry_analysis(self):
         task = _binary_task(summary={"firmware_unpack_results": [{"firmware_key": "fw-1"}]})
