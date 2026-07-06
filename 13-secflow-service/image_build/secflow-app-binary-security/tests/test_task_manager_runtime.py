@@ -1715,6 +1715,56 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("worker-stale", db.runtime_leases[0].owner_instance_id)
         self.assertIn("active_nonpending_takeover_suppressed_active_lease", [row.event_type for row in db.events])
 
+    async def test_reconcile_work_queues_dedupes_repeated_active_nonpending_takeover_suppressed_observation(self):
+        task = BinarySecurityTask(
+            id="task-running-active-lease-dedupe",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("reconcile-active-nonpending-active-lease-dedupe"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        active_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-stale",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=2),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[], runtime_leases=[active_lease])
+
+        class _Queue:
+            async def queue_positions(self, _queue_key, *, context=None):
+                del _queue_key, context
+                return {}
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                raise AssertionError(f"unexpected force_requeue_task {task_id} {context}")
+
+            async def push_task(self, task_id, context=None):
+                raise AssertionError(f"unexpected push_task {task_id} {context}")
+
+            async def cleanup_dedupe_orphans(self, _queue_key):
+                del _queue_key
+                return {}
+
+        self.manager._last_queue_reconcile_at = None
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch.object(self.manager, "reconcile_orphan_parent_tasks_missing_initial_enqueue", AsyncMock(return_value=0)),
+            patch.object(self.manager, "_queue_reconcile_task_rows", return_value=[task]),
+            patch.object(self.manager, "_queue_reconcile_operation_rows", return_value=[]),
+        ):
+            await self.manager._reconcile_work_queues_once(db, now_value=_now())
+            first_event_count = len(db.events)
+            await self.manager._reconcile_work_queues_once(db, now_value=_now() + timedelta(seconds=30))
+
+        self.assertEqual(first_event_count, len(db.events))
+
     async def test_reconcile_work_queues_reenqueues_active_nonpending_when_only_local_handle_alive_but_lease_missing(self):
         task = BinarySecurityTask(
             id="task-running-local-handle-no-lease",

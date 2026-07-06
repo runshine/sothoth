@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 from datetime import timedelta
 from contextlib import suppress
 from typing import TYPE_CHECKING
@@ -1495,6 +1496,41 @@ class TaskRuntimeServiceMixin:
         elapsed = (now_value - self._last_queue_reconcile_at).total_seconds()
         return elapsed >= interval_seconds
 
+    def _should_emit_queue_reconcile_observation(
+        self: TaskManager,
+        *,
+        task_id: str,
+        observation_type: str,
+        signature: dict[str, Any],
+        now_value: datetime | None = None,
+    ) -> bool:
+        from app.service.task import shared as task_shared
+
+        observed_at = now_value or task_shared._now()
+        normalized_task_id = str(task_id or "").strip()
+        normalized_type = str(observation_type or "").strip()
+        if not normalized_task_id or not normalized_type:
+            return True
+        state = getattr(self, "_queue_reconcile_observation_state", None)
+        if not isinstance(state, dict):
+            return True
+        key = (normalized_task_id, normalized_type)
+        normalized_signature = json.dumps(self._normalize_event_payload_value(signature), sort_keys=True, ensure_ascii=True)
+        previous = state.get(key) or {}
+        previous_signature = str(previous.get("signature") or "").strip()
+        previous_emitted_at = previous.get("emitted_at")
+        if normalized_signature != previous_signature:
+            state[key] = {"signature": normalized_signature, "emitted_at": observed_at}
+            return True
+        if previous_emitted_at is None:
+            age_seconds = None
+        else:
+            age_seconds = max(0.0, (observed_at - previous_emitted_at).total_seconds())
+        if age_seconds is None or age_seconds >= 300:
+            state[key] = {"signature": normalized_signature, "emitted_at": observed_at}
+            return True
+        return False
+
     async def _reconcile_work_queues(self: TaskManager, db: Session) -> None:
         from app.service import task_manager as task_manager_module
 
@@ -1726,29 +1762,36 @@ class TaskRuntimeServiceMixin:
                     continue
                 if self._task_has_healthy_active_owner_runtime(db, task):
                     runtime_lease_owner, _runtime_lease_expires_at = self._runtime_lease_log_view(db, task)
-                    task_manager_module.logger.info(
-                        "binary-security queue reconcile suppressed shared-dispatch reenqueue for pending task with active owner: "
-                        "task_id=%s task_status=%s runtime_phase=%s runtime_lease_owner=%s",
-                        normalized_task_id,
-                        current_status,
-                        self._task_runtime_phase(task),
-                        runtime_lease_owner,
-                    )
-                    self._record_event(
-                        db,
-                        task,
-                        "pending_task_shared_dispatch_reenqueue_suppressed_active_owner",
-                        "检测到 pending 任务仍由健康 owner 持有，本次不再注入共享调度队列",
-                        level="info",
-                        stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
-                        payload={
-                            "task_status": current_status,
-                            "runtime_phase": self._task_runtime_phase(task),
-                            "runtime_lease_owner": runtime_lease_owner,
-                            "enqueue_context": "queue_reconcile",
-                            "reason": "pending_task_already_has_active_owner_runtime",
-                        },
-                    )
+                    observation_payload = {
+                        "task_status": current_status,
+                        "runtime_phase": self._task_runtime_phase(task),
+                        "runtime_lease_owner": runtime_lease_owner,
+                        "enqueue_context": "queue_reconcile",
+                        "reason": "pending_task_already_has_active_owner_runtime",
+                    }
+                    if self._should_emit_queue_reconcile_observation(
+                        task_id=normalized_task_id,
+                        observation_type="pending_task_shared_dispatch_reenqueue_suppressed_active_owner",
+                        signature=observation_payload,
+                        now_value=now_value,
+                    ):
+                        task_manager_module.logger.info(
+                            "binary-security queue reconcile suppressed shared-dispatch reenqueue for pending task with active owner: "
+                            "task_id=%s task_status=%s runtime_phase=%s runtime_lease_owner=%s",
+                            normalized_task_id,
+                            current_status,
+                            self._task_runtime_phase(task),
+                            runtime_lease_owner,
+                        )
+                        self._record_event(
+                            db,
+                            task,
+                            "pending_task_shared_dispatch_reenqueue_suppressed_active_owner",
+                            "检测到 pending 任务仍由健康 owner 持有，本次不再注入共享调度队列",
+                            level="info",
+                            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                            payload=observation_payload,
+                        )
                     continue
                 await queue.push_task(normalized_task_id)
                 continue
@@ -1758,31 +1801,38 @@ class TaskRuntimeServiceMixin:
                 active_operation=active_delete_operation,
             )
             if takeover_decision.runtime_lease_active:
-                task_manager_module.logger.info(
-                    "binary-security queue reconcile suppressed stale owner takeover for active non-pending task because runtime lease is still active: "
-                    "task_id=%s task_status=%s runtime_phase=%s runtime_lease_owner=%s",
-                    normalized_task_id,
-                    str(getattr(task, "status", "") or "").strip() or None,
-                    self._task_runtime_phase(task),
-                    takeover_decision.runtime_lease_owner,
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "active_nonpending_takeover_suppressed_active_lease",
-                    "检测到 non-pending 任务的 runtime lease 仍有效，本次不释放 owner 也不重新注入共享调度队列",
-                    level="info",
-                    stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
-                    payload={
-                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
-                        "runtime_phase": self._task_runtime_phase(task),
-                        "runtime_lease_active": takeover_decision.runtime_lease_active,
-                        "runtime_lease_owner": takeover_decision.runtime_lease_owner,
-                        "local_handle_alive": takeover_decision.local_handle_alive,
-                        "reason": takeover_decision.decision_reason,
-                        "enqueue_context": "queue_reconcile",
-                    },
-                )
+                observation_payload = {
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "runtime_lease_active": takeover_decision.runtime_lease_active,
+                    "runtime_lease_owner": takeover_decision.runtime_lease_owner,
+                    "local_handle_alive": takeover_decision.local_handle_alive,
+                    "reason": takeover_decision.decision_reason,
+                    "enqueue_context": "queue_reconcile",
+                }
+                if self._should_emit_queue_reconcile_observation(
+                    task_id=normalized_task_id,
+                    observation_type="active_nonpending_takeover_suppressed_active_lease",
+                    signature=observation_payload,
+                    now_value=now_value,
+                ):
+                    task_manager_module.logger.info(
+                        "binary-security queue reconcile suppressed stale owner takeover for active non-pending task because runtime lease is still active: "
+                        "task_id=%s task_status=%s runtime_phase=%s runtime_lease_owner=%s",
+                        normalized_task_id,
+                        str(getattr(task, "status", "") or "").strip() or None,
+                        self._task_runtime_phase(task),
+                        takeover_decision.runtime_lease_owner,
+                    )
+                    self._record_event(
+                        db,
+                        task,
+                        "active_nonpending_takeover_suppressed_active_lease",
+                        "检测到 non-pending 任务的 runtime lease 仍有效，本次不释放 owner 也不重新注入共享调度队列",
+                        level="info",
+                        stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                        payload=observation_payload,
+                    )
                 continue
             if self._task_has_supported_runtime_owner(db, task):
                 continue
@@ -1903,30 +1953,37 @@ class TaskRuntimeServiceMixin:
                 continue
             if self._task_has_healthy_active_owner_runtime(db, task):
                 runtime_lease_owner, _runtime_lease_expires_at = self._runtime_lease_log_view(db, task)
-                task_manager_module.logger.info(
-                    "binary-security queue reconcile suppressed shared-dispatch wakeup for task with active operation and active owner: "
-                    "task_id=%s task_status=%s runtime_lease_owner=%s current_operation_id=%s",
-                    normalized_task_id,
-                    str(getattr(task, "status", "") or "").strip() or None,
-                    runtime_lease_owner,
-                    current_operation_id,
-                )
-                self._record_event(
-                    db,
-                    task,
-                    "active_operation_shared_dispatch_reenqueue_suppressed_active_owner",
-                    "检测到活跃 operation 仍由健康 owner 推进，本次不再注入共享调度队列",
-                    level="info",
-                    stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
-                    payload={
-                        "task_status": str(getattr(task, "status", "") or "").strip() or None,
-                        "runtime_phase": self._task_runtime_phase(task),
-                        "runtime_lease_owner": runtime_lease_owner,
-                        "current_operation_id": current_operation_id,
-                        "enqueue_context": "queue_reconcile_operation",
-                        "reason": "active_operation_already_has_active_owner_runtime",
-                    },
-                )
+                observation_payload = {
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "runtime_lease_owner": runtime_lease_owner,
+                    "current_operation_id": current_operation_id,
+                    "enqueue_context": "queue_reconcile_operation",
+                    "reason": "active_operation_already_has_active_owner_runtime",
+                }
+                if self._should_emit_queue_reconcile_observation(
+                    task_id=normalized_task_id,
+                    observation_type="active_operation_shared_dispatch_reenqueue_suppressed_active_owner",
+                    signature=observation_payload,
+                    now_value=now_value,
+                ):
+                    task_manager_module.logger.info(
+                        "binary-security queue reconcile suppressed shared-dispatch wakeup for task with active operation and active owner: "
+                        "task_id=%s task_status=%s runtime_lease_owner=%s current_operation_id=%s",
+                        normalized_task_id,
+                        str(getattr(task, "status", "") or "").strip() or None,
+                        runtime_lease_owner,
+                        current_operation_id,
+                    )
+                    self._record_event(
+                        db,
+                        task,
+                        "active_operation_shared_dispatch_reenqueue_suppressed_active_owner",
+                        "检测到活跃 operation 仍由健康 owner 推进，本次不再注入共享调度队列",
+                        level="info",
+                        stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                        payload=observation_payload,
+                    )
                 continue
             await queue.push_task(normalized_task_id)
         await queue.cleanup_dedupe_orphans(self.cfg.queue.task_queue_key)
