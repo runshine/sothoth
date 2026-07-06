@@ -1256,7 +1256,7 @@ class TaskItemSyncServiceMixin:
 
     def _sleep_after_retryable_lock_error(self: TaskManager, attempt: int) -> None:
         attempt_no = max(1, int(attempt))
-        backoff_seconds = {1: 1.0, 2: 3.0, 3: 5.0}.get(attempt_no, 5.0)
+        backoff_seconds = {1: 0.05, 2: 0.1, 3: 0.2}.get(attempt_no, 0.2)
         time.sleep(backoff_seconds)
 
     def _refresh_polled_child_sync_snapshot(

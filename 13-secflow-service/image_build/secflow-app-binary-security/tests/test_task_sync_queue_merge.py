@@ -32,7 +32,7 @@ class TaskSyncQueueMergeTests(unittest.TestCase):
         self.assertEqual(["i1", "i2"], merged["item_ids"])
         self.assertEqual({"a": 1, "b": 2}, merged["payload"])
         self.assertTrue(merged["force"])
-        self.assertEqual(1, merged["attempts"])
+        self.assertEqual(0, merged["attempts"])
         self.assertEqual(40, merged["priority"])
 
 

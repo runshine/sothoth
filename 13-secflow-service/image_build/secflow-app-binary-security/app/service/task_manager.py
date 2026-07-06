@@ -237,6 +237,7 @@ from app.service.llm_gateway import LLMGatewayWorkKeyIssueError, get_llm_gateway
 from app.time_utils import now_local
 
 logger = logging.getLogger(__name__)
+_RUNTIME_FAST_LOCK_WAIT_TIMEOUT_SECONDS = 3
 
 DB_SUMMARY_ITEM_LIMIT = 50
 DB_FAILURE_ITEM_LIMIT = 20
@@ -1777,6 +1778,25 @@ class TaskManager(
         )
         self._lease_watchdog_thread.start()
 
+    def _configure_runtime_session_fast_lock_wait_timeout(
+        self,
+        session: Session | Any | None,
+        *,
+        seconds: int = _RUNTIME_FAST_LOCK_WAIT_TIMEOUT_SECONDS,
+    ) -> None:
+        if session is None:
+            return
+        execute = getattr(session, "execute", None)
+        if not callable(execute):
+            return
+        try:
+            execute(
+                text("SET SESSION innodb_lock_wait_timeout = :seconds"),
+                {"seconds": max(1, int(seconds or _RUNTIME_FAST_LOCK_WAIT_TIMEOUT_SECONDS))},
+            )
+        except Exception:
+            logger.debug("binary-security runtime fast lock timeout setup skipped", exc_info=True)
+
     def _stop_runtime_lease_watchdog(self) -> None:
         self._lease_watchdog_stop_event.set()
         thread = self._lease_watchdog_thread
@@ -1870,6 +1890,7 @@ class TaskManager(
                         continue
                     db = get_session_factory()()
                     try:
+                        self._configure_runtime_session_fast_lock_wait_timeout(db)
                         task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
                         if not self._watchdog_should_keep_runtime_lease(db, task, handle):
                             continue
@@ -2440,6 +2461,7 @@ class TaskManager(
         normalized_task_id = str(task_id or "").strip()
         session = get_session_factory()()
         try:
+            self._configure_runtime_session_fast_lock_wait_timeout(session)
             decision = self._assert_active_runtime_lease_owner(
                 session,
                 normalized_task_id,
@@ -2468,6 +2490,7 @@ class TaskManager(
         )
         db = get_session_factory()()
         try:
+            self._configure_runtime_session_fast_lock_wait_timeout(db)
             task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == normalized_task_id).first()
             if task is not None:
                 self._record_event(
@@ -2567,6 +2590,7 @@ class TaskManager(
         session = get_session_factory()()
         processed = False
         try:
+            self._configure_runtime_session_fast_lock_wait_timeout(session)
             task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
             if task is None:
                 return False
@@ -5681,6 +5705,7 @@ class TaskManager(
         try:
             sync_db = get_session_factory()()
             try:
+                self._configure_runtime_session_fast_lock_wait_timeout(sync_db)
                 if operation == "child_create":
                     self._enqueue_task(task.id)
                 else:

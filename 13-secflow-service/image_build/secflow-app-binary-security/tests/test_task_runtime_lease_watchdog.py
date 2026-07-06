@@ -21,9 +21,14 @@ class _FakeQuery:
 class _FakeSession:
     def __init__(self, task):
         self._task = task
+        self.executed = []
 
     def query(self, *_args, **_kwargs):
         return _FakeQuery(self._task)
+
+    def execute(self, statement, params=None):
+        self.executed.append((str(statement), dict(params or {})))
+        return None
 
     def close(self):
         return None
@@ -62,6 +67,18 @@ class TaskRuntimeLeaseWatchdogTests(unittest.IsolatedAsyncioTestCase):
         manager._lease_watchdog_stop_event.set()
         await asyncio.to_thread(manager._stop_runtime_lease_watchdog)
         self.assertFalse(manager._lease_watchdog_alive())
+
+    async def test_runtime_session_fast_lock_timeout_is_best_effort(self):
+        manager = TaskManager()
+        session = _FakeSession(task=None)
+
+        manager._configure_runtime_session_fast_lock_wait_timeout(session)
+        manager._configure_runtime_session_fast_lock_wait_timeout(object())
+
+        self.assertEqual(1, len(session.executed))
+        statement, params = session.executed[0]
+        self.assertIn("innodb_lock_wait_timeout", statement)
+        self.assertEqual(3, params["seconds"])
 
     async def test_watchdog_refreshes_runtime_lease_without_per_task_heartbeat_write(self):
         manager = TaskManager()

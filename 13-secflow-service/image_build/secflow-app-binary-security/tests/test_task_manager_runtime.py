@@ -445,7 +445,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             firmware_source="project_filesystem",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("run-task-finally-cancels-paired-runtime-companions"),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -485,6 +485,8 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._run_current_task_operation = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
         manager._run_task_runtime_signals = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
         manager._execute_task = lambda *_args, **_kwargs: asyncio.sleep(0)
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_transition_guard_active = lambda *_args, **_kwargs: False
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             with suppress(asyncio.CancelledError):
@@ -2944,7 +2946,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_source="project_filesystem",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("run-task-processes-operation-before-runtime-signals"),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -3004,7 +3006,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_source="project_filesystem",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("run-task-keeps-runtime-alive-for-authoritative-active-stage-context"),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -3077,7 +3079,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_source="project_filesystem",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("run-task-keeps-runtime-alive-for-stage-start-transition-guard"),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,
@@ -3152,7 +3154,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_source="project_filesystem",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=self._workspace_root("run-task-clears-stage-start-transition-guard-only-after-authoritative-context-materializes"),
         )
         runtime_lease = BinarySecurityTaskRuntimeLease(
             task_id=task.id,

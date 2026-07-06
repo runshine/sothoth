@@ -10,6 +10,7 @@ from app.model import (
     BinarySecurityTaskRuntimeLease,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_RUNTIME_PHASE_TERMINAL,
+    TASK_TYPE_SOURCE,
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager
@@ -211,8 +212,9 @@ class TaskStateMachineTests(unittest.TestCase):
             project_id="project-1",
             name="task",
             status="running",
+            task_type=TASK_TYPE_SOURCE,
             current_stage="system_analysis",
-            workspace_root="/tmp/ws",
+            workspace_root="/tmp/test-decide-task-action-after-stage-terminal-keeps-system-analysis-final-when-no-next-stage",
             output_root="/tmp/out",
         )
         db = _ModelAwareDb(tasks=[task])
@@ -435,8 +437,23 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertIn("stage_terminal_waiting_for_archive", event_types)
 
     def test_apply_task_action_after_stage_terminal_activates_streaming_tail(self):
-        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="system_analysis", workspace_root="/tmp/ws", output_root="/tmp/out")
-        db = _ModelAwareDb(tasks=[task])
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="system_analysis",
+            workspace_root="/tmp/test-apply-task-action-after-stage-terminal-activates-streaming-tail",
+            output_root="/tmp/out",
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=1,
+            owner_instance_id="worker-1",
+            heartbeat_at=task_manager_module._now(),
+            lease_expires_at=task_manager_module._now() + task_manager_module.timedelta(seconds=30),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease])
 
         async def _noop_write(*_args, **_kwargs):
             return None
@@ -455,17 +472,7 @@ class TaskStateMachineTests(unittest.TestCase):
             patch.object(self.manager, "_record_event") as record_event,
             patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
             patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=True),
-            patch.object(
-                self.manager,
-                "_maybe_upsert_runtime_lease",
-                return_value=BinarySecurityTaskRuntimeLease(
-                    task_id=task.id,
-                    execution_epoch=1,
-                    owner_instance_id="worker-1",
-                    heartbeat_at=task_manager_module._now(),
-                    lease_expires_at=task_manager_module._now() + task_manager_module.timedelta(seconds=30),
-                ),
-            ),
+            patch.object(self.manager, "_repair_running_lease_invariant") as repair_running_lease_invariant,
         ):
             applied = asyncio.run(
                 self.manager._apply_task_action_after_stage_terminal(
@@ -480,13 +487,22 @@ class TaskStateMachineTests(unittest.TestCase):
             )
 
         self.assertTrue(applied)
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertGreaterEqual(record_event.call_count, 1)
+        repair_running_lease_invariant.assert_not_called()
 
     def test_apply_task_action_after_stage_terminal_blocks_streaming_tail_without_owner(self):
-        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="running", current_stage="system_analysis", workspace_root="/tmp/ws", output_root="/tmp/out")
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="system_analysis",
+            workspace_root="/tmp/test-apply-task-action-after-stage-terminal-blocks-streaming-tail-without-owner",
+            output_root="/tmp/out",
+        )
         db = _ModelAwareDb(tasks=[task])
 
         async def _noop_write(*_args, **_kwargs):
@@ -506,7 +522,7 @@ class TaskStateMachineTests(unittest.TestCase):
             patch.object(self.manager, "_record_event") as record_event,
             patch.object(self.manager, "_write_task_metadata_async", new=_noop_write),
             patch.object(self.manager, "_task_runtime_owner_matches_current_instance", return_value=False),
-            patch.object(self.manager, "_maybe_upsert_runtime_lease", return_value=None) as acquire_lease,
+            patch.object(self.manager, "_repair_running_lease_invariant") as repair_running_lease_invariant,
         ):
             applied = asyncio.run(
                 self.manager._apply_task_action_after_stage_terminal(
@@ -524,7 +540,7 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual("running", task.status)
         self.assertEqual("system_analysis", task.current_stage)
         self.assertNotEqual("tail_reconciliation", task.runtime_phase)
-        self.assertFalse(acquire_lease.called)
+        repair_running_lease_invariant.assert_not_called()
         event_types = [call.args[2] for call in record_event.call_args_list]
         self.assertIn("main_state_write_blocked", event_types)
 
@@ -813,7 +829,14 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertEqual(3, record_event.call_count)
 
     def test_refresh_task_status_after_sync_active_operation_returns_early(self):
-        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="failed", workspace_root="/tmp/ws", output_root="/tmp/out")
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="failed",
+            workspace_root="/tmp/test-refresh-task-status-after-sync-active-operation-returns-early",
+            output_root="/tmp/out",
+        )
         operation = SimpleNamespace(id="op-1", status="running")
         db = _ModelAwareDb(tasks=[task], operations=[operation])
 
@@ -822,6 +845,8 @@ class TaskStateMachineTests(unittest.TestCase):
             patch.object(self.manager, "_ensure_task_remains_cancelling", return_value=None),
             patch.object(self.manager, "_recover_failed_cancelled_task_state", return_value=False),
             patch.object(self.manager, "_active_operation", return_value=operation),
+            patch.object(self.manager, "_release_task_without_supported_runtime_owner", return_value=False),
+            patch.object(self.manager, "_repair_running_lease_invariant", return_value=False),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
@@ -829,7 +854,14 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertIsNone(task.finished_at)
 
     def test_refresh_task_status_after_sync_finalizes_failed_task_without_active_reconcile_items(self):
-        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", status="failed", workspace_root="/tmp/ws", output_root="/tmp/out")
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="failed",
+            workspace_root="/tmp/test-refresh-task-status-after-sync-finalizes-failed-task-without-active-reconcile-items",
+            output_root="/tmp/out",
+        )
         db = _ModelAwareDb(tasks=[task], stage_runs=[])
 
         with (
@@ -1009,7 +1041,7 @@ class TaskStateMachineTests(unittest.TestCase):
             name="task",
             status="cancelled",
             current_stage="entry_analysis",
-            workspace_root="/tmp/ws",
+            workspace_root="/tmp/test-refresh-task-status-after-sync-early-return-terminalizes-cancelled-task-for-owner",
             output_root="/tmp/out",
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
@@ -1030,7 +1062,7 @@ class TaskStateMachineTests(unittest.TestCase):
             status=task_manager_module.TASK_STATUS_CANCEL_FAILED,
             current_stage="entry_analysis",
             last_error="cancel failed",
-            workspace_root="/tmp/ws",
+            workspace_root="/tmp/test-refresh-task-status-after-sync-early-return-terminalizes-cancel-failed-task-for-owner",
             output_root="/tmp/out",
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
@@ -1052,7 +1084,7 @@ class TaskStateMachineTests(unittest.TestCase):
             status="failed",
             current_stage="entry_analysis",
             last_error="boom",
-            workspace_root="/tmp/ws",
+            workspace_root="/tmp/test-refresh-task-status-after-sync-early-return-terminalizes-factless-failed-task-for-owner",
             output_root="/tmp/out",
         )
         db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
