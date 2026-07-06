@@ -151,6 +151,8 @@ class BinarySecurityTask(Base, JsonMixin):
     execution_mode = Column(String(32), nullable=True, index=True)
     target_stage_name = Column(String(64), nullable=True, index=True)
     current_operation_id = Column(String(48), nullable=True, index=True)
+    dispatcher_instance_id = Column(String(128), nullable=True, index=True)
+    dispatch_started_at = Column(DateTime, nullable=True, index=True)
     cleanup_snapshot_json = Column(_mediumtext_type(), nullable=True)
     last_error = Column(Text, nullable=True)
     latest_abnormal_reason_json = Column(_mediumtext_type(), nullable=True)
@@ -778,6 +780,14 @@ def _ensure_compat_columns(engine) -> None:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN current_operation_id VARCHAR(48) NULL"
             )
+        if "dispatcher_instance_id" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN dispatcher_instance_id VARCHAR(128) NULL"
+            )
+        if "dispatch_started_at" not in columns:
+            statements.append(
+                f"ALTER TABLE {task_table} ADD COLUMN dispatch_started_at DATETIME NULL"
+            )
         if "runtime_override_json" not in columns:
             statements.append(
                 f"ALTER TABLE {task_table} ADD COLUMN runtime_override_json TEXT NULL"
@@ -884,6 +894,14 @@ def _ensure_compat_columns(engine) -> None:
         if "ix_bst_operation_lock_expires" not in indexes:
             index_statements.append(
                 f"CREATE INDEX ix_bst_operation_lock_expires ON {task_table} (operation_lock_expires_at)"
+            )
+        if "idx_secflow_binary_security_task_dispatcher_instance_id" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX idx_secflow_binary_security_task_dispatcher_instance_id ON {task_table} (dispatcher_instance_id)"
+            )
+        if "idx_secflow_binary_security_task_dispatch_started_at" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX idx_secflow_binary_security_task_dispatch_started_at ON {task_table} (dispatch_started_at)"
             )
         _execute_compat_statements(index_statements)
     event_table = BinarySecurityEvent.__tablename__

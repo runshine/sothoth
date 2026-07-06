@@ -19847,69 +19847,6 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.assertEqual(self.manager.instance_id, lease.owner_instance_id)
             self.assertIsNotNone(lease.lease_expires_at)
 
-    def test_touch_task_heartbeat_keeps_lease_alive_for_active_streaming_stage_workers(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            started_at = _now() - timedelta(seconds=20)
-            original_expiry = _now() + timedelta(seconds=5)
-            task = BinarySecurityTask(
-                id="task-streaming-heartbeat",
-                project_id="p1",
-                name="n",
-                status="running",
-                task_type=TASK_TYPE_SOURCE,
-                current_stage="dataflow_vuln_scan",
-                firmware_source="project_filesystem",
-                firmware_path="/src",
-                output_root=str(Path(tmp) / "output"),
-                workspace_root=tmp,
-                updated_at=started_at,
-                policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-            )
-            active_item = BinarySecurityStageItem(
-                id="si-df-active",
-                task_id="task-streaming-heartbeat",
-                project_id="p1",
-                stage_run_id="sr-df",
-                stage_name="dataflow_vuln_scan",
-                item_key="entry-a",
-                item_name="func_a",
-                parent_key="mod-a",
-                item_identity_key="entry-a::mod-a",
-                status="running",
-            )
-            runtime_lease = BinarySecurityTaskRuntimeLease(
-                task_id=task.id,
-                execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
-                owner_instance_id=self.manager.instance_id,
-                owner_started_at=started_at,
-                heartbeat_at=started_at,
-                lease_expires_at=original_expiry,
-            )
-            db = _AppendingModelAwareDb(tasks=[task], stage_items=[active_item], runtime_leases=[runtime_lease])
-
-            original_factory = task_manager_module.get_session_factory
-            original_interval = self.manager.cfg.scheduler.heartbeat_update_interval_seconds
-            original_workers = dict(self.manager._workers)
-            original_stage_workers = dict(self.manager._stage_item_workers)
-            task_manager_module.get_session_factory = lambda: (lambda: db)
-            self.manager.cfg.scheduler.heartbeat_update_interval_seconds = 0
-            self.manager._workers.pop(task.id, None)
-
-            loop = asyncio.new_event_loop()
-            try:
-                worker = loop.create_future()
-                self.manager._stage_item_workers[active_item.id] = worker
-                self.manager._touch_task_heartbeat(task.id)
-            finally:
-                task_manager_module.get_session_factory = original_factory
-                self.manager.cfg.scheduler.heartbeat_update_interval_seconds = original_interval
-                self.manager._workers = original_workers
-                self.manager._stage_item_workers = original_stage_workers
-                loop.close()
-
-            self.assertGreater(db.runtime_leases[0].lease_expires_at, original_expiry)
-            self.assertGreater(task.updated_at, started_at)
-
     def test_refresh_stage_run_from_items_preserves_streaming_tail_failed_status_without_items(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -28547,10 +28484,8 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             return None
 
         original_ensure = self.manager._ensure_task_execution_current_async
-        original_touch = self.manager._touch_task_heartbeat_async
         original_cancelled = self.manager._is_task_cancelled_async
         self.manager._ensure_task_execution_current_async = _noop_async
-        self.manager._touch_task_heartbeat_async = _noop_async
         self.manager._is_task_cancelled_async = unittest.mock.AsyncMock(return_value=False)
         try:
             status, payload = asyncio.run(
@@ -28563,7 +28498,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             )
         finally:
             self.manager._ensure_task_execution_current_async = original_ensure
-            self.manager._touch_task_heartbeat_async = original_touch
             self.manager._is_task_cancelled_async = original_cancelled
 
         self.assertEqual("cancelled", status)
@@ -28606,11 +28540,9 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         refresh_mock = unittest.mock.Mock()
         original_ensure = self.manager._ensure_task_execution_current_async
-        original_touch = self.manager._touch_task_heartbeat_async
         original_cancelled = self.manager._is_task_cancelled_async
         original_refresh = self.manager._refresh_polled_child_sync_snapshot
         self.manager._ensure_task_execution_current_async = _noop_async
-        self.manager._touch_task_heartbeat_async = _noop_async
         self.manager._is_task_cancelled_async = unittest.mock.AsyncMock(return_value=False)
         self.manager._refresh_polled_child_sync_snapshot = refresh_mock
         try:
@@ -28626,7 +28558,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
                 )
         finally:
             self.manager._ensure_task_execution_current_async = original_ensure
-            self.manager._touch_task_heartbeat_async = original_touch
             self.manager._is_task_cancelled_async = original_cancelled
             self.manager._refresh_polled_child_sync_snapshot = original_refresh
 
@@ -28658,10 +28589,8 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             return None
 
         original_ensure = self.manager._ensure_task_execution_current_async
-        original_touch = self.manager._touch_task_heartbeat_async
         original_cancelled = self.manager._is_task_cancelled_async
         self.manager._ensure_task_execution_current_async = _noop_async
-        self.manager._touch_task_heartbeat_async = _noop_async
         self.manager._is_task_cancelled_async = unittest.mock.AsyncMock(return_value=False)
         try:
             status, payload = asyncio.run(
@@ -28674,7 +28603,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             )
         finally:
             self.manager._ensure_task_execution_current_async = original_ensure
-            self.manager._touch_task_heartbeat_async = original_touch
             self.manager._is_task_cancelled_async = original_cancelled
 
         self.assertEqual("success", status)
@@ -29331,102 +29259,6 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             )
 
         self.assertEqual([], [event for event in db.added if isinstance(event, BinarySecurityEvent)])
-
-    def test_touch_task_heartbeat_skips_when_local_worker_is_not_active(self):
-        manager = TaskManager()
-        manager._workers = {}
-        manager._last_task_heartbeat_at.pop("task-1", None)
-
-        class _Session:
-            def __init__(self):
-                self.query_called = False
-
-            def query(self, *_args, **_kwargs):
-                self.query_called = True
-                raise AssertionError("query should not be called when worker is inactive")
-
-            def close(self):
-                return None
-
-        session = _Session()
-
-        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: session):
-            manager._touch_task_heartbeat("task-1")
-
-        self.assertFalse(session.query_called)
-        self.assertNotIn("task-1", manager._last_task_heartbeat_at)
-
-    def test_touch_task_heartbeat_rolls_back_when_update_matches_no_rows(self):
-        manager = TaskManager()
-
-        class _Worker:
-            def done(self):
-                return False
-
-        manager._workers = {"task-1": _Worker()}
-        manager._register_task_execution_owner("task-1", "primary_task_worker")
-        manager._last_task_heartbeat_at.pop("task-1", None)
-
-        class _TaskQuery:
-            def filter(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def first(self):
-                return SimpleNamespace(
-                    id="task-1",
-                    status="running",
-                    runtime_lease_owner=manager.instance_id,
-                    finished_at=None,
-                )
-
-            def update(self, *args, **kwargs):
-                del args, kwargs
-                return 0
-
-        class _Query:
-            def filter(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def order_by(self, *args, **kwargs):
-                del args, kwargs
-                return self
-
-            def first(self):
-                return None
-
-            def update(self, *args, **kwargs):
-                del args, kwargs
-                return 0
-
-        class _Session:
-            def __init__(self):
-                self.commit_calls = 0
-                self.rollback_calls = 0
-
-            def query(self, model, *_args, **_kwargs):
-                if getattr(model, "__name__", "") == "BinarySecurityTask":
-                    return _TaskQuery()
-                return _Query()
-
-            def commit(self):
-                self.commit_calls += 1
-
-            def rollback(self):
-                self.rollback_calls += 1
-
-            def close(self):
-                return None
-
-        session = _Session()
-
-        with patch.object(task_manager_module, "get_session_factory", return_value=lambda: session):
-            manager._touch_task_heartbeat("task-1")
-
-        self.assertEqual(0, session.commit_calls)
-        self.assertEqual(1, session.rollback_calls)
-        self.assertNotIn("task-1", manager._last_task_heartbeat_at)
 
     def test_execute_task_failed_stage_does_not_requeue_same_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -39338,7 +39170,6 @@ def _test_sync_downstream_status_requeues_missing_entry_item_for_owned_execution
     self.assertEqual(False, observation.get("budget_exhausted"))
     event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
     self.assertIn("streaming_stage_item_downstream_missing_detected", event_types)
-    self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
 
 
 def _test_sync_downstream_status_does_not_requeue_missing_entry_item_for_non_owner(self):
@@ -39421,7 +39252,6 @@ def _test_sync_downstream_status_does_not_requeue_missing_entry_item_for_non_own
     self.assertEqual("downstream_missing", item.status)
     self.assertEqual("eat-missing-entry", item.downstream_task_id)
     event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
-    self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
 
 
 def _test_sync_downstream_status_does_not_requeue_missing_entry_item_claimed_by_current_execution(self):
@@ -39504,7 +39334,6 @@ def _test_sync_downstream_status_does_not_requeue_missing_entry_item_claimed_by_
     self.assertEqual("downstream_missing", item.status)
     self.assertEqual("eat-missing-entry", item.downstream_task_id)
     event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
-    self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
 
 
 def _test_prepare_stage_items_for_execution_preserves_existing_missing_streaming_item_for_observation(self):
@@ -39603,7 +39432,6 @@ def _test_prepare_stage_items_for_execution_preserves_existing_missing_streaming
     self.assertEqual("eat-old", observation.get("last_observed_downstream_task_id"))
     self.assertEqual(False, observation.get("budget_exhausted"))
     event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
-    self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
 
 
 def _test_prepare_stage_items_for_execution_preserves_successful_streaming_item_without_reseed(self):
@@ -39693,7 +39521,6 @@ def _test_prepare_stage_items_for_execution_preserves_successful_streaming_item_
     self.assertEqual("success", item.status)
     self.assertEqual("dvs-existing", item.downstream_task_id)
     event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
-    self.assertIn("streaming_stage_item_success_preserved", event_types)
 
 
 def _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted(self):

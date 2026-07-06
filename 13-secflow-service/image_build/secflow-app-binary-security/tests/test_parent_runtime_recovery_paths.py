@@ -67,69 +67,10 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         previous_heartbeat_at = lease.heartbeat_at
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
-            manager._touch_task_heartbeat(task.id)
+            manager._write_task_heartbeat(db, task.id, now_value=_now(), source="watchdog")
 
         self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)
         self.assertGreater(task.updated_at, previous_heartbeat_at)
-
-    def test_touch_task_heartbeat_keeps_lease_alive_for_tail_reconcile_owner(self):
-        manager = TaskManager()
-        now_value = _now()
-        started_at = _now() - timedelta(seconds=20)
-        original_expiry = now_value + timedelta(seconds=5)
-        task = BinarySecurityTask(
-            id="task-tail-touch-heartbeat",
-            project_id="p1",
-            status="running",
-            current_stage="entry_analysis",
-            task_type=TASK_TYPE_SOURCE,
-            firmware_source="project_filesystem",
-            firmware_path="/src",
-            output_root="/o",
-            workspace_root="/w",
-            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
-            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
-            updated_at=started_at,
-        )
-        item = BinarySecurityStageItem(
-            id="si-tail-touch-heartbeat",
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_name="entry_analysis",
-            item_key="module-a",
-            status="running",
-            downstream_service="entry_analyse",
-            downstream_task_id="eat-1",
-        )
-        lease = BinarySecurityTaskRuntimeLease(
-            task_id=task.id,
-            execution_epoch=0,
-            owner_instance_id=manager.instance_id,
-            heartbeat_at=_now() - timedelta(seconds=20),
-            lease_expires_at=original_expiry,
-        )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], runtime_leases=[lease])
-        original_factory = task_manager_module.get_session_factory
-        original_interval = manager.cfg.scheduler.heartbeat_update_interval_seconds
-        try:
-            task_manager_module.get_session_factory = lambda: (lambda: db)
-            manager.cfg.scheduler.heartbeat_update_interval_seconds = 0
-            manager._register_task_execution_owner(task.id, "primary_task_worker")
-            manager._workers[task.id] = task_manager_module.TaskRuntimeHandle(
-                task_id=task.id,
-                runner_task=AsyncMock(),
-                heartbeat_task=None,
-                claimed_at=now_value,
-                execution_token=None,
-                lease_owner_instance_id=manager.instance_id,
-            )
-            manager._touch_task_heartbeat(task.id)
-        finally:
-            task_manager_module.get_session_factory = original_factory
-            manager.cfg.scheduler.heartbeat_update_interval_seconds = original_interval
-
-        self.assertGreater(db.runtime_leases[0].lease_expires_at, original_expiry)
-        self.assertGreater(task.updated_at, started_at)
 
     def test_task_heartbeat_controller_keeps_lease_after_runner_exit_when_owner_still_active(self):
         manager = TaskManager()
@@ -170,7 +111,7 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             previous_expiry = db.runtime_leases[0].lease_expires_at
-            manager._touch_task_heartbeat(task.id)
+            manager._write_task_heartbeat(db, task.id, now_value=_now(), source="watchdog")
 
         self.assertGreater(db.runtime_leases[0].lease_expires_at, previous_expiry)
         self.assertEqual(manager.instance_id, db.runtime_leases[0].owner_instance_id)

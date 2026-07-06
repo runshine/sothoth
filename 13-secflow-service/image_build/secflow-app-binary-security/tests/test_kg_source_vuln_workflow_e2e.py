@@ -608,7 +608,6 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("downstream_missing", dataflow_item.status)
         self.assertEqual("downstream_missing", dataflow_summary.status)
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
-        self.assertIn("streaming_stage_item_observation_gap_detected", [event.event_type for event in db.added])
 
     def test_kg_source_vuln_workflow_e2e_dataflow_downstream_missing_recovers_on_next_owner_prepare(self):
         entry = {
@@ -719,7 +718,6 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
         observation = dict((dataflow_item.result or {}).get("sync_observation") or {})
         self.assertEqual("not_found", observation.get("error_type"))
-        self.assertIn("streaming_stage_item_observation_gap_detected", [event.event_type for event in db.added])
 
         executable = self.manager._prepare_stage_items_for_execution(
             db,
@@ -736,7 +734,7 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _current: {},
         )
 
-        self.assertEqual([], executable)
+        self.assertEqual([dict(entry)], executable)
         self.assertEqual("downstream_missing", dataflow_item.status)
         self.assertEqual("df-missing-owner", dataflow_item.downstream_task_id)
 
@@ -1513,6 +1511,202 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("knowledge_graph_entry_fetch", operation.target_stage)
         self.assertEqual(operation.id, task.current_operation_id)
         self.assertEqual("task_retry_failed_items_archive_full_accepted", getattr(db.added[-1], "event_type", ""))
+
+    def test_kg_source_vuln_workflow_e2e_dataflow_partial_success_keeps_parent_active(self):
+        task = self._kg_fetch_task("/tmp/kg-partial-success-active")
+        task.current_stage = "dataflow_vuln_scan"
+        task.summary = {
+            **(task.summary or {}),
+            "entry_results": [
+                {
+                    "module_key": "knowledge-graph-source-project",
+                    "module_name": "source-project",
+                    "module_kind": "knowledge_graph_module",
+                    "source_stage": "knowledge_graph_entry_fetch",
+                    "execution_epoch": 0,
+                    "completion_state": "success",
+                    "completion_ready": True,
+                    "entries": [
+                        {"entry_key": "src-a", "module_key": "knowledge-graph-source-project", "module_name": "source-project", "function_name": "sink"},
+                        {"entry_key": "src-b", "module_key": "knowledge-graph-source-project", "module_name": "source-project", "function_name": "helper"},
+                    ],
+                    "entry_count": 2,
+                }
+            ],
+            "dataflow_results": [
+                {"entry_key": "src-a", "module_key": "knowledge-graph-source-project", "vulns": [{"id": "v-a"}]},
+                {"entry_key": "src-b", "module_key": "knowledge-graph-source-project", "error": "analysis failed"},
+            ],
+        }
+        dataflow_run = BinarySecurityStageRun(
+            id="sr-kg-dataflow-partial-success-active",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="partial_success",
+            finished_at=_now(),
+            output_summary={"success_count": 1, "failed_count": 1},
+        )
+        success_item = BinarySecurityStageItem(
+            id="si-kg-dataflow-partial-success-active",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="src-a",
+            item_name="sink",
+            parent_key="knowledge-graph-source-project",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="df-kg-a",
+        )
+        failed_item = BinarySecurityStageItem(
+            id="si-kg-dataflow-partial-failed-active",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="src-b",
+            item_name="helper",
+            parent_key="knowledge-graph-source-project",
+            status="failed",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="df-kg-b",
+            error_message="analysis failed",
+        )
+        self._persist_stage_item_result(success_item, payload={"entry_key": "src-a", "module_key": "knowledge-graph-source-project", "vulns": [{"id": "v-a"}]})
+        self._persist_stage_item_result(failed_item, payload={"entry_key": "src-b", "module_key": "knowledge-graph-source-project", "error": "analysis failed"})
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[dataflow_run],
+            stage_items=[success_item, failed_item],
+            archive_jobs=[],
+            events=[],
+        )
+
+        original_enqueue = self.manager._enqueue_task
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            self.manager._refresh_task_status_after_sync(db, task)
+        finally:
+            self.manager._enqueue_task = original_enqueue
+
+        detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        self.assertEqual("running", task.status)
+        self.assertEqual("running", detail.status)
+        self.assertEqual(
+            "partial_success",
+            next(summary.status for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan"),
+        )
+
+    def test_kg_source_workflow_e2e_owner_restart_recovery_preserves_authoritative_state(self):
+        task = self._kg_fetch_task("/tmp/kg-owner-recover")
+        task.current_stage = "dataflow_vuln_scan"
+        task.status = "running"
+        task.summary = {
+            **(task.summary or {}),
+            "entry_results": [
+                {
+                    "module_key": "knowledge-graph-source-project",
+                    "module_name": "source-project",
+                    "module_kind": "knowledge_graph_module",
+                    "source_stage": "knowledge_graph_entry_fetch",
+                    "execution_epoch": 0,
+                    "completion_state": "success",
+                    "completion_ready": True,
+                    "entries": [
+                        {
+                            "entry_key": "src-1",
+                            "module_key": "knowledge-graph-source-project",
+                            "module_name": "source-project",
+                            "function_name": "sink",
+                        }
+                    ],
+                    "entry_count": 1,
+                }
+            ],
+        }
+        kg_run = BinarySecurityStageRun(
+            id="sr-kg-recover",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="knowledge_graph_entry_fetch",
+            sequence_no=1,
+            status="success",
+            started_at=_now(),
+        )
+        dataflow_run = BinarySecurityStageRun(
+            id="sr-df-kg-recover",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="success",
+            started_at=_now(),
+        )
+        dataflow_item = BinarySecurityStageItem(
+            id="si-df-kg-recover",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="src-1",
+            item_name="sink",
+            parent_key="knowledge-graph-source-project",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="df-kg-recover",
+        )
+        self._persist_stage_item_result(
+            dataflow_item,
+            payload={
+                "entry_key": "src-1",
+                "module_key": "knowledge-graph-source-project",
+                "vulns": [{"id": "v-kg-recover", "severity": "high"}],
+            },
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[kg_run, dataflow_run],
+            stage_items=[dataflow_item],
+            archive_jobs=[],
+            events=[],
+        )
+
+        recovering_manager = TaskManager()
+        recovering_manager.instance_id = "worker-b"
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-b",
+            heartbeat_at=_now(),
+            lease_expires_at=_now(),
+        )
+        db.runtime_leases.append(runtime_lease)
+
+        original_factory = task_manager_module.get_session_factory
+        original_write = recovering_manager._write_task_metadata_async
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        task_manager_module.get_session_factory = lambda: (lambda: db)
+        recovering_manager._write_task_metadata_async = _noop_write
+        try:
+            asyncio.run(recovering_manager._sync_streaming_task_tail_state(task.id))
+        finally:
+            task_manager_module.get_session_factory = original_factory
+            recovering_manager._write_task_metadata_async = original_write
+
+        self.assertEqual("dataflow_vuln_scan", task.current_stage)
+        self.assertEqual("running", task.status)
+        self.assertEqual("worker-b", db.runtime_leases[0].owner_instance_id)
+        detail = recovering_manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        self.assertEqual("running", detail.status)
+        kg_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "knowledge_graph_entry_fetch")
+        self.assertEqual("success", kg_summary.status)
+        dataflow_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan")
+        self.assertEqual("success", dataflow_summary.status)
 
     def test_kg_source_workflow_e2e_dataflow_partial_success_archive_terminalizes_parent_success(self):
         task = self._kg_fetch_task("/tmp/kg-ps-archive")

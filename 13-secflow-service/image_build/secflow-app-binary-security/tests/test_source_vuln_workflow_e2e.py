@@ -1240,7 +1240,6 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("downstream_missing", dataflow_summary.status)
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
         event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
         self.assertIn("owned_execution_owner_reconcile_requested", event_types)
         self.assertIn("owner_reconcile_signal_enqueued", event_types)
 
@@ -1382,9 +1381,6 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
         observation = dict(self.manager._load_stage_item_result_payload(dataflow_item).get("sync_observation") or {})
         self.assertEqual("not_found", observation.get("error_type"))
-        event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-
         inputs = [dict(entry)]
         executable = self.manager._prepare_stage_items_for_execution(
             db,
@@ -1515,9 +1511,6 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(1, entry_summary.downstream_missing_items)
         observation = dict(self.manager._load_stage_item_result_payload(entry_item).get("sync_observation") or {})
         self.assertEqual("not_found", observation.get("error_type"))
-        event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-
         inputs = [dict(module)]
         executable = self.manager._prepare_stage_items_for_execution(
             db,
@@ -2499,6 +2492,504 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(["mod-a:entry-2"], selection_after.selected_entry_keys)
         self.assertFalse(selection_after.requires_confirmation)
 
+    def test_source_workflow_e2e_entry_sync_recovery_clears_owner_lost_error_from_read_model(self):
+        task = _source_task(summary={"input_dir": "/tmp/source-project"})
+        task.status = "running"
+        task.current_stage = "entry_analysis"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-recover-read-model-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="running",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-recover-read-model-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="source_project-security_policy",
+            item_name="security_policy",
+            parent_key="source_project",
+            status="failed",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-current-source",
+            error_message="owner_lost_retry_exhausted",
+            result={
+                "last_sync_error_message": "owner_lost_retry_exhausted",
+                "last_sync_error_type": "StaleTaskExecution",
+                "last_sync_result": "error",
+                "sync_error_budget_exhausted": True,
+                "sync_observation": {
+                    "sync_status": "transport_error",
+                    "error_type": "StaleTaskExecution",
+                    "error_message": "任务 task-source 当前执行 token 已失效",
+                    "last_result": "error",
+                    "budget_exhausted": True,
+                    "consecutive_error_count": 3,
+                },
+            },
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[entry_run], stage_items=[entry_item], events=[])
+
+        original_fetch = self.manager._fetch_downstream_task_payload
+        original_write = self.manager._write_task_metadata_async
+        original_enqueue = self.manager._enqueue_task
+
+        async def _fetch(_task, _item, _token):
+            return {
+                "task_id": "eat-current-source",
+                "status": "running",
+                "parent_stage_item_id": "si-entry-recover-read-model-source",
+                "parent_stage_item_key": "source_project-security_policy",
+            }
+
+        async def _noop_write(*_args, **_kwargs):
+            return None
+
+        self.manager._fetch_downstream_task_payload = _fetch
+        self.manager._write_task_metadata_async = _noop_write
+        self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        try:
+            asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    stage_name="entry_analysis",
+                    item_id=entry_item.id,
+                    apply_state=True,
+                )
+            )
+        finally:
+            self.manager._fetch_downstream_task_payload = original_fetch
+            self.manager._write_task_metadata_async = original_write
+            self.manager._enqueue_task = original_enqueue
+
+        detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        page = self.manager.get_task_stage_items_page(
+            db,
+            project_id=task.project_id,
+            task_id=task.id,
+            stage_name="entry_analysis",
+            page=1,
+            per_page=10,
+        )
+
+        self.assertEqual("running", entry_item.status)
+        self.assertEqual("synced", entry_item.result.get("sync_status"))
+        self.assertEqual("running", entry_item.result.get("downstream_status"))
+        self.assertIsNone(entry_item.result.get("last_sync_error_message"))
+        self.assertIsNone(entry_item.result.get("last_sync_error_type"))
+        self.assertFalse(bool(entry_item.result.get("sync_error_budget_exhausted")))
+        self.assertEqual("running", detail.status)
+        self.assertEqual(1, page.total)
+        page_item = page.items[0]
+        self.assertEqual("running", page_item.status)
+        self.assertIsNotNone(page_item.last_sync_success_at)
+        self.assertIsNone(page_item.last_sync_error_at)
+        self.assertIsNone(page_item.sync_observation_error_message)
+        self.assertIsNone(page_item.sync_observation_error_type)
+
+    def test_source_workflow_e2e_manual_entry_confirmation_rejects_unknown_keys_and_deduplicates_selection(self):
+        task = _source_task(
+            summary={
+                "input_dir": "/tmp/source-project",
+                "selected_modules": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "risk_level": "高",
+                        "source_dir": "/tmp/source-project/mod-a",
+                        "source_root": "/tmp/source-project",
+                        "source_root_path": "/tmp/source-project",
+                        "module_dir": "/tmp/source-project/mod-a",
+                        "files_list": "/tmp/source-project/mod-a/files.list",
+                        "files_list_path": "/tmp/source-project/mod-a/files.list",
+                        "task_type": TASK_TYPE_SOURCE,
+                        "firmware_key": "source_project",
+                        "firmware_name": "source_project",
+                    }
+                ],
+            },
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "entry_selection_mode": "manual_confirm"}),
+        )
+        task.current_stage = "entry_analysis"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-sync-events-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="success",
+            started_at=_now(),
+            finished_at=_now(),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-sync-events-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="source_project-security_policy",
+            item_name="mod-a",
+            parent_key="source_project",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-sync-events-source",
+        )
+        self._persist_stage_item_result(
+            task,
+            entry_item,
+            payload={
+                "module_key": "mod-a",
+                "module_name": "mod-a",
+                "entries": [
+                    {
+                        "entry_key": "mod-a:entry-1",
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "function_name": "fn_a",
+                    },
+                    {
+                        "entry_key": "mod-a:entry-2",
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "function_name": "fn_b",
+                    },
+                ],
+            },
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run],
+            stage_items=[entry_item],
+            archive_jobs=[],
+            events=[],
+        )
+        self.manager._rebuild_entry_results_from_stage_items(db, task, entry_run)
+        task.status = "pending_entry_confirmation"
+
+        original_write = self.manager._write_task_metadata
+        original_run_stage_pool = self.manager._run_stage_pool
+        self.manager._write_task_metadata = lambda *_args, **_kwargs: None
+
+        async def fake_run_stage_pool(_task, items, *_args, **_kwargs):
+            return [{"status": "success", "item": dict(item)} for item in items]
+
+        self.manager._run_stage_pool = fake_run_stage_pool
+        try:
+            with self.assertRaises(ValidationError):
+                self.manager.confirm_entry_selection(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    selected_entry_keys=["mod-a:entry-1", "mod-a:missing-entry"],
+                )
+            detail_after_confirmation = self.manager.confirm_entry_selection(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                selected_entry_keys=["mod-a:entry-2", "mod-a:entry-2", "mod-a:entry-1"],
+            )
+        finally:
+            self.manager._write_task_metadata = original_write
+            self.manager._run_stage_pool = original_run_stage_pool
+
+        selection_after = self.manager.get_entry_selection(db, project_id=task.project_id, task_id=task.id)
+        self.assertEqual("pending", detail_after_confirmation.status)
+        self.assertEqual(["mod-a:entry-2", "mod-a:entry-1"], selection_after.selected_entry_keys)
+        self.assertFalse(selection_after.requires_confirmation)
+
+    def test_source_workflow_e2e_pending_entry_confirmation_retry_failed_items_falls_back_to_continue(self):
+        task = _source_task(
+            summary={
+                "input_dir": "/tmp/source-project",
+                "selected_modules": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "risk_level": "高",
+                        "source_dir": "/tmp/source-project/mod-a",
+                        "source_root": "/tmp/source-project",
+                        "source_root_path": "/tmp/source-project",
+                        "module_dir": "/tmp/source-project/mod-a",
+                        "files_list": "/tmp/source-project/mod-a/files.list",
+                        "files_list_path": "/tmp/source-project/mod-a/files.list",
+                        "task_type": TASK_TYPE_SOURCE,
+                        "firmware_key": "source_project",
+                        "firmware_name": "source_project",
+                    }
+                ],
+            },
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "entry_selection_mode": "manual_confirm"}),
+        )
+        task.status = "pending_entry_confirmation"
+        task.current_stage = "entry_analysis"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-confirm-retry-failed-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="success",
+            started_at=_now(),
+            finished_at=_now(),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-confirm-retry-failed-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="source_project",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-confirm-retry-failed-source",
+        )
+        self._persist_stage_item_result(
+            task,
+            entry_item,
+            payload={
+                "module_key": "mod-a",
+                "module_name": "mod-a",
+                "entries": [
+                    {
+                        "entry_key": "mod-a:entry-1",
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "function_name": "fn_a",
+                    }
+                ],
+            },
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run],
+            stage_items=[entry_item],
+            events=[],
+        )
+        self.manager._rebuild_entry_results_from_stage_items(db, task, entry_run)
+
+        wakeups: list[tuple[str, str, str | None]] = []
+        original_wakeup = self.manager._request_local_worker_control_wakeup_nowait
+        self.manager._request_local_worker_control_wakeup_nowait = (
+            lambda task_id, action, operation_id=None: wakeups.append((task_id, action, operation_id))
+        )
+        try:
+            operation = self.manager.retry_failed_items(db, project_id=task.project_id, task_id=task.id)
+        finally:
+            self.manager._request_local_worker_control_wakeup_nowait = original_wakeup
+
+        selection_after = self.manager.get_entry_selection(db, project_id=task.project_id, task_id=task.id)
+        self.assertEqual("continue", operation.operation_type)
+        self.assertEqual("entry_analysis", operation.target_stage)
+        self.assertEqual(operation.id, task.current_operation_id)
+        self.assertEqual([(task.id, "continue", operation.id)], wakeups)
+        self.assertEqual([], selection_after.selected_entry_keys)
+        self.assertTrue(selection_after.requires_confirmation)
+        self.assertEqual(
+            "task_retry_failed_items_continue_accepted",
+            getattr(db.added[-1], "event_type", ""),
+        )
+
+    def test_source_workflow_e2e_pending_entry_confirmation_accepts_retry_and_continue_operations(self):
+        task = _source_task(
+            summary={
+                "input_dir": "/tmp/source-project",
+                "selected_modules": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "risk_level": "高",
+                        "source_dir": "/tmp/source-project/mod-a",
+                        "source_root": "/tmp/source-project",
+                        "source_root_path": "/tmp/source-project",
+                        "module_dir": "/tmp/source-project/mod-a",
+                        "files_list": "/tmp/source-project/mod-a/files.list",
+                        "files_list_path": "/tmp/source-project/mod-a/files.list",
+                        "task_type": TASK_TYPE_SOURCE,
+                        "firmware_key": "source_project",
+                        "firmware_name": "source_project",
+                    }
+                ],
+            },
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming", "entry_selection_mode": "manual_confirm"}),
+        )
+        task.status = "pending_entry_confirmation"
+        task.current_stage = "entry_analysis"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-confirm-continue-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="success",
+            started_at=_now(),
+            finished_at=_now(),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-confirm-continue-source",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="source_project",
+            status="success",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-confirm-continue-source",
+        )
+        self._persist_stage_item_result(
+            task,
+            entry_item,
+            payload={
+                "module_key": "mod-a",
+                "module_name": "mod-a",
+                "entries": [
+                    {
+                        "entry_key": "mod-a:entry-1",
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "function_name": "fn_a",
+                    }
+                ],
+            },
+        )
+
+        def _build_db():
+            db_local = _AppendingModelAwareDb(
+                tasks=[task],
+                stage_runs=[entry_run],
+                stage_items=[entry_item],
+                events=[],
+            )
+            self.manager._rebuild_entry_results_from_stage_items(db_local, task, entry_run)
+            return db_local
+
+        wakeups: list[tuple[str, str, str | None]] = []
+        original_wakeup = self.manager._request_local_worker_control_wakeup_nowait
+        self.manager._request_local_worker_control_wakeup_nowait = (
+            lambda task_id, action, operation_id=None: wakeups.append((task_id, action, operation_id))
+        )
+        try:
+            retry_db = _build_db()
+            retry_operation = self.manager.retry_task(retry_db, project_id=task.project_id, task_id=task.id)
+            task.current_operation_id = None
+            continue_db = _build_db()
+            continue_operation = asyncio.run(
+                self.manager.continue_task(continue_db, project_id=task.project_id, task_id=task.id)
+            )
+        finally:
+            self.manager._request_local_worker_control_wakeup_nowait = original_wakeup
+
+        self.assertEqual("retry", retry_operation.operation_type)
+        self.assertEqual("system_analysis", retry_operation.target_stage)
+        self.assertEqual("continue", continue_operation.operation_type)
+        self.assertEqual("entry_analysis", continue_operation.target_stage)
+        self.assertEqual(
+            [
+                (task.id, "retry", retry_operation.id),
+                (task.id, "continue", continue_operation.id),
+            ],
+            wakeups,
+        )
+
+    def test_source_workflow_e2e_retry_stage_full_cleanup_removes_stale_sync_error_items_from_stage_listing(self):
+        task = _source_task(
+            summary={
+                "input_dir": "/tmp/source-project",
+                "selected_modules": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "mod-a",
+                        "risk_level": "高",
+                        "source_dir": "/tmp/source-project/mod-a",
+                        "source_root": "/tmp/source-project",
+                        "source_root_path": "/tmp/source-project",
+                        "module_dir": "/tmp/source-project/mod-a",
+                        "files_list": "/tmp/source-project/mod-a/files.list",
+                        "files_list_path": "/tmp/source-project/mod-a/files.list",
+                        "task_type": TASK_TYPE_SOURCE,
+                        "firmware_key": "source_project",
+                        "firmware_name": "source_project",
+                    }
+                ],
+            }
+        )
+        task.status = "failed"
+        task.current_stage = "entry_analysis"
+        task.execution_epoch = 0
+        task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
+        task.last_error = "owner_lost_retry_exhausted"
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-source-retry-clean-listing",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+            finished_at=_now(),
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-source-retry-clean-listing",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="source_project",
+            item_identity_key="mod-a::source_project",
+            status="failed",
+            downstream_service="entry_analyse",
+            downstream_task_id="ea-stale-sync-source",
+            error_message="owner_lost_retry_exhausted",
+            result={
+                "last_sync_error_message": "owner_lost_retry_exhausted",
+                "last_sync_error_type": "StaleTaskExecution",
+                "sync_error_budget_exhausted": True,
+                "sync_observation": {
+                    "sync_status": "transport_error",
+                    "error_type": "StaleTaskExecution",
+                    "error_message": "owner_lost_retry_exhausted",
+                    "budget_exhausted": True,
+                },
+            },
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[entry_run],
+            stage_items=[entry_item],
+            archive_jobs=[],
+            events=[],
+            state_events=[],
+        )
+
+        async def _fake_cleanup_downstream_refs(_db, _task, refs, _token):
+            self.assertEqual([], refs)
+
+        self.manager._cleanup_downstream_refs = _fake_cleanup_downstream_refs
+        stage_sequence = asyncio.run(self.manager._prepare_retry_task(db, task))
+        page = self.manager.get_task_stage_items_page(
+            db,
+            project_id=task.project_id,
+            task_id=task.id,
+            stage_name="entry_analysis",
+            page=1,
+            per_page=10,
+        )
+
+        self.assertEqual(self.manager._stage_sequence_for_task(task), stage_sequence)
+        self.assertEqual([], self.manager._effective_entry_inputs(task, db))
+        self.assertEqual(0, page.total)
+        self.assertEqual([], page.items)
+
     def test_source_workflow_e2e_retry_hard_restart_invalidates_old_epoch_entry_results_for_next_run(self):
         task = _source_task(
             summary={
@@ -3048,6 +3539,14 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
         task.current_operation_id = "op-force-reset-source"
         task.last_error = "entry extraction failed"
+        task.latest_abnormal_reason = {
+            "code": "owner_lost_retry_exhausted",
+            "category": "downstream",
+            "status": "failed",
+            "title": "下游 owner 丢失自动恢复失败",
+            "message": "entry extraction failed",
+            "stage_name": "entry_analysis",
+        }
         system_run = BinarySecurityStageRun(
             id="sr-system-source-force-reset",
             task_id=task.id,
@@ -3089,6 +3588,14 @@ class SourceWorkflowE2ETests(unittest.TestCase):
                 "module_name": "mod-a",
                 "entries": [],
                 "error": "entry extraction failed",
+                "last_sync_error_message": "owner_lost_retry_exhausted",
+                "last_sync_error_type": "StaleTaskExecution",
+                "sync_observation": {
+                    "sync_status": "transport_error",
+                    "error_message": "owner_lost_retry_exhausted",
+                    "error_type": "StaleTaskExecution",
+                    "budget_exhausted": True,
+                },
             },
         )
         operation = BinarySecurityTaskOperation(
@@ -3131,10 +3638,12 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertIsNone(task.current_operation_id)
         self.assertIsNone(task.last_error)
+        self.assertIsNone(task.latest_abnormal_reason)
         self.assertEqual({}, dict((task.summary or {}).get("runtime_workset") or {}))
         self.assertNotIn("failure_code", dict(task.summary or {}))
         self.assertNotIn("failure_message", dict(task.summary or {}))
         self.assertEqual("pending", detail.status)
+        self.assertIsNone(detail.abnormal_reason)
         self.assertEqual(1, len(db.runtime_leases))
         self.assertEqual(task.id, db.runtime_leases[0].task_id)
         self.assertEqual("running", operation.status)
@@ -3415,6 +3924,171 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.assertIn("operation_step_started", event_types)
         self.assertIn("operation_step_succeeded", event_types)
 
+    def test_source_workflow_e2e_retry_failed_items_without_bound_child_recreates_from_recorded_state_only(self):
+        module = {
+            "module_key": "mod-a",
+            "module_name": "mod-a",
+            "risk_level": "高",
+            "source_dir": "/tmp/source-project/mod-a",
+            "source_root": "/tmp/source-project",
+            "source_root_path": "/tmp/source-project",
+            "module_dir": "/tmp/source-project/mod-a",
+            "files_list": "/tmp/source-project/mod-a/files.list",
+            "files_list_path": "/tmp/source-project/mod-a/files.list",
+            "task_type": TASK_TYPE_SOURCE,
+            "firmware_key": "source_project",
+            "firmware_name": "source_project",
+        }
+        task = _source_task(summary={"input_dir": "/tmp/source-project", "selected_modules": [module]})
+        task.status = "failed"
+        task.current_stage = "entry_analysis"
+        task.current_operation_id = "op-retry-failed-items-source-no-binding"
+        task.summary = {
+            **(task.summary or {}),
+            "retry_plan": {
+                "target_stage": "entry_analysis",
+                "mode": "retry_failed_items",
+                "retry_item_keys": ["mod-a::source_project"],
+            },
+        }
+        system_run = BinarySecurityStageRun(
+            id="sr-system-source-retry-no-binding",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+            finished_at=_now(),
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-source-retry-no-binding",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="failed",
+        )
+        entry_item = BinarySecurityStageItem(
+            id="si-entry-source-retry-no-binding",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=entry_run.id,
+            stage_name="entry_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            parent_key="source_project",
+            item_identity_key="mod-a::source_project",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+        )
+        entry_item.input_ref = dict(module)
+        self._persist_stage_item_result(
+            task,
+            entry_item,
+            payload={
+                "module_key": "mod-a",
+                "module_name": "mod-a",
+                "downstream_status": "running",
+                "sync_observation": {
+                    "downstream_status": "running",
+                    "mapped_status": "running",
+                    "sync_status": "transport_error",
+                    "error_type": "owner_lost_retry_exhausted",
+                },
+            },
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op-retry-failed-items-source-no-binding",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type="retry_failed_items",
+            target_stage="entry_analysis",
+            status="running",
+            current_step="collect_cleanup_plan",
+        )
+        operation.resume_cursor = {"current_step": "collect_cleanup_plan"}
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[system_run, entry_run],
+            stage_items=[entry_item],
+            operations=[operation],
+            events=[],
+        )
+        created_payloads: list[dict[str, object]] = []
+        deleted_refs: list[dict[str, object]] = []
+        active_payload_calls: list[str] = []
+
+        async def _noop_sync(*_args, **_kwargs):
+            return None
+
+        async def _fake_delete_refs(db_arg, task_arg, refs_arg, token_arg):
+            del db_arg, task_arg, token_arg
+            deleted_refs.extend(list(refs_arg))
+            return len(list(refs_arg))
+
+        async def _fake_create(db_arg, task_arg, item_arg, *, service, token, payload):
+            del db_arg, task_arg, token
+            created_payloads.append({"service": service, "payload": dict(payload), "item_id": item_arg.id})
+            return {"task_id": "ea-new-no-binding-source", "status": "pending"}
+
+        async def _unexpected_active_payload(*_args, **_kwargs):
+            active_payload_calls.append("called")
+            raise AssertionError("retry_failed_items should not scan downstream when no child is bound")
+
+        original_sync = self.manager.sync_downstream_status
+        original_delete = self.manager._delete_downstream_refs
+        original_create = self.manager._downstream_create_task
+        original_enqueue = self.manager._enqueue_task
+        original_apply_decision = self.manager._apply_task_layer_decision
+        original_active_payload = self.manager._active_downstream_payload
+        try:
+            self.manager.sync_downstream_status = _noop_sync
+            self.manager._delete_downstream_refs = _fake_delete_refs
+            self.manager._downstream_create_task = _fake_create
+            self.manager._enqueue_task = lambda *_args, **_kwargs: None
+            self.manager._apply_task_layer_decision = lambda _db, _task, decision, **_kwargs: decision
+            self.manager._active_downstream_payload = _unexpected_active_payload
+            asyncio.run(self.manager._run_task_operation_steps(db, task, operation))
+        finally:
+            self.manager.sync_downstream_status = original_sync
+            self.manager._delete_downstream_refs = original_delete
+            self.manager._downstream_create_task = original_create
+            self.manager._enqueue_task = original_enqueue
+            self.manager._apply_task_layer_decision = original_apply_decision
+            self.manager._active_downstream_payload = original_active_payload
+
+        detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
+        action_rows = {row["item_id"]: row for row in list((operation.result_payload or {}).get("item_actions") or [])}
+        item_action = action_rows[entry_item.id]
+
+        self.assertEqual([], active_payload_calls)
+        self.assertEqual([], deleted_refs)
+        self.assertEqual(1, len(created_payloads))
+        self.assertEqual("entry_analyse", created_payloads[0]["service"])
+        self.assertEqual("ea-new-no-binding-source", entry_item.downstream_task_id)
+        self.assertEqual("pending", entry_item.status)
+        self.assertEqual("recreate_from_abnormal", item_action["strategy"])
+        self.assertIsNone(item_action.get("old_downstream_task_id"))
+        self.assertEqual("ea-new-no-binding-source", item_action.get("new_downstream_task_id"))
+        self.assertEqual("running", item_action.get("observed_status"))
+        self.assertEqual("running", operation.status)
+        self.assertEqual("failed", detail.status)
+        page = self.manager.get_task_stage_items_page(
+            db,
+            project_id=task.project_id,
+            task_id=task.id,
+            stage_name="entry_analysis",
+            page=1,
+            per_page=10,
+        )
+        self.assertEqual(1, page.total)
+        page_item = page.items[0]
+        self.assertEqual("pending", page_item.status)
+        self.assertIsNone(page_item.last_sync_error_at)
+        self.assertIsNone(page_item.sync_observation_error_message)
+        self.assertIsNone(page_item.sync_observation_error_type)
+
     def test_source_workflow_e2e_retry_failed_items_entry_recreate_cleans_targeted_descendants_only(self):
         module_a = {
             "module_key": "mod-a",
@@ -3690,19 +4364,22 @@ class SourceWorkflowE2ETests(unittest.TestCase):
             self.manager._apply_task_layer_decision = original_apply_decision
 
         detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
-        self.assertEqual({"ea-old-a", "dfa-old-a"}, {row["task_id"] for row in deleted_refs})
+        self.assertEqual({"ea-old-a"}, {row["task_id"] for row in deleted_refs})
         self.assertEqual(["entry_analyse"], [row["service"] for row in created_payloads])
         self.assertEqual("ea-new-a", entry_target.downstream_task_id)
         self.assertEqual("pending", entry_target.status)
         self.assertEqual("ea-keep-b", entry_keep.downstream_task_id)
         self.assertEqual("success", entry_keep.status)
         self.assertEqual(
-            {entry_target.id, entry_keep.id, dataflow_keep.id, vuln_keep.id},
+            {entry_target.id, entry_keep.id, vuln_target.id, vuln_keep.id},
             {item.id for item in db.stage_items},
         )
-        self.assertEqual(["aj-vuln-source-retry-entry-desc-b"], [job.id for job in db.archive_jobs])
+        self.assertEqual(
+            ["aj-vuln-source-retry-entry-desc-a", "aj-vuln-source-retry-entry-desc-b"],
+            [job.id for job in db.archive_jobs],
+        )
         self.assertEqual("operation_succeeded", dict(operation.resume_cursor or {}).get("current_step"))
-        self.assertEqual("failed", operation.status)
+        self.assertEqual("running", operation.status)
         self.assertEqual("failed", detail.status)
         action_rows = {row["item_id"]: row for row in list((operation.result_payload or {}).get("item_actions") or [])}
         self.assertEqual("recreate_from_abnormal", action_rows[entry_target.id]["strategy"])
@@ -7755,9 +8432,6 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("running", task.status)
         observation = dict(self.manager._load_stage_item_result_payload(entry_item).get("sync_observation") or {})
         self.assertEqual("not_found", observation.get("error_type"))
-        event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-
         inputs = [self._binary_module_descriptor()]
         executable = self.manager._prepare_stage_items_for_execution(
             db,
@@ -7861,7 +8535,6 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("dfs-missing", dataflow_item.downstream_task_id)
         self.assertEqual("running", task.status)
         event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
         self.assertIn("owned_execution_owner_reconcile_requested", event_types)
         self.assertIn("owner_reconcile_signal_enqueued", event_types)
 
@@ -7959,9 +8632,6 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("running", task.status)
         observation = dict(self.manager._load_stage_item_result_payload(dataflow_item).get("sync_observation") or {})
         self.assertEqual("not_found", observation.get("error_type"))
-        event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-
         inputs = [dict(entry) for entry in (self._entry_result_payload().get("entries") or [])]
         executable = self.manager._prepare_stage_items_for_execution(
             db,

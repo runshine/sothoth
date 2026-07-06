@@ -1420,24 +1420,6 @@ class TaskDownstreamServiceMixin:
                 existing_item.stage_run_id = stage_run.id
                 existing_item.updated_at = observed_at
                 preserved_success_identities.add(identity_key)
-                self._record_event(
-                    db,
-                    task,
-                    "streaming_stage_item_success_preserved",
-                    "流式阶段已成功的 authoritative item 保持完成态，仅参与观测与聚合",
-                    level="info",
-                    stage_name=stage_run.stage_name,
-                    item=existing_item,
-                    payload={
-                        "before_status": previous_status,
-                        "after_status": previous_status,
-                        "downstream_task_id": previous_downstream_task_id,
-                        "task_runtime_phase": self._task_runtime_phase(task),
-                        "runtime_lease_owner": self._parent_runtime_ownership_snapshot(db, task).runtime_lease_owner,
-                        "task_execution_token": self._dispatch_token(task),
-                        "recovery_action": "observe_only",
-                    },
-                )
                 continue
             sync_observation = dict(existing_result.get("sync_observation") or {})
             sync_observation.update(
@@ -1469,24 +1451,6 @@ class TaskDownstreamServiceMixin:
                 existing_item,
                 stage_name=stage_run.stage_name,
                 result=existing_result,
-            )
-            self._record_event(
-                db,
-                task,
-                "streaming_stage_item_observation_gap_detected",
-                "当前执行实例已接管流式阶段，保留已有下游绑定并等待继续观测",
-                level="warning",
-                stage_name=stage_run.stage_name,
-                item=existing_item,
-                payload={
-                    "before_status": previous_status,
-                    "after_status": existing_item.status,
-                    "downstream_task_id": previous_downstream_task_id,
-                    "task_runtime_phase": self._task_runtime_phase(task),
-                    "runtime_lease_owner": self._parent_runtime_ownership_snapshot(db, task).runtime_lease_owner,
-                    "task_execution_token": self._dispatch_token(task),
-                    "recovery_action": "observe_only",
-                },
             )
             preserved_observe_only_identities.add(identity_key)
 

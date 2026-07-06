@@ -2321,10 +2321,6 @@ class TaskManager(
                 sync_maintenance_task=sync_maintenance_task,
             )
             self._workers[normalized_task_id] = handle
-            await asyncio.to_thread(
-                self._touch_task_heartbeat,
-                normalized_task_id,
-            )
             task_manager_module.logger.info(
                 "binary-security start_task_runtime created new local handle: task_id=%s runner_task=%s heartbeat_task=%s sync_maintenance_task=%s lease_owner_instance_id=%s",
                 normalized_task_id,
@@ -4315,6 +4311,7 @@ class TaskManager(
                 generation=self._owner_generation,
                 owner_started_at=self.owner_started_at,
             )
+            task.dispatcher_instance_id = str(self.instance_id or "").strip() or None
             if str(getattr(task, "runtime_phase", "") or "").strip() != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
                 task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
             task.tail_reconcile_state = "idle"
@@ -13216,7 +13213,6 @@ class TaskManager(
             try:
                 await self._ensure_task_execution_current_async(task)
                 await self._drain_owner_inbox_during_polling(task)
-                await self._touch_task_heartbeat_async(task.id)
                 payload = await fetcher()
                 await self._ensure_task_execution_current_async(task)
                 poll_count += 1
@@ -13286,46 +13282,6 @@ class TaskManager(
                         http_status=self._extract_http_status_from_exception(exc),
                     )
                 await asyncio.sleep(self._stage_downstream_sync_backoff_base_seconds())
-
-    def _touch_task_heartbeat(self, task_id: str) -> None:
-        now = _now()
-        last_heartbeat_at = self._last_task_heartbeat_at.get(task_id)
-        interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
-        if last_heartbeat_at and (now - last_heartbeat_at).total_seconds() < interval_seconds:
-            observe_heartbeat_update("fallback_skipped")
-            return
-        handle = self._runtime_handle(task_id)
-        has_owner = self._has_local_task_execution_owner(task_id) or bool(handle is not None and handle.owner_active)
-        has_streaming_worker = self._task_has_active_streaming_stage_workers(task_id)
-        if not has_owner and not has_streaming_worker:
-            observe_heartbeat_update("fallback_skipped")
-            return
-        session = get_session_factory()()
-        try:
-            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
-            if not self._should_continue_parent_lease_heartbeat(session, task, handle):
-                if not has_streaming_worker:
-                    observe_heartbeat_update("fallback_skipped")
-                    return
-                if task is None or str(getattr(task, "status", "") or "").strip().lower() in TASK_TERMINAL_STATUSES:
-                    observe_heartbeat_update("fallback_skipped")
-                    return
-                lease = self._runtime_lease_for_task(session, task_id)
-                if not (
-                    self._runtime_lease_is_active(lease)
-                    and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
-                ):
-                    observe_heartbeat_update("fallback_skipped")
-                    return
-            elif not self._should_keep_task_heartbeat(session, task):
-                observe_heartbeat_update("fallback_skipped")
-                return
-            self._write_task_heartbeat(session, task_id, now_value=now, source="fallback")
-        finally:
-            session.close()
-
-    async def _touch_task_heartbeat_async(self, task_id: str) -> None:
-        await asyncio.to_thread(self._touch_task_heartbeat, task_id)
 
     def _is_task_cancelled(self, task_id: str) -> bool:
         session = get_session_factory()()

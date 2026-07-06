@@ -330,8 +330,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         started: list[str] = []
         heartbeat_started = asyncio.Event()
         sync_maintenance_started = asyncio.Event()
-        touched: list[str] = []
-
         async def _run_task(task_id):
             started.append(f"runner:{task_id}")
             await asyncio.sleep(0)
@@ -350,8 +348,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._run_task_heartbeat = _run_heartbeat
         manager._run_task_sync_maintenance = _run_sync_maintenance
 
-        with patch.object(manager, "_touch_task_heartbeat", side_effect=lambda task_id: touched.append(task_id)):
-            created = await manager._start_task_runtime("task-1")
+        created = await manager._start_task_runtime("task-1")
         self.assertTrue(created)
         await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
         await asyncio.wait_for(sync_maintenance_started.wait(), timeout=1)
@@ -364,7 +361,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("runner:task-1", started)
         self.assertIn("heartbeat:task-1", started)
         self.assertIn("sync:task-1", started)
-        self.assertEqual(["task-1"], touched)
 
         handle.cancel()
         await asyncio.gather(
@@ -375,7 +371,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         manager._workers.pop("task-1", None)
 
-    async def test_start_task_runtime_writes_runtime_lease_before_return(self):
+    async def test_start_task_runtime_does_not_write_runtime_lease_before_return(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         started = asyncio.Event()
@@ -409,30 +405,11 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
         manager._run_task_sync_maintenance = _run_sync_maintenance
-
-        def _touch(task_id):
-            self.assertEqual("task-1", task_id)
-            task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
-            lease_expires_at = _now() + timedelta(minutes=5)
-            db.runtime_leases.append(
-                BinarySecurityTaskRuntimeLease(
-                    task_id=task.id,
-                    owner_instance_id="worker-a",
-                    heartbeat_at=_now(),
-                    lease_expires_at=lease_expires_at,
-                )
-            )
-
-        with patch.object(manager, "_touch_task_heartbeat", side_effect=_touch):
-            created = await manager._start_task_runtime("task-1")
+        created = await manager._start_task_runtime("task-1")
 
         self.assertTrue(created)
         await asyncio.wait_for(started.wait(), timeout=1)
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-        lease = next((row for row in db.runtime_leases if row.task_id == "task-1"), None)
-        self.assertIsNotNone(lease)
-        self.assertEqual("worker-a", lease.owner_instance_id)
-        self.assertIsNotNone(lease.lease_expires_at)
+        self.assertEqual([], db.runtime_leases)
 
         handle = manager._workers.get("task-1")
         self.assertIsNotNone(handle)
@@ -3657,9 +3634,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _ensure(_task):
             return None
 
-        async def _touch(_task_id):
-            return None
-
         async def _cancelled(_task_id):
             return False
 
@@ -3676,7 +3650,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "success"}
 
         manager._ensure_task_execution_current_async = _ensure
-        manager._touch_task_heartbeat_async = _touch
         manager._is_task_cancelled_async = _cancelled
         manager._record_polled_child_sync_failure = _record_failure
         manager._run_current_task_operation = _cancelled
@@ -3705,9 +3678,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _ensure(_task):
             return None
 
-        async def _touch(_task_id):
-            return None
-
         def _record_failure(**kwargs):
             failures.append(kwargs)
 
@@ -3715,9 +3685,8 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             raise RuntimeError("任务 task-1 当前 owned_execution runtime lease owner 已变更")
 
         manager._ensure_task_execution_current_async = _ensure
-        manager._touch_task_heartbeat_async = _touch
         manager._record_polled_child_sync_failure = _record_failure
-        manager._run_current_task_operation = _touch
+        manager._run_current_task_operation = _ensure
 
         with self.assertRaises(StaleTaskExecution):
             await manager._poll_until_terminal(
@@ -3740,9 +3709,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _ensure(_task):
             return None
 
-        async def _touch(_task_id):
-            return None
-
         async def _cancelled(_task_id):
             return False
 
@@ -3755,7 +3721,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "success"}
 
         manager._ensure_task_execution_current_async = _ensure
-        manager._touch_task_heartbeat_async = _touch
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _run_operation
 
@@ -3790,9 +3755,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _ensure(_task):
             return None
 
-        async def _touch(_task_id):
-            return None
-
         async def _cancelled(_task_id):
             return False
 
@@ -3804,7 +3766,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "success", "task_id": "child-1"}
 
         manager._ensure_task_execution_current_async = _ensure
-        manager._touch_task_heartbeat_async = _touch
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _cancelled
         manager._refresh_polled_child_sync_snapshot = lambda **_kwargs: None
@@ -3842,9 +3803,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _ensure(_task):
             return None
 
-        async def _touch(_task_id):
-            return None
-
         async def _cancelled(_task_id):
             return False
 
@@ -3852,7 +3810,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "completed_limited", "task_id": "child-1"}
 
         manager._ensure_task_execution_current_async = _ensure
-        manager._touch_task_heartbeat_async = _touch
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _cancelled
 

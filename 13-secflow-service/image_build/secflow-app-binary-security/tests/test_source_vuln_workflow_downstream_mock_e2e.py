@@ -318,7 +318,6 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
             patch.object(downstream_base_module, "invalidate_shared_async_client", new=AsyncMock(return_value=True)),
             patch.object(self.manager, "_ensure_task_execution_current_async", new=AsyncMock(return_value=None)),
             patch.object(self.manager, "_drain_owner_inbox_during_polling", new=AsyncMock(return_value=None)),
-            patch.object(self.manager, "_touch_task_heartbeat_async", new=AsyncMock(return_value=None)),
             patch.object(self.manager, "_is_task_cancelled_async", new=AsyncMock(return_value=False)),
             patch.object(self.manager, "_downstream_child_sync_interval_seconds", return_value=0),
             patch.object(self.manager, "_stage_downstream_sync_backoff_base_seconds", return_value=0),

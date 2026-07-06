@@ -1635,7 +1635,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("downstream_missing", dataflow_summary.status)
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
         event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
         self.assertIn("owned_execution_owner_reconcile_requested", event_types)
         self.assertIn("owner_reconcile_signal_enqueued", event_types)
 
@@ -1745,9 +1744,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("running", task.status)
         observation = dict(self.manager._load_stage_item_result_payload(dataflow_item).get("sync_observation") or {})
         self.assertEqual("not_found", observation.get("error_type"))
-        event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-
         inputs = [dict(entry)]
         executable = self.manager._prepare_stage_items_for_execution(
             db,
@@ -2061,9 +2057,6 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("running", task.status)
         observation = dict(self.manager._load_stage_item_result_payload(entry_item).get("sync_observation") or {})
         self.assertEqual("not_found", observation.get("error_type"))
-        event_types = [event.event_type for event in db.added]
-        self.assertIn("streaming_stage_item_observation_gap_detected", event_types)
-
         inputs = [dict(module)]
         executable = self.manager._prepare_stage_items_for_execution(
             db,
