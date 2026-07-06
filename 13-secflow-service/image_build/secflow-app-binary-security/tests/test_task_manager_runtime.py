@@ -3304,10 +3304,11 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_enqueue_task", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_repair_running_lease_invariant", return_value=False),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 
@@ -3395,10 +3396,11 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(self.manager, "_refresh_stage_from_authoritative_items", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_enqueue_task", side_effect=lambda *_args, **_kwargs: None),
             patch.object(self.manager, "_clear_task_abnormal_reason_snapshot", side_effect=lambda *_args, **_kwargs: None),
+            patch.object(self.manager, "_repair_running_lease_invariant", return_value=False),
         ):
             self.manager._refresh_task_status_after_sync(db, task)
 
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, self.manager._task_runtime_phase(task))
         self.assertEqual("idle", task.tail_reconcile_state)
 

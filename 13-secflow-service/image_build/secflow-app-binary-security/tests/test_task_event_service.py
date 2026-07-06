@@ -3,6 +3,8 @@ import unittest
 import os
 from pathlib import Path
 
+from sqlalchemy.exc import OperationalError
+
 from app.model import BinarySecurityEvent, BinarySecurityTask, TASK_TYPE_SOURCE
 from app.service.task.events import TaskEventServiceMixin
 from app.service.task_manager import TaskManager
@@ -36,6 +38,14 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+    @staticmethod
+    def _deadlock_error():
+        return OperationalError(
+            "DELETE FROM secflow_binary_security_event ...",
+            {},
+            Exception(1213, "Deadlock found when trying to get lock; try restarting transaction"),
+        )
 
     def test_record_event_trims_task_timeline_to_limit(self):
         task = BinarySecurityTask(
@@ -76,6 +86,115 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(10_000, len(db.events))
         self.assertFalse(any(event.id == "evt-00000" for event in db.events))
         self.assertTrue(any(event.event_type == "overflow" for event in db.events))
+
+    def test_trim_task_timeline_events_suppresses_retryable_lock_error(self):
+        task = BinarySecurityTask(
+            id="task-timeline-lock",
+            project_id="p1",
+            name="timeline-lock",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+
+        class _DeleteRaisesDb(_ModelAwareDb):
+            def delete(self, obj):
+                del obj
+                raise TaskEventServiceBehaviorTests._deadlock_error()
+
+        events = []
+        base_time = _now() - timedelta(seconds=10001)
+        for index in range(10_001):
+            event = BinarySecurityEvent(
+                id=f"evt-lock-{index:05d}",
+                task_id=task.id,
+                project_id=task.project_id,
+                level="info",
+                event_type="seed",
+                message=f"seed-{index}",
+            )
+            event.created_at = base_time + timedelta(seconds=index)
+            events.append(event)
+        db = _DeleteRaisesDb(tasks=[task], events=events)
+
+        self.manager._trim_task_timeline_events(db, task_id=task.id)
+
+        self.assertEqual(10_001, len(db.events))
+
+    def test_trim_task_sync_events_suppresses_retryable_lock_error(self):
+        task = BinarySecurityTask(
+            id="task-sync-lock",
+            project_id="p1",
+            name="sync-lock",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+
+        class _SyncRow:
+            def __init__(self, idx: int):
+                self.id = f"sync-{idx}"
+                self.task_id = task.id
+                self.item_bucket_key = "item:a"
+                self.created_at = _now() - timedelta(seconds=idx)
+
+        class _DeleteRaisesDb(_ModelAwareDb):
+            def delete(self, obj):
+                del obj
+                raise TaskEventServiceBehaviorTests._deadlock_error()
+
+        db = _DeleteRaisesDb(tasks=[task])
+        db.sync_events = [_SyncRow(i) for i in range(1001)]
+
+        self.manager._trim_task_sync_events(db, task_id=task.id, keep_limit=1000)
+
+        self.assertEqual(1001, len(db.sync_events))
+
+    def test_trim_stage_item_sync_events_suppresses_retryable_lock_error(self):
+        task = BinarySecurityTask(
+            id="task-stage-sync-lock",
+            project_id="p1",
+            name="stage-sync-lock",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+
+        class _SyncRow:
+            def __init__(self, idx: int):
+                self.id = f"stage-sync-{idx}"
+                self.task_id = task.id
+                self.item_bucket_key = "item:a"
+                self.created_at = _now() - timedelta(seconds=idx)
+
+        class _DeleteRaisesDb(_ModelAwareDb):
+            def delete(self, obj):
+                del obj
+                raise TaskEventServiceBehaviorTests._deadlock_error()
+
+        db = _DeleteRaisesDb(tasks=[task])
+        db.sync_events = [_SyncRow(i) for i in range(21)]
+
+        self.manager._trim_stage_item_sync_events(
+            db,
+            task_id=task.id,
+            item_bucket_key="item:a",
+            keep_limit=20,
+        )
+
+        self.assertEqual(21, len(db.sync_events))
 
     def test_record_event_skips_duplicate_owned_execution_takeover_requeued_events(self):
         task = BinarySecurityTask(

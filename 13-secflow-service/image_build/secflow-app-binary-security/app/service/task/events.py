@@ -8,6 +8,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
 from app.model import BinarySecurityStageItem, BinarySecuritySyncEvent, BinarySecurityTask
@@ -19,6 +20,26 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
+    def _suppress_event_trim_lock_error(
+        self: TaskManager,
+        exc: OperationalError,
+        *,
+        task_id: str,
+        trim_kind: str,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if not self._is_retryable_lock_error(exc):
+            return False
+        task_manager_module.logger.warning(
+            "binary-security %s trim skipped due to retryable db lock conflict: task_id=%s error_type=%s error=%s",
+            trim_kind,
+            str(task_id or "").strip() or None,
+            exc.__class__.__name__,
+            exc,
+        )
+        return True
+
     def _sync_event_item_bucket_key(
         self: TaskManager,
         *,
@@ -259,29 +280,34 @@ class TaskEventServiceMixin:
         effective_limit = task_manager_module.DB_SYNC_EVENT_LIMIT if keep_limit is None else int(keep_limit)
         if effective_limit <= 0 or not hasattr(db, "query") or not hasattr(db, "delete"):
             return
-        current_count = 0
-        if hasattr(db, "sync_events"):
-            current_count = len(getattr(db, "sync_events") or [])
-        else:
-            current_count = (
+        try:
+            current_count = 0
+            if hasattr(db, "sync_events"):
+                current_count = len(getattr(db, "sync_events") or [])
+            else:
+                current_count = (
+                    db.query(task_manager_module.BinarySecuritySyncEvent)
+                    .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
+                    .count()
+                )
+            overflow = (
+                current_count - effective_limit
+            )
+            if overflow <= 0:
+                return
+            stale_rows = (
                 db.query(task_manager_module.BinarySecuritySyncEvent)
                 .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
-                .count()
+                .order_by(task_manager_module.BinarySecuritySyncEvent.created_at.asc(), task_manager_module.BinarySecuritySyncEvent.id.asc())
+                .limit(overflow)
+                .all()
             )
-        overflow = (
-            current_count - effective_limit
-        )
-        if overflow <= 0:
-            return
-        stale_rows = (
-            db.query(task_manager_module.BinarySecuritySyncEvent)
-            .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
-            .order_by(task_manager_module.BinarySecuritySyncEvent.created_at.asc(), task_manager_module.BinarySecuritySyncEvent.id.asc())
-            .limit(overflow)
-            .all()
-        )
-        for stale_row in stale_rows:
-            db.delete(stale_row)
+            for stale_row in stale_rows:
+                db.delete(stale_row)
+        except OperationalError as exc:
+            if self._suppress_event_trim_lock_error(exc, task_id=task_id, trim_kind="sync event"):
+                return
+            raise
 
     def _trim_stage_item_sync_events(
         self: TaskManager,
@@ -297,33 +323,42 @@ class TaskEventServiceMixin:
         effective_limit = max(1, int(keep_limit or 20))
         if not normalized_bucket or not hasattr(db, "query") or not hasattr(db, "delete"):
             return
-        if hasattr(db, "sync_events"):
-            bucket_rows = [
-                row for row in (getattr(db, "sync_events") or [])
-                if str(getattr(row, "task_id", "") or "").strip() == task_id
-                and str(getattr(row, "item_bucket_key", "") or "").strip() == normalized_bucket
-            ]
-            current_count = len(bucket_rows)
-        else:
-            current_count = (
+        try:
+            if hasattr(db, "sync_events"):
+                bucket_rows = [
+                    row for row in (getattr(db, "sync_events") or [])
+                    if str(getattr(row, "task_id", "") or "").strip() == task_id
+                    and str(getattr(row, "item_bucket_key", "") or "").strip() == normalized_bucket
+                ]
+                current_count = len(bucket_rows)
+            else:
+                current_count = (
+                    db.query(task_manager_module.BinarySecuritySyncEvent)
+                    .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
+                    .filter(task_manager_module.BinarySecuritySyncEvent.item_bucket_key == normalized_bucket)
+                    .count()
+                )
+            overflow = current_count - effective_limit
+            if overflow <= 0:
+                return
+            stale_rows = (
                 db.query(task_manager_module.BinarySecuritySyncEvent)
                 .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
                 .filter(task_manager_module.BinarySecuritySyncEvent.item_bucket_key == normalized_bucket)
-                .count()
+                .order_by(task_manager_module.BinarySecuritySyncEvent.created_at.asc(), task_manager_module.BinarySecuritySyncEvent.id.asc())
+                .limit(overflow)
+                .all()
             )
-        overflow = current_count - effective_limit
-        if overflow <= 0:
-            return
-        stale_rows = (
-            db.query(task_manager_module.BinarySecuritySyncEvent)
-            .filter(task_manager_module.BinarySecuritySyncEvent.task_id == task_id)
-            .filter(task_manager_module.BinarySecuritySyncEvent.item_bucket_key == normalized_bucket)
-            .order_by(task_manager_module.BinarySecuritySyncEvent.created_at.asc(), task_manager_module.BinarySecuritySyncEvent.id.asc())
-            .limit(overflow)
-            .all()
-        )
-        for stale_row in stale_rows:
-            db.delete(stale_row)
+            for stale_row in stale_rows:
+                db.delete(stale_row)
+        except OperationalError as exc:
+            if self._suppress_event_trim_lock_error(
+                exc,
+                task_id=task_id,
+                trim_kind="stage item sync event",
+            ):
+                return
+            raise
 
     def _record_stage_item_sync_audit(
         self: TaskManager,
@@ -500,29 +535,34 @@ class TaskEventServiceMixin:
             return
         if not hasattr(db, "query") or not hasattr(db, "delete"):
             return
-        current_count = 0
-        if hasattr(db, "events"):
-            current_count = len(getattr(db, "events") or [])
-        else:
-            current_count = (
+        try:
+            current_count = 0
+            if hasattr(db, "events"):
+                current_count = len(getattr(db, "events") or [])
+            else:
+                current_count = (
+                    db.query(task_manager_module.BinarySecurityEvent)
+                    .filter(task_manager_module.BinarySecurityEvent.task_id == task_id)
+                    .count()
+                )
+            overflow = (
+                current_count - effective_limit
+            )
+            if overflow <= 0:
+                return
+            stale_events = (
                 db.query(task_manager_module.BinarySecurityEvent)
                 .filter(task_manager_module.BinarySecurityEvent.task_id == task_id)
-                .count()
+                .order_by(task_manager_module.BinarySecurityEvent.created_at.asc(), task_manager_module.BinarySecurityEvent.id.asc())
+                .limit(overflow)
+                .all()
             )
-        overflow = (
-            current_count - effective_limit
-        )
-        if overflow <= 0:
-            return
-        stale_events = (
-            db.query(task_manager_module.BinarySecurityEvent)
-            .filter(task_manager_module.BinarySecurityEvent.task_id == task_id)
-            .order_by(task_manager_module.BinarySecurityEvent.created_at.asc(), task_manager_module.BinarySecurityEvent.id.asc())
-            .limit(overflow)
-            .all()
-        )
-        for stale_event in stale_events:
-            db.delete(stale_event)
+            for stale_event in stale_events:
+                db.delete(stale_event)
+        except OperationalError as exc:
+            if self._suppress_event_trim_lock_error(exc, task_id=task_id, trim_kind="timeline event"):
+                return
+            raise
 
     @staticmethod
     def _json_payload_size_bytes(value: Any) -> int:

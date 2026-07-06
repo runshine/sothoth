@@ -51,6 +51,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.manager = TaskManager()
         self.manager.instance_id = "worker-a"
         self.manager._enqueue_task = lambda *_args, **_kwargs: None
+        self.manager._repair_running_lease_invariant = lambda *_args, **_kwargs: False
         if not hasattr(self.manager, "_terminal_stage_for_task"):
             self.manager._terminal_stage_for_task = lambda task: (
                 self.manager._stage_sequence_for_task(task)[-1]
@@ -992,8 +993,8 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("archive_apply", str(signals[-1].get("reconcile_reason") or ""))
         self.assertTrue(any(event.event_type == "task_layer_reconcile_completed" for event in db.events))
         self.assertEqual("entry_analysis", task.current_stage)
-        self.assertEqual("pending", task.status)
-        self.assertEqual("pending", detail.status)
+        self.assertEqual("running", task.status)
+        self.assertEqual("running", detail.status)
         self.assertEqual([], self.manager._stage_items(db, task.id, "entry_analysis"))
         self.assertEqual([], [run for run in db.stage_runs if str(run.stage_name or "").strip() == "entry_analysis"])
         b2s_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "binary_to_source")
@@ -1327,7 +1328,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         entry_results = list((task.summary or {}).get("entry_results") or [])
         self.assertTrue(any((row.get("entries") or []) == [] for row in entry_results))
         self.assertEqual([], self.manager._stage_items(db, task.id, "dataflow_vuln_scan"))
-        self.assertEqual("pending", task.status)
+        self.assertEqual("running", task.status)
         self.assertEqual("system_analysis", task.current_stage)
 
     def test_binary_firmware_workflow_e2e_entry_success_without_archive_does_not_start_dataflow(self):
