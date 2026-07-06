@@ -4411,6 +4411,7 @@ class TaskRuntimeServiceMixin:
                 running_status="queued",
             )
             session.commit()
+            self._release_session_connection_before_wait(session)
             active_payload = await self._active_downstream_payload(task, item, token)
             created = None
             retry_strategy = None
@@ -4421,6 +4422,7 @@ class TaskRuntimeServiceMixin:
                     active_payload=active_payload,
                 )
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    self._release_session_connection_before_wait(session)
                     action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                         session,
                         task,
@@ -4443,6 +4445,7 @@ class TaskRuntimeServiceMixin:
                     updates={"project_id": task.project_id},
                 )
                 self._commit_stage_item_active_state(session, task, stage_run)
+                self._release_session_connection_before_wait(session)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success"},
@@ -4453,6 +4456,7 @@ class TaskRuntimeServiceMixin:
                 created = None
             else:
                 if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+                    self._release_session_connection_before_wait(session)
                     control = await self._downstream_control_existing_task(
                         session,
                         stage_name=stage_run.stage_name,
@@ -4475,6 +4479,7 @@ class TaskRuntimeServiceMixin:
                             updates={"project_id": task.project_id},
                         )
                         self._commit_stage_item_active_state(session, task, stage_run)
+                        self._release_session_connection_before_wait(session)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success"},
@@ -4513,6 +4518,7 @@ class TaskRuntimeServiceMixin:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
+                    self._release_session_connection_before_wait(session)
                     current_child_payload = await self._active_downstream_payload(task, item, token)
                     if current_child_payload is not None and str(item.downstream_task_id or "").strip():
                         current_child_status = self._map_downstream_status(str(current_child_payload.get("status") or "")) or "running"
@@ -4541,6 +4547,7 @@ class TaskRuntimeServiceMixin:
                             },
                         )
                         session.commit()
+                        self._release_session_connection_before_wait(session)
                         status, payload = await self._poll_until_terminal(
                             lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success"},
@@ -4559,6 +4566,7 @@ class TaskRuntimeServiceMixin:
                             response_item=input_file,
                         )
                     else:
+                        self._release_session_connection_before_wait(session)
                         created = await self._downstream_create_task(
                             session,
                             task,
@@ -4601,6 +4609,7 @@ class TaskRuntimeServiceMixin:
                     },
                 )
                 session.commit()
+                self._release_session_connection_before_wait(session)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success"},
@@ -4623,6 +4632,7 @@ class TaskRuntimeServiceMixin:
             )
             item.finished_at = _now()
             item.started_at = item.started_at or _now()
+            self._release_session_connection_before_wait(session)
             archive_root, archive_job = await self._queue_archive_and_wait(
                 session,
                 task,
@@ -4746,6 +4756,7 @@ class TaskRuntimeServiceMixin:
                 auto_retrying=auto_retrying,
             )
             session.commit()
+            self._release_session_connection_before_wait(session)
             active_payload = await self._active_downstream_payload(task, item)
             retry_strategy = None
             retry_strategy_status = None
@@ -4755,6 +4766,7 @@ class TaskRuntimeServiceMixin:
                     active_payload=active_payload,
                 )
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
+                    self._release_session_connection_before_wait(session)
                     action_snapshot = await self._prepare_retry_child_for_reuse_or_recreate(
                         session,
                         task,
@@ -4772,6 +4784,7 @@ class TaskRuntimeServiceMixin:
                 item.started_at = item.started_at or _now()
                 item.error_message = None
                 self._commit_stage_item_active_state(session, task, stage_run)
+                self._release_session_connection_before_wait(session)
                 status, payload = await self._poll_until_terminal(
                     lambda: self._downstream_fetch_item_payload(task, item, None),
                     success_statuses={"passed", "success"},
@@ -4790,6 +4803,7 @@ class TaskRuntimeServiceMixin:
                         response_item=firmware,
                     )
                 else:
+                    self._release_session_connection_before_wait(session)
                     created = await self._downstream_create_task(
                         session,
                         task,
@@ -4828,6 +4842,7 @@ class TaskRuntimeServiceMixin:
                         },
                     )
                     session.commit()
+                    self._release_session_connection_before_wait(session)
                     status, payload = await self._poll_until_terminal(
                         lambda: self._downstream_fetch_item_payload(task, item, None),
                         success_statuses={"passed", "success"},
@@ -4838,6 +4853,7 @@ class TaskRuntimeServiceMixin:
             result_payload = {}
             if status == "success":
                 try:
+                    self._release_session_connection_before_wait(session)
                     result_payload = await self._downstream_fetch_item_result(item)
                 except Exception:
                     result_payload = {}
@@ -4853,6 +4869,7 @@ class TaskRuntimeServiceMixin:
             )
             item.status = mapped_status
             item.finished_at = _now()
+            self._release_session_connection_before_wait(session)
             archive_root, archive_job = await self._queue_archive_and_wait(
                 session,
                 task,

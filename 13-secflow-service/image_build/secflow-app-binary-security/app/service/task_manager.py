@@ -19,7 +19,7 @@ import time
 import tempfile
 import uuid
 import zipfile
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager, nullcontext, suppress
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -1453,6 +1453,7 @@ class TaskManager(
                 },
             )
         try:
+            self._release_session_connection_before_wait(db)
             work_key_payload = await self._derive_downstream_work_key(task=task, item=item, service=service)
         except (UnauthorizedError, ForbiddenError, LLMGatewayWorkKeyIssueError) as exc:
             status_code = getattr(exc, "gateway_status_code", None)
@@ -1524,6 +1525,7 @@ class TaskManager(
                     "agent_task_key_source": work_key_payload.get("agent_task_key_source"),
                 },
             )
+        self._release_session_connection_before_wait(db)
         created = await self._downstream_tasks().create_child_task(
             db,
             task,
@@ -1565,6 +1567,7 @@ class TaskManager(
         normalized_status = str(item.status or "").strip().lower()
         if str(item.downstream_task_id or "").strip():
             try:
+                self._release_session_connection_before_wait(db)
                 payload = await self._fetch_downstream_task_payload(task, item, token or "")
             except Exception:
                 payload = None
@@ -1573,6 +1576,7 @@ class TaskManager(
                 return {"outcome": "already_running", "payload": payload}
             if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
                 return {"outcome": "already_running", "payload": payload}
+        self._release_session_connection_before_wait(db)
         return await self._downstream_tasks().control_existing_child(
             db,
             stage_name=stage_name,
@@ -6539,6 +6543,14 @@ class TaskManager(
             return max(1, int(stage_parallelism[stage_name]))
         return max(1, int(policy.get("max_stage_parallelism") or 1))
 
+    def _release_session_connection_before_wait(self, session: Session | None) -> None:
+        if session is None:
+            return
+        try:
+            session.close()
+        except Exception:
+            logger.debug("binary-security ignored session close failure before async wait", exc_info=True)
+
     def _module_selection_mode(self, task: BinarySecurityTask) -> str:
         mode = str((task.policy or {}).get("module_selection_mode") or MODULE_SELECTION_MODE_AUTO).strip()
         if mode not in {MODULE_SELECTION_MODE_AUTO, MODULE_SELECTION_MODE_MANUAL_CONFIRM}:
@@ -8258,9 +8270,11 @@ class TaskManager(
         elif sync_status == "synced" and (last_sync_result or "").strip().lower() == "success":
             sync_event_type = "succeeded"
         max_attempts = self._retryable_write_attempts()
+        defer_flush = bool(getattr(db, "_binary_security_defer_flush", False))
         for attempt in range(max_attempts):
             try:
-                with self._savepoint(db):
+                context_manager = nullcontext() if defer_flush else self._savepoint(db)
+                with context_manager:
                     if observation_would_change:
                         self._mark_stage_item_sync_observation(
                             item,
@@ -8332,7 +8346,8 @@ class TaskManager(
                                 **(extra_payload or {}),
                             },
                         )
-                    db.flush()
+                    if not defer_flush:
+                        db.flush()
                 return True
             except Exception as exc:
                 if self._is_retryable_lock_error(exc) and attempt < max_attempts - 1:
@@ -8384,11 +8399,14 @@ class TaskManager(
     ) -> bool:
         before_status = str(item.status or "").strip().lower() or None
         max_attempts = self._retryable_write_attempts()
+        defer_flush = bool(getattr(db, "_binary_security_defer_flush", False))
         for attempt in range(max_attempts):
             try:
-                with self._savepoint(db):
+                context_manager = nullcontext() if defer_flush else self._savepoint(db)
+                with context_manager:
                     apply_fn()
-                    db.flush()
+                    if not defer_flush:
+                        db.flush()
                 return True
             except Exception as exc:
                 if self._is_retryable_lock_error(exc) and attempt < max_attempts - 1:
@@ -11358,6 +11376,7 @@ class TaskManager(
             )
             session.commit()
             try:
+                self._release_session_connection_before_wait(session)
                 await self._downstream_cancel_refs(
                     session,
                     task,
@@ -11393,6 +11412,7 @@ class TaskManager(
                 },
             )
             session.commit()
+            self._release_session_connection_before_wait(session)
             await self._delete_downstream_refs(
                 session,
                 task,
@@ -11520,6 +11540,7 @@ class TaskManager(
             )
             session.commit()
             try:
+                self._release_session_connection_before_wait(session)
                 await self._downstream_tasks().delete_child_task(
                     service="dataflow_vuln_scan",
                     project_id=task.project_id,

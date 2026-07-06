@@ -1047,6 +1047,7 @@ class TaskArchiveServiceMixin:
         if job is None:
             return None, None
         db.commit()
+        self._release_session_connection_before_wait(db)
         completed = await self._wait_archive_job_completion(job.id, task.id)
         try:
             db.refresh(item)

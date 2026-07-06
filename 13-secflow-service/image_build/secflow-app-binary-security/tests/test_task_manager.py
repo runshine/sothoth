@@ -46104,6 +46104,189 @@ def _test_fake_task_sync_queue_has_due_request_respects_future_retry_at(self):
     self.assertFalse(asyncio.run(fake_queue.has_due_task_sync_request(task_id)))
 
 
+def _test_sync_downstream_status_defers_commit_until_fetch_cycle_finishes(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-batch-commit",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-sync-batch-commit",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item1 = BinarySecurityStageItem(
+        id="si-sync-batch-commit-1",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="entry_analysis",
+        item_key="module-a",
+        item_name="module-a",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-batch-1",
+    )
+    item2 = BinarySecurityStageItem(
+        id="si-sync-batch-commit-2",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="entry_analysis",
+        item_key="module-b",
+        item_name="module-b",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-batch-2",
+    )
+    db = _FlakyCommitDb(tasks=[task], stage_runs=[run], stage_items=[item1, item2], events=[])
+
+    fetch_order: list[str] = []
+
+    async def _fetch(_task, item, _token):
+        fetch_order.append(str(item.id))
+        self.assertEqual(0, db.commit_calls)
+        return {
+            "task_id": str(item.downstream_task_id),
+            "status": "passed",
+            "parent_stage_item_id": str(item.id),
+            "result": {},
+        }
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._write_task_metadata_async = AsyncMock(return_value=None)
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        resp = asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name="entry_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    self.assertEqual(["si-sync-batch-commit-1", "si-sync-batch-commit-2"], fetch_order)
+    self.assertGreaterEqual(db.commit_calls, 1)
+    self.assertIn(resp.synced_downstream_count, {0, 1, 2})
+    self.assertEqual("requested", db.sync_events[0].sync_status if db.sync_events else "requested")
+    observation = dict((item1.result or {}).get("sync_observation") or {})
+    self.assertTrue(observation or db.archive_jobs)
+
+
+def _test_sync_downstream_status_persists_transport_error_observation_in_same_cycle(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-batch-error",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="entry_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-sync-batch-error",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="entry_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    ok_item = BinarySecurityStageItem(
+        id="si-sync-batch-error-ok",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="entry_analysis",
+        item_key="module-ok",
+        item_name="module-ok",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-ok",
+    )
+    err_item = BinarySecurityStageItem(
+        id="si-sync-batch-error-err",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="entry_analysis",
+        item_key="module-err",
+        item_name="module-err",
+        status="running",
+        downstream_service="entry_analyse",
+        downstream_task_id="eat-err",
+    )
+    db = _FlakyCommitDb(tasks=[task], stage_runs=[run], stage_items=[ok_item, err_item], events=[])
+
+    async def _fetch(_task, item, _token):
+        self.assertEqual(0, db.commit_calls)
+        if str(item.id) == "si-sync-batch-error-err":
+            raise UpstreamError("mock transport failed")
+        return {
+            "task_id": str(item.downstream_task_id),
+            "status": "running",
+            "parent_stage_item_id": str(item.id),
+            "result": {},
+        }
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._write_task_metadata_async = AsyncMock(return_value=None)
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        resp = asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name="entry_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    err_observation = dict((err_item.result or {}).get("sync_observation") or {})
+    self.assertEqual("transport_error", err_observation.get("sync_status"))
+    self.assertEqual("mock transport failed", err_observation.get("error_message"))
+    self.assertEqual("UpstreamError", err_observation.get("error_type"))
+    sync_rows = [row for row in db.sync_events if getattr(row, "item_id", None) == err_item.id]
+    self.assertTrue(sync_rows)
+    self.assertEqual("transport_error", sync_rows[-1].sync_status)
+    self.assertEqual("mock transport failed", sync_rows[-1].error_message)
+    self.assertGreaterEqual(db.commit_calls, 1)
+    self.assertGreaterEqual(resp.failed_downstream_count, 1)
+
+
 TaskManagerTests.test_owned_execution_takeover_requeue_uses_stage_name_for_main_state = _test_owned_execution_takeover_requeue_uses_stage_name_for_main_state
 TaskManagerTests.test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window = _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window
 TaskManagerTests.test_clear_runtime_lease_returns_retry_later_for_lock_timeout = _test_clear_runtime_lease_returns_retry_later_for_lock_timeout
@@ -46148,6 +46331,8 @@ TaskManagerTests.test_local_runtime_sync_maintenance_consumes_owner_signal = _te
 TaskManagerTests.test_task_sync_entry_score_respects_timezone_iso_retry_at = _test_task_sync_entry_score_respects_timezone_iso_retry_at
 TaskManagerTests.test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp = _test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp
 TaskManagerTests.test_fake_task_sync_queue_has_due_request_respects_future_retry_at = _test_fake_task_sync_queue_has_due_request_respects_future_retry_at
+TaskManagerTests.test_sync_downstream_status_defers_commit_until_fetch_cycle_finishes = _test_sync_downstream_status_defers_commit_until_fetch_cycle_finishes
+TaskManagerTests.test_sync_downstream_status_persists_transport_error_observation_in_same_cycle = _test_sync_downstream_status_persists_transport_error_observation_in_same_cycle
 TaskManagerTests.test_confirm_entry_selection_requires_pending_confirmation_status = _test_confirm_entry_selection_requires_pending_confirmation_status
 TaskManagerTests.test_confirm_entry_selection_rejects_unknown_keys_and_deduplicates_inputs = _test_confirm_entry_selection_rejects_unknown_keys_and_deduplicates_inputs
 TaskManagerTests.test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled = _test_sync_downstream_status_does_not_auto_recover_failed_dataflow_item_when_apply_disabled
