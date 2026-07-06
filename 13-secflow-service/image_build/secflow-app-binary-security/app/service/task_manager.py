@@ -777,7 +777,6 @@ class TaskManager(
         self._event_loop_last_stall_at: datetime | None = None
         self._last_stale_operation_requeue_at: datetime | None = None
         self._last_stage_item_sync_reconcile_at: datetime | None = None
-        self._queue_reconcile_observation_state: dict[tuple[str, str], dict[str, Any]] = {}
         self._non_owner_claim_log_state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._non_owner_claim_log_lock = threading.Lock()
         self._non_owner_claim_event_state: dict[tuple[str, str, str, str], datetime] = {}
