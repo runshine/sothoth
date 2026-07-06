@@ -1708,7 +1708,7 @@ class TaskRuntimeServiceMixin:
                         runtime_lease_owner
                         or str(getattr(task, "current_operation_id", "") or "").strip()
                     ):
-                        released = self._release_task_without_supported_runtime_owner(
+                        released = await self._release_task_without_supported_runtime_owner_async(
                             db,
                             task,
                             reason="pending_task_not_enqueued_reconcile",
@@ -1805,7 +1805,7 @@ class TaskRuntimeServiceMixin:
             if self._task_has_supported_runtime_owner(db, task):
                 continue
             if takeover_decision.allow_reenqueue:
-                released = self._release_task_without_supported_runtime_owner(
+                released = await self._release_task_without_supported_runtime_owner_async(
                     db,
                     task,
                     active_operation=active_delete_operation,

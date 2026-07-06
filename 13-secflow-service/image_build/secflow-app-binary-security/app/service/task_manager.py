@@ -3016,7 +3016,7 @@ class TaskManager(
     def _parent_takeover_lock_ttl_seconds(self) -> int:
         return 60
 
-    def _acquire_parent_takeover_lock(
+    async def _acquire_parent_takeover_lock_async(
         self,
         task_id: str,
         *,
@@ -3027,13 +3027,11 @@ class TaskManager(
             return ParentTakeoverAttemptResult(acquired=False, task_id=normalized_task_id, reason="missing_task_id")
         owner_token = f"{str(self.instance_id or '').strip() or 'unknown'}:{uuid.uuid4().hex}"
         acquired = bool(
-            self._run_async_blocking(
-                get_task_queue().acquire_parent_takeover_lock(
-                    normalized_task_id,
-                    owner_token=owner_token,
-                    ttl_seconds=self._parent_takeover_lock_ttl_seconds(),
-                    context=context,
-                )
+            await get_task_queue().acquire_parent_takeover_lock(
+                normalized_task_id,
+                owner_token=owner_token,
+                ttl_seconds=self._parent_takeover_lock_ttl_seconds(),
+                context=context,
             )
         )
         if not acquired:
@@ -3053,7 +3051,20 @@ class TaskManager(
             ),
         )
 
-    def _release_parent_takeover_lock(
+    def _acquire_parent_takeover_lock(
+        self,
+        task_id: str,
+        *,
+        context: str,
+    ) -> ParentTakeoverAttemptResult:
+        return self._run_async_blocking(
+            self._acquire_parent_takeover_lock_async(
+                task_id,
+                context=context,
+            )
+        )
+
+    async def _release_parent_takeover_lock_async(
         self,
         lock: ParentTakeoverLock | None,
         *,
@@ -3062,12 +3073,23 @@ class TaskManager(
         if lock is None:
             return False
         return bool(
-            self._run_async_blocking(
-                get_task_queue().release_parent_takeover_lock(
-                    lock.task_id,
-                    lock.lock_token,
-                    context=context,
-                )
+            await get_task_queue().release_parent_takeover_lock(
+                lock.task_id,
+                lock.lock_token,
+                context=context,
+            )
+        )
+
+    def _release_parent_takeover_lock(
+        self,
+        lock: ParentTakeoverLock | None,
+        *,
+        context: str,
+    ) -> bool:
+        return self._run_async_blocking(
+            self._release_parent_takeover_lock_async(
+                lock,
+                context=context,
             )
         )
 
@@ -4243,7 +4265,7 @@ class TaskManager(
             return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING} or bool(force)
         return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING, "failed"} or bool(force)
 
-    def _release_task_without_supported_runtime_owner(
+    async def _release_task_without_supported_runtime_owner_async(
         self,
         db: Session,
         task: BinarySecurityTask,
@@ -4299,7 +4321,7 @@ class TaskManager(
                 stage_name=task.current_stage,
             )
             return False
-        takeover_attempt = self._acquire_parent_takeover_lock(
+        takeover_attempt = await self._acquire_parent_takeover_lock_async(
             task.id,
             context="parent_runtime_release_for_takeover",
         )
@@ -4430,9 +4452,13 @@ class TaskManager(
                     level="warning",
                 )
                 self._repair_active_operations_for_task(db, task)
-                requeue_succeeded = self._force_requeue_task_sync(
-                    task.id,
-                    context="owned_execution_release_for_takeover",
+                requeue_succeeded = bool(
+                    await self._enqueue_task_and_wait(
+                        task.id,
+                        context="owned_execution_release_for_takeover",
+                        timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+                        force_requeue=True,
+                    )
                 )
                 summary = dict(getattr(task, "summary", None) or {})
                 summary["parent_takeover_pending_claim"] = {
@@ -4495,10 +4521,29 @@ class TaskManager(
                     )
                 return True
             finally:
-                self._release_parent_takeover_lock(
+                await self._release_parent_takeover_lock_async(
                     takeover_attempt.lock,
                     context="parent_runtime_release_for_takeover",
                 )
+
+    def _release_task_without_supported_runtime_owner(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        active_operation=None,
+        reason: str,
+    ) -> bool:
+        return bool(
+            self._run_async_blocking(
+                self._release_task_without_supported_runtime_owner_async(
+                    db,
+                    task,
+                    active_operation=active_operation,
+                    reason=reason,
+                )
+            )
+        )
 
     def _write_task_heartbeat(self, session: Session, task_id: str, *, now_value: datetime, source: str) -> bool:
         task = session.query(BinarySecurityTask).filter(
