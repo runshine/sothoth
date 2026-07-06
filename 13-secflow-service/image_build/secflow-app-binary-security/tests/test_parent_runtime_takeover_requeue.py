@@ -37,10 +37,29 @@ class ParentRuntimeTakeoverRequeueTests(unittest.IsolatedAsyncioTestCase):
     def test_repair_running_lease_invariant_requeues_immediately_when_runtime_lease_missing(self):
         task = self._task()
         db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
-        queued = []
+        requeue_calls = []
 
         with (
-            patch.object(self.manager, "_enqueue_task", lambda task_id: queued.append(task_id)),
+            patch.object(
+                self.manager,
+                "_force_requeue_task_sync",
+                lambda task_id, *, context: requeue_calls.append((task_id, context)) or True,
+            ),
+            patch.object(
+                self.manager,
+                "_acquire_parent_takeover_lock",
+                return_value=task_manager_module.ParentTakeoverAttemptResult(
+                    acquired=True,
+                    task_id=task.id,
+                    lock=task_manager_module.ParentTakeoverLock(
+                        task_id=task.id,
+                        lock_token="unit-test-lock",
+                        ttl_seconds=60,
+                        instance_id=self.manager.instance_id,
+                    ),
+                ),
+            ),
+            patch.object(self.manager, "_release_parent_takeover_lock", return_value=True),
             patch.object(self.manager, "_clear_runtime_lease") as clear_lease_mock,
         ):
             repaired = self.manager._repair_running_lease_invariant(
@@ -50,7 +69,7 @@ class ParentRuntimeTakeoverRequeueTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertTrue(repaired)
-        self.assertEqual([task.id], queued)
+        self.assertEqual([(task.id, "owned_execution_release_for_takeover")], requeue_calls)
         clear_lease_mock.assert_not_called()
         self.assertEqual("pending", task.status)
         event_types = [event.event_type for event in db.events]

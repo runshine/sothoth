@@ -747,7 +747,6 @@ class TaskManager(
         self._delete_loop_task: Optional[asyncio.Task] = None
         self._downstream_reconcile_task: Optional[asyncio.Task] = None
         self._readless_reconcile_task: Optional[asyncio.Task] = None
-        self._stage_item_sync_reconcile_task: Optional[asyncio.Task] = None
         self._archive_runtime_reconcile_task: Optional[asyncio.Task] = None
         self._state_repair_reconcile_task: Optional[asyncio.Task] = None
         self._state_event_inbox_loop_task: Optional[asyncio.Task] = None
@@ -784,7 +783,6 @@ class TaskManager(
         self._event_loop_stall_threshold_seconds = 5.0
         self._event_loop_last_stall_at: datetime | None = None
         self._last_stale_operation_requeue_at: datetime | None = None
-        self._last_stage_item_sync_reconcile_at: datetime | None = None
         self._queue_reconcile_observation_state: dict[tuple[str, str], dict[str, Any]] = {}
         self._non_owner_claim_log_state: dict[tuple[str, str, str, str], dict[str, Any]] = {}
         self._non_owner_claim_log_lock = threading.Lock()
@@ -1301,20 +1299,6 @@ class TaskManager(
             configured,
             int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30) * 3,
         )
-
-    def _stage_item_sync_reconcile_interval_seconds(self) -> int:
-        configured = int(
-            getattr(
-                self.cfg.scheduler,
-                "stage_item_sync_reconcile_interval_seconds",
-                self._downstream_child_sync_interval_seconds(),
-            )
-            or self._downstream_child_sync_interval_seconds()
-        )
-        return max(5, configured)
-
-    def _stage_item_sync_reconcile_batch_size(self) -> int:
-        return max(1, int(getattr(self.cfg.scheduler, "stage_item_sync_reconcile_batch_size", 100) or 100))
 
     def _stage_orchestration_max_consecutive_errors(self) -> int:
         return max(1, int(getattr(self.cfg.scheduler, "stage_orchestration_max_consecutive_errors", 10) or 10))
@@ -2549,7 +2533,6 @@ class TaskManager(
         ):
             return False
         consume_reason: str | None = None
-        due_sync_request = False
         owner_signal_payload = await get_task_queue().consume_owner_signal(
             str(self.instance_id or "").strip() or None,
             normalized_task_id,
@@ -2557,24 +2540,18 @@ class TaskManager(
         )
         if owner_signal_payload:
             consume_reason = str(owner_signal_payload.get("context") or "owner_signal").strip() or "owner_signal"
-        due_sync_request = await get_task_queue().has_due_task_sync_request(
-            normalized_task_id,
-            context="task_sync_due_check",
-        )
-        if not consume_reason and not due_sync_request:
-            return False
         handle.sync_maintenance_in_progress = True
         try:
             processed = await self._drain_local_runtime_sync_queue_once(
                 normalized_task_id,
-                reason=consume_reason or "due_task_sync_request",
+                reason=consume_reason or "periodic_reconcile",
                 max_passes=5,
             )
             if processed:
                 logger.info(
                     "binary-security local runtime sync maintenance processed queued sync requests: task_id=%s reason=%s",
                     normalized_task_id,
-                    consume_reason or "due_task_sync_request",
+                    consume_reason or "periodic_reconcile",
                 )
             return processed
         finally:
@@ -4230,7 +4207,7 @@ class TaskManager(
         sync_kind: str,
         force: bool,
     ) -> bool:
-        normalized_sync_kind = str(sync_kind or "downstream_status").strip() or "downstream_status"
+        normalized_sync_kind = str(sync_kind or "child_sync").strip() or "child_sync"
         normalized_status = str(getattr(task, "status", "") or "").strip().lower()
         if self._task_is_hidden_by_delete_queue(task):
             return False
@@ -4238,12 +4215,7 @@ class TaskManager(
             return False
         if self._task_has_healthy_active_owner_runtime(db, task):
             return False
-        if normalized_sync_kind in {
-            "downstream_status",
-            "binding_repair",
-            "late_child_terminal_sync",
-            "stale_sync_retry",
-        }:
+        if normalized_sync_kind == "child_sync":
             return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING} or bool(force)
         return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING, "failed"} or bool(force)
 
@@ -5427,25 +5399,23 @@ class TaskManager(
     def _task_sync_request_dedupe_key(
         self,
         *,
-        sync_kind: str,
+        operation: str,
         stage_name: str | None,
         item_ids: list[str] | None,
         archive_job_ids: list[str] | None,
     ) -> str:
-        normalized_kind = str(sync_kind or "downstream_status").strip() or "downstream_status"
+        del archive_job_ids
+        normalized_operation = str(operation or "child_sync").strip() or "child_sync"
         normalized_stage = str(stage_name or "").strip() or "*"
-        if normalized_kind in {"downstream_status", "binding_repair", "late_child_terminal_sync"}:
-            return f"{normalized_kind}:{normalized_stage}:*:*"
         normalized_item_ids = ",".join(sorted({str(item_id).strip() for item_id in list(item_ids or []) if str(item_id).strip()})) or "*"
-        normalized_archive_job_ids = ",".join(sorted({str(job_id).strip() for job_id in list(archive_job_ids or []) if str(job_id).strip()})) or "*"
-        return f"{normalized_kind}:{normalized_stage}:{normalized_item_ids}:{normalized_archive_job_ids}"
+        return f"{normalized_operation}:{normalized_stage}:{normalized_item_ids}"
 
     async def _enqueue_task_sync_request(
         self,
         task: BinarySecurityTask,
         *,
         db: Session | None = None,
-        sync_kind: str,
+        operation: str,
         source: str,
         reason: str,
         stage_name: str | None = None,
@@ -5458,7 +5428,7 @@ class TaskManager(
     ) -> dict[str, Any]:
         requested_at = _now().isoformat()
         entry = {
-            "sync_kind": str(sync_kind or "downstream_status").strip() or "downstream_status",
+            "operation": str(operation or "child_sync").strip() or "child_sync",
             "source": str(source or "").strip() or "unknown",
             "reason": str(reason or "").strip() or "sync_requested",
             "source_event_type": str(source_event_type or "").strip() or None,
@@ -5468,13 +5438,11 @@ class TaskManager(
             "force": bool(force),
             "requested_at": requested_at,
             "last_requested_at": requested_at,
-            "next_retry_at": requested_at,
-            "attempts": 0,
             "priority": int(priority or 100),
             "payload": dict(payload or {}),
         }
         dedupe_key = self._task_sync_request_dedupe_key(
-            sync_kind=entry["sync_kind"],
+            operation=entry["operation"],
             stage_name=entry.get("stage_name"),
             item_ids=entry.get("item_ids"),
             archive_job_ids=entry.get("archive_job_ids"),
@@ -5496,7 +5464,7 @@ class TaskManager(
                     level="warning",
                     stage_name=entry.get("stage_name"),
                     payload={
-                        "sync_kind": entry["sync_kind"],
+                        "operation": entry["operation"],
                         "reason": entry["reason"],
                         "source": entry["source"],
                         "source_event_type": entry.get("source_event_type"),
@@ -5511,43 +5479,11 @@ class TaskManager(
         if self._should_enqueue_parent_dispatch_for_task_sync(
             db,
             task,
-            sync_kind=entry["sync_kind"],
+            sync_kind=entry["operation"],
             force=bool(entry["force"]),
         ):
             self._enqueue_task(task.id)
         return normalized_entry
-
-    def _sync_request_entry_due(
-        self,
-        entry: dict[str, Any],
-        *,
-        now_value: datetime | None = None,
-    ) -> bool:
-        next_retry_at = self._parse_comparable_datetime(dict(entry or {}).get("next_retry_at"))
-        if next_retry_at is None:
-            return True
-        return next_retry_at <= (now_value or _now())
-
-    def _sync_request_blocked_by_budget_exhaustion(
-        self,
-        db: Session,
-        task: BinarySecurityTask,
-        entry: dict[str, Any],
-    ) -> bool:
-        item_ids = [str(item_id).strip() for item_id in list(dict(entry or {}).get("item_ids") or []) if str(item_id).strip()]
-        if not item_ids:
-            return False
-        items = (
-            db.query(BinarySecurityStageItem)
-            .filter(
-                BinarySecurityStageItem.task_id == task.id,
-                BinarySecurityStageItem.id.in_(item_ids),
-            )
-            .all()
-        )
-        if not items:
-            return False
-        return all(self._stage_item_sync_error_budget_exhausted(item) for item in items)
 
     async def _reconcile_missing_task_sync_requests(self, db: Session, task: BinarySecurityTask) -> int:
         expected = self._build_expected_sync_requests_from_db(db, task)
@@ -5563,21 +5499,17 @@ class TaskManager(
         repaired = 0
         for entry in expected:
             dedupe_key = self._task_sync_request_dedupe_key(
-                sync_kind=str(entry.get("sync_kind") or "").strip(),
+                operation=str(entry.get("operation") or "").strip(),
                 stage_name=entry.get("stage_name"),
                 item_ids=entry.get("item_ids"),
                 archive_job_ids=entry.get("archive_job_ids"),
             )
             if dedupe_key in existing_dedupe_keys:
                 continue
-            if not self._sync_request_entry_due(entry, now_value=now_value):
-                continue
-            if self._sync_request_blocked_by_budget_exhaustion(db, task, entry):
-                continue
             await self._enqueue_task_sync_request(
                 task,
                 db=db,
-                sync_kind=str(entry.get("sync_kind") or "").strip(),
+                operation=str(entry.get("operation") or "").strip(),
                 source="task_sync_reconcile",
                 reason=str(entry.get("reason") or "repair_missing_or_stale_sync_queue_entry").strip(),
                 stage_name=entry.get("stage_name"),
@@ -5598,7 +5530,7 @@ class TaskManager(
                 "子任务同步请求缺失，已按 DB 事实重新补回队列",
                 stage_name=entry.get("stage_name"),
                 payload={
-                    "sync_kind": entry.get("sync_kind"),
+                    "operation": entry.get("operation"),
                     "reason": entry.get("reason"),
                     "item_ids": list(entry.get("item_ids") or []),
                     "archive_job_ids": list(entry.get("archive_job_ids") or []),
@@ -5624,38 +5556,34 @@ class TaskManager(
         ):
             normalized_stage = str(normalize_stage_name(item.stage_name) or "").strip() or None
             observed_status = self._latest_observed_downstream_status(item)
-            needs_binding_repair = self._item_needs_downstream_binding_reconcile(item)
-            needs_sync = self._item_needs_downstream_sync(
+            decision = self._compute_item_downstream_action(
+                task,
                 item,
                 for_task_status=str(task.status or "").strip().lower() or None,
             )
             missing_recorded_status = self._item_missing_recorded_downstream_status(item)
-            if not (needs_binding_repair or needs_sync or missing_recorded_status):
+            if decision["action"] == "noop" and not missing_recorded_status:
                 continue
-            sync_kind = "binding_repair" if needs_binding_repair else "late_child_terminal_sync" if (
-                observed_status in {"success", "failed", "partial_success", "cancelled", "downstream_missing"}
-                and (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
-                not in {"success", "failed", "partial_success", "cancelled", "downstream_missing"}
-            ) else "downstream_status"
             entry = {
-                "sync_kind": sync_kind,
+                "operation": "child_create" if decision["action"] == "create_child" else "child_sync",
                 "source": "db_repair",
                 "reason": "repair_missing_or_stale_sync_queue_entry",
                 "source_event_type": "task_sync_queue_repair",
                 "stage_name": normalized_stage,
                 "item_ids": [str(item.id or "").strip()] if str(item.id or "").strip() else [],
                 "archive_job_ids": [],
-                "force": bool(needs_binding_repair or missing_recorded_status),
+                "force": bool(missing_recorded_status),
                 "payload": {
                     "item_key": str(item.item_key or "").strip() or None,
                     "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
                     "observed_downstream_status": observed_status,
+                    "decision_reason": decision["reason"],
                     "cross_stage_sync": bool(normalized_stage and normalized_stage != str(normalize_stage_name(task.current_stage) or "").strip()),
                 },
-                "priority": 10 if needs_binding_repair else 20 if missing_recorded_status else 30,
+                "priority": 10 if decision["action"] == "create_child" else 20 if missing_recorded_status else 30,
             }
             dedupe_key = self._task_sync_request_dedupe_key(
-                sync_kind=entry["sync_kind"],
+                operation=entry["operation"],
                 stage_name=entry.get("stage_name"),
                 item_ids=entry.get("item_ids"),
                 archive_job_ids=entry.get("archive_job_ids"),
@@ -5683,7 +5611,7 @@ class TaskManager(
             repaired = 0
             for entry in expected:
                 dedupe_key = self._task_sync_request_dedupe_key(
-                    sync_kind=str(entry.get("sync_kind") or "").strip(),
+                    operation=str(entry.get("operation") or "").strip(),
                     stage_name=entry.get("stage_name"),
                     item_ids=entry.get("item_ids"),
                     archive_job_ids=entry.get("archive_job_ids"),
@@ -5693,7 +5621,7 @@ class TaskManager(
                 await self._enqueue_task_sync_request(
                     task,
                     db=db,
-                    sync_kind=str(entry.get("sync_kind") or "").strip(),
+                    operation=str(entry.get("operation") or "").strip(),
                     source="runtime_start_repair",
                     reason=str(entry.get("reason") or "repair_missing_or_stale_sync_queue_entry").strip(),
                     stage_name=entry.get("stage_name"),
@@ -5717,17 +5645,14 @@ class TaskManager(
         stage_name = str(signal.get("stage_name") or "").strip() or None
         item_ids = [str(item_id).strip() for item_id in list(signal.get("item_ids") or []) if str(item_id).strip()]
         archive_job_ids = [str(job_id).strip() for job_id in list(signal.get("archive_job_ids") or []) if str(job_id).strip()]
-        sync_kind = "binding_repair" if str(signal.get("reason") or "").strip() in {"binding_repair", "stale_binding_repair"} else "downstream_status"
-        source_event_type = str(signal.get("source_event_type") or "").strip() or (
-            "legacy_pending_binding_repair" if sync_kind == "binding_repair" else "legacy_pending_downstream_sync"
-        )
+        operation = "child_sync"
+        source_event_type = str(signal.get("source_event_type") or "").strip() or "legacy_pending_downstream_sync"
         return await self._enqueue_task_sync_request(
             task,
             db=None,
-            sync_kind=sync_kind,
+            operation=operation,
             source=str(signal.get("source") or "legacy_runtime_workset").strip() or "legacy_runtime_workset",
-            reason=str(signal.get("reason") or ("legacy_pending_binding_repair" if sync_kind == "binding_repair" else "legacy_pending_downstream_sync")).strip()
-            or ("legacy_pending_binding_repair" if sync_kind == "binding_repair" else "legacy_pending_downstream_sync"),
+            reason=str(signal.get("reason") or "legacy_pending_downstream_sync").strip() or "legacy_pending_downstream_sync",
             stage_name=stage_name,
             item_ids=item_ids,
             archive_job_ids=archive_job_ids,
@@ -5736,7 +5661,7 @@ class TaskManager(
             payload={
                 "migrated_from_runtime_workset": True,
                 "legacy_signal": True,
-                "legacy_signal_kind": sync_kind,
+                "legacy_signal_operation": operation,
             },
             priority=50,
         )
@@ -5752,32 +5677,24 @@ class TaskManager(
         stage_name = str(entry.get("stage_name") or "").strip() or None
         item_ids = [str(item_id).strip() for item_id in list(entry.get("item_ids") or []) if str(item_id).strip()]
         force = bool(entry.get("force"))
-        sync_kind = str(entry.get("sync_kind") or "downstream_status").strip() or "downstream_status"
+        operation = str(entry.get("operation") or entry.get("sync_kind") or "child_sync").strip() or "child_sync"
         try:
-            if sync_kind == "binding_repair":
-                repaired = self._repair_replacement_binding_state_for_task(db, task)
-                db.commit()
-                if repaired:
-                    await get_task_queue().ack_task_sync_request(
-                        task.id,
-                        queue_item_id=queue_item_id,
-                        dedupe_key=dedupe_key,
-                        context="task_sync_ack",
-                    )
-                    return True
             sync_db = get_session_factory()()
             try:
-                await self.sync_downstream_status(
-                    sync_db,
-                    project_id=task.project_id,
-                    task_id=task.id,
-                    stage_name=stage_name,
-                    item_ids=item_ids or None,
-                    force=force,
-                    token=self._service_token(),
-                    record_request_event=False,
-                    apply_state=True,
-                )
+                if operation == "child_create":
+                    self._enqueue_task(task.id)
+                else:
+                    await self.sync_downstream_status(
+                        sync_db,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        stage_name=stage_name,
+                        item_ids=item_ids or None,
+                        force=force,
+                        token=self._service_token(),
+                        record_request_event=False,
+                        apply_state=True,
+                    )
             finally:
                 sync_db.close()
             await get_task_queue().ack_task_sync_request(
@@ -5824,7 +5741,7 @@ class TaskManager(
                         task=task,
                         item=stage_item,
                         stage_name=str(getattr(stage_item, "stage_name", "") or "").strip() or stage_name,
-                        operation=sync_kind,
+                        operation=operation,
                         event_type="skipped",
                         sync_status="skipped",
                         outcome="stale_sync_request_discarded",
@@ -5832,7 +5749,7 @@ class TaskManager(
                         error_type="stale_sync_request",
                         error_message=message,
                         payload={
-                            "operation": sync_kind,
+                            "operation": operation,
                             "queue_item_id": queue_item_id,
                             "dedupe_key": dedupe_key,
                             "item_ids": item_ids,
@@ -5853,15 +5770,15 @@ class TaskManager(
                 self._record_event(
                     db,
                     task,
-                    "task_sync_request_discarded_as_stale_noop",
-                    message,
-                    level="warning",
-                    stage_name=stage_name,
-                    payload={
-                        "sync_kind": sync_kind,
-                        "queue_item_id": queue_item_id,
-                        "dedupe_key": dedupe_key,
-                        "item_ids": item_ids,
+                        "task_sync_request_discarded_as_stale_noop",
+                        message,
+                        level="warning",
+                        stage_name=stage_name,
+                        payload={
+                            "operation": operation,
+                            "queue_item_id": queue_item_id,
+                            "dedupe_key": dedupe_key,
+                            "item_ids": item_ids,
                         "existing_item_ids": existing_item_ids,
                         "missing_item_ids": missing_item_ids,
                         "source": str(entry.get("source") or "").strip() or None,
@@ -5901,7 +5818,7 @@ class TaskManager(
                     level="warning",
                     stage_name=stage_name,
                     payload={
-                        "sync_kind": sync_kind,
+                        "operation": operation,
                         "queue_item_id": queue_item_id,
                         "dedupe_key": dedupe_key,
                         "item_ids": item_ids,
@@ -5927,7 +5844,7 @@ class TaskManager(
                     await self._enqueue_task_sync_request(
                         task,
                         db=db,
-                        sync_kind=sync_kind,
+                        operation=operation,
                         source=str(entry.get("source") or "task_sync_invalid_item_filter").strip() or "task_sync_invalid_item_filter",
                         reason=str(entry.get("reason") or "invalid_item_ids_filtered_after_pop").strip() or "invalid_item_ids_filtered_after_pop",
                         stage_name=stage_name,
@@ -5957,76 +5874,22 @@ class TaskManager(
                     str(exc),
                 )
                 return True
-            retry_seconds = max(5, min(60, 5 * (2 ** min(5, int(entry.get("attempts") or 0)))))
-            retry_at = _now() + timedelta(seconds=retry_seconds)
-            retry_entry = {
-                **dict(entry),
-                "attempts": int(entry.get("attempts") or 0) + 1,
-                "last_error": str(exc),
-                "next_retry_at": retry_at.isoformat(),
-            }
-            try:
-                await get_task_queue().retry_task_sync_request(task.id, retry_entry, context="task_sync_retry")
-            except Exception as retry_exc:
-                item_ids = [str(item_id).strip() for item_id in list(retry_entry.get("item_ids") or []) if str(item_id).strip()]
-                stage_items: list[BinarySecurityStageItem] = []
-                if item_ids:
-                    stage_items = (
-                        db.query(BinarySecurityStageItem)
-                        .filter(
-                            BinarySecurityStageItem.task_id == task.id,
-                            BinarySecurityStageItem.id.in_(item_ids),
-                        )
-                        .all()
-                    )
-                sync_error_type = self._classify_downstream_sync_error(exc)
-                sync_error_message = str(exc)
-                for stage_item in stage_items:
-                    state = self._build_next_downstream_sync_failure_state(stage_item, observed_at=retry_at)
-                    self._persist_child_sync_observation(
-                        db,
-                        task=task,
-                        item=stage_item,
-                        change_source="task_sync_retry_enqueue_failed",
-                        sync_status="transport_error" if sync_error_type == "UpstreamError" else "observed",
-                        synced_at=retry_at,
-                        error_message=sync_error_message,
-                        error_type=sync_error_type,
-                        status_raw=self._stage_item_observed_downstream_status(stage_item),
-                        mapped_status=self._normalize_downstream_status(self._stage_item_observed_downstream_status(stage_item)),
-                        downstream_status=self._stage_item_observed_downstream_status(stage_item),
-                        state_applied=False,
-                        consecutive_error_count=state.consecutive_error_count,
-                        budget_exhausted=state.budget_exhausted,
-                        next_retry_at=state.next_retry_at,
-                        last_sync_result="error",
-                        extra_payload={
-                            "operation": "downstream_sync",
-                            "queue_item_id": queue_item_id,
-                            "retry_enqueue_error": str(retry_exc),
-                            "retry_enqueue_error_type": retry_exc.__class__.__name__,
-                            "retry_seconds": retry_seconds,
-                        },
-                    )
-                self._record_event(
-                    db,
-                    task,
-                    "task_sync_retry_enqueue_failed_but_db_retry_persisted",
-                    "子任务同步重试入队失败，但重试事实已写入 DB，后续将自动补偿",
-                    level="warning",
-                    stage_name=stage_name,
-                    payload={
-                        "sync_kind": sync_kind,
-                        "item_ids": item_ids,
-                        "queue_item_id": queue_item_id,
-                        "dedupe_key": dedupe_key,
-                        "next_retry_at": retry_entry.get("next_retry_at"),
-                        "error_type": exc.__class__.__name__,
-                        "error": str(exc),
-                        "retry_enqueue_error_type": retry_exc.__class__.__name__,
-                        "retry_enqueue_error": str(retry_exc),
-                    },
-                )
+            self._record_event(
+                db,
+                task,
+                "downstream_sync_failed",
+                "下游同步失败，等待下一轮正常扫描继续尝试",
+                level="warning",
+                stage_name=stage_name,
+                payload={
+                    "operation": operation,
+                    "queue_item_id": queue_item_id,
+                    "dedupe_key": dedupe_key,
+                    "item_ids": item_ids,
+                    "error_type": exc.__class__.__name__,
+                    "error": str(exc),
+                },
+            )
             raise
 
     def _resolve_task_sync_entry_item_targets(

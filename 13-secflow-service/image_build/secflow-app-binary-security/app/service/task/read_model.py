@@ -2532,7 +2532,6 @@ class TaskReadModelServiceMixin:
             "stage_item_dispatch": "阶段子项分发 loop",
             "task_heartbeat": "任务保活 loop",
             "downstream_reconcile": "下游收口 loop",
-            "stage_item_sync_reconcile": "阶段同步 reconcile loop",
             "archive_dispatch": "归档分发 loop",
             "archive_runtime_reconcile": "归档 reconcile loop",
             "state_repair_reconcile": "状态修复 loop",
@@ -2555,7 +2554,6 @@ class TaskReadModelServiceMixin:
             "downstream_reconcile": getattr(self, "_downstream_reconcile_task", None),
             "archive_dispatch": getattr(self, "_archive_loop_task", None),
             "archive_runtime_reconcile": getattr(self, "_archive_runtime_reconcile_task", None),
-            "stage_item_sync_reconcile": getattr(self, "_stage_item_sync_reconcile_task", None),
             "state_repair_reconcile": getattr(self, "_state_repair_reconcile_task", None),
             "readless_reconcile": getattr(self, "_readless_reconcile_task", None),
         }

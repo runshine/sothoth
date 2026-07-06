@@ -176,7 +176,6 @@ class TaskLifecycleServiceMixin:
             "archive_dispatch": max(1, int(getattr(self.cfg.scheduler, "poll_interval_seconds", 5) or 5)),
             "stage_item_dispatch": max(1, int(getattr(self.cfg.scheduler, "stage_poll_interval_seconds", 5) or 5)),
             "downstream_reconcile": max(1, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30)),
-            "stage_item_sync_reconcile": self._stage_item_sync_reconcile_interval_seconds(),
             "archive_runtime_reconcile": self._archive_runtime_reconcile_interval_seconds(),
             "state_repair_reconcile": self._state_repair_reconcile_interval_seconds(),
             "readless_reconcile": max(1, int(getattr(self.cfg.scheduler, "readless_reconcile_interval_seconds", 300) or 300)),
@@ -360,7 +359,7 @@ class TaskLifecycleServiceMixin:
             await self._enqueue_task_sync_request(
                 task,
                 db=db,
-                sync_kind="downstream_status",
+                operation="child_sync",
                 source="lease_auditor_signal",
                 reason="downstream_reconcile_requested",
                 force=False,
@@ -450,101 +449,6 @@ class TaskLifecycleServiceMixin:
         finally:
             db.close()
 
-    async def _reconcile_stale_stage_item_sync_ref(self: TaskManager, ref: dict[str, Any], token: str | None) -> None:
-        from app.service import task_manager as task_manager_module
-
-        db = task_manager_module.get_session_factory()()
-        try:
-            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
-            self._record_event(
-                db,
-                task,
-                "downstream_sync_reconcile_triggered",
-                "检测到阶段下游同步陈旧，已通知任务 owner 串行重同步",
-                stage_name=ref.get("stage_name"),
-                payload={
-                    "task_id": ref["task_id"],
-                    "stage_name": ref.get("stage_name"),
-                    "item_ids": list(ref.get("item_ids") or []),
-                    "resolution_reason": "stale_sync_attempt",
-                    "source": "lease_auditor_signal",
-                },
-            )
-            await self._enqueue_task_sync_request(
-                task,
-                db=db,
-                sync_kind="stale_sync_retry",
-                source="lease_auditor_signal",
-                reason="stale_sync_attempt",
-                stage_name=str(ref.get("stage_name") or "").strip() or None,
-                item_ids=[str(item_id).strip() for item_id in list(ref.get("item_ids") or []) if str(item_id).strip()],
-                force=True,
-                source_event_type="downstream_status_observed",
-                payload={
-                    "resolution_reason": "stale_sync_attempt",
-                    "requested_by_token_present": bool(str(token or "").strip()),
-                },
-                priority=20,
-            )
-            db.commit()
-        finally:
-            db.close()
-
-    def _list_tasks_with_stale_stage_item_syncs(self: TaskManager, db: Session) -> list[dict[str, Any]]:
-        from app.service import task_manager as task_manager_module
-
-        now_value = task_shared._now()
-        stale_threshold_seconds = self._stage_item_sync_stale_seconds()
-        batch_size = max(1, int(getattr(self.cfg.scheduler, "stage_item_sync_reconcile_batch_size", 100) or 100))
-        refs: list[dict[str, Any]] = []
-        for task in db.query(task_manager_module.BinarySecurityTask).all():
-            task_id = str(getattr(task, "id", "") or "").strip()
-            project_id = str(getattr(task, "project_id", "") or "").strip()
-            if not task_id or not project_id:
-                continue
-            items = self._task_reconcile_candidate_items(
-                db,
-                task,
-                force=False,
-                include_failed_terminal_items=True,
-            )
-            if not items:
-                continue
-            stage_item_ids: dict[str, list[str]] = {}
-            for item in items:
-                item_id = str(getattr(item, "id", "") or "").strip()
-                stage_name = str(getattr(item, "stage_name", "") or "").strip()
-                if not item_id or not stage_name:
-                    continue
-                stale = False
-                if self._item_needs_downstream_binding_reconcile(item) or self._item_missing_recorded_downstream_status(item):
-                    stale = True
-                else:
-                    next_retry_at = self._stage_item_next_sync_retry_at_value(item)
-                    if next_retry_at is not None and next_retry_at <= now_value:
-                        stale = True
-                    else:
-                        attempt_at = self._stage_item_sync_attempt_at_value(item)
-                        if attempt_at is None:
-                            stale = True
-                        else:
-                            stale = (now_value - attempt_at).total_seconds() >= stale_threshold_seconds
-                if not stale:
-                    continue
-                stage_item_ids.setdefault(stage_name, []).append(item_id)
-            for stage_name, item_ids in stage_item_ids.items():
-                refs.append(
-                    {
-                        "project_id": project_id,
-                        "task_id": task_id,
-                        "stage_name": stage_name,
-                        "item_ids": item_ids,
-                    }
-                )
-                if len(refs) >= batch_size:
-                    return refs
-        return refs
-
     async def _downstream_reconcile_loop(self: TaskManager) -> None:
         from app.service import task_manager as task_manager_module
 
@@ -567,7 +471,7 @@ class TaskLifecycleServiceMixin:
                     results = await self._run_with_limits(
                         task_refs,
                         lambda ref: self._reconcile_downstream_task_ref(ref, token),
-                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                        concurrency=max(1, min(int(getattr(self.cfg.scheduler, "downstream_action_concurrency", 8) or 8), 8)),
                         timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
                     )
                     for ref, _, exc in results:
@@ -598,7 +502,7 @@ class TaskLifecycleServiceMixin:
                     deferred_results = await self._run_with_limits(
                         deferred_cleanup_refs,
                         lambda ref: self._reconcile_deferred_cleanup_task_ref(ref, token),
-                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
+                        concurrency=max(1, min(int(getattr(self.cfg.scheduler, "downstream_action_concurrency", 8) or 8), 8)),
                         timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
                     )
                     for ref, _, exc in deferred_results:
@@ -629,56 +533,6 @@ class TaskLifecycleServiceMixin:
             except Exception as exc:
                 self._recover_loop_db_error("downstream_reconcile", db, exc)
                 task_manager_module.logger.exception("binary-security downstream reconcile loop crashed and recovered")
-                await asyncio.sleep(1)
-            finally:
-                db.close()
-            await asyncio.sleep(interval_seconds)
-
-    async def _stage_item_sync_reconcile_loop(self: TaskManager) -> None:
-        from app.service import task_manager as task_manager_module
-
-        interval_seconds = self._stage_item_sync_reconcile_interval_seconds()
-        while self._running:
-            db = task_manager_module.get_session_factory()()
-            try:
-                with observe_scheduler_loop("stage_item_sync_reconcile"):
-                    self._mark_loop_heartbeat("stage_item_sync_reconcile")
-                    refs = await asyncio.to_thread(self._list_tasks_with_stale_stage_item_syncs, db)
-                    token = self._service_token()
-                    results = await self._run_with_limits(
-                        refs,
-                        lambda ref: self._reconcile_stale_stage_item_sync_ref(ref, token),
-                        concurrency=max(1, min(int(self.cfg.scheduler.downstream_sync_concurrency or 1), 8)),
-                        timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
-                    )
-                    for ref, _, exc in results:
-                        if exc is None:
-                            continue
-                        with suppress(Exception):
-                            task = self._task_or_404(db, ref["project_id"], ref["task_id"])
-                            self._record_event(
-                                db,
-                                task,
-                                "downstream_sync_reconcile_failed",
-                                f"后台 stale sync 收敛失败: {exc}",
-                                level="warning",
-                                stage_name=ref.get("stage_name"),
-                                payload={
-                                    "task_id": ref["task_id"],
-                                    "project_id": ref["project_id"],
-                                    "stage_name": ref.get("stage_name"),
-                                    "item_ids": list(ref.get("item_ids") or []),
-                                    "error": str(exc),
-                                    "error_type": exc.__class__.__name__,
-                                },
-                            )
-                            db.commit()
-                    self._mark_loop_heartbeat("stage_item_sync_reconcile")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._recover_loop_db_error("stage_item_sync_reconcile", db, exc)
-                task_manager_module.logger.exception("binary-security stage item sync reconcile loop crashed and recovered")
                 await asyncio.sleep(1)
             finally:
                 db.close()

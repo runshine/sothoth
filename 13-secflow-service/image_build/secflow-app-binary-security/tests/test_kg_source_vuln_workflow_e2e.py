@@ -609,7 +609,7 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
         self.assertEqual("downstream_missing", dataflow_summary.status)
         self.assertEqual(1, dataflow_summary.downstream_missing_items)
 
-    def test_kg_source_vuln_workflow_e2e_dataflow_downstream_missing_recovers_on_next_owner_prepare(self):
+    def test_kg_source_vuln_workflow_e2e_dataflow_downstream_missing_stays_terminal_on_next_owner_prepare(self):
         entry = {
             "entry_key": "src-1",
             "module_key": "knowledge-graph-source-project",
@@ -734,7 +734,7 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _current: {},
         )
 
-        self.assertEqual([dict(entry)], executable)
+        self.assertEqual([], executable)
         self.assertEqual("downstream_missing", dataflow_item.status)
         self.assertEqual("df-missing-owner", dataflow_item.downstream_task_id)
 

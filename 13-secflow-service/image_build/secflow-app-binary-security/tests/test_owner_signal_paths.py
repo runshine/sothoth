@@ -46,7 +46,7 @@ class OwnerSignalPathTests(unittest.TestCase):
             asyncio.run(
                 manager._enqueue_task_sync_request(
                     task,
-                    sync_kind="downstream_status",
+                    operation="child_sync",
                     source="test",
                     reason="owner-sync",
                     stage_name="entry_analysis",
@@ -86,7 +86,7 @@ class OwnerSignalPathTests(unittest.TestCase):
             asyncio.run(
                 manager._enqueue_task_sync_request(
                     task,
-                    sync_kind="downstream_status",
+                    operation="child_sync",
                     source="test",
                     reason="no-owner-sync",
                     stage_name="entry_analysis",
@@ -133,7 +133,7 @@ class OwnerSignalPathTests(unittest.TestCase):
                 manager._enqueue_task_sync_request(
                     task,
                     db=db,
-                    sync_kind="downstream_status",
+                    operation="child_sync",
                     source="test",
                     reason="healthy-owner-sync",
                     stage_name="entry_analysis",

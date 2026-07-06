@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 
 class TaskItemSyncServiceMixin:
+    _ACTIVE_CHILD_STATUSES = {"pending", "queued", "dispatching", "running"}
+    _TERMINAL_CHILD_STATUSES = {"success", "failed", "cancelled", "downstream_missing", "partial_success"}
+
     def _task_reconcile_requested_items(
         self: TaskManager,
         db: Session,
@@ -109,9 +112,12 @@ class TaskItemSyncServiceMixin:
         if not candidates:
             return False
         return any(
-            (self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower())
-            in {"pending", "queued", "dispatching", "running"}
-            or self._item_needs_downstream_binding_reconcile(item)
+            self._compute_item_downstream_action(
+                task,
+                item,
+                for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
+            )["action"]
+            in {"create_child", "sync_child"}
             for item in candidates
         )
 
@@ -259,6 +265,153 @@ class TaskItemSyncServiceMixin:
         downstream_payload = dict(result.get("downstream") or {})
         return not self._string_or_none(downstream_payload.get("status"))
 
+    def _item_authoritative_child_bound(self: TaskManager, item: BinarySecurityStageItem) -> bool:
+        return bool(str(getattr(item, "downstream_task_id", "") or "").strip())
+
+    def _item_authoritative_child_status(self: TaskManager, item: BinarySecurityStageItem) -> str | None:
+        if not self._item_authoritative_child_bound(item):
+            return None
+        result = self._load_stage_item_result_payload(item)
+        observed_status = self._latest_observed_downstream_status(item)
+        if observed_status:
+            normalized_observed = self._normalize_downstream_status(observed_status) or str(observed_status or "").strip().lower()
+            if normalized_observed:
+                return normalized_observed
+        candidates = [
+            getattr(item, "downstream_mapped_status", None),
+            getattr(item, "downstream_status", None),
+            result.get("downstream_status"),
+            dict(result.get("downstream") or {}).get("status"),
+            getattr(item, "status", None),
+        ]
+        for candidate in candidates:
+            normalized = self._map_downstream_status(str(candidate or "")) or str(candidate or "").strip().lower()
+            if normalized:
+                return normalized
+        return None
+
+    def _item_authoritative_child_terminal(self: TaskManager, item: BinarySecurityStageItem) -> bool:
+        return (self._item_authoritative_child_status(item) or "") in self._TERMINAL_CHILD_STATUSES
+
+    def _item_authoritative_child_active(self: TaskManager, item: BinarySecurityStageItem) -> bool:
+        return (self._item_authoritative_child_status(item) or "") in self._ACTIVE_CHILD_STATUSES
+
+    def _child_counts_as_active_for_parallelism(self: TaskManager, item: BinarySecurityStageItem) -> bool:
+        return self._item_authoritative_child_bound(item) and self._item_authoritative_child_active(item)
+
+    def _item_needs_authoritative_terminal_apply(self: TaskManager, item: BinarySecurityStageItem) -> bool:
+        if not self._item_authoritative_child_bound(item):
+            return False
+        child_status = self._item_authoritative_child_status(item)
+        if child_status not in self._TERMINAL_CHILD_STATUSES:
+            return False
+        item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if item_status != child_status:
+            return True
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = self._stage_item_sync_observation(item)
+        if self._item_missing_recorded_downstream_status(item):
+            return True
+        state_applied = sync_observation.get("state_applied")
+        if state_applied is None:
+            state_applied = result.get("downstream_state_applied")
+        if state_applied is None:
+            sync_status = self._stage_item_sync_status_value(item)
+            if sync_status == "synced" and item_status == child_status:
+                return False
+        return not bool(state_applied)
+
+    def _compute_item_downstream_action(
+        self: TaskManager,
+        task: BinarySecurityTask | None,
+        item: BinarySecurityStageItem,
+        *,
+        for_task_status: str | None = None,
+        now_value: datetime | None = None,
+    ) -> dict[str, Any]:
+        del task
+        item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if not str(item.downstream_service or "").strip():
+            return {
+                "action": "noop",
+                "child_bound": False,
+                "child_status": None,
+                "child_terminal": False,
+                "child_active": False,
+                "counts_as_active_child": False,
+                "reason": "missing_downstream_service",
+            }
+        child_bound = self._item_authoritative_child_bound(item)
+        child_status = self._item_authoritative_child_status(item)
+        child_terminal = bool(child_status in self._TERMINAL_CHILD_STATUSES)
+        child_active = bool(child_status in self._ACTIVE_CHILD_STATUSES)
+        counts_as_active_child = child_bound and child_active
+        if not child_bound:
+            if item_status in {"pending", "queued", "running", "dispatching"}:
+                return {
+                    "action": "create_child",
+                    "child_bound": False,
+                    "child_status": None,
+                    "child_terminal": False,
+                    "child_active": False,
+                    "counts_as_active_child": False,
+                    "reason": "missing_authoritative_child",
+                }
+            return {
+                "action": "noop",
+                "child_bound": False,
+                "child_status": None,
+                "child_terminal": False,
+                "child_active": False,
+                "counts_as_active_child": False,
+                "reason": "unbound_terminal_item",
+            }
+        if child_terminal:
+            if self._item_needs_authoritative_terminal_apply(item):
+                return {
+                    "action": "sync_child",
+                    "child_bound": True,
+                    "child_status": child_status,
+                    "child_terminal": True,
+                    "child_active": False,
+                    "counts_as_active_child": False,
+                    "reason": "terminal_child_needs_apply",
+                }
+            return {
+                "action": "noop",
+                "child_bound": True,
+                "child_status": child_status,
+                "child_terminal": True,
+                "child_active": False,
+                "counts_as_active_child": False,
+                "reason": "terminal_child_already_applied",
+            }
+        if self._item_needs_initial_downstream_sync(item):
+            reason = "active_child_initial_sync"
+        elif self._item_downstream_sync_stale(item, now_value):
+            reason = "active_child_stale_sync"
+        elif item_status == "failed" and (for_task_status or "") in {"dispatching", "running", "failed"}:
+            reason = "failed_item_active_child_resync"
+        else:
+            return {
+                "action": "noop",
+                "child_bound": True,
+                "child_status": child_status,
+                "child_terminal": False,
+                "child_active": True,
+                "counts_as_active_child": True,
+                "reason": "active_child_fresh",
+            }
+        return {
+            "action": "sync_child",
+            "child_bound": True,
+            "child_status": child_status,
+            "child_terminal": False,
+            "child_active": True,
+            "counts_as_active_child": True,
+            "reason": reason,
+        }
+
     def _task_reconcile_candidate_items(
         self: TaskManager,
         db: Session,
@@ -295,17 +448,12 @@ class TaskItemSyncServiceMixin:
                 and not self._item_missing_recorded_downstream_status(item)
             ):
                 continue
-            if (
-                normalize_stage_name(item.stage_name) == "dataflow_vuln_scan"
-                and not str(item.downstream_task_id or "").strip()
-                and self._item_needs_downstream_binding_reconcile(item)
-            ):
-                candidates.append(item)
-                continue
-            if self._item_needs_downstream_sync(
+            decision = self._compute_item_downstream_action(
+                task,
                 item,
                 for_task_status=str(task.status or "").strip().lower() or None,
-            ):
+            )
+            if decision["action"] != "noop":
                 candidates.append(item)
                 continue
             if self._item_missing_recorded_downstream_status(item):
@@ -736,7 +884,7 @@ class TaskItemSyncServiceMixin:
 
     def _item_needs_initial_downstream_sync(self: TaskManager, item: BinarySecurityStageItem) -> bool:
         sync_status = self._stage_item_sync_status_value(item)
-        if sync_status in {None, "", "pending", "transport_error"}:
+        if sync_status in {None, "", "pending", "transport_error", "rate_limited", "binding_mismatch", "skipped"}:
             return True
         return self._stage_item_sync_attempt_at_value(item) is None
 
@@ -747,18 +895,13 @@ class TaskItemSyncServiceMixin:
         for_task_status: str | None = None,
         now_value: datetime | None = None,
     ) -> bool:
-        if not str(item.downstream_service or "").strip() or not str(item.downstream_task_id or "").strip():
-            return False
-        if self._stage_item_sync_in_retry_backoff(item, now_value):
-            return False
-        item_status = str(item.status or "").strip().lower()
-        if item_status in {"pending", "queued", "running", "dispatching"}:
-            return self._item_needs_initial_downstream_sync(item) or self._item_downstream_sync_stale(item, now_value)
-        if item_status == "failed":
-            return (for_task_status or "") in {"dispatching", "running", "failed"} or self._item_needs_initial_downstream_sync(item)
-        if item_status in {"success", "cancelled", "downstream_missing", "partial_success"}:
-            return self._item_needs_initial_downstream_sync(item)
-        return False
+        decision = self._compute_item_downstream_action(
+            None,
+            item,
+            for_task_status=for_task_status,
+            now_value=now_value,
+        )
+        return decision["action"] == "sync_child"
 
     def _stage_item_sync_priority(
         self: TaskManager,
@@ -1582,66 +1725,21 @@ class TaskItemSyncServiceMixin:
         auth_token = token or self._service_token()
         ready_items: list[BinarySecurityStageItem] = []
         for item in items:
-            repaired_false_mismatch = self._repair_false_not_started_binding_mismatch(item)
-            if self._item_waiting_for_initial_dataflow_binding(item):
-                if repaired_false_mismatch:
-                    self._record_event(
-                        db,
-                        task,
-                        "downstream_binding_waiting_state_restored",
-                        "dataflow 阶段项仍在等待编排器创建 child，已清理误写的同步异常状态",
-                        level="info",
-                        stage_name=item.stage_name,
-                        item=item,
-                        payload={
-                            "item_id": str(item.id or "").strip() or None,
-                            "item_key": str(item.item_key or "").strip() or None,
-                            "downstream_service": str(item.downstream_service or "").strip() or None,
-                            "binding_state": self._downstream_binding_state(item),
-                        },
-                    )
+            decision = self._compute_item_downstream_action(
+                task,
+                item,
+                for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
+            )
+            if decision["action"] != "sync_child":
+                self._repair_false_not_started_binding_mismatch(item)
                 skipped_count += 1
-                continue
-            if self._item_needs_downstream_binding_reconcile(item):
-                skipped_count += 1
-                binding_payload = {
-                    "operation": "downstream_sync",
-                    "sync_status": "binding_mismatch",
-                    "reason_code": "missing_bound_downstream_task_id",
-                    "downstream_service": str(item.downstream_service or "").strip() or None,
-                    "binding_state": self._downstream_binding_state(item),
-                    "expected_downstream_task_id": str(item.downstream_task_id or "").strip() or None,
-                    "expected_parent_stage_item_id": str(item.id or "").strip() or None,
-                    "expected_parent_stage_item_key": str(item.item_key or "").strip() or None,
-                }
-                self._record_binding_mismatch_event(
-                    db,
-                    task,
-                    item,
-                    event_type="downstream_binding_missing",
-                    message="下游绑定缺失，当前仅允许通过已绑定 child 同步，已跳过本次自动对账",
-                    payload=binding_payload,
-                )
-                if not self._persist_child_sync_observation(
-                    db,
-                    task=task,
-                    item=item,
-                    change_source="downstream_sync",
-                    sync_status="binding_mismatch",
-                    synced_at=task_manager_module._now(),
-                    error_message="下游绑定缺失：未记录 downstream_task_id，禁止通过列表接口推断或复用 child",
-                    error_type="missing_bound_downstream_task_id",
-                    state_applied=False,
-                    extra_payload=binding_payload,
-                ):
-                    failed_count += 1
                 continue
             ready_items.append(item)
 
         fetch_results = await self._run_with_limits(
             ready_items,
             lambda current_item: self._fetch_downstream_task_payload(task, current_item, auth_token),
-            concurrency=self.cfg.scheduler.downstream_sync_concurrency,
+            concurrency=max(1, int(getattr(self.cfg.scheduler, "downstream_action_concurrency", 8) or 8)),
             timeout_seconds=self.cfg.scheduler.downstream_request_timeout_seconds,
         )
         for item, payload, exc in fetch_results:

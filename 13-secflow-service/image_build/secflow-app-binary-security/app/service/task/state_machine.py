@@ -16,6 +16,7 @@ from app.model import (
     normalize_stage_name,
 )
 from app.service.task.shared import NO_CANDIDATE_MODULES_FAILURE_CODE
+from . import shared as task_shared
 
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager

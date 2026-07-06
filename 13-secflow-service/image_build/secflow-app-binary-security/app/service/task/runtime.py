@@ -2753,22 +2753,21 @@ class TaskRuntimeServiceMixin:
             if max_new_items_per_tick > 0 and claimed_counts_by_stage.get(throttle_key, 0) >= max_new_items_per_tick:
                 continue
             try:
-                active_count = int(
-                    db.query(func.count(task_manager_module.BinarySecurityStageItem.id))
+                stage_items = (
+                    db.query(task_manager_module.BinarySecurityStageItem)
                     .filter(
                         task_manager_module.BinarySecurityStageItem.task_id == task.id,
                         task_manager_module.BinarySecurityStageItem.stage_name == item.stage_name,
-                        task_manager_module.BinarySecurityStageItem.status.in_(["dispatching", "running"]),
                     )
-                    .scalar()
-                    or 0
+                    .all()
                 )
+                active_count = sum(1 for stage_item in stage_items if self._child_counts_as_active_for_parallelism(stage_item))
             except OperationalError as exc:
                 if not self._is_retryable_lock_error(exc):
                     raise
                 db.rollback()
                 task_manager_module.logger.warning(
-                    "binary-security streaming stage item claim skipped by retryable lock conflict while counting active items: item_id=%s stage=%s",
+                    "binary-security streaming stage item claim skipped by retryable lock conflict while counting active children: item_id=%s stage=%s",
                     item.id,
                     item.stage_name,
                 )

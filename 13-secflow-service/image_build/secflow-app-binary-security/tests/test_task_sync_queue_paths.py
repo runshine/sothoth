@@ -44,7 +44,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             asyncio.run(
                 manager._enqueue_task_sync_request(
                     task,
-                    sync_kind="downstream_status",
+                    operation="child_sync",
                     source="test",
                     reason="merge-a",
                     stage_name="entry_analysis",
@@ -54,11 +54,12 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             asyncio.run(
                 manager._enqueue_task_sync_request(
                     task,
-                    sync_kind="downstream_status",
+                    operation="child_sync",
                     source="test",
                     reason="merge-b",
                     stage_name="entry_analysis",
-                    item_ids=["i2"],
+                    item_ids=["i1"],
+                    payload={"second": True},
                 )
             )
         finally:
@@ -67,7 +68,10 @@ class TaskSyncQueuePathTests(unittest.TestCase):
 
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
-        self.assertEqual(["i1", "i2"], entries[0]["item_ids"])
+        self.assertEqual({"second": True}, entries[0]["payload"])
+        self.assertEqual("merge-b", entries[0]["reason"])
+        self.assertEqual("child_sync", entries[0]["operation"])
+        self.assertEqual(["i1"], entries[0]["item_ids"])
         self.assertEqual([task.id, task.id], queued)
 
     def test_merge_task_sync_entries_accepts_non_empty_list_and_dict_fields(self):
@@ -75,7 +79,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             {
                 "queue_item_id": "q1",
                 "dedupe_key": "k1",
-                "sync_kind": "downstream_status",
+                "operation": "child_sync",
                 "item_ids": ["i1"],
                 "archive_job_ids": [],
                 "payload": {"old": "value"},
@@ -84,7 +88,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             {
                 "queue_item_id": "q1",
                 "dedupe_key": "k1",
-                "sync_kind": "downstream_status",
+                "operation": "child_sync",
                 "item_ids": ["i2"],
                 "archive_job_ids": ["a1"],
                 "payload": {"new": "value"},
@@ -97,7 +101,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual({"old": "value", "new": "value"}, merged["payload"])
         self.assertEqual("new", merged["reason"])
 
-    def test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_late_sync(self):
+    def test_repair_task_sync_queue_on_runtime_start_recovers_cross_stage_terminal_apply_as_child_sync(self):
         manager = TaskManager()
         manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
@@ -154,7 +158,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
         self.assertEqual("entry_analysis", entries[0]["stage_name"])
-        self.assertEqual("late_child_terminal_sync", entries[0]["sync_kind"])
+        self.assertEqual("child_sync", entries[0]["operation"])
         self.assertEqual(["si-entry-late"], entries[0]["item_ids"])
 
     def test_drain_task_sync_queue_consumes_and_acks_entry(self):
@@ -176,8 +180,8 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         fake_queue.entries_by_task[task.id] = [
             {
                 "queue_item_id": "tsq-1",
-                "dedupe_key": "downstream_status:entry_analysis:i1:*",
-                "sync_kind": "downstream_status",
+                "dedupe_key": "child_sync:entry_analysis:i1",
+                "operation": "child_sync",
                 "source": "test",
                 "reason": "drain",
                 "source_event_type": "downstream_status_observed",
@@ -187,8 +191,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                 "force": True,
                 "requested_at": _now().isoformat(),
                 "last_requested_at": _now().isoformat(),
-                "next_retry_at": _now().isoformat(),
-                "attempts": 0,
                 "priority": 10,
                 "payload": {},
             }
@@ -217,7 +219,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual([("sync", "entry_analysis", ["i1"], True)], calls)
         self.assertEqual([], fake_queue.entries_by_task[task.id])
 
-    def test_drain_task_sync_queue_retries_failed_entry(self):
+    def test_drain_task_sync_queue_records_failure_and_keeps_entry_for_future_reconcile(self):
         manager = TaskManager()
         task = BinarySecurityTask(
             id="task-sync-retry",
@@ -231,13 +233,13 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             output_root="/o",
             workspace_root="/w",
         )
-        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
+        db = _AppendingModelAwareDb(tasks=[task], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
         fake_queue = _FakeTaskSyncQueue()
         fake_queue.entries_by_task[task.id] = [
             {
                 "queue_item_id": "tsq-retry-1",
-                "dedupe_key": "downstream_status:entry_analysis:i1:*",
-                "sync_kind": "downstream_status",
+                "dedupe_key": "child_sync:entry_analysis:i1",
+                "operation": "child_sync",
                 "source": "test",
                 "reason": "retry",
                 "source_event_type": "downstream_status_observed",
@@ -247,8 +249,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                 "force": False,
                 "requested_at": _now().isoformat(),
                 "last_requested_at": _now().isoformat(),
-                "next_retry_at": _now().isoformat(),
-                "attempts": 0,
                 "priority": 10,
                 "payload": {},
             }
@@ -273,8 +273,9 @@ class TaskSyncQueuePathTests(unittest.TestCase):
 
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
-        self.assertEqual(1, entries[0]["attempts"])
-        self.assertEqual("boom", entries[0]["last_error"])
+        failure_events = [event for event in db.events if event.event_type == "downstream_sync_failed"]
+        self.assertEqual(1, len(failure_events))
+        self.assertEqual("UpstreamError", failure_events[0].payload.get("error_type"))
 
     def test_drain_task_sync_queue_discards_terminal_invalid_entry_and_records_event(self):
         manager = TaskManager()
@@ -295,8 +296,8 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         fake_queue.entries_by_task[task.id] = [
             {
                 "queue_item_id": "tsq-terminal-1",
-                "dedupe_key": "downstream_status:entry_analysis:si-missing:*",
-                "sync_kind": "downstream_status",
+                "dedupe_key": "child_sync:entry_analysis:si-missing",
+                "operation": "child_sync",
                 "source": "runtime_start_repair",
                 "reason": "repair_missing_or_stale_sync_queue_entry",
                 "source_event_type": "task_sync_queue_repair",
@@ -306,8 +307,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                 "force": False,
                 "requested_at": _now().isoformat(),
                 "last_requested_at": _now().isoformat(),
-                "next_retry_at": _now().isoformat(),
-                "attempts": 2,
                 "priority": 30,
                 "payload": {},
             }
@@ -316,7 +315,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         original_sync = manager.sync_downstream_status
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         original_reconcile = manager._reconcile_missing_task_sync_requests
-        original_should_ack_stale = manager._should_ack_stale_task_sync_entry_without_retry
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
@@ -343,10 +341,8 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual("repair_missing_or_stale_sync_queue_entry", payload.get("reason"))
         self.assertEqual("NotFoundError", payload.get("error_type"))
         self.assertEqual("acked_and_discarded", payload.get("disposition"))
-        self.assertEqual([], payload.get("existing_item_ids"))
-        self.assertEqual(["si-missing"], payload.get("missing_item_ids"))
 
-    def test_drain_task_sync_queue_keeps_retry_when_some_item_ids_still_exist(self):
+    def test_drain_task_sync_queue_filters_missing_item_ids_and_requeues_existing_targets(self):
         manager = TaskManager()
         task = BinarySecurityTask(
             id="task-sync-partial-missing",
@@ -377,8 +373,8 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         fake_queue.entries_by_task[task.id] = [
             {
                 "queue_item_id": "tsq-partial-1",
-                "dedupe_key": "downstream_status:entry_analysis:si-existing:*",
-                "sync_kind": "downstream_status",
+                "dedupe_key": "child_sync:entry_analysis:si-existing,si-missing",
+                "operation": "child_sync",
                 "source": "runtime_start_repair",
                 "reason": "repair_missing_or_stale_sync_queue_entry",
                 "source_event_type": "task_sync_queue_repair",
@@ -388,8 +384,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                 "force": False,
                 "requested_at": _now().isoformat(),
                 "last_requested_at": _now().isoformat(),
-                "next_retry_at": _now().isoformat(),
-                "attempts": 0,
                 "priority": 30,
                 "payload": {},
             }
@@ -398,7 +392,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         original_sync = manager.sync_downstream_status
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         original_reconcile = manager._reconcile_missing_task_sync_requests
-        original_should_ack_stale = manager._should_ack_stale_task_sync_entry_without_retry
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
@@ -419,14 +412,9 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
         self.assertEqual(["si-existing"], entries[0]["item_ids"])
-        self.assertEqual("repair_missing_or_stale_sync_queue_entry", entries[0]["reason"])
         payload = dict(entries[0].get("payload") or {})
         self.assertEqual(["si-missing"], payload.get("filtered_missing_item_ids"))
         self.assertEqual(["si-existing"], payload.get("recovered_existing_item_ids"))
-        self.assertEqual(
-            ["task_sync_request_discarded_after_invalid_item_error"],
-            [event.event_type for event in db.events if event.event_type == "task_sync_request_discarded_after_invalid_item_error"],
-        )
 
     def test_drain_task_sync_queue_discards_missing_single_item_id_entry(self):
         manager = TaskManager()
@@ -447,8 +435,8 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         fake_queue.entries_by_task[task.id] = [
             {
                 "queue_item_id": "tsq-missing-single",
-                "dedupe_key": "downstream_status:entry_analysis:si-missing:*",
-                "sync_kind": "downstream_status",
+                "dedupe_key": "child_sync:entry_analysis:si-missing",
+                "operation": "child_sync",
                 "source": "test",
                 "reason": "single-item-missing",
                 "source_event_type": "downstream_status_observed",
@@ -459,8 +447,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                 "force": False,
                 "requested_at": _now().isoformat(),
                 "last_requested_at": _now().isoformat(),
-                "next_retry_at": _now().isoformat(),
-                "attempts": 0,
                 "priority": 10,
                 "payload": {},
             }
@@ -500,12 +486,9 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual([], fake_queue.entries_by_task[task.id])
         self.assertEqual(
-            [("task-sync-missing-single", "tsq-missing-single", "downstream_status:entry_analysis:si-missing:*", "task_sync_ack_terminal_discard")],
+            [("task-sync-missing-single", "tsq-missing-single", "child_sync:entry_analysis:si-missing", "task_sync_ack_terminal_discard")],
             acked,
         )
-        discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_after_invalid_item_error"]
-        self.assertEqual(1, len(discard_events))
-        self.assertEqual(["si-missing"], discard_events[0].payload.get("missing_item_ids"))
 
     def test_reconcile_missing_task_sync_requests_requeues_due_db_fact(self):
         manager = TaskManager()
@@ -549,10 +532,10 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
         self.assertEqual(["si-reconcile-1"], entries[0]["item_ids"])
-        self.assertEqual("downstream_status", entries[0]["sync_kind"])
+        self.assertEqual("child_sync", entries[0]["operation"])
         self.assertIn("task_sync_request_reconcile_requeued", [event.event_type for event in db.events])
 
-    def test_drain_task_sync_queue_persists_db_retry_fact_when_retry_enqueue_fails(self):
+    def test_drain_task_sync_queue_failure_does_not_persist_retry_budget_state(self):
         manager = TaskManager()
         task = BinarySecurityTask(
             id="task-sync-retry-db-fact",
@@ -583,8 +566,8 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         fake_queue.entries_by_task[task.id] = [
             {
                 "queue_item_id": "tsq-retry-db-fact",
-                "dedupe_key": "downstream_status:entry_analysis:si-retry-db-fact:*",
-                "sync_kind": "downstream_status",
+                "dedupe_key": "child_sync:entry_analysis:si-retry-db-fact",
+                "operation": "child_sync",
                 "source": "test",
                 "reason": "retry",
                 "source_event_type": "downstream_status_observed",
@@ -594,8 +577,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                 "force": False,
                 "requested_at": _now().isoformat(),
                 "last_requested_at": _now().isoformat(),
-                "next_retry_at": _now().isoformat(),
-                "attempts": 0,
                 "priority": 10,
                 "payload": {},
             }
@@ -610,13 +591,9 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             async def _fake_sync(*_args, **_kwargs):
                 raise UpstreamError("retry db fact boom")
 
-            async def _broken_retry(*_args, **_kwargs):
-                raise RuntimeError("retry queue down")
-
             manager.sync_downstream_status = _fake_sync
             manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
             manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
-            fake_queue.retry_task_sync_request = _broken_retry
             with self.assertRaises(UpstreamError):
                 asyncio.run(manager._drain_task_sync_queue(db, task))
         finally:
@@ -626,14 +603,9 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             manager._reconcile_missing_task_sync_requests = original_reconcile
 
         sync_observation = dict(item.result.get("sync_observation") or {})
-        self.assertEqual("error", sync_observation.get("last_result"))
-        self.assertEqual("UpstreamError", sync_observation.get("error_type"))
-        self.assertIsNotNone(sync_observation.get("next_retry_at"))
+        self.assertIsNone(sync_observation.get("next_retry_at"))
         self.assertFalse(bool(sync_observation.get("budget_exhausted")))
-        self.assertIn(
-            "task_sync_retry_enqueue_failed_but_db_retry_persisted",
-            [event.event_type for event in db.events],
-        )
+        self.assertIn("downstream_sync_failed", [event.event_type for event in db.events])
 
     def test_migrate_legacy_pending_downstream_sync_to_redis_queue(self):
         manager = TaskManager()
@@ -674,104 +646,10 @@ class TaskSyncQueuePathTests(unittest.TestCase):
 
         entries = fake_queue.entries_by_task[task.id]
         self.assertEqual(1, len(entries))
-        self.assertEqual("downstream_status", entries[0]["sync_kind"])
+        self.assertEqual("child_sync", entries[0]["operation"])
         self.assertEqual(["i1", "i2"], entries[0]["item_ids"])
         self.assertTrue(entries[0]["payload"]["migrated_from_runtime_workset"])
         self.assertEqual([task.id], queued)
-
-    def test_migrate_legacy_pending_binding_repair_to_redis_queue(self):
-        manager = TaskManager()
-        task = BinarySecurityTask(
-            id="task-sync-binding-legacy",
-            project_id="p1",
-            name="sync",
-            task_type=TASK_TYPE_SOURCE,
-            status="running",
-            current_stage="dataflow_vuln_scan",
-            firmware_source="project_filesystem",
-            firmware_path="/src",
-            output_root="/o",
-            workspace_root="/w",
-        )
-        fake_queue = _FakeTaskSyncQueue()
-        queued = []
-        original_get_queue = task_manager_module.get_task_queue
-        original_enqueue = manager._enqueue_task
-        try:
-            task_manager_module.get_task_queue = lambda: fake_queue
-            manager._enqueue_task = lambda task_id, *_args, **_kwargs: queued.append(task_id)
-            asyncio.run(
-                manager._migrate_legacy_pending_sync_signal_to_redis_queue(
-                    task,
-                    {
-                        "source": "legacy",
-                        "reason": "binding_repair",
-                        "stage_name": "dataflow_vuln_scan",
-                        "item_ids": ["i1"],
-                        "force": True,
-                    },
-                )
-            )
-        finally:
-            task_manager_module.get_task_queue = original_get_queue
-            manager._enqueue_task = original_enqueue
-
-        entries = fake_queue.entries_by_task[task.id]
-        self.assertEqual(1, len(entries))
-        self.assertEqual("binding_repair", entries[0]["sync_kind"])
-        self.assertEqual("legacy_pending_binding_repair", entries[0]["source_event_type"])
-        self.assertEqual("binding_repair", entries[0]["payload"]["legacy_signal_kind"])
-        self.assertEqual([task.id], queued)
-
-    def test_list_tasks_with_stale_stage_item_syncs_keeps_cross_stage_tail_task(self):
-        manager = TaskManager()
-        manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
-        task = BinarySecurityTask(
-            id="task-stale-tail-cross-stage",
-            project_id="p1",
-            name="sync",
-            task_type=TASK_TYPE_SOURCE,
-            status="running",
-            current_stage="dataflow_vuln_scan",
-            runtime_phase="tail_reconciliation",
-            firmware_source="project_filesystem",
-            firmware_path="/src",
-            output_root="/o",
-            workspace_root="/w",
-            policy_json='{"pipeline_mode": "mixed_streaming"}',
-        )
-        entry_item = BinarySecurityStageItem(
-            id="si-stale-entry",
-            task_id=task.id,
-            project_id=task.project_id,
-            stage_run_id="sr-entry",
-            stage_name="entry_analysis",
-            item_key="source_project-a",
-            item_name="module-a",
-            parent_key="source_project",
-            item_identity_key="source_project-a::source_project",
-            status="running",
-            downstream_service="entry_analyse",
-            downstream_task_id="eat-1",
-            result={
-                "sync_observation": {
-                    "sync_status": "synced",
-                    "downstream_status": "running",
-                    "mapped_status": "running",
-                    "last_attempt_at": (_now() - timedelta(minutes=10)).isoformat(),
-                },
-                "downstream_status": "running",
-            },
-            updated_at=_now() - timedelta(minutes=10),
-        )
-        db = _AppendingModelAwareDb(tasks=[task], stage_items=[entry_item], events=[])
-
-        refs = manager._list_tasks_with_stale_stage_item_syncs(db)
-
-        self.assertEqual(1, len(refs))
-        self.assertEqual(task.id, refs[0]["task_id"])
-        self.assertEqual("entry_analysis", refs[0]["stage_name"])
-        self.assertEqual(["si-stale-entry"], refs[0]["item_ids"])
 
     def test_drain_task_sync_queue_acks_stale_existing_items_without_retry(self):
         manager = TaskManager()
@@ -810,8 +688,8 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         fake_queue.entries_by_task[task.id] = [
             {
                 "queue_item_id": "tsq-stale-existing",
-                "dedupe_key": "downstream_status:entry_analysis:si-stale-existing:*",
-                "sync_kind": "downstream_status",
+                "dedupe_key": "child_sync:entry_analysis:si-stale-existing",
+                "operation": "child_sync",
                 "source": "runtime_start_repair",
                 "reason": "repair_missing_or_stale_sync_queue_entry",
                 "source_event_type": "task_sync_queue_repair",
@@ -821,8 +699,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                 "force": False,
                 "requested_at": _now().isoformat(),
                 "last_requested_at": _now().isoformat(),
-                "next_retry_at": _now().isoformat(),
-                "attempts": 7,
                 "priority": 30,
                 "payload": {
                     "observed_downstream_status": "success",
@@ -830,7 +706,6 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             }
         ]
         acked: list[tuple[str, str, str | None, str | None]] = []
-        retried: list[dict[str, object]] = []
         original_get_queue = task_manager_module.get_task_queue
         original_sync = manager.sync_downstream_status
         original_repair = manager._repair_task_sync_queue_on_runtime_start
@@ -846,11 +721,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
                     entry for entry in entries if entry.get("queue_item_id") != queue_item_id
                 ]
 
-            async def _fake_retry(task_id, entry, *, context=""):
-                retried.append({"task_id": task_id, "entry": dict(entry), "context": context})
-
             fake_queue.ack_task_sync_request = _fake_ack
-            fake_queue.retry_task_sync_request = _fake_retry
 
             async def _fake_sync(*_args, **_kwargs):
                 raise task_manager_module.NotFoundError("阶段子任务不存在")
@@ -875,11 +746,14 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual([], fake_queue.entries_by_task[task.id])
         self.assertEqual(
-            [("task-sync-stale-existing", "tsq-stale-existing", "downstream_status:entry_analysis:si-stale-existing:*", "task_sync_ack_stale_noop")],
+            [("task-sync-stale-existing", "tsq-stale-existing", "child_sync:entry_analysis:si-stale-existing", "task_sync_ack_stale_noop")],
             acked,
         )
-        self.assertEqual([], retried)
         discard_events = [event for event in db.events if event.event_type == "task_sync_request_discarded_as_stale_noop"]
         self.assertEqual(1, len(discard_events))
         self.assertEqual(["si-stale-existing"], discard_events[0].payload.get("existing_item_ids"))
         self.assertEqual("acked_as_stale_noop", discard_events[0].payload.get("disposition"))
+
+
+if __name__ == "__main__":
+    unittest.main()

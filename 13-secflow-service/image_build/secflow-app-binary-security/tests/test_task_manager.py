@@ -57,6 +57,7 @@ from app.schemas import (
 from app.service import downstream_tasks as downstream_tasks_module
 from app.service import llm_gateway as llm_gateway_module
 from app.service import task_manager as task_manager_module
+from app.service.task.shared import NO_CANDIDATE_MODULES_FAILURE_CODE
 from app.service.task_queue import TaskQueue
 from app.service.task_manager import (
     TASK_ACTION_CONTINUE,
@@ -391,6 +392,9 @@ class _FakeTaskSyncQueue:
         for current in task_entries:
             if self._dedupe_key(current) != resolved_dedupe_key:
                 continue
+            for key in ("operation", "source", "reason", "source_event_type", "stage_name"):
+                if entry.get(key):
+                    current[key] = entry.get(key)
             current["item_ids"] = sorted(
                 {
                     *[str(value).strip() for value in list(current.get("item_ids") or []) if str(value).strip()],
@@ -406,6 +410,7 @@ class _FakeTaskSyncQueue:
             current["force"] = bool(current.get("force") or entry.get("force"))
             current["last_requested_at"] = entry.get("last_requested_at") or current.get("last_requested_at")
             current["payload"] = {**dict(current.get("payload") or {}), **dict(entry.get("payload") or {})}
+            current["priority"] = min(int(current.get("priority") or 100), int(entry.get("priority") or 100))
             return dict(current)
         normalized = dict(entry)
         normalized["dedupe_key"] = resolved_dedupe_key
@@ -10991,7 +10996,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("failed", task.status)
         self.assertEqual(["t1"], queued)
         self.assertIn("task_runtime_released_without_local_owner", events)
-        self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
+        self.assertIn("parent_takeover_recovery_committed", events)
         self.assertEqual("running", operation.status)
 
     def test_requeue_stale_operations_releases_stale_dispatch_owner_for_active_operation(self):
@@ -11032,7 +11037,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("pending", task.status)
         self.assertEqual(["t1"], queued)
         self.assertIn("task_runtime_released_without_local_owner", events)
-        self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
+        self.assertIn("parent_takeover_recovery_committed", events)
         self.assertEqual([], cleared_leases)
 
     def test_requeue_stale_operations_releases_stale_owner_for_cancelling_task(self):
@@ -11073,7 +11078,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
         self.assertEqual(["t1"], queued)
         self.assertIn("task_runtime_released_without_local_owner", events)
-        self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
+        self.assertIn("parent_takeover_recovery_committed", events)
         self.assertEqual([], cleared_leases)
 
     def test_requeue_stale_operations_defers_release_for_active_cancel_finalize_with_runtime_lease(self):
@@ -11404,7 +11409,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertTrue(changed)
         self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
         self.assertIn("task_runtime_released_without_local_owner", events)
-        self.assertIn("owned_execution_release_reenqueued_for_takeover", events)
+        self.assertIn("parent_takeover_recovery_committed", events)
         self.assertEqual([], cleared_leases)
 
     def test_run_task_operation_steps_resumes_from_requeue_step(self):
@@ -25894,8 +25899,9 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
                 state_event_id="evt-1",
             )
 
-        self.assertEqual("finalize_success", decision.action)
+        self.assertEqual("finalize_failed", decision.action)
         self.assertIsNone(decision.next_stage)
+        self.assertEqual(NO_CANDIDATE_MODULES_FAILURE_CODE, decision.payload.get("failure_code"))
 
     def test_stage_system_analysis_pending_result_does_not_close_as_success(self):
         task = BinarySecurityTask(
@@ -37366,7 +37372,7 @@ def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     self.assertEqual(operation.id, task.current_operation_id)
     event_types = [event.event_type for event in db.events]
     self.assertIn("task_runtime_released_without_local_owner", event_types)
-    self.assertIn("owned_execution_release_reenqueued_for_takeover", event_types)
+    self.assertIn("parent_takeover_recovery_committed", event_types)
 
 
 def _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry(self):
@@ -45846,7 +45852,7 @@ def _test_local_runtime_sync_maintenance_drains_due_task_sync_requests(self):
         ):
             processed = asyncio.run(manager._service_local_runtime_sync_maintenance(task.id))
         self.assertTrue(processed)
-        self.assertEqual([(task.id, "due_task_sync_request", 5)], helper_calls)
+        self.assertEqual([(task.id, "periodic_reconcile", 5)], helper_calls)
     finally:
         manager._drain_local_runtime_sync_queue_once = original_helper
         manager._workers.pop(task.id, None)
@@ -45911,9 +45917,9 @@ def _test_local_runtime_sync_maintenance_consumes_owner_signal(self):
 
 
 def _test_task_sync_entry_score_respects_timezone_iso_retry_at(self):
-    retry_at = "2026-07-05T04:34:48.590704+08:00"
-    score = TaskQueue._task_sync_entry_score({"next_retry_at": retry_at})
-    self.assertAlmostEqual(datetime.fromisoformat(retry_at).timestamp(), score, places=3)
+    requested_at = "2026-07-05T04:34:48.590704+08:00"
+    score = TaskQueue._task_sync_entry_score({"requested_at": requested_at})
+    self.assertAlmostEqual(datetime.fromisoformat(requested_at).timestamp(), score, places=3)
 
 
 def _test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp(self):

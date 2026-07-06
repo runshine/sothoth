@@ -58,6 +58,22 @@ logger = logging.getLogger(__name__)
 
 
 class TaskQueryServiceMixin:
+    def _apply_light_terminalized_stage_summary_overrides(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_summaries: list[BinarySecurityStageSummary],
+    ) -> list[BinarySecurityStageSummary]:
+        if not self._source_workflow_no_candidate_modules_terminal_fact(db, task):
+            return stage_summaries
+        overridden: list[BinarySecurityStageSummary] = []
+        for summary in stage_summaries:
+            if str(getattr(summary, "stage_name", "") or "").strip() in {"entry_analysis", "dataflow_vuln_scan"}:
+                overridden.append(summary.model_copy(update={"status": "success", "last_error": None}))
+            else:
+                overridden.append(summary)
+        return overridden
+
     def _stage_item_summary_response(
         self: TaskManager,
         task: BinarySecurityTask,
@@ -147,6 +163,11 @@ class TaskQueryServiceMixin:
                 task,
                 latest_stage_runs=latest_stage_runs,
             )
+        normalized_stage_summaries = self._apply_light_terminalized_stage_summary_overrides(
+            db,
+            task,
+            normalized_stage_summaries,
+        )
         stage_sequence = self._stage_sequence_for_task(task)
         task_retry_supported, task_retry_reason, _ = self._task_retry_support(db, task)
         task_continue_supported, task_continue_reason, _ = self._task_continue_support(db, task)
@@ -166,6 +187,23 @@ class TaskQueryServiceMixin:
         queue_info = {"pending_positions": {}, "running_count": 0, "queued_count": 0, "last_reconcile_at": self._last_queue_reconcile_at}
         queue_state, recoverable_reason = self._task_queue_state(task, queue_info, db=db)
         lease_owner, lease_expires_at, lease_source, _lease_pod_uid, _lease_boot_id, _lease_generation = self._task_runtime_lease_view(db, task)
+        active_stage_run = None
+        current_stage_name = str(getattr(task, "current_stage", "") or "").strip()
+        if current_stage_name:
+            active_stage_run = latest_stage_runs.get(current_stage_name)
+        failure_snapshot = self._stage_failure_snapshot(task, active_stage_run)
+        if not str(failure_snapshot.get("failure_category") or "").strip():
+            failure_snapshot = {
+                **failure_snapshot,
+                **task_manager_module._failure_shape(task.summary),
+            }
+        terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
+        workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=list(latest_stage_runs.values()))
+        workflow_terminalization_ready = self._workflow_ready_for_finalization(db, task, workflow_snapshots)
+        workflow_blocked_by_stage = self._workflow_blocked_on_stage(db, task, workflow_snapshots)
+        if self._task_status_is_terminal(task.status):
+            workflow_terminalization_ready = True
+            workflow_blocked_by_stage = None
         active_operation = self._active_operation(db, task.id)
         if active_operation is not None and str(active_operation.operation_type or "").strip() != task_manager_module.TASK_ACTION_CANCEL:
             cancel_operation = None
@@ -194,14 +232,14 @@ class TaskQueryServiceMixin:
             delete_last_error=self._string_or_none(delete_state.get("delete_last_error")),
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
-            workflow_terminalization_ready=self._task_status_is_terminal(task.status),
-            workflow_blocked_by_stage=None,
+            workflow_terminalization_ready=workflow_terminalization_ready,
+            workflow_blocked_by_stage=workflow_blocked_by_stage,
             last_error=task.last_error,
-            terminal_failure=False,
-            requeue_suppressed=False,
-            failure_code=None,
-            failure_category=None,
-            failure_message=None,
+            terminal_failure=terminal_failure,
+            requeue_suppressed=terminal_failure,
+            failure_code=self._string_or_none(failure_snapshot.get("failure_code")) if terminal_failure else None,
+            failure_category=self._string_or_none(failure_snapshot.get("failure_category")) if terminal_failure else None,
+            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")) if terminal_failure else None,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=queue_state == "queued",
@@ -542,6 +580,15 @@ class TaskQueryServiceMixin:
         delete_state = self._task_delete_queue_state(task)
         task_status = str(getattr(task, "status", "") or "").strip().lower()
         queue_state = "dispatching" if task_status in {"pending", "dispatching"} else "idle"
+        current_stage_name = str(getattr(task, "current_stage", "") or "").strip()
+        active_stage_run = latest_stage_runs.get(current_stage_name) if latest_stage_runs and current_stage_name else None
+        failure_snapshot = self._stage_failure_snapshot(task, active_stage_run)
+        if not str(failure_snapshot.get("failure_category") or "").strip():
+            failure_snapshot = {
+                **failure_snapshot,
+                **task_manager_module._failure_shape(task.summary),
+            }
+        terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
         return BinarySecurityTaskResponse(
             id=task.id,
             project_id=task.project_id,
@@ -562,14 +609,14 @@ class TaskQueryServiceMixin:
             delete_last_error=self._string_or_none(delete_state.get("delete_last_error")),
             execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
             current_stage=task.current_stage,
-            workflow_terminalization_ready=False,
+            workflow_terminalization_ready=self._task_status_is_terminal(task.status),
             workflow_blocked_by_stage=None,
             last_error=task.last_error,
-            terminal_failure=False,
-            requeue_suppressed=False,
-            failure_code=None,
-            failure_category=None,
-            failure_message=None,
+            terminal_failure=terminal_failure,
+            requeue_suppressed=terminal_failure,
+            failure_code=self._string_or_none(failure_snapshot.get("failure_code")) if terminal_failure else None,
+            failure_category=self._string_or_none(failure_snapshot.get("failure_category")) if terminal_failure else None,
+            failure_message=self._string_or_none(failure_snapshot.get("failure_message") or failure_snapshot.get("error")) if terminal_failure else None,
             firmware_path=task.firmware_path,
             stage_sequence=stage_sequence,
             is_queued=task_status == "pending",

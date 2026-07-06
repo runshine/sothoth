@@ -8983,7 +8983,7 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _module: {},
         )
 
-        self.assertEqual(inputs, executable)
+        self.assertEqual([], executable)
         self.assertEqual("downstream_missing", entry_item.status)
         self.assertEqual("ea-missing", entry_item.downstream_task_id)
 

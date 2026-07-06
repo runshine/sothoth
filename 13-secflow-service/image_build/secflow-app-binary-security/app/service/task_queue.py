@@ -1023,7 +1023,7 @@ class TaskQueue:
 
     @staticmethod
     def _task_sync_entry_score(entry: dict[str, Any]) -> float:
-        raw = str(dict(entry or {}).get("next_retry_at") or dict(entry or {}).get("requested_at") or "").strip()
+        raw = str(dict(entry or {}).get("requested_at") or "").strip()
         if raw:
             try:
                 return max(0.0, datetime.fromisoformat(raw).timestamp())
@@ -1037,7 +1037,7 @@ class TaskQueue:
         normalized = {
             "queue_item_id": str(payload.get("queue_item_id") or "").strip() or None,
             "dedupe_key": str(payload.get("dedupe_key") or "").strip() or None,
-            "sync_kind": str(payload.get("sync_kind") or "downstream_status").strip() or "downstream_status",
+            "operation": str(payload.get("operation") or payload.get("sync_kind") or "child_sync").strip() or "child_sync",
             "source": str(payload.get("source") or "").strip() or None,
             "reason": str(payload.get("reason") or "").strip() or None,
             "source_event_type": str(payload.get("source_event_type") or "").strip() or None,
@@ -1047,11 +1047,8 @@ class TaskQueue:
             "force": bool(payload.get("force")),
             "requested_at": str(payload.get("requested_at") or "").strip() or None,
             "last_requested_at": str(payload.get("last_requested_at") or "").strip() or None,
-            "next_retry_at": str(payload.get("next_retry_at") or "").strip() or None,
-            "attempts": int(payload.get("attempts") or 0),
             "priority": int(payload.get("priority") or 100),
             "payload": dict(payload.get("payload") or {}) if isinstance(payload.get("payload"), dict) else {},
-            "last_error": str(payload.get("last_error") or "").strip() or None,
         }
         return normalized
 

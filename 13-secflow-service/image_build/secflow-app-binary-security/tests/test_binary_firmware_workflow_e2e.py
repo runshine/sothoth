@@ -1951,7 +1951,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertIn("downstream_parent_mismatch", [event.event_type for event in db.events])
         self.assertNotIn("stale_downstream_payload_applied", [event.event_type for event in db.events])
 
-    def test_binary_firmware_workflow_e2e_entry_downstream_missing_recovers_on_next_owner_prepare(self):
+    def test_binary_firmware_workflow_e2e_entry_downstream_missing_stays_terminal_on_next_owner_prepare(self):
         now = _now()
         from datetime import timedelta
 
@@ -2074,7 +2074,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _current: {},
         )
 
-        self.assertEqual(inputs, executable)
+        self.assertEqual([], executable)
         self.assertEqual("downstream_missing", entry_item.status)
         self.assertEqual("ea-missing-binary", entry_item.downstream_task_id)
 
