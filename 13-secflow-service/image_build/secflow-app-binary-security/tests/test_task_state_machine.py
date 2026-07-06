@@ -231,7 +231,7 @@ class TaskStateMachineTests(unittest.TestCase):
                 state_event_id="evt-1",
             )
 
-        self.assertEqual("finalize_success", decision.action)
+        self.assertEqual("finalize_failed", decision.action)
         self.assertIsNone(decision.next_stage)
 
     def test_apply_task_resume_decision_requeues_and_records_event(self):

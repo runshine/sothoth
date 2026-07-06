@@ -15,6 +15,7 @@ from app.model import (
     TASK_TYPE_SOURCE,
     normalize_stage_name,
 )
+from app.service.task.shared import NO_CANDIDATE_MODULES_FAILURE_CODE
 
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager
@@ -729,6 +730,11 @@ class TaskStateMachineMixin:
         items: list[BinarySecurityStageItem],
     ) -> bool:
         normalized_stage = normalize_stage_name(stage_name)
+        if self._source_workflow_no_candidate_modules_terminal_fact(db, task) and normalized_stage in {
+            "entry_analysis",
+            "dataflow_vuln_scan",
+        }:
+            return False
         if self._should_finalize_without_entries(db, task, stage_name):
             return False
         if normalized_stage == "dataflow_vuln_scan":
@@ -806,14 +812,28 @@ class TaskStateMachineMixin:
                 and raw_run_status in {"success", "partial_success"}
             ):
                 normalized_status = raw_run_status
+            if (
+                self._source_workflow_no_candidate_modules_terminal_fact(db, task)
+                and stage_name == "system_analysis"
+            ):
+                normalized_status = "failed"
+            synthetic_terminal_no_modules = bool(
+                self._source_workflow_no_candidate_modules_terminal_fact(db, task)
+                and stage_name in {"entry_analysis", "dataflow_vuln_scan"}
+            )
+            if synthetic_terminal_no_modules:
+                normalized_status = "success"
             is_terminal = self._task_status_is_terminal(normalized_status)
             has_active_items = any((self._normalize_downstream_status(item.status) or str(item.status or "").strip()) in {"pending", "queued", "running", "dispatching"} for item in stage_items)
             unresolved_expected_outputs = self._stage_has_unresolved_expected_outputs(db, task, stage_name, stage_run, stage_items)
             ready_for_terminalization = self._stage_ready_for_terminalization(db, task, stage_name, stage_run, stage_items)
+            if synthetic_terminal_no_modules:
+                unresolved_expected_outputs = False
+                ready_for_terminalization = True
             snapshot = {
                 "stage_name": stage_name,
                 "enabled": True,
-                "has_stage_run": stage_run is not None,
+                "has_stage_run": stage_run is not None or synthetic_terminal_no_modules,
                 "item_count": len(stage_items),
                 "status": normalized_status or "pending",
                 "is_terminal": is_terminal,
@@ -2030,6 +2050,30 @@ class TaskStateMachineMixin:
             return not bool(self._entry_results(task))
         return False
 
+    def _source_workflow_no_candidate_modules_terminal_fact(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        if self._task_type(task) != TASK_TYPE_SOURCE:
+            return False
+        if normalize_stage_name(str(getattr(task, "current_stage", "") or "").strip()) != "system_analysis":
+            return False
+        if not self._system_analysis_authoritative_complete(db, task):
+            return False
+        summary = dict(getattr(task, "summary", None) or {})
+        metrics = dict(getattr(task, "metrics", None) or {})
+        failure_code = str(summary.get("failure_code") or "").strip()
+        selected_modules = list(summary.get("selected_modules") or []) if isinstance(summary.get("selected_modules"), list) else []
+        candidate_modules = list(summary.get("candidate_modules") or []) if isinstance(summary.get("candidate_modules"), list) else []
+        return (
+            failure_code == NO_CANDIDATE_MODULES_FAILURE_CODE
+            and int(metrics.get("selected_module_count") or 0) == 0
+            and int(metrics.get("candidate_module_count") or 0) == 0
+            and not selected_modules
+            and not candidate_modules
+        )
+
     def _first_failed_terminal_stage(
         self: TaskManager,
         db: Session,
@@ -2739,16 +2783,18 @@ class TaskStateMachineMixin:
                 or []
             )
             if not candidate_modules:
-                decision.action = "finalize_success"
-                decision.event_type = "task_completed_without_candidate_modules"
-                decision.message = "系统分析已完成且未选出可推进模块，任务直接结束"
-                decision.level = "info"
+                failure = task_shared._no_candidate_modules_failure()
+                decision.action = "finalize_failed"
+                decision.event_type = "task_failed_without_candidate_modules"
+                decision.message = str(failure.get("failure_message") or "系统分析已完成且未选出可推进模块，任务直接结束")
+                decision.level = "warning"
                 decision.payload = {
                     "state_event_id": state_event_id,
                     "completed_stage": stage_name,
                     "selection_mode": "auto",
                     "candidate_module_count": 0,
                     "selected_module_count": 0,
+                    **failure,
                 }
                 return decision
         next_stage = self._next_stage_candidate(db, task)

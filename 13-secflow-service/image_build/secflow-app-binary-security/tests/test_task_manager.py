@@ -26005,12 +26005,12 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.manager._refresh_system_analysis_stage_from_synced_items(db, task)
 
             self.assertEqual("success", stage_run.status)
-            self.assertIsNone(stage_run.output_summary.get("failure_code"))
-            self.assertIsNone(stage_run.output_summary.get("failure_category"))
+            self.assertEqual("no_candidate_modules", stage_run.output_summary.get("failure_code"))
+            self.assertEqual("business", stage_run.output_summary.get("failure_category"))
             self.assertIsNone(stage_run.last_error)
-            self.assertIsNone(task.last_error)
-            self.assertIsNone(task.summary.get("failure_code"))
-            self.assertIsNone(task.summary.get("failure_category"))
+            self.assertEqual("系统分析已完成，但未发现匹配所选风险等级的风险模块", task.last_error)
+            self.assertEqual("no_candidate_modules", task.summary.get("failure_code"))
+            self.assertEqual("business", task.summary.get("failure_category"))
             event_types = [getattr(event, "event_type", "") for event in db.added if isinstance(event, BinarySecurityEvent)]
             self.assertIn("system_analysis_no_candidate_modules", event_types)
             self.assertTrue(

@@ -1968,6 +1968,11 @@ class TaskReadModelServiceMixin:
         active_stage_run = next((run for run in stage_runs if str(run.stage_name or "").strip() == str(task.current_stage or "").strip()), None)
         tail_summary = self._tail_stage_work_summary(db, task)
         failure_snapshot = self._stage_failure_snapshot(task, active_stage_run)
+        if not str(failure_snapshot.get("failure_category") or "").strip():
+            failure_snapshot = {
+                **failure_snapshot,
+                **task_manager_module._failure_shape(task.summary),
+            }
         terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
         workflow_snapshots = self._build_workflow_stage_snapshots(db, task, stage_runs=stage_runs)
         workflow_terminalization_ready = self._workflow_ready_for_finalization(db, task, workflow_snapshots)
@@ -3582,6 +3587,11 @@ class TaskReadModelServiceMixin:
                 None,
             ),
         )
+        if not str(failure_snapshot.get("failure_category") or "").strip():
+            failure_snapshot = {
+                **failure_snapshot,
+                **task_manager_module._failure_shape(task.summary),
+            }
         terminal_failure = self._task_status_is_terminal(task.status) and str(failure_snapshot.get("failure_category") or "").strip() == "business"
         delete_state = self._task_delete_queue_state(task)
         return task_manager_module.BinarySecurityTaskResponse(

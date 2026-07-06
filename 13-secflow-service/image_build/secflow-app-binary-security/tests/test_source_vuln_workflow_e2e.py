@@ -569,16 +569,21 @@ class SourceWorkflowE2ETests(unittest.TestCase):
         self.manager._refresh_task_status_after_sync(db, task)
 
         detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
-        self.assertEqual("running", task.status)
-        self.assertEqual("running", detail.status)
+        self.assertEqual("failed", task.status)
+        self.assertEqual("failed", detail.status)
+        self.assertTrue(detail.workflow_terminalization_ready)
+        self.assertTrue(detail.terminal_failure)
+        self.assertEqual("no_candidate_modules", detail.failure_code)
         self.assertTrue(self.manager._should_finalize_without_entries(db, task, "entry_analysis"))
         self.assertEqual([], self.manager._stage_items(db, task.id, "entry_analysis"))
         self.assertEqual([], [run for run in db.stage_runs if str(run.stage_name or "").strip() == "dataflow_vuln_scan"])
         self.assertFalse(any(event.event_type == "streaming_tail_activated" for event in db.events))
         system_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "system_analysis")
-        self.assertIn(system_summary.status, {"running", "success"})
+        self.assertEqual("success", system_summary.status)
         entry_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "entry_analysis")
-        self.assertIn(entry_summary.status, {"pending", "queued"})
+        self.assertEqual("success", entry_summary.status)
+        dataflow_summary = next(summary for summary in detail.stage_summaries if summary.stage_name == "dataflow_vuln_scan")
+        self.assertEqual("success", dataflow_summary.status)
 
     def test_source_workflow_e2e_system_archive_apply_stays_owner_driven_before_entry_materialization(self):
         task = _source_task(
