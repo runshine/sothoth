@@ -657,6 +657,7 @@ class TaskRuntimeHandle:
     claimed_at: datetime
     execution_token: str | None
     lease_owner_instance_id: str | None
+    sync_maintenance_task: asyncio.Task | None = None
     cancel_requested: bool = False
     cancel_requested_reason: str | None = None
     last_progress_at: datetime | None = None
@@ -685,6 +686,8 @@ class TaskRuntimeHandle:
         self.cancel_requested_reason = str(reason or "").strip() or self.cancel_requested_reason
         if self.heartbeat_task is not None and not self.heartbeat_task.done():
             self.heartbeat_task.cancel()
+        if self.sync_maintenance_task is not None and not self.sync_maintenance_task.done():
+            self.sync_maintenance_task.cancel()
         if not self.runner_task.done():
             self.runner_task.cancel()
 
@@ -1721,6 +1724,8 @@ class TaskManager(
             active_tasks.append(handle.runner_task)
             if handle.heartbeat_task is not None:
                 active_tasks.append(handle.heartbeat_task)
+            if handle.sync_maintenance_task is not None:
+                active_tasks.append(handle.sync_maintenance_task)
         if active_tasks:
             await asyncio.gather(*active_tasks, return_exceptions=True)
         # 优雅退出：主动释放本实例持有的 runtime_lease + 清 task 行 owner，
@@ -1916,6 +1921,10 @@ class TaskManager(
                 self._run_task_heartbeat(normalized_task_id),
                 name=f"binary-security-heartbeat-{normalized_task_id}-restart",
             )
+            sync_maintenance_task = asyncio.create_task(
+                self._run_task_sync_maintenance(normalized_task_id),
+                name=f"binary-security-sync-maintenance-{normalized_task_id}-restart",
+            )
             generation = int(getattr(existing, "runner_generation", 0) or 0) + 1
             handle = TaskRuntimeHandle(
                 task_id=normalized_task_id,
@@ -1924,6 +1933,7 @@ class TaskManager(
                 claimed_at=_now(),
                 execution_token=getattr(existing, "execution_token", None),
                 lease_owner_instance_id=str(self.instance_id or "").strip() or None,
+                sync_maintenance_task=sync_maintenance_task,
                 cancel_requested=False,
                 owner_active=True,
                 release_requested=False,
@@ -1999,11 +2009,12 @@ class TaskManager(
             if existing is not None and not existing.done():
                 task_manager_module.logger.warning(
                     "binary-security start_task_runtime skipped because local handle is still active: "
-                    "task_id=%s handle_done=%s cancel_requested=%s heartbeat_done=%s execution_token=%s lease_owner_instance_id=%s",
+                    "task_id=%s handle_done=%s cancel_requested=%s heartbeat_done=%s sync_maintenance_done=%s execution_token=%s lease_owner_instance_id=%s",
                     normalized_task_id,
                     existing.done(),
                     existing.cancel_requested,
                     existing.heartbeat_task.done() if existing.heartbeat_task is not None else None,
+                    existing.sync_maintenance_task.done() if existing.sync_maintenance_task is not None else None,
                     existing.execution_token,
                     existing.lease_owner_instance_id,
                 )
@@ -2016,6 +2027,10 @@ class TaskManager(
                 self._run_task_heartbeat(normalized_task_id),
                 name=f"binary-security-heartbeat-{normalized_task_id}",
             )
+            sync_maintenance_task = asyncio.create_task(
+                self._run_task_sync_maintenance(normalized_task_id),
+                name=f"binary-security-sync-maintenance-{normalized_task_id}",
+            )
             handle = TaskRuntimeHandle(
                 task_id=normalized_task_id,
                 runner_task=runner_task,
@@ -2023,6 +2038,7 @@ class TaskManager(
                 claimed_at=_now(),
                 execution_token=None,
                 lease_owner_instance_id=str(self.instance_id or "").strip() or None,
+                sync_maintenance_task=sync_maintenance_task,
             )
             self._workers[normalized_task_id] = handle
             await asyncio.to_thread(
@@ -2030,10 +2046,11 @@ class TaskManager(
                 normalized_task_id,
             )
             task_manager_module.logger.info(
-                "binary-security start_task_runtime created new local handle: task_id=%s runner_task=%s heartbeat_task=%s lease_owner_instance_id=%s",
+                "binary-security start_task_runtime created new local handle: task_id=%s runner_task=%s heartbeat_task=%s sync_maintenance_task=%s lease_owner_instance_id=%s",
                 normalized_task_id,
                 runner_task.get_name(),
                 heartbeat_task.get_name(),
+                sync_maintenance_task.get_name(),
                 handle.lease_owner_instance_id,
             )
             return True
@@ -2056,15 +2073,6 @@ class TaskManager(
                 )
                 if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
                     return
-                try:
-                    await self._service_local_runtime_sync_maintenance(task_id)
-                except StaleTaskExecution:
-                    raise
-                except Exception:
-                    logger.exception(
-                        "binary-security local runtime sync maintenance failed but lease is still active: task_id=%s",
-                        task_id,
-                    )
                 handle.last_progress_at = _now()
                 failure_count = 0
             except asyncio.CancelledError:
@@ -2078,6 +2086,59 @@ class TaskManager(
                         handle.runner_task.cancel()
                     return
             await asyncio.sleep(interval_seconds)
+
+    async def _run_task_sync_maintenance(self, task_id: str) -> None:
+        interval_seconds = max(
+            1,
+            int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
+        )
+        logger.info("binary-security sync maintenance worker started: task_id=%s", task_id)
+        try:
+            while self._running:
+                handle = self._runtime_handle(task_id)
+                if (
+                    handle is None
+                    or handle.cancel_requested
+                    or handle.runner_task.done()
+                    or handle.release_requested
+                    or handle.takeover_observed
+                ):
+                    return
+                if not handle.active_commit_succeeded or not handle.lease_established:
+                    await asyncio.sleep(interval_seconds)
+                    continue
+                ownership_decision = await asyncio.to_thread(
+                    self._verify_local_runtime_lease_or_abort,
+                    task_id,
+                    "sync_maintenance_loop",
+                )
+                if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
+                    return
+                try:
+                    processed = await self._service_local_runtime_sync_maintenance(task_id)
+                    if processed:
+                        handle.last_progress_at = _now()
+                except asyncio.CancelledError:
+                    raise
+                except StaleTaskExecution:
+                    return
+                except Exception:
+                    logger.exception(
+                        "binary-security local runtime sync maintenance worker failed: task_id=%s",
+                        task_id,
+                    )
+                    await asyncio.sleep(2)
+                    continue
+                await asyncio.sleep(interval_seconds)
+        finally:
+            handle = self._runtime_handle(task_id)
+            logger.info(
+                "binary-security sync maintenance worker exiting: task_id=%s cancel_requested=%s runner_done=%s heartbeat_done=%s source=sync_maintenance_loop",
+                task_id,
+                bool(getattr(handle, "cancel_requested", False)) if handle is not None else None,
+                bool(handle.runner_task.done()) if handle is not None else None,
+                bool(handle.heartbeat_task.done()) if handle is not None and handle.heartbeat_task is not None else None,
+            )
 
     def _verify_local_runtime_lease_or_abort(
         self,
@@ -12710,6 +12771,8 @@ class TaskManager(
             tasks = [handle.runner_task]
             if handle.heartbeat_task is not None:
                 tasks.append(handle.heartbeat_task)
+            if handle.sync_maintenance_task is not None:
+                tasks.append(handle.sync_maintenance_task)
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _cancel_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:

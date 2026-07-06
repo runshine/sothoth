@@ -2609,7 +2609,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         self.assertEqual("success", terminal_run.status)
         self.assertIsNotNone(terminal_run.finished_at)
 
-    def test_trigger_entry_items_from_b2s_result_signature_change_requeues_target_item(self):
+    def test_trigger_entry_items_from_b2s_result_signature_change_preserves_existing_binding(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
             id="t1",
@@ -2702,8 +2702,8 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         )
 
         self.assertIs(seeded, existing_item)
-        self.assertEqual("pending", seeded.status)
-        self.assertIsNone(seeded.downstream_task_id)
+        self.assertEqual("success", seeded.status)
+        self.assertEqual("ea-1", seeded.downstream_task_id)
         self.assertEqual("success", archive_job.archive_status)
         self.assertTrue(any(event.event_type == "entry_analysis_execution_signature_changed" for event in db.events))
 
@@ -3088,7 +3088,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         )
 
         self.assertIs(seeded, existing)
-        self.assertEqual("pending", seeded.status)
+        self.assertEqual("dispatching", seeded.status)
         self.assertEqual("si-df", seeded.input_ref["upstream_item_id"])
         self.assertTrue(any(event.event_type == "streaming_vuln_item_refreshed" for event in db.events))
 
@@ -3155,7 +3155,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         )
 
         self.assertIs(seeded, existing)
-        self.assertEqual("pending", seeded.status)
+        self.assertEqual("running", seeded.status)
         self.assertEqual("si-df", seeded.input_ref["upstream_item_id"])
 
     def test_trigger_vuln_items_from_dataflow_result_metadata_only_refresh_preserves_success_item(self):
@@ -3477,7 +3477,7 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         self.assertTrue(any(event.event_type == "stale_dataflow_rebuild_reverted" for event in db.events))
         self.assertFalse(self.manager._replacement_in_progress_state(item)["replacement_in_progress"])
 
-    def test_trigger_vuln_items_from_dataflow_result_real_signature_change_requeues_target_item(self):
+    def test_trigger_vuln_items_from_dataflow_result_real_signature_change_preserves_existing_binding(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
             id="t1",
@@ -3562,11 +3562,11 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         )
 
         self.assertIs(seeded, existing)
-        self.assertEqual("pending", seeded.status)
-        self.assertIsNone(seeded.downstream_task_id)
-        self.assertEqual("superseded", archive_job.archive_status)
-        self.assertEqual(1, int(seeded.rerun_count or 0))
-        self.assertEqual(1, int((seeded.result or {}).get("rebuild_rerun_count") or 0))
+        self.assertEqual("success", seeded.status)
+        self.assertEqual("dvs_existing", seeded.downstream_task_id)
+        self.assertEqual("success", archive_job.archive_status)
+        self.assertEqual(0, int(seeded.rerun_count or 0))
+        self.assertEqual(0, int((seeded.result or {}).get("rebuild_rerun_count") or 0))
         self.assertTrue(any(event.event_type == "legacy_vuln_execution_signature_changed" for event in db.events))
 
     def test_reclaim_stale_streaming_stage_items_resets_dispatching_vuln_item(self):
@@ -30865,6 +30865,79 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertTrue(adopted_events)
         self.assertEqual("authoritative_child_already_active", adopted_events[-1].payload.get("reason"))
 
+    def test_run_dataflow_item_with_bound_child_and_observation_gap_does_not_create_replacement(self):
+        task = BinarySecurityTask(
+            id="t1",
+            name="source-task",
+            project_id="p1",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw",
+        )
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            sequence_no=3,
+            status="running",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="main",
+            parent_key="module-1",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs-bound",
+            status="running",
+            output_ref={},
+        )
+        entry = {
+            "entry_key": "entry-1",
+            "function_name": "main",
+            "module_name": "module-1",
+            "source_dir": "/tmp/src",
+            "source_file": "main.c",
+            "file_name": "main.c",
+            "module_key": "module-1",
+            "module_input_path": "/tmp/repo/modules/module-1",
+            "source_root_path": "/tmp/repo/src",
+            "is_definition_found": True,
+            "definition_kind": "definition",
+            "definition_file": "main.c",
+            "definition_line": "10",
+            "taint_params": ["argv"],
+        }
+        fake_session = _AppendingModelAwareDb(stage_items=[item], events=[])
+        defer_calls: list[str] = []
+
+        def fake_defer(*args, **kwargs):
+            del args
+            defer_calls.append(str(kwargs.get("operation") or ""))
+            return {"status": "running", "item": kwargs["response_item"]}
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", return_value=None),
+            patch.object(
+                self.manager,
+                "_downstream_create_task",
+                new=AsyncMock(side_effect=AssertionError("should not create replacement dataflow child")),
+            ),
+            patch.object(self.manager, "_defer_item_after_downstream_transport_error", side_effect=fake_defer),
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=False),
+        ):
+            result = asyncio.run(self.manager._run_dataflow_item(task, stage_run, entry, token="tok", retrying=False))
+
+        self.assertEqual("running", result["status"])
+        self.assertEqual(["dataflow_vuln_scan_observe"], defer_calls)
+        self.assertEqual("dvs-bound", item.downstream_task_id)
+
     def test_run_dataflow_item_seeds_vuln_item_when_streaming_mode_enabled(self):
         task = BinarySecurityTask(
             id="t1",
@@ -32550,7 +32623,7 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertTrue(any(event.event_type == "streaming_dataflow_item_metadata_refreshed" for event in fake_session.events))
         self.assertFalse(any(event.event_type == "dataflow_entry_execution_signature_changed" for event in fake_session.events))
 
-    def test_trigger_dataflow_items_from_entry_result_signature_change_requeues_only_target_item(self):
+    def test_trigger_dataflow_items_from_entry_result_signature_change_preserves_existing_binding(self):
         task = BinarySecurityTask(
             id="t1",
             name="module-task",
@@ -32642,11 +32715,11 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
 
         self.assertEqual(1, len(items))
         self.assertIs(existing_item, items[0])
-        self.assertEqual("pending", existing_item.status)
-        self.assertIsNone(existing_item.downstream_task_id)
-        self.assertEqual("superseded", archive_job.archive_status)
+        self.assertEqual("success", existing_item.status)
+        self.assertEqual("dfvs-1", existing_item.downstream_task_id)
+        self.assertEqual("success", archive_job.archive_status)
         self.assertTrue(any(event.event_type == "dataflow_entry_execution_signature_changed" for event in fake_session.events))
-        self.assertTrue(any(event.event_type == "stale_dataflow_item_requeued_after_signature_change" for event in fake_session.events))
+        self.assertFalse(any(event.event_type == "stale_dataflow_item_requeued_after_signature_change" for event in fake_session.events))
 
     def test_trigger_dataflow_items_from_entry_result_false_signature_change_is_suppressed(self):
         task = BinarySecurityTask(
@@ -39258,7 +39331,7 @@ def _test_prepare_stage_items_for_execution_preserves_existing_missing_streaming
         output_ref=lambda _module: {},
     )
 
-    self.assertEqual(inputs, executable)
+    self.assertEqual([], executable)
     self.assertEqual("downstream_missing", item.status)
     self.assertEqual("eat-old", item.downstream_task_id)
     result = manager._load_stage_item_result_payload(item)

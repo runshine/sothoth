@@ -20,6 +20,7 @@ from app.config import get_config
 logger = logging.getLogger(__name__)
 REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS = 10
 REDIS_SOCKET_TIMEOUT_SECONDS = 10
+REDIS_BLOCKING_SOCKET_TIMEOUT_SECONDS: int | None = None
 DEFAULT_QUEUE_CONTEXT = "unspecified"
 REDIS_REBUILD_RETRY_MAX_SLEEP_SECONDS = 10
 REDIS_HEALTH_CHECK_INTERVAL_SECONDS = 10
@@ -32,12 +33,18 @@ class RedisSelfHealingClientHelper:
         redis_url: str,
         client_log_name: str,
         client_type: str,
+        client_mode: str = "general",
+        socket_timeout: int | None = REDIS_SOCKET_TIMEOUT_SECONDS,
         extra_log_fields_fn=None,
+        on_recovered=None,
     ) -> None:
         self.redis_url = redis_url
         self.client_log_name = str(client_log_name or "redis").strip() or "redis"
         self.client_type = str(client_type or "redis").strip() or "redis"
+        self.client_mode = str(client_mode or "general").strip() or "general"
+        self.socket_timeout = socket_timeout
         self.extra_log_fields_fn = extra_log_fields_fn
+        self.on_recovered = on_recovered
         self._clients_by_loop_id: dict[asyncio.AbstractEventLoop, Redis] = {}
 
     def current_loop(self) -> asyncio.AbstractEventLoop:
@@ -74,21 +81,23 @@ class RedisSelfHealingClientHelper:
         extra_fmt, extra_values = self._extra_log_fields()
         logger.info(
             f"binary-security {self.client_log_name} creating redis client: context=%s loop_id=%s redis_url=%s "
-            f"socket_connect_timeout=%s socket_timeout=%s health_check_interval=%s active_loop_client_count=%s"
+            f"socket_connect_timeout=%s socket_timeout=%s health_check_interval=%s active_loop_client_count=%s "
+            f"client_mode=%s"
             f"{extra_fmt}",
             str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
             id(loop),
             str(self.redis_url or "").strip() or None,
             REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
-            REDIS_SOCKET_TIMEOUT_SECONDS,
+            self.socket_timeout,
             REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
             len(self._clients_by_loop_id),
+            self.client_mode,
             *extra_values,
         )
         client = Redis.from_url(
             self.redis_url,
             decode_responses=True,
-            socket_timeout=REDIS_SOCKET_TIMEOUT_SECONDS,
+            socket_timeout=self.socket_timeout,
             socket_connect_timeout=REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS,
             health_check_interval=REDIS_HEALTH_CHECK_INTERVAL_SECONDS,
             socket_keepalive=True,
@@ -138,11 +147,12 @@ class RedisSelfHealingClientHelper:
         except RuntimeError:
             loop_id = None
         logger.warning(
-            "binary-security redis client invalidated: op_name=%s context=%s loop_id=%s redis_client_type=%s redis_url=%s error_type=%s error=%s",
+            "binary-security redis client invalidated: op_name=%s context=%s loop_id=%s redis_client_type=%s client_mode=%s redis_url=%s error_type=%s error=%s",
             str(op_name or "unknown").strip() or "unknown",
             str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
             loop_id,
             self.client_type,
+            self.client_mode,
             str(self.redis_url or "").strip() or None,
             error.__class__.__name__,
             error,
@@ -176,13 +186,20 @@ class RedisSelfHealingClientHelper:
                 result = await fn(client)
                 if attempt > 0:
                     logger.info(
-                        "binary-security redis operation recovered after rebuild: op_name=%s context=%s attempts=%s redis_client_type=%s redis_url=%s",
+                        "binary-security redis operation recovered after rebuild: op_name=%s context=%s attempts=%s redis_client_type=%s client_mode=%s redis_url=%s",
                         str(op_name or "unknown").strip() or "unknown",
                         str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
                         attempt + 1,
                         self.client_type,
+                        self.client_mode,
                         str(self.redis_url or "").strip() or None,
                     )
+                    if callable(self.on_recovered):
+                        self.on_recovered(
+                            op_name=str(op_name or "unknown").strip() or "unknown",
+                            context=str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+                            attempts=attempt + 1,
+                        )
                 return result
             except asyncio.CancelledError:
                 raise
@@ -197,11 +214,12 @@ class RedisSelfHealingClientHelper:
                     error=exc,
                 )
                 logger.warning(
-                    "binary-security redis client rebuild retry scheduled: op_name=%s context=%s attempt=%s redis_client_type=%s redis_url=%s error_type=%s error=%s",
+                    "binary-security redis client rebuild retry scheduled: op_name=%s context=%s attempt=%s redis_client_type=%s client_mode=%s redis_url=%s error_type=%s error=%s",
                     str(op_name or "unknown").strip() or "unknown",
                     str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
                     attempt,
                     self.client_type,
+                    self.client_mode,
                     str(self.redis_url or "").strip() or None,
                     exc.__class__.__name__,
                     exc,
@@ -209,12 +227,13 @@ class RedisSelfHealingClientHelper:
                 await self.sleep_before_rebuild_retry(attempt)
                 self.new_client(context=context)
                 logger.info(
-                    "binary-security redis client rebuilt successfully: op_name=%s context=%s attempt=%s loop_id=%s redis_client_type=%s redis_url=%s",
+                    "binary-security redis client rebuilt successfully: op_name=%s context=%s attempt=%s loop_id=%s redis_client_type=%s client_mode=%s redis_url=%s",
                     str(op_name or "unknown").strip() or "unknown",
                     str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
                     attempt,
                     id(self.current_loop()),
                     self.client_type,
+                    self.client_mode,
                     str(self.redis_url or "").strip() or None,
                 )
 
@@ -238,23 +257,60 @@ class RedisSelfHealingClientHelper:
 class TaskQueue:
     def __init__(self) -> None:
         self.config = get_config().queue
-        self._redis_helper = RedisSelfHealingClientHelper(
+        self._general_redis_helper = RedisSelfHealingClientHelper(
             redis_url=self.config.redis_url,
             client_log_name="task queue",
             client_type="task_queue",
+            client_mode="general",
             extra_log_fields_fn=lambda: {
                 "task_queue_key": str(self.config.task_queue_key or "").strip() or None,
             },
         )
+        self._redis_helper = self._general_redis_helper
+        self._blocking_recovered_at_by_channel: dict[str, float] = {}
+        self._task_dispatch_blocking_redis_helper = RedisSelfHealingClientHelper(
+            redis_url=self.config.redis_url,
+            client_log_name="task queue blocking redis client",
+            client_type="task_queue",
+            client_mode="blocking",
+            socket_timeout=REDIS_BLOCKING_SOCKET_TIMEOUT_SECONDS,
+            extra_log_fields_fn=lambda: {
+                "channel": "task_dispatch_pop",
+                "task_queue_key": str(self.config.task_queue_key or "").strip() or None,
+            },
+            on_recovered=lambda **payload: self._mark_blocking_client_recovered("task_dispatch_pop", **payload),
+        )
+        self._task_delete_blocking_redis_helper = RedisSelfHealingClientHelper(
+            redis_url=self.config.redis_url,
+            client_log_name="task queue blocking redis client",
+            client_type="task_queue",
+            client_mode="blocking",
+            socket_timeout=REDIS_BLOCKING_SOCKET_TIMEOUT_SECONDS,
+            extra_log_fields_fn=lambda: {
+                "channel": "task_delete_dispatch_pop",
+                "task_queue_key": str(
+                    getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue"
+                ).strip(),
+            },
+            on_recovered=lambda **payload: self._mark_blocking_client_recovered("task_delete_dispatch_pop", **payload),
+        )
 
     def _current_loop(self) -> asyncio.AbstractEventLoop:
-        return self._redis_helper.current_loop()
+        return self._general_redis_helper.current_loop()
 
     def _forget_client(self, client: Redis, *, loop: asyncio.AbstractEventLoop | None = None) -> None:
-        self._redis_helper.forget_client(client, loop=loop)
+        self._general_redis_helper.forget_client(client, loop=loop)
 
     def _new_client(self, *, context: str = DEFAULT_QUEUE_CONTEXT) -> Redis:
-        return self._redis_helper.new_client(context=context)
+        return self._general_redis_helper.new_client(context=context)
+
+    def _blocking_helper_for_channel(self, channel: str) -> RedisSelfHealingClientHelper:
+        if str(channel or "").strip() == "task_delete_dispatch_pop":
+            return self._task_delete_blocking_redis_helper
+        return self._task_dispatch_blocking_redis_helper
+
+    def _new_blocking_client(self, *, channel: str, context: str = DEFAULT_QUEUE_CONTEXT) -> Redis:
+        return self._blocking_helper_for_channel(channel).new_client(context=context)
 
     @staticmethod
     def _is_retryable_redis_connection_error(exc: Exception) -> bool:
@@ -292,8 +348,47 @@ class TaskQueue:
             fn=fn,
         )
 
+    async def _execute_blocking_with_client_rebuild_forever(
+        self,
+        op_name: str,
+        *,
+        context: str,
+        channel: str,
+        fn,
+    ):
+        return await self._blocking_helper_for_channel(channel).execute_with_rebuild_forever(
+            op_name,
+            context=context,
+            fn=fn,
+        )
+
+    def _mark_blocking_client_recovered(
+        self,
+        channel: str,
+        *,
+        op_name: str,
+        context: str,
+        attempts: int,
+    ) -> None:
+        normalized_channel = str(channel or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT
+        self._blocking_recovered_at_by_channel[normalized_channel] = time.monotonic()
+        logger.info(
+            "binary-security blocking redis operation recovered: channel=%s op_name=%s context=%s attempts=%s",
+            normalized_channel,
+            str(op_name or "unknown").strip() or "unknown",
+            str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            attempts,
+        )
+
+    def blocking_client_recently_recovered(self, *, channel: str, within_seconds: float) -> bool:
+        normalized_channel = str(channel or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT
+        recovered_at = self._blocking_recovered_at_by_channel.get(normalized_channel)
+        if recovered_at is None:
+            return False
+        return (time.monotonic() - recovered_at) <= max(0.0, float(within_seconds or 0.0))
+
     async def ping(self, *, context: str = "startup_warmup") -> None:
-        await self._redis_helper.ping(context=context)
+        await self._general_redis_helper.ping(context=context)
 
     async def wait_until_ready(
         self,
@@ -394,36 +489,66 @@ class TaskQueue:
         )
 
     async def pop_task(self, timeout_seconds: int | None = None, *, context: str = "task_dispatch_pop") -> Optional[str]:
+        logger.debug(
+            "binary-security blocking pop started: channel=%s op_name=%s context=%s timeout_seconds=%s",
+            "task_dispatch_pop",
+            "pop_task",
+            str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
+        )
         async def _pop(client: Redis):
             result = await client.blpop(
                 self.config.task_queue_key,
                 timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
             )
             return await self._consume_result(client, self.config.task_queue_key, result)
-
-        return await self._execute_with_client_rebuild_forever(
+        popped = await self._execute_blocking_with_client_rebuild_forever(
             "pop_task",
             context=context,
+            channel="task_dispatch_pop",
             fn=_pop,
         )
+        if popped is None:
+            logger.debug(
+                "binary-security blocking pop timeout returned empty: channel=%s op_name=%s context=%s",
+                "task_dispatch_pop",
+                "pop_task",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            )
+        return popped
 
     async def pop_delete_task(self, timeout_seconds: int | None = None, *, context: str = "task_delete_dispatch_pop") -> Optional[str]:
         queue_key = str(getattr(self.config, "delete_queue_key", "") or "binary_security_delete_queue").strip()
+        logger.debug(
+            "binary-security blocking pop started: channel=%s op_name=%s context=%s timeout_seconds=%s",
+            "task_delete_dispatch_pop",
+            "pop_delete_task",
+            str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
+        )
         async def _pop(client: Redis):
             result = await client.blpop(
                 queue_key,
                 timeout=max(1, int(timeout_seconds or self.config.block_timeout_seconds)),
             )
             return await self._consume_result(client, queue_key, result)
-
-        return await self._execute_with_client_rebuild_forever(
+        popped = await self._execute_blocking_with_client_rebuild_forever(
             "pop_delete_task",
             context=context,
+            channel="task_delete_dispatch_pop",
             fn=_pop,
         )
+        if popped is None:
+            logger.debug(
+                "binary-security blocking pop timeout returned empty: channel=%s op_name=%s context=%s",
+                "task_delete_dispatch_pop",
+                "pop_delete_task",
+                str(context or DEFAULT_QUEUE_CONTEXT).strip() or DEFAULT_QUEUE_CONTEXT,
+            )
+        return popped
 
     async def _close_client(self, client: Redis) -> None:
-        await self._redis_helper.close_client(client)
+        await self._general_redis_helper.close_client(client)
 
     async def _push_unique(self, client: Redis, queue_key: str, task_id: str) -> None:
         value = str(task_id or "").strip()
@@ -582,7 +707,9 @@ class TaskQueue:
         )
 
     async def close(self) -> None:
-        await self._redis_helper.close()
+        await self._general_redis_helper.close()
+        await self._task_dispatch_blocking_redis_helper.close()
+        await self._task_delete_blocking_redis_helper.close()
 
     def _task_sync_queue_base(self, task_id: str) -> str:
         prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"

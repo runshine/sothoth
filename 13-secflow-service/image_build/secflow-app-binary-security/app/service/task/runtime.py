@@ -349,10 +349,28 @@ class TaskRuntimeServiceMixin:
             try:
                 with task_manager_module.observe_scheduler_loop("task_delete_dispatch"):
                     self._mark_loop_heartbeat("task_delete_dispatch")
-                    task_id = await task_manager_module.get_task_queue().pop_delete_task(
+                    queue = task_manager_module.get_task_queue()
+                    task_id = await queue.pop_delete_task(
                         self.cfg.queue.block_timeout_seconds,
                         context="task_delete_dispatch_pop",
                     )
+                    recovered_recently = False
+                    blocking_client_recently_recovered = getattr(
+                        queue,
+                        "blocking_client_recently_recovered",
+                        None,
+                    )
+                    if callable(blocking_client_recently_recovered):
+                        recovered_recently = bool(
+                            blocking_client_recently_recovered(
+                                channel="task_delete_dispatch_pop",
+                                within_seconds=max(5.0, float(self.cfg.queue.block_timeout_seconds or 5)),
+                            )
+                        )
+                    if task_id is None and recovered_recently:
+                        task_manager_module.logger.info(
+                            "binary-security delete dispatch pop recovered and resuming"
+                        )
                     if task_id:
                         await self._consume_delete_queue_task(db, task_id)
                     self._mark_loop_heartbeat("task_delete_dispatch")
@@ -3455,12 +3473,20 @@ class TaskRuntimeServiceMixin:
                         current_handle.heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError, Exception):
                             await current_handle.heartbeat_task
+                    if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
+                        current_handle.sync_maintenance_task.cancel()
+                        with suppress(asyncio.CancelledError, Exception):
+                            await current_handle.sync_maintenance_task
                     self._workers.pop(task_id, None)
                 elif current_handle is not None and not bool(current_handle.owner_active):
                     if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
                         current_handle.heartbeat_task.cancel()
                         with suppress(asyncio.CancelledError, Exception):
                             await current_handle.heartbeat_task
+                    if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
+                        current_handle.sync_maintenance_task.cancel()
+                        with suppress(asyncio.CancelledError, Exception):
+                            await current_handle.sync_maintenance_task
                     self._workers.pop(task_id, None)
             if owner_registered and not self._has_local_task_execution_owner(task_id):
                 self._release_task_execution_owner(task_id, "primary_task_worker")
@@ -4024,13 +4050,13 @@ class TaskRuntimeServiceMixin:
                             item=item,
                         )
                         created = None
-                    elif str(item.downstream_task_id or "").strip() and not retrying:
+                    elif str(item.downstream_task_id or "").strip():
                         return self._defer_item_after_downstream_transport_error(
                             session,
                             task,
                             item,
                             operation="firmware_unpack_observe",
-                            exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
+                            exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
                             response_item=input_file,
                         )
                     else:
@@ -4047,14 +4073,10 @@ class TaskRuntimeServiceMixin:
                         )
             if created is not None:
                 item.status = "running"
-                old_downstream_task_id = await self._replace_active_child_binding(
-                    session,
-                    task,
+                self._bind_created_downstream_child(
                     item,
                     new_downstream_task_id=created.get("task_id") or created.get("id"),
-                    token=token,
                     reason="firmware_unpack_child_create",
-                    transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                 )
                 item.started_at = _now()
                 self._merge_stage_item_result_fields(
@@ -4073,7 +4095,7 @@ class TaskRuntimeServiceMixin:
                         "stage_name": item.stage_name,
                         "item_id": item.id,
                         "item_key": item.item_key,
-                        "old_downstream_task_id": old_downstream_task_id,
+                        "old_downstream_task_id": None,
                         "new_downstream_task_id": item.downstream_task_id,
                         "strategy": retry_strategy if retrying else None,
                         "old_downstream_status": retry_strategy_status if retrying else None,
@@ -4259,13 +4281,13 @@ class TaskRuntimeServiceMixin:
                     item=item,
                 )
             else:
-                if str(item.downstream_task_id or "").strip() and not retrying:
+                if str(item.downstream_task_id or "").strip():
                     return self._defer_item_after_downstream_transport_error(
                         session,
                         task,
                         item,
                         operation="system_analysis_observe",
-                        exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
+                        exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
                         response_item=firmware,
                     )
                 else:
@@ -4282,14 +4304,10 @@ class TaskRuntimeServiceMixin:
                             "analysis_mode": self._task_type(task),
                         },
                     )
-                    old_downstream_task_id = await self._replace_active_child_binding(
-                        session,
-                        task,
+                    self._bind_created_downstream_child(
                         item,
                         new_downstream_task_id=created.get("task_id") or created.get("id"),
-                        token=self._resolve_downstream_token(),
                         reason="system_analysis_child_create",
-                        transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                     )
                     item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                     item.started_at = item.started_at or _now()
@@ -4304,7 +4322,7 @@ class TaskRuntimeServiceMixin:
                             "stage_name": item.stage_name,
                             "item_id": item.id,
                             "item_key": item.item_key,
-                            "old_downstream_task_id": old_downstream_task_id,
+                            "old_downstream_task_id": None,
                             "new_downstream_task_id": item.downstream_task_id,
                             "strategy": retry_strategy if retrying else None,
                             "old_downstream_status": retry_strategy_status if retrying else None,
@@ -4597,14 +4615,10 @@ class TaskRuntimeServiceMixin:
                             "engine": b2s_engine,
                         },
                     )
-                    old_downstream_task_id = await self._replace_active_child_binding(
-                        session,
-                        task,
+                    self._bind_created_downstream_child(
                         item,
                         new_downstream_task_id=created.get("task_id") or created.get("id"),
-                        token=token,
                         reason="binary_to_source_child_create",
-                        transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                     )
                     self._merge_stage_item_result_fields(
                         task,
@@ -4625,7 +4639,7 @@ class TaskRuntimeServiceMixin:
                             "stage_name": item.stage_name,
                             "item_id": item.id,
                             "item_key": item.item_key,
-                            "old_downstream_task_id": old_downstream_task_id,
+                            "old_downstream_task_id": None,
                             "new_downstream_task_id": item.downstream_task_id,
                             "strategy": retry_strategy if retrying else None,
                             "old_downstream_status": retry_strategy_status if retrying else None,
@@ -4866,7 +4880,7 @@ class TaskRuntimeServiceMixin:
                 )
                 created = None
             else:
-                if str(item.downstream_task_id or "").strip() and not retrying:
+                if str(item.downstream_task_id or "").strip():
                     terminal_payload = None
                     try:
                         terminal_payload = await self._downstream_fetch_item_payload(task, item, token or "")
@@ -4896,7 +4910,7 @@ class TaskRuntimeServiceMixin:
                             task,
                             item,
                             operation="entry_analysis_observe",
-                            exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
+                            exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
                             response_item=entry_input if "entry_input" in locals() else module,
                         )
                 else:
@@ -5345,14 +5359,10 @@ class TaskRuntimeServiceMixin:
                                 ],
                             },
                         )
-                        old_downstream_task_id = await self._replace_active_child_binding(
-                            session,
-                            task,
+                        self._bind_created_downstream_child(
                             item,
                             new_downstream_task_id=created.get("task_id") or created.get("id"),
-                            token=self._resolve_downstream_token(token),
                             reason="dataflow_vuln_scan_child_create",
-                            transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                         )
                         self._record_downstream_item_disposition(
                             session,
@@ -5364,7 +5374,7 @@ class TaskRuntimeServiceMixin:
                                 "stage_name": item.stage_name,
                                 "item_id": item.id,
                                 "item_key": item.item_key,
-                                "old_downstream_task_id": old_downstream_task_id,
+                                "old_downstream_task_id": None,
                                 "new_downstream_task_id": item.downstream_task_id,
                                 "strategy": retry_strategy if retrying else None,
                                 "old_downstream_status": retry_strategy_status if retrying else None,
@@ -5596,14 +5606,10 @@ class TaskRuntimeServiceMixin:
                         },
                     )
                     if created is not None:
-                        old_downstream_task_id = await self._replace_active_child_binding(
-                            session,
-                            task,
+                        self._bind_created_downstream_child(
                             item,
                             new_downstream_task_id=created.get("task_id") or created.get("id"),
-                            token=token,
                             reason="dataflow_vuln_scan_recreate_child_create",
-                            transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                         )
                         item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                         self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
@@ -5617,7 +5623,7 @@ class TaskRuntimeServiceMixin:
                                 "stage_name": item.stage_name,
                                 "item_id": item.id,
                                 "item_key": item.item_key,
-                                "old_downstream_task_id": old_downstream_task_id,
+                                "old_downstream_task_id": None,
                                 "new_downstream_task_id": item.downstream_task_id,
                                 "strategy": retry_strategy,
                                 "old_downstream_status": retry_strategy_status,
@@ -5716,13 +5722,13 @@ class TaskRuntimeServiceMixin:
                         payload,
                         success_statuses={"success", "succeeded", "completed"},
                     )
-                if str(item.downstream_task_id or "").strip() and not retrying:
+                if str(item.downstream_task_id or "").strip():
                     return self._defer_item_after_downstream_transport_error(
                         session,
                         task,
                         item,
                         operation="dataflow_vuln_scan_observe",
-                        exc=UpstreamError("下游子任务暂不可观测，保留绑定并等待下一轮同步"),
+                        exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
                         response_item=dataflow_result,
                     )
                 elif not (retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item)):
@@ -5748,14 +5754,10 @@ class TaskRuntimeServiceMixin:
                         },
                     )
             if created is not None:
-                old_downstream_task_id = await self._replace_active_child_binding(
-                    session,
-                    task,
+                self._bind_created_downstream_child(
                     item,
                     new_downstream_task_id=created.get("task_id") or created.get("id"),
-                    token=token,
                     reason=f"{stage_run.stage_name}_child_create",
-                    transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                 )
                 item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
                 self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
@@ -5769,7 +5771,7 @@ class TaskRuntimeServiceMixin:
                         "stage_name": item.stage_name,
                         "item_id": item.id,
                         "item_key": item.item_key,
-                        "old_downstream_task_id": old_downstream_task_id,
+                        "old_downstream_task_id": None,
                         "new_downstream_task_id": item.downstream_task_id,
                         "strategy": retry_strategy if retrying else None,
                         "old_downstream_status": retry_strategy_status if retrying else None,

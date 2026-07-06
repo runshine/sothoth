@@ -360,65 +360,46 @@ class TaskDownstreamServiceMixin:
         item: BinarySecurityStageItem,
     ) -> None:
         old_task_id = str(item.downstream_task_id or "").strip() or None
-        rebuild_rerun_count = 0
+        result = self._load_stage_item_result_payload(item)
+        result["signature_change_detected"] = True
+        result["signature_change_requires_manual_action"] = True
+        result["last_signature_change_reason"] = "streaming_entry_execution_changed"
         if old_task_id:
-            rebuild_rerun_count = self._increment_stage_item_rebuild_rerun_count(
-                item,
-                reason="streaming_entry_execution_signature_changed",
-            )
-            self._supersede_archive_jobs_for_downstream_task(
-                db,
-                task,
-                item,
-                old_downstream_task_id=old_task_id,
-                reason="streaming_entry_execution_signature_changed",
-            )
-            self._mark_superseded_downstream_state(
-                item,
-                old_downstream_task_id=old_task_id,
-                message="执行契约已变化，旧 child 结果已失效，等待新 child 重建",
-            )
-        if old_task_id:
-            self._record_event(
-                db,
-                task,
-                "stale_dataflow_item_requeued_after_signature_change",
-                "DFVS 执行契约已变化，旧下游绑定已废弃，等待定点重建",
-                stage_name=item.stage_name,
-                item=item,
-                level="warning",
-                payload={
-                    "item_id": item.id,
-                    "item_key": item.item_key,
-                    "old_downstream_task_id": old_task_id,
-                    "reason": "streaming_entry_execution_signature_changed",
-                    "rebuild_rerun_count": rebuild_rerun_count,
-                },
-            )
-        self._clear_item_downstream_runtime_state(item)
-        self._mark_replacement_in_progress(
-            item,
-            old_downstream_task_id=old_task_id,
-            binding_cleared=True,
-            verification_status="pending",
-            transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
-        )
+            result["signature_change_preserved_downstream_task_id"] = old_task_id
+        item.result = result
         self._set_downstream_binding_snapshot(
             item,
-            state="not_started",
-            attempts=0,
-            first_attempt_at=None,
-            last_attempt_at=None,
+            state="bound" if old_task_id else "not_started",
+            attempts=int((self._downstream_binding_snapshot(item) or {}).get("attempts") or 0),
+            first_attempt_at=(self._downstream_binding_snapshot(item) or {}).get("first_attempt_at"),
+            last_attempt_at=(self._downstream_binding_snapshot(item) or {}).get("last_attempt_at"),
             next_retry_at=None,
             last_error=None,
             last_error_type=None,
             recoverable=None,
-            message="执行契约变化后等待重建新的下游任务",
+            message="检测到执行契约变化，已保留当前 authoritative child，等待人工决定是否重跑",
         )
-        item.status = "pending"
-        item.finished_at = None
-        item.started_at = None
+        self._clear_replacement_in_progress(item)
         item.error_message = None
+
+    def _bind_created_downstream_child(
+        self,
+        item: BinarySecurityStageItem,
+        *,
+        new_downstream_task_id: str | None,
+        reason: str,
+    ) -> None:
+        new_task_id = str(new_downstream_task_id or "").strip() or None
+        current_task_id = str(item.downstream_task_id or "").strip() or None
+        if not new_task_id:
+            return
+        if current_task_id and current_task_id != new_task_id:
+            raise ValidationError(
+                f"existing authoritative child binding preserved for {item.stage_name}:{item.item_key}; "
+                f"auto replacement is forbidden ({reason})"
+            )
+        item.downstream_task_id = new_task_id
+        self._clear_replacement_in_progress(item)
 
     def _should_suppress_dataflow_signature_rebuild(
         self,
@@ -562,39 +543,26 @@ class TaskDownstreamServiceMixin:
         item: BinarySecurityStageItem,
     ) -> None:
         old_task_id = str(item.downstream_task_id or "").strip() or None
+        result = self._load_stage_item_result_payload(item)
+        result["signature_change_detected"] = True
+        result["signature_change_requires_manual_action"] = True
+        result["last_signature_change_reason"] = "entry_analysis_execution_changed"
         if old_task_id:
-            self._increment_stage_item_rebuild_rerun_count(
-                item,
-                reason="streaming_entry_execution_signature_changed",
-            )
-            self._supersede_archive_jobs_for_downstream_task(
-                db,
-                task,
-                item,
-                old_downstream_task_id=old_task_id,
-                reason="streaming_entry_execution_signature_changed",
-            )
-            self._mark_superseded_downstream_state(
-                item,
-                old_downstream_task_id=old_task_id,
-                message="入口分析执行契约已变化，旧 child 结果已失效，等待新 child 重建",
-            )
-        self._clear_item_downstream_runtime_state(item)
+            result["signature_change_preserved_downstream_task_id"] = old_task_id
+        item.result = result
         self._set_downstream_binding_snapshot(
             item,
-            state="not_started",
-            attempts=0,
-            first_attempt_at=None,
-            last_attempt_at=None,
+            state="bound" if old_task_id else "not_started",
+            attempts=int((self._downstream_binding_snapshot(item) or {}).get("attempts") or 0),
+            first_attempt_at=(self._downstream_binding_snapshot(item) or {}).get("first_attempt_at"),
+            last_attempt_at=(self._downstream_binding_snapshot(item) or {}).get("last_attempt_at"),
             next_retry_at=None,
             last_error=None,
             last_error_type=None,
             recoverable=None,
-            message="执行契约变化后等待重建新的下游任务",
+            message="检测到执行契约变化，已保留当前 authoritative child，等待人工决定是否重跑",
         )
-        item.status = "pending"
-        item.finished_at = None
-        item.started_at = None
+        self._clear_replacement_in_progress(item)
         item.error_message = None
 
     def _dataflow_item_archive_success(self, db: Session, item: BinarySecurityStageItem) -> bool:
@@ -949,7 +917,7 @@ class TaskDownstreamServiceMixin:
                     db,
                     task,
                     "entry_analysis_execution_signature_changed",
-                    f"binary-to-source 刷新改变了入口分析执行契约，已准备定点重建: {module_key}",
+                    f"binary-to-source 刷新改变了入口分析执行契约，已保留旧绑定并等待人工决策: {module_key}",
                     stage_name="entry_analysis",
                     item=item,
                     level="warning",
@@ -1146,7 +1114,7 @@ class TaskDownstreamServiceMixin:
                             db,
                             task,
                             "dataflow_entry_execution_signature_changed",
-                            f"入口刷新改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
+                            f"入口刷新改变了 DFVS 执行契约，已保留旧绑定并等待人工决策: {entry_key}",
                             stage_name="dataflow_vuln_scan",
                             item=item,
                             level="warning",
@@ -1321,7 +1289,7 @@ class TaskDownstreamServiceMixin:
                         db,
                         task,
                         "legacy_vuln_execution_signature_changed",
-                        f"历史兼容路径改变了 DFVS 执行契约，已准备定点重建: {entry_key}",
+                        f"历史兼容路径改变了 DFVS 执行契约，已保留旧绑定并等待人工决策: {entry_key}",
                         stage_name="dataflow_vuln_scan",
                         item=item,
                         level="warning",
@@ -1413,6 +1381,7 @@ class TaskDownstreamServiceMixin:
         processed_identities = set(existing_items_by_identity.keys())
 
         preserved_success_identities: set[str] = set()
+        preserved_observe_only_identities: set[str] = set()
 
         def _should_preserve_existing_streaming_item(existing_item: BinarySecurityStageItem) -> bool:
             if not self._streaming_mode_enabled(task):
@@ -1519,12 +1488,14 @@ class TaskDownstreamServiceMixin:
                     "recovery_action": "observe_only",
                 },
             )
+            preserved_observe_only_identities.add(identity_key)
 
-        if preserved_success_identities:
+        if preserved_success_identities or preserved_observe_only_identities:
             executable_inputs = [
                 row[0]
                 for row in candidate_inputs
                 if row[5] not in preserved_success_identities
+                and row[5] not in preserved_observe_only_identities
             ]
 
         batch_size = min(100, max(25, int(task.policy.get("stage_item_seed_batch_size") or 100)))

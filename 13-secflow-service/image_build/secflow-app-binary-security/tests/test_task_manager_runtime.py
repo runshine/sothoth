@@ -2,7 +2,7 @@ import asyncio
 import json
 import unittest
 from datetime import timedelta, datetime
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -325,10 +325,11 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([("task-pending", "startup_seed")], pushed)
 
-    async def test_start_task_runtime_creates_runner_and_heartbeat_handle(self):
+    async def test_start_task_runtime_creates_runner_heartbeat_and_sync_maintenance_handle(self):
         manager = TaskManager()
         started: list[str] = []
         heartbeat_started = asyncio.Event()
+        sync_maintenance_started = asyncio.Event()
         touched: list[str] = []
 
         async def _run_task(task_id):
@@ -340,24 +341,38 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             heartbeat_started.set()
             await asyncio.sleep(3600)
 
+        async def _run_sync_maintenance(task_id):
+            started.append(f"sync:{task_id}")
+            sync_maintenance_started.set()
+            await asyncio.sleep(3600)
+
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
+        manager._run_task_sync_maintenance = _run_sync_maintenance
 
         with patch.object(manager, "_touch_task_heartbeat", side_effect=lambda task_id: touched.append(task_id)):
             created = await manager._start_task_runtime("task-1")
         self.assertTrue(created)
         await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
+        await asyncio.wait_for(sync_maintenance_started.wait(), timeout=1)
 
         handle = manager._workers.get("task-1")
         self.assertIsNotNone(handle)
         self.assertIsNotNone(handle.runner_task)
         self.assertIsNotNone(handle.heartbeat_task)
+        self.assertIsNotNone(handle.sync_maintenance_task)
         self.assertIn("runner:task-1", started)
         self.assertIn("heartbeat:task-1", started)
+        self.assertIn("sync:task-1", started)
         self.assertEqual(["task-1"], touched)
 
         handle.cancel()
-        await asyncio.gather(handle.runner_task, handle.heartbeat_task, return_exceptions=True)
+        await asyncio.gather(
+            handle.runner_task,
+            handle.heartbeat_task,
+            handle.sync_maintenance_task,
+            return_exceptions=True,
+        )
         manager._workers.pop("task-1", None)
 
     async def test_start_task_runtime_writes_runtime_lease_before_return(self):
@@ -387,8 +402,13 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             del task_id
             await asyncio.sleep(3600)
 
+        async def _run_sync_maintenance(task_id):
+            del task_id
+            await asyncio.sleep(3600)
+
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
+        manager._run_task_sync_maintenance = _run_sync_maintenance
 
         def _touch(task_id):
             self.assertEqual("task-1", task_id)
@@ -417,10 +437,15 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         handle = manager._workers.get("task-1")
         self.assertIsNotNone(handle)
         handle.cancel()
-        await asyncio.gather(handle.runner_task, handle.heartbeat_task, return_exceptions=True)
+        await asyncio.gather(
+            handle.runner_task,
+            handle.heartbeat_task,
+            handle.sync_maintenance_task,
+            return_exceptions=True,
+        )
         manager._workers.pop("task-1", None)
 
-    async def test_run_task_finally_cancels_paired_heartbeat(self):
+    async def test_run_task_finally_cancels_paired_runtime_companions(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         task = BinarySecurityTask(
@@ -445,6 +470,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         )
         db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
         heartbeat_cancelled = asyncio.Event()
+        sync_maintenance_cancelled = asyncio.Event()
 
         async def _heartbeat():
             try:
@@ -453,10 +479,18 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 heartbeat_cancelled.set()
                 raise
 
+        async def _sync_maintenance():
+            try:
+                await asyncio.sleep(3600)
+            except asyncio.CancelledError:
+                sync_maintenance_cancelled.set()
+                raise
+
         manager._workers["task-1"] = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
             runner_task=asyncio.current_task(),
             heartbeat_task=asyncio.create_task(_heartbeat()),
+            sync_maintenance_task=asyncio.create_task(_sync_maintenance()),
             claimed_at=_now(),
             execution_token=None,
             lease_owner_instance_id="worker-a",
@@ -470,6 +504,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 await manager._run_task("task-1")
 
         self.assertTrue(heartbeat_cancelled.is_set())
+        self.assertTrue(sync_maintenance_cancelled.is_set())
         self.assertNotIn("task-1", manager._workers)
 
     async def test_task_heartbeat_handoffs_active_serial_control_operation(self):
@@ -664,6 +699,51 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([("task-1", "dispatch_claim_not_acquired_reenqueue")], requeued)
         self.assertIn("dispatch_claim_reenqueued", [row.event_type for row in db.events])
 
+    async def test_delete_dispatch_loop_logs_recovered_and_resuming_after_blocking_client_recovery(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+
+        class _Queue:
+            def __init__(self):
+                self.pop_calls = 0
+                self.context = None
+                self.channel = None
+                self.within_seconds = None
+
+            async def pop_delete_task(self, _timeout_seconds, context=None):
+                self.pop_calls += 1
+                self.context = context
+                manager._running = False
+                return None
+
+            def blocking_client_recently_recovered(self, *, channel, within_seconds):
+                self.channel = channel
+                self.within_seconds = within_seconds
+                return channel == "task_delete_dispatch_pop"
+
+        queue = _Queue()
+        db = _ModelAwareDb(tasks=[], events=[], state_events=[])
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=queue),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+            patch("app.service.task_manager.observe_scheduler_loop", return_value=nullcontext()),
+            patch("app.service.task_manager.logger.info") as logger_info,
+            patch.object(manager, "_consume_delete_queue_task", new=AsyncMock()) as consume_delete,
+        ):
+            await manager._delete_dispatch_loop()
+
+        self.assertEqual(1, queue.pop_calls)
+        self.assertEqual("task_delete_dispatch_pop", queue.context)
+        self.assertEqual("task_delete_dispatch_pop", queue.channel)
+        self.assertGreaterEqual(queue.within_seconds, 5.0)
+        consume_delete.assert_not_awaited()
+        self.assertTrue(
+            any("binary-security delete dispatch pop recovered and resuming" in str(call.args[0]) for call in logger_info.call_args_list)
+        )
+
     async def test_dispatch_loop_drops_popped_task_when_claim_decision_says_no_requeue(self):
         manager = TaskManager()
         manager._running = True
@@ -748,6 +828,68 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 "task_layer_reconcile",
                 "non_pending_task_already_owned_by_supported_runtime",
             },
+        )
+
+    async def test_dispatch_loop_ignores_delete_channel_recovery_and_still_claims_task(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[], runtime_leases=[])
+
+        class _Queue:
+            def __init__(self):
+                self._popped = False
+
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
+                if not self._popped:
+                    self._popped = True
+                    return "task-1"
+                manager._running = False
+                return None
+
+            def blocking_client_recently_recovered(self, *, channel, within_seconds):
+                del within_seconds
+                return channel == "task_delete_dispatch_pop"
+
+        async def _reconcile(_db):
+            return None
+
+        async def _observe(_db):
+            return None
+
+        manager._dispatch_task_by_id = lambda _db, task_id: task_id
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+        manager._run_parent_reclaim_pass = lambda _db: (False, False, False, False, False, False, False, False)
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+            patch.object(manager, "_load_service_config", return_value=SimpleNamespace(worker_task_concurrency=2)),
+            patch.object(manager, "_local_active_runtime_count", return_value=0),
+            patch.object(manager, "_start_task_runtime", new=AsyncMock(return_value=True)) as start_runtime,
+            patch("app.service.task_manager.logger.info") as logger_info,
+        ):
+            await manager._dispatch_loop()
+
+        start_runtime.assert_awaited_once_with("task-1")
+        self.assertFalse(
+            any("binary-security dispatch pop recovered and resuming" in str(call.args[0]) for call in logger_info.call_args_list)
         )
 
     async def test_dispatch_loop_forwards_foreign_owner_signal_for_nonpending_without_resumable_operation(self):

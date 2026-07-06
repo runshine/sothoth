@@ -1401,7 +1401,7 @@ class SourceWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _current: {},
         )
 
-        self.assertEqual(inputs, executable)
+        self.assertEqual([], executable)
         self.assertEqual("downstream_missing", dataflow_item.status)
         self.assertEqual("dfa-missing-owner", dataflow_item.downstream_task_id)
 
@@ -1534,7 +1534,7 @@ class SourceWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _current: {},
         )
 
-        self.assertEqual(inputs, executable)
+        self.assertEqual([], executable)
         self.assertEqual("downstream_missing", entry_item.status)
         self.assertEqual("ea-missing-source", entry_item.downstream_task_id)
 
@@ -7157,7 +7157,7 @@ class BinaryModuleWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _entry: {},
         )
 
-        self.assertEqual(inputs, executable)
+        self.assertEqual([], executable)
         self.assertEqual("downstream_missing", dataflow_item.status)
         self.assertEqual("dfs-missing-owner", dataflow_item.downstream_task_id)
 

@@ -1763,7 +1763,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
             output_ref=lambda _current: {},
         )
 
-        self.assertEqual(inputs, executable)
+        self.assertEqual([], executable)
         self.assertEqual("downstream_missing", dataflow_item.status)
         self.assertEqual("dfa-missing-owner-binary", dataflow_item.downstream_task_id)
 
