@@ -37271,6 +37271,49 @@ def _test_dispatch_task_by_id_requeues_on_retryable_lock_conflict(self):
     self.assertTrue(bool(decision.get("should_requeue")))
 
 
+def _test_dispatch_task_by_id_requeues_on_runtime_lease_duplicate_insert_race(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-claim-duplicate-lease",
+        project_id="p1",
+        name="source",
+        status="pending",
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="system_analysis",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+    original_upsert = manager._upsert_runtime_lease
+
+    def _raise_duplicate(*_args, **_kwargs):
+        raise IntegrityError(
+            "insert",
+            None,
+            Exception(
+                "1062 duplicate entry 'task-claim-duplicate-lease' for key "
+                "'secflow_binary_security_task_runtime_lease.PRIMARY'"
+            ),
+        )
+
+    manager._upsert_runtime_lease = _raise_duplicate
+    try:
+        claimed = manager._dispatch_task_by_id(db, task.id)
+    finally:
+        manager._upsert_runtime_lease = original_upsert
+
+    self.assertIsNone(claimed)
+    self.assertEqual("pending", task.status)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("dispatch_claim_deferred_by_lock", event_types)
+    decision = manager._dispatch_claim_decision() or {}
+    self.assertEqual("claim_runtime_lease_duplicate_retry_later", decision.get("blocked_reason"))
+    self.assertTrue(bool(decision.get("should_requeue")))
+
+
 def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"

@@ -2651,6 +2651,37 @@ class TaskRuntimeServiceMixin:
                 should_requeue=True,
             )
             return None
+        except IntegrityError as exc:
+            if not self._is_runtime_lease_duplicate_insert_error(exc):
+                raise
+            db.rollback()
+            task.status = previous_status_value
+            task.runtime_phase = previous_runtime_phase_value
+            task.updated_at = previous_updated_at_value
+            self._record_dispatch_lock_conflict_after_rollback(
+                db,
+                task_id,
+                event_type="dispatch_claim_deferred_by_lock",
+                message="dispatch claim 遇到 runtime lease 并发插入冲突，当前轮延后重试",
+                payload={
+                    "reason": "claim_runtime_lease_duplicate_retry_later",
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "error_type": exc.__class__.__name__,
+                },
+            )
+            self._log_dispatch_claim_blocked(
+                task_id,
+                reason="claim_runtime_lease_duplicate_retry_later",
+                task=task,
+                current_operation=current_operation,
+            )
+            self._set_dispatch_claim_decision(
+                task_id=task_id,
+                claimed_task_id=None,
+                blocked_reason="claim_runtime_lease_duplicate_retry_later",
+                should_requeue=True,
+            )
+            return None
         except task_manager_module.StaleTaskExecution:
             db.rollback()
             task.status = previous_status_value

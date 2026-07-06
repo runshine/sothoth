@@ -3658,6 +3658,20 @@ class TaskManager(
         except StaleTaskExecution:
             return self._runtime_lease_for_task(db, task.id)
 
+    def _is_runtime_lease_duplicate_insert_error(self, exc: BaseException) -> bool:
+        current: BaseException | None = exc
+        while current is not None:
+            if isinstance(current, IntegrityError):
+                args = getattr(getattr(current, "orig", None), "args", ()) or ()
+                code = args[0] if args else None
+                message = str(current).lower()
+                if code == 1062 and "secflow_binary_security_task_runtime_lease.primary" in message:
+                    return True
+                if "duplicate entry" in message and "secflow_binary_security_task_runtime_lease.primary" in message:
+                    return True
+            current = getattr(current, "__cause__", None) or getattr(current, "orig", None)
+        return False
+
     def _runtime_lease_is_active(self, lease: BinarySecurityTaskRuntimeLease | None) -> bool:
         if lease is None:
             return False
