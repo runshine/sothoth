@@ -696,7 +696,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
             patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
         ):
-            await manager._dispatch_loop()
+            await asyncio.wait_for(manager._dispatch_loop(), timeout=2)
 
         self.assertEqual([("task-1", "dispatch_claim_not_acquired_reenqueue")], requeued)
         self.assertIn("dispatch_claim_reenqueued", [row.event_type for row in db.events])
@@ -756,6 +756,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         class _Queue:
             def __init__(self):
                 self._popped = False
+                self.parent_takeover_locks = {}
 
             async def pop_task(self, _timeout_seconds, context=None):
                 del context
@@ -767,6 +768,20 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
             async def force_requeue_task(self, task_id, *, context=None):
                 requeued.append((task_id, context))
+
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
 
         async def _reconcile(_db):
             return None
@@ -786,6 +801,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._dispatch_task_by_id = _dispatch_task_by_id
         manager._reconcile_work_queues = _reconcile
         manager._observe_runtime_metrics = _observe
+        manager._run_parent_reclaim_pass = lambda _db: (False, False, False, False, False, False, False, False)
 
         task = BinarySecurityTask(
             id="task-1",
@@ -934,6 +950,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._dispatch_task_by_id = _dispatch_task_by_id
         manager._reconcile_work_queues = _reconcile
         manager._observe_runtime_metrics = _observe
+        manager._run_parent_reclaim_pass = lambda _db: (False, False, False, False, False, False, False, False)
 
         task = BinarySecurityTask(
             id="task-1",
@@ -973,6 +990,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         class _Queue:
             def __init__(self):
                 self._popped = False
+                self.parent_takeover_locks = {}
 
             async def pop_task(self, _timeout_seconds, context=None):
                 del context
@@ -984,6 +1002,20 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
             async def force_requeue_task(self, task_id, *, context=None):
                 requeued.append((task_id, context))
+
+            async def acquire_parent_takeover_lock(self, task_id, owner_token, *, ttl_seconds=60, context=None):
+                del ttl_seconds, context
+                if task_id in self.parent_takeover_locks:
+                    return False
+                self.parent_takeover_locks[task_id] = owner_token
+                return True
+
+            async def release_parent_takeover_lock(self, task_id, owner_token, *, context=None):
+                del context
+                if self.parent_takeover_locks.get(task_id) != owner_token:
+                    return False
+                self.parent_takeover_locks.pop(task_id, None)
+                return True
 
         async def _reconcile(_db):
             return None
@@ -1004,6 +1036,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._dispatch_task_by_id = _dispatch_task_by_id
         manager._reconcile_work_queues = _reconcile
         manager._observe_runtime_metrics = _observe
+        manager._run_parent_reclaim_pass = lambda _db: (False, False, False, False, False, False, False, False)
 
         task = BinarySecurityTask(
             id="task-1",
@@ -1023,7 +1056,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
             patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
         ):
-            await manager._dispatch_loop()
+            await asyncio.wait_for(manager._dispatch_loop(), timeout=2)
 
         self.assertEqual([], requeued)
         self.assertIn("dispatch_claim_requeue_cooldown_started", [row.event_type for row in db.events])
