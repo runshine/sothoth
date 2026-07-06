@@ -1,6 +1,9 @@
 import asyncio
 import unittest
 from datetime import timedelta
+from types import MethodType
+
+from sqlalchemy.exc import OperationalError
 
 from app.model import (
     BinarySecurityStageItem,
@@ -139,6 +142,51 @@ class TaskLayerReconcileDeliveryTests(unittest.TestCase):
         self.assertEqual("stage_worker_terminal_observed", payload.get("source_event_type"))
         self.assertEqual("worker-owner", payload.get("runtime_lease_owner"))
         self.assertTrue(payload.get("runtime_lease_active"))
+
+    def test_drop_unclaimed_dispatch_task_after_pop_suppresses_retryable_lock_conflict_on_commit(self):
+        task = self._task(current_stage="dataflow_vuln_scan")
+        task.summary = {
+            "pending_shared_dispatch_signal": {
+                "signal_type": "task_layer_reconcile",
+                "enqueue_context": "shared_dispatch_task_layer_reconcile_enqueue",
+                "source_event_type": "stage_worker_terminal_observed",
+                "requested_by_instance_id": "worker-origin",
+            }
+        }
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-owner",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[lease])
+
+        deadlock_error = OperationalError(
+            "DELETE FROM secflow_binary_security_event ...",
+            {},
+            Exception(1213, "Deadlock found when trying to get lock; try restarting transaction"),
+        )
+        rollback_calls: list[bool] = []
+
+        def _commit_with_deadlock(self):
+            raise deadlock_error
+
+        def _rollback(self):
+            rollback_calls.append(True)
+            return None
+
+        db.commit = MethodType(_commit_with_deadlock, db)
+        db.rollback = MethodType(_rollback, db)
+
+        asyncio.run(
+            self.manager._drop_unclaimed_dispatch_task_after_pop(
+                db,
+                task.id,
+                reason="non_pending_task_already_owned_by_supported_runtime",
+            )
+        )
+
+        self.assertTrue(rollback_calls)
+        self.assertTrue(any(row.event_type == "dispatch_claim_dropped_after_pop" for row in db.events))
 
     def test_task_layer_reconcile_delivery_decision_ignores_stale_dispatcher_without_runtime_lease(self):
         task = self._task()

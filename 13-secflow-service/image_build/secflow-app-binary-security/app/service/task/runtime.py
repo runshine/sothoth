@@ -215,7 +215,22 @@ class TaskRuntimeServiceMixin:
                 },
             )
             self._clear_pending_shared_dispatch_signal(task)
-            db.commit()
+            try:
+                db.commit()
+            except OperationalError as exc:
+                with suppress(Exception):
+                    db.rollback()
+                if self._is_retryable_lock_error(exc):
+                    task_manager_module.logger.warning(
+                        "binary-security dispatch popped task drop deferred by retryable db lock conflict: "
+                        "task_id=%s reason=%s error_type=%s error=%s",
+                        normalized_task_id,
+                        normalized_reason,
+                        exc.__class__.__name__,
+                        exc,
+                    )
+                    return
+                raise
             task_manager_module.logger.warning(
                 "binary-security dispatch popped task but claim was not acquired; task dropped after pop: "
                 "task_id=%s reason=%s status=%s runtime_phase=%s "
