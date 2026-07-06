@@ -1813,6 +1813,15 @@ class TaskManager(
             return False
         return True
 
+    def _watchdog_should_skip_lease_write(self, handle: TaskRuntimeHandle | None, *, now_value: datetime) -> bool:
+        if handle is None:
+            return True
+        last_refresh_at = getattr(handle, "last_lease_refresh_at", None)
+        if last_refresh_at is None:
+            return False
+        interval_seconds = max(1.0, float(self._runtime_watchdog_interval_seconds()))
+        return (now_value - last_refresh_at).total_seconds() < interval_seconds
+
     def _record_watchdog_runtime_stall_before_abort(
         self,
         task_id: str,
@@ -1886,9 +1895,23 @@ class TaskManager(
                             )
                             self._verify_local_runtime_lease_or_abort(task_id, "runtime_lease_watchdog")
                             continue
+                        if self._watchdog_should_skip_lease_write(handle, now_value=tick_at):
+                            continue
                         self._write_task_heartbeat(db, task_id, now_value=tick_at, source="watchdog")
                     except StaleTaskExecution:
                         self._verify_local_runtime_lease_or_abort(task_id, "runtime_lease_watchdog")
+                    except OperationalError as exc:
+                        db.rollback()
+                        if self._is_retryable_lock_error(exc):
+                            logger.info(
+                                "binary-security runtime lease watchdog deferred by lock conflict: task_id=%s error_type=%s",
+                                task_id,
+                                exc.__class__.__name__,
+                            )
+                            with self._lease_watchdog_state_lock:
+                                self._lease_watchdog_last_error = f"task:{task_id}:lock_conflict"
+                            continue
+                        raise
                     except Exception:
                         logger.exception(
                             "binary-security runtime lease watchdog failed: task_id=%s",

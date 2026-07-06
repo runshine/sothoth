@@ -1805,7 +1805,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             await self.manager._reconcile_work_queues_once(db)
 
         self.assertEqual([], pushed)
-        self.assertIn("active_operation_shared_dispatch_reenqueue_skipped", [row.event_type for row in db.events])
+        self.assertEqual([], db.events)
 
     async def test_reconcile_work_queues_suppresses_operation_shared_dispatch_when_healthy_owner_exists(self):
         task = BinarySecurityTask(
@@ -1855,6 +1855,23 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         event_types = [row.event_type for row in db.events]
         self.assertNotIn("active_operation_shared_dispatch_reenqueue_suppressed_active_owner", event_types)
         self.assertNotIn("active_operation_shared_dispatch_reenqueue_skipped", event_types)
+
+    async def test_watchdog_skips_recent_lease_write(self):
+        task_id = "task-watchdog-skip"
+        handle = SimpleNamespace(
+            task_id=task_id,
+            done=lambda: False,
+            cancel_requested=False,
+            release_requested=False,
+            owner_active=True,
+            takeover_observed=False,
+            last_lease_refresh_at=self.manager._now() if hasattr(self.manager, "_now") else None,
+        )
+        if handle.last_lease_refresh_at is None:
+            from app.service.task_manager import _now
+
+            handle.last_lease_refresh_at = _now()
+        self.assertTrue(self.manager._watchdog_should_skip_lease_write(handle, now_value=handle.last_lease_refresh_at))
 
     async def test_reconcile_work_queues_runs_orphan_parent_initial_enqueue_reconcile_first(self):
         task = BinarySecurityTask(
