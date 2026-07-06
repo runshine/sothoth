@@ -26182,6 +26182,60 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("pending", task.stage_summary["entry_analysis"]["status"])
         self.assertNotIn("BinarySecurityStageItem", db.queried_models)
 
+    def test_list_tasks_light_stage_summary_promotes_pending_snapshot_to_success_when_counts_are_fully_successful(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source-task",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+        )
+        task.policy = {}
+        task.stage_summary = {
+            "entry_analysis": {
+                "sequence_no": 2,
+                "status": "pending",
+                "counts": {
+                    "total_items": 9,
+                    "success_items": 9,
+                    "failed_items": 0,
+                    "orchestration_failed_items": 0,
+                    "downstream_missing_items": 0,
+                    "skipped_items": 0,
+                    "running_items": 0,
+                    "cancelled_items": 0,
+                },
+                "started_at": "2026-06-29T16:14:13",
+                "finished_at": None,
+            }
+        }
+        stage_run = BinarySecurityStageRun(
+            id="sr1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+            started_at=datetime(2026, 6, 29, 16, 14, 13),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+        response = self.manager.list_tasks(db, project_id="p1")
+
+        summary_by_stage = {summary.stage_name: summary for summary in response.items[0].stage_summaries}
+        entry_summary = summary_by_stage["entry_analysis"]
+        self.assertEqual("success", entry_summary.status)
+        self.assertEqual(9, entry_summary.total_items)
+        self.assertEqual(9, entry_summary.success_items)
+        self.assertEqual(0, entry_summary.failed_items)
+        self.assertEqual(0, entry_summary.running_items)
+        self.assertNotIn("BinarySecurityStageItem", db.queried_models)
+
     def test_list_tasks_manual_operation_state_uses_lightweight_heuristic(self):
         task = BinarySecurityTask(
             id="t1",

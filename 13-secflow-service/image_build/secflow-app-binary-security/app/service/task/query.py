@@ -359,12 +359,64 @@ class TaskQueryServiceMixin:
         summaries: list[BinarySecurityStageSummary] = []
         for index, stage_name in enumerate(stage_sequence, start=1):
             payload = snapshot.get(stage_name) if isinstance(snapshot.get(stage_name), dict) else {}
+            counts = payload.get("counts") if isinstance(payload.get("counts"), dict) else {}
+            total_items = int(
+                payload.get("total_items")
+                or counts.get("total_items")
+                or 0
+            )
+            success_items = int(
+                payload.get("success_items")
+                or counts.get("success_items")
+                or 0
+            )
+            failed_items = int(
+                payload.get("failed_items")
+                or counts.get("failed_items")
+                or 0
+            )
+            orchestration_failed_items = int(
+                payload.get("orchestration_failed_items")
+                or counts.get("orchestration_failed_items")
+                or 0
+            )
+            downstream_missing_items = int(
+                payload.get("downstream_missing_items")
+                or counts.get("downstream_missing_items")
+                or 0
+            )
+            skipped_items = int(
+                payload.get("skipped_items")
+                or counts.get("skipped_items")
+                or 0
+            )
+            running_items = int(
+                payload.get("running_items")
+                or counts.get("running_items")
+                or 0
+            )
+            cancelled_items = int(
+                payload.get("cancelled_items")
+                or counts.get("cancelled_items")
+                or 0
+            )
             latest_run = latest_stage_runs.get(stage_name)
             status_value = (
                 str(getattr(latest_run, "status", "") or "").strip()
                 or str(payload.get("status") or "").strip()
                 or ("pending" if stage_name != task.current_stage else str(task.status or "pending"))
             )
+            if (
+                status_value == "pending"
+                and total_items > 0
+                and success_items == total_items
+                and failed_items == 0
+                and orchestration_failed_items == 0
+                and downstream_missing_items == 0
+                and running_items == 0
+                and cancelled_items == 0
+            ):
+                status_value = "success"
             summaries.append(
                 BinarySecurityStageSummary(
                     stage_name=stage_name,
@@ -377,14 +429,14 @@ class TaskQueryServiceMixin:
                     retry_failed_reason=None,
                     retry_full_supported=False,
                     retry_full_reason=None,
-                    total_items=0,
-                    success_items=0,
-                    failed_items=0,
-                    orchestration_failed_items=0,
-                    downstream_missing_items=0,
-                    skipped_items=0,
-                    running_items=0,
-                    cancelled_items=0,
+                    total_items=total_items,
+                    success_items=success_items,
+                    failed_items=failed_items,
+                    orchestration_failed_items=orchestration_failed_items,
+                    downstream_missing_items=downstream_missing_items,
+                    skipped_items=skipped_items,
+                    running_items=running_items,
+                    cancelled_items=cancelled_items,
                     downstream_status_counts={},
                     started_at=getattr(latest_run, "started_at", None) or payload.get("started_at"),
                     finished_at=getattr(latest_run, "finished_at", None) or payload.get("finished_at"),
