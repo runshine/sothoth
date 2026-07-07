@@ -17,6 +17,49 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    def _task_requires_downstream_sync_maintenance(
+        self: TaskManager,
+        db: Session,
+        task,
+    ) -> tuple[bool, dict[str, object]]:
+        from app.service import task_manager as task_manager_module
+
+        if task is None:
+            return False, {"reason": "task_missing"}
+        try:
+            expected = self._build_expected_sync_requests_from_db(db, task)
+        except Exception:
+            task_manager_module.logger.exception(
+                "binary-security failed to inspect downstream sync keepalive requirement: task_id=%s",
+                str(getattr(task, "id", "") or "").strip() or None,
+            )
+            return False, {"reason": "downstream_sync_inspection_failed"}
+        if not expected:
+            return False, {
+                "reason": "no_pending_downstream_sync_requests",
+                "pending_request_count": 0,
+            }
+        operations = sorted(
+            {
+                str(entry.get("operation") or "").strip()
+                for entry in expected
+                if str(entry.get("operation") or "").strip()
+            }
+        )
+        stage_names = sorted(
+            {
+                str(entry.get("stage_name") or "").strip()
+                for entry in expected
+                if str(entry.get("stage_name") or "").strip()
+            }
+        )
+        return True, {
+            "reason": "pending_downstream_sync_requests",
+            "pending_request_count": len(expected),
+            "operations": operations,
+            "stage_names": stage_names,
+        }
+
     def _delete_queue_stalled_after_seconds(self: TaskManager) -> int:
         return max(30, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5) * 6)
 
@@ -163,23 +206,137 @@ class TaskRuntimeServiceMixin:
         self: TaskManager,
         db: Session,
         task,
-    ) -> bool:
+    ) -> tuple[bool, dict[str, object]]:
         from app.service import task_manager as task_manager_module
 
         if task is None:
-            return False
+            return False, {"reason": "task_missing"}
         current_status = str(getattr(task, "status", "") or "").strip().lower()
         if current_status in task_manager_module.TASK_TERMINAL_STATUSES:
-            return False
-        if current_status not in {
+            return False, {"reason": "task_terminal", "task_status": current_status}
+        runtime_phase = str(self._task_runtime_phase(task) or "").strip()
+        if runtime_phase != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return False, {
+                "reason": "runtime_phase_not_owned_execution",
+                "task_status": current_status,
+                "runtime_phase": runtime_phase or None,
+            }
+        owner_matches = self._task_runtime_owner_matches_current_instance(db, task)
+        if not owner_matches:
+            return False, {
+                "reason": "runtime_owner_mismatch",
+                "task_status": current_status,
+                "runtime_phase": runtime_phase or None,
+            }
+        if str(getattr(task, "current_operation_id", "") or "").strip():
+            return True, {
+                "reason": "active_control_operation_present",
+                "task_status": current_status,
+                "runtime_phase": runtime_phase or None,
+                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+            }
+        if self._task_runtime_transition_guard_active(task):
+            return True, {
+                "reason": "runtime_transition_guard_active",
+                "task_status": current_status,
+                "runtime_phase": runtime_phase or None,
+            }
+        active_stage_name = str(getattr(task, "current_stage", "") or "").strip() or None
+        if self._task_has_authoritative_active_stage_context(
+            db,
+            task,
+            stage_name=active_stage_name,
+        ):
+            return True, {
+                "reason": "authoritative_active_stage_context",
+                "task_status": current_status,
+                "runtime_phase": runtime_phase or None,
+                "stage_name": active_stage_name,
+            }
+        downstream_sync_required, sync_payload = self._task_requires_downstream_sync_maintenance(db, task)
+        if downstream_sync_required:
+            return True, {
+                "reason": "downstream_sync_required",
+                "task_status": current_status,
+                "runtime_phase": runtime_phase or None,
+                **sync_payload,
+            }
+        if current_status in {
             "running",
             "dispatching",
             task_manager_module.TASK_STATUS_CANCELLING,
         }:
-            return False
-        if str(self._task_runtime_phase(task) or "").strip() != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
-            return False
-        return self._task_runtime_owner_matches_current_instance(db, task)
+            return True, {
+                "reason": "owned_execution_non_terminal_status",
+                "task_status": current_status,
+                "runtime_phase": runtime_phase or None,
+            }
+        return False, {
+            "reason": "non_terminal_but_not_keepalive_eligible",
+            "task_status": current_status,
+            "runtime_phase": runtime_phase or None,
+        }
+
+    def _runtime_runner_handle_snapshot(
+        self: TaskManager,
+        task_id: str,
+    ) -> dict[str, object]:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return {
+                "local_handle_present": False,
+                "cancel_requested": None,
+                "cancel_requested_reason": None,
+                "release_requested": None,
+                "release_reason": None,
+                "runner_done": None,
+                "heartbeat_done": None,
+                "sync_maintenance_done": None,
+            }
+        return {
+            "local_handle_present": True,
+            "cancel_requested": bool(getattr(handle, "cancel_requested", False)),
+            "cancel_requested_reason": str(getattr(handle, "cancel_requested_reason", "") or "").strip() or None,
+            "release_requested": bool(getattr(handle, "release_requested", False)),
+            "release_reason": str(getattr(handle, "release_reason", "") or "").strip() or None,
+            "runner_done": bool(handle.runner_task.done()) if getattr(handle, "runner_task", None) is not None else None,
+            "heartbeat_done": bool(handle.heartbeat_task.done()) if getattr(handle, "heartbeat_task", None) is not None else None,
+            "sync_maintenance_done": bool(handle.sync_maintenance_task.done()) if getattr(handle, "sync_maintenance_task", None) is not None else None,
+        }
+
+    def _record_runtime_runner_exit_event(
+        self: TaskManager,
+        db: Session,
+        task,
+        *,
+        event_type: str,
+        message: str,
+        source: str,
+        reason: str,
+        level: str = "warning",
+        payload: dict[str, object] | None = None,
+    ) -> None:
+        if task is None:
+            return
+        task_id = str(getattr(task, "id", "") or "").strip()
+        runtime_payload = {
+            "task_status": str(getattr(task, "status", "") or "").strip() or None,
+            "runtime_phase": str(self._task_runtime_phase(task) or "").strip() or None,
+            "current_stage": str(getattr(task, "current_stage", "") or "").strip() or None,
+            "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+            "reason": str(reason or "").strip() or None,
+            **self._runtime_runner_handle_snapshot(task_id),
+            **dict(payload or {}),
+        }
+        self._record_event(
+            db,
+            task,
+            event_type,
+            message,
+            level=level,
+            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+            payload=runtime_payload,
+        )
 
     def _task_is_runtime_owner_handoff_pending(self: TaskManager, db: Session, task) -> bool:
         from app.service import task_manager as task_manager_module
@@ -3783,6 +3940,21 @@ class TaskRuntimeServiceMixin:
                         self._task_runtime_phase(task),
                         ownership_snapshot.runtime_lease_owner,
                     )
+                    self._record_runtime_runner_exit_event(
+                        db,
+                        task,
+                        event_type="task_runtime_runner_exited_before_active_execution",
+                        message="本地 runner 在进入 active execution 前退出，本轮未满足执行前置条件",
+                        source="run_task_precondition",
+                        reason="precondition_failed_before_active_execution",
+                        payload={
+                            "expected_instance_id": str(self.instance_id or "").strip() or None,
+                            "runtime_lease_active": bool(ownership_snapshot.runtime_lease_active),
+                            "runtime_lease_owner": ownership_snapshot.runtime_lease_owner,
+                            "runtime_lease_expires_at": ownership_snapshot.runtime_lease_expires_at,
+                        },
+                    )
+                    db.commit()
                 return
             task_manager_module.logger.info(
                 "binary-security run_task entering active execution: task_id=%s current_operation_id=%s runtime_phase=%s runtime_lease_owner=%s runtime_lease_expires_at=%s",
@@ -3951,6 +4123,15 @@ class TaskRuntimeServiceMixin:
                         str(getattr(task_before_execute, "status", "") or "").strip(),
                         self._task_runtime_phase(task_before_execute),
                     )
+                    self._record_runtime_runner_exit_event(
+                        execution_gate_db,
+                        task_before_execute,
+                        event_type="task_runtime_runner_exited_before_business_execution",
+                        message="本地 runner 暂停业务执行并退出，等待当前控制操作完成后再由后续循环接管",
+                        source="run_task_business_gate",
+                        reason="active_control_operation_still_present",
+                    )
+                    execution_gate_db.commit()
                     return
                 if str(getattr(task_before_execute, "status", "") or "").strip().lower() != "running":
                     task_manager_module.logger.info(
@@ -3960,6 +4141,15 @@ class TaskRuntimeServiceMixin:
                         str(getattr(task_before_execute, "status", "") or "").strip(),
                         self._task_runtime_phase(task_before_execute),
                     )
+                    self._record_runtime_runner_exit_event(
+                        execution_gate_db,
+                        task_before_execute,
+                        event_type="task_runtime_runner_exited_before_business_execution",
+                        message="本地 runner 在业务执行前退出，任务当前状态已不再适合继续本轮执行",
+                        source="run_task_business_gate",
+                        reason="task_not_runnable_after_control_operation",
+                    )
+                    execution_gate_db.commit()
                     return
             finally:
                 execution_gate_db.close()
@@ -4006,11 +4196,35 @@ class TaskRuntimeServiceMixin:
                             runtime_db.commit()
                         should_remain_active = True
                     else:
-                        should_remain_active = bool(
-                            authoritative_context_active
-                            or self._task_should_keep_runtime_runner_alive(runtime_db, task_after_execute)
+                        should_keep_alive, keepalive_detail = self._task_should_keep_runtime_runner_alive(
+                            runtime_db,
+                            task_after_execute,
                         )
+                        should_remain_active = bool(authoritative_context_active or should_keep_alive)
                     if not should_remain_active:
+                        task_manager_module.logger.warning(
+                            "binary-security run_task keepalive loop exiting after execute pass: "
+                            "task_id=%s reason=%s status=%s runtime_phase=%s stage=%s authoritative_context_active=%s",
+                            task_id,
+                            str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
+                            str(getattr(task_after_execute, "status", "") or "").strip() or None,
+                            self._task_runtime_phase(task_after_execute),
+                            str(getattr(task_after_execute, "current_stage", "") or "").strip() or None,
+                            authoritative_context_active,
+                        )
+                        self._record_runtime_runner_exit_event(
+                            runtime_db,
+                            task_after_execute,
+                            event_type="task_runtime_runner_keepalive_exited",
+                            message="本地 runner 已完成当前执行轮次，当前任务不再满足继续保活条件",
+                            source="run_task_keepalive_post_execute",
+                            reason=str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
+                            payload={
+                                "authoritative_context_active": authoritative_context_active,
+                                **dict(keepalive_detail or {}),
+                            },
+                        )
+                        runtime_db.commit()
                         break
                 finally:
                     runtime_db.close()
@@ -4052,11 +4266,35 @@ class TaskRuntimeServiceMixin:
                             )
                             runtime_db.commit()
                         continue
-                    if authoritative_context_active or self._task_should_keep_runtime_runner_alive(
+                    should_keep_alive, keepalive_detail = self._task_should_keep_runtime_runner_alive(
                         runtime_db,
                         task_after_signals,
-                    ):
+                    )
+                    if authoritative_context_active or should_keep_alive:
                         continue
+                    task_manager_module.logger.warning(
+                        "binary-security run_task keepalive loop exiting after signal pass: "
+                        "task_id=%s reason=%s status=%s runtime_phase=%s stage=%s authoritative_context_active=%s",
+                        task_id,
+                        str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
+                        str(getattr(task_after_signals, "status", "") or "").strip() or None,
+                        self._task_runtime_phase(task_after_signals),
+                        str(getattr(task_after_signals, "current_stage", "") or "").strip() or None,
+                        authoritative_context_active,
+                    )
+                    self._record_runtime_runner_exit_event(
+                        runtime_db,
+                        task_after_signals,
+                        event_type="task_runtime_runner_keepalive_exited",
+                        message="本地 runner 已完成当前执行轮次，signal 处理后当前任务不再满足继续保活条件",
+                        source="run_task_keepalive_post_signal",
+                        reason=str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
+                        payload={
+                            "authoritative_context_active": authoritative_context_active,
+                            **dict(keepalive_detail or {}),
+                        },
+                    )
+                    runtime_db.commit()
                     break
                 finally:
                     runtime_db.close()
@@ -4273,9 +4511,72 @@ class TaskRuntimeServiceMixin:
                 current_handle = self._workers.get(task_id)
                 if current_handle is not None and current_handle.runner_task is asyncio.current_task():
                     if preserve_local_runtime_holder:
+                        task_manager_module.logger.info(
+                            "binary-security local runtime holder preserved after runner exit: task_id=%s reason=%s",
+                            task_id,
+                            str(getattr(current_handle, "release_reason", "") or "").strip() or "runner_task_exited",
+                        )
+                        lifecycle_db = session_factory()
+                        try:
+                            task_for_event = lifecycle_db.query(task_manager_module.BinarySecurityTask).filter(
+                                task_manager_module.BinarySecurityTask.id == task_id
+                            ).first()
+                            if task_for_event is not None:
+                                self._record_runtime_runner_exit_event(
+                                    lifecycle_db,
+                                    task_for_event,
+                                    event_type="task_runtime_local_owner_preserved_after_runner_exit",
+                                    message="本地 runner 已退出，但任务仍需保持 owner 与 lease 以继续等待后续推进",
+                                    source="run_task_cleanup",
+                                    reason="preserve_local_runtime_holder",
+                                    level="info",
+                                )
+                                lifecycle_db.commit()
+                        except Exception:
+                            lifecycle_db.rollback()
+                            task_manager_module.logger.exception(
+                                "binary-security failed to record preserved local runtime holder event: task_id=%s",
+                                task_id,
+                            )
+                        finally:
+                            lifecycle_db.close()
                         current_handle.owner_active = True
                         current_handle.last_runner_exit_at = task_manager_module._now()
                         return
+                    task_manager_module.logger.warning(
+                        "binary-security local runtime handle released after runner exit: task_id=%s cancel_requested=%s release_requested=%s reason=%s",
+                        task_id,
+                        bool(getattr(current_handle, "cancel_requested", False)),
+                        bool(getattr(current_handle, "release_requested", False)),
+                        str(getattr(current_handle, "cancel_requested_reason", "") or getattr(current_handle, "release_reason", "") or "runner_cleanup").strip() or "runner_cleanup",
+                    )
+                    lifecycle_db = session_factory()
+                    try:
+                        task_for_event = lifecycle_db.query(task_manager_module.BinarySecurityTask).filter(
+                            task_manager_module.BinarySecurityTask.id == task_id
+                        ).first()
+                        if task_for_event is not None:
+                            self._record_runtime_runner_exit_event(
+                                lifecycle_db,
+                                task_for_event,
+                                event_type="task_runtime_local_handle_released_after_runner_exit",
+                                message="本地 runner 已退出，当前任务的本地 runtime handle 已释放",
+                                source="run_task_cleanup",
+                                reason=(
+                                    str(getattr(current_handle, "cancel_requested_reason", "") or "").strip()
+                                    or str(getattr(current_handle, "release_reason", "") or "").strip()
+                                    or "runner_cleanup"
+                                ),
+                            )
+                            lifecycle_db.commit()
+                    except Exception:
+                        lifecycle_db.rollback()
+                        task_manager_module.logger.exception(
+                            "binary-security failed to record local runtime handle release event: task_id=%s",
+                            task_id,
+                        )
+                    finally:
+                        lifecycle_db.close()
                     current_handle.owner_active = False
                     if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
                         current_handle.heartbeat_task.cancel()

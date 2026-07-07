@@ -38832,6 +38832,64 @@ def _test_persist_child_sync_observation_reuses_observation_but_still_records_sy
     self.assertTrue(bool((sync_event.payload or {}).get("observation_reused")))
 
 
+def _test_persist_child_sync_observation_refreshes_last_attempt_at_for_periodic_sync_round(self):
+    manager = TaskManager()
+    item = BinarySecurityStageItem(
+        id="si-periodic-sync-round",
+        task_id="t-periodic-sync-round",
+        project_id="p1",
+        stage_name="entry_analysis",
+        item_key="entry-1",
+        status="running",
+    )
+    previous_attempt_at = _now() - timedelta(seconds=61)
+    observed_at = _now()
+    item.result = {
+        "sync_status": "synced",
+        "downstream_status": "running",
+        "last_sync_attempt_at": previous_attempt_at.isoformat(),
+        "sync_observation": {
+            "sync_status": "synced",
+            "last_attempt_at": previous_attempt_at.isoformat(),
+            "last_success_at": previous_attempt_at.isoformat(),
+            "last_synced_at": previous_attempt_at.isoformat(),
+            "error_message": None,
+            "http_status": None,
+            "error_type": None,
+            "status_raw": "running",
+            "mapped_status": "running",
+            "downstream_status": "running",
+            "state_applied": False,
+            "last_result": "success",
+        },
+    }
+    task = BinarySecurityTask(id="t-periodic-sync-round", project_id="p1", status="running")
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    persisted = manager._persist_child_sync_observation(
+        db,
+        task=task,
+        item=item,
+        change_source="downstream_sync",
+        sync_status="synced",
+        synced_at=observed_at,
+        error_message=None,
+        http_status=None,
+        error_type=None,
+        status_raw="running",
+        mapped_status="running",
+        downstream_status="running",
+        state_applied=False,
+        last_sync_result="success",
+    )
+
+    self.assertTrue(persisted)
+    self.assertEqual(observed_at.isoformat(), item.result.get("last_sync_attempt_at"))
+    self.assertEqual(observed_at.isoformat(), dict(item.result.get("sync_observation") or {}).get("last_attempt_at"))
+    self.assertEqual(1, len(db.sync_events))
+    self.assertEqual("succeeded", db.sync_events[0].event_type)
+
+
 def _test_active_operation_ignores_expired_claim_lease(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -43699,6 +43757,7 @@ TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_runnin
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child = _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child
 TaskManagerTests.test_persist_child_sync_observation_reuses_observation_but_still_records_sync_event = _test_persist_child_sync_observation_reuses_observation_but_still_records_sync_event
+TaskManagerTests.test_persist_child_sync_observation_refreshes_last_attempt_at_for_periodic_sync_round = _test_persist_child_sync_observation_refreshes_last_attempt_at_for_periodic_sync_round
 TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
 TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed
