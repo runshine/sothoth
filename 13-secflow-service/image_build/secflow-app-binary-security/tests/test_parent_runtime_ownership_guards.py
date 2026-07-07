@@ -409,3 +409,52 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
             [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
             self.fake_task_queue.requeued_tasks,
         )
+
+    def test_release_task_without_supported_runtime_owner_requeues_only_after_db_commit(self):
+        self.manager.instance_id = "worker-new"
+        task = self._task(
+            id="task-running-release-ordering",
+            status="dispatching",
+            current_stage="dataflow_vuln_scan",
+            workspace_root="/tmp/ws-release-ordering",
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-dead",
+            lease_expires_at=_now() - timedelta(minutes=1),
+            heartbeat_at=_now() - timedelta(minutes=1),
+        )
+        ordering: list[tuple[str, str]] = []
+        original_enqueue = self.manager._enqueue_task_and_wait
+
+        async def _recording_enqueue(task_id, *, context, timeout_seconds=None, force_requeue=False):
+            ordering.append(("enqueue", str(task.status or "")))
+            return await original_enqueue(
+                task_id,
+                context=context,
+                timeout_seconds=timeout_seconds,
+                force_requeue=force_requeue,
+            )
+
+        class _CommitTrackingDb(_ModelAwareDb):
+            def commit(self_inner):
+                ordering.append(("commit", str(task.status or "")))
+                return super().commit()
+
+        db = _CommitTrackingDb(tasks=[task], runtime_leases=[expired_lease], events=[])
+        self.manager._enqueue_task_and_wait = _recording_enqueue
+        try:
+            released = self.manager._release_task_without_supported_runtime_owner(
+                db,
+                task,
+                reason="unit_test_release_requeue_only_after_db_commit",
+            )
+        finally:
+            self.manager._enqueue_task_and_wait = original_enqueue
+
+        self.assertTrue(released)
+        self.assertEqual("pending", task.status)
+        self.assertEqual(
+            [("commit", "pending"), ("enqueue", "pending"), ("commit", "pending")],
+            ordering,
+        )

@@ -4752,6 +4752,7 @@ class TaskManager(
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         observed_owner = str(decision.runtime_lease_owner or "").strip() or None
+        should_force_requeue = False
         try:
             with self._savepoint(db):
                 refreshed_snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
@@ -4837,21 +4838,13 @@ class TaskManager(
                     level="warning",
                 )
                 self._repair_active_operations_for_task(db, task)
-                requeue_succeeded = bool(
-                    await self._enqueue_task_and_wait(
-                        task.id,
-                        context="owned_execution_release_for_takeover",
-                        timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
-                        force_requeue=True,
-                    )
-                )
                 summary = dict(getattr(task, "summary", None) or {})
                 summary["parent_takeover_pending_claim"] = {
                     "active": True,
                     "released_at": _isoformat_or_none(_now()),
                     "released_by_instance_id": str(self.instance_id or "").strip() or None,
                     "enqueue_context": "owned_execution_release_for_takeover",
-                    "requeue_succeeded": bool(requeue_succeeded),
+                    "requeue_succeeded": False,
                 }
                 task.summary = summary
                 self._record_event(
@@ -4870,10 +4863,33 @@ class TaskManager(
                         "local_task_runtime_handle_alive": self._has_local_task_execution_owner(task.id),
                         "local_streaming_stage_worker_alive": self._task_has_active_streaming_stage_workers(task.id),
                         "active_runtime_lease_owner": active_runtime_lease_owner,
-                        "force_requeue": requeue_succeeded,
+                        "force_requeue": False,
                         "enqueue_context": "owned_execution_release_for_takeover",
                     },
                 )
+                should_force_requeue = True
+            if should_force_requeue:
+                db.commit()
+            requeue_succeeded = bool(
+                await self._enqueue_task_and_wait(
+                    task.id,
+                    context="owned_execution_release_for_takeover",
+                    timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+                    force_requeue=True,
+                )
+            ) if should_force_requeue else False
+            if should_force_requeue:
+                refresh_task = None
+                if hasattr(db, "query"):
+                    refresh_task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+                if refresh_task is not None:
+                    task = refresh_task
+                summary = dict(getattr(task, "summary", None) or {})
+                takeover_pending_claim = dict(summary.get("parent_takeover_pending_claim") or {})
+                if takeover_pending_claim:
+                    takeover_pending_claim["requeue_succeeded"] = bool(requeue_succeeded)
+                    summary["parent_takeover_pending_claim"] = takeover_pending_claim
+                    task.summary = summary
                 if requeue_succeeded:
                     self._record_event(
                         db,
@@ -4904,6 +4920,7 @@ class TaskManager(
                             "enqueue_context": "owned_execution_release_for_takeover",
                         },
                     )
+                db.commit()
                 return True
         except OperationalError as exc:
             if not self._is_retryable_lock_error(exc):
