@@ -34,6 +34,7 @@ class _FakeSyncMaintenanceThreadHandle:
         self._done = False
         self._cancelled = False
         self._on_cancel = None
+        self.thread = type("_Thread", (), {"start": lambda _self: None})()
 
     def done(self):
         return self._done
@@ -378,7 +379,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
-        manager._start_runtime_sync_maintenance_thread = lambda task_id: (
+        manager._build_runtime_sync_maintenance_thread = lambda task_id: (
             started.append(f"sync:{task_id}") or task_manager_module.TaskRuntimeThreadHandle(
                 name=f"sync:{task_id}",
                 thread=threading.Thread(target=lambda: None, name=f"sync:{task_id}"),
@@ -435,7 +436,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
 
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
-        manager._start_runtime_sync_maintenance_thread = lambda task_id: _FakeSyncMaintenanceThreadHandle(name=f"sync:{task_id}")
+        manager._build_runtime_sync_maintenance_thread = lambda task_id: _FakeSyncMaintenanceThreadHandle(name=f"sync:{task_id}")
         created = await manager._start_task_runtime("task-1")
 
         self.assertTrue(created)

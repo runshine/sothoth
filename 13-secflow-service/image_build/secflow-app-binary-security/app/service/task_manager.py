@@ -2238,7 +2238,7 @@ class TaskManager(
         handle.pending_operation_id = None
         handle.pending_operation_type = None
 
-    def _start_runtime_sync_maintenance_thread(self, task_id: str) -> TaskRuntimeThreadHandle:
+    def _build_runtime_sync_maintenance_thread(self, task_id: str) -> TaskRuntimeThreadHandle:
         normalized_task_id = str(task_id or "").strip()
         thread_name = f"binary-security-sync-maintenance-{normalized_task_id}"
         stop_event = threading.Event()
@@ -2261,7 +2261,6 @@ class TaskManager(
             stop_event=stop_event,
             done_event=done_event,
         )
-        thread.start()
         return handle
 
     def _request_local_worker_control_wakeup_nowait(
@@ -2303,7 +2302,7 @@ class TaskManager(
                 self._run_task_heartbeat(normalized_task_id),
                 name=f"binary-security-heartbeat-{normalized_task_id}-restart",
             )
-            sync_maintenance_task = self._start_runtime_sync_maintenance_thread(normalized_task_id)
+            sync_maintenance_task = self._build_runtime_sync_maintenance_thread(normalized_task_id)
             generation = int(getattr(existing, "runner_generation", 0) or 0) + 1
             handle = TaskRuntimeHandle(
                 task_id=normalized_task_id,
@@ -2329,6 +2328,7 @@ class TaskManager(
                 sync_maintenance_in_progress=bool(getattr(existing, "sync_maintenance_in_progress", False)),
             )
             self._workers[normalized_task_id] = handle
+            sync_maintenance_task.thread.start()
             return True
 
     def _task_should_remain_owned_without_active_runner(
@@ -2406,7 +2406,7 @@ class TaskManager(
                 self._run_task_heartbeat(normalized_task_id),
                 name=f"binary-security-heartbeat-{normalized_task_id}",
             )
-            sync_maintenance_task = self._start_runtime_sync_maintenance_thread(normalized_task_id)
+            sync_maintenance_task = self._build_runtime_sync_maintenance_thread(normalized_task_id)
             handle = TaskRuntimeHandle(
                 task_id=normalized_task_id,
                 runner_task=runner_task,
@@ -2417,6 +2417,7 @@ class TaskManager(
                 sync_maintenance_task=sync_maintenance_task,
             )
             self._workers[normalized_task_id] = handle
+            sync_maintenance_task.thread.start()
             task_manager_module.logger.info(
                 "binary-security start_task_runtime created new local handle: task_id=%s runner_task=%s heartbeat_task=%s sync_maintenance_task=%s lease_owner_instance_id=%s",
                 normalized_task_id,

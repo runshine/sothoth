@@ -12,6 +12,7 @@ class _FakeSyncMaintenanceThreadHandle:
         self._name = name
         self._done = False
         self._cancelled = False
+        self.thread = type("_Thread", (), {"start": lambda _self: None})()
 
     def done(self):
         return self._done
@@ -246,7 +247,7 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             started.append(f"heartbeat:{task_id}")
             await asyncio.sleep(3600)
 
-        manager._start_runtime_sync_maintenance_thread = lambda task_id: (
+        manager._build_runtime_sync_maintenance_thread = lambda task_id: (
             started.append(f"sync:{task_id}") or _FakeSyncMaintenanceThreadHandle(name=f"sync:{task_id}")
         )
 
