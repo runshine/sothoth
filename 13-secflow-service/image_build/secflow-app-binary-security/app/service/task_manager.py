@@ -2472,7 +2472,6 @@ class TaskManager(
                 if (
                     handle is None
                     or handle.cancel_requested
-                    or handle.runner_task.done()
                     or handle.release_requested
                     or handle.takeover_observed
                 ):
@@ -2529,7 +2528,6 @@ class TaskManager(
                 if (
                     handle is None
                     or handle.cancel_requested
-                    or handle.runner_task.done()
                     or handle.release_requested
                     or handle.takeover_observed
                 ):
@@ -2662,10 +2660,11 @@ class TaskManager(
         handle = self._runtime_handle(normalized_task_id)
         if (
             handle is None
-            or handle.done()
             or handle.cancel_requested
             or not handle.active_commit_succeeded
             or not handle.lease_established
+            or handle.release_requested
+            or handle.takeover_observed
             or handle.sync_maintenance_in_progress
         ):
             return False

@@ -131,6 +131,52 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(processed.is_set())
 
+    async def test_sync_maintenance_worker_thread_does_not_exit_only_because_runner_task_is_done(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        runner_task = asyncio.create_task(asyncio.sleep(0), name="runner-done")
+        await asyncio.gather(runner_task, return_exceptions=True)
+        heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="hb")
+        handle = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=runner_task,
+            heartbeat_task=heartbeat_task,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+        )
+        manager._workers["task-1"] = handle
+        manager._verify_local_runtime_lease_or_abort = lambda *_args, **_kwargs: task_manager_module._RuntimeLeaseOwnershipDecision(
+            should_continue=True,
+            runtime_lease_present=True,
+            runtime_lease_active=True,
+            runtime_lease_owner="worker-a",
+            local_handle_alive=True,
+        )
+        processed_calls = {"count": 0}
+
+        def _service(_task_id):
+            processed_calls["count"] += 1
+            manager._running = False
+            return True
+
+        manager._service_local_runtime_sync_maintenance_blocking = _service
+
+        try:
+            await asyncio.to_thread(
+                manager._run_task_sync_maintenance_thread_worker,
+                "task-1",
+                threading.Event(),
+            )
+        finally:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+        self.assertEqual(1, processed_calls["count"])
+
     async def test_process_task_sync_entry_blocking_runs_child_sync_with_thread_owned_session(self):
         manager = TaskManager()
         calls: list[tuple[str, str, str | None, list[str], bool]] = []
