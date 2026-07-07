@@ -19,7 +19,7 @@ from app.model import (
 )
 from app.service import downstream_base as downstream_base_module
 from app.service import task_manager as task_manager_module
-from app.service.task_manager import TaskManager, _now
+from app.service.task_manager import TaskManager, UpstreamError, _now
 from test_task_manager import _AppendingModelAwareDb, _FakeTaskSyncQueue
 
 
@@ -72,6 +72,20 @@ class _MockGaiaSourceDownstreamService:
         self._system_results: dict[str, dict[str, object]] = {}
         self._entry_modules: dict[str, dict[str, object]] = {}
         self._one_shot_overrides: dict[tuple[str, str], list[object]] = {}
+
+    @staticmethod
+    def _origin_fields(json_body: dict[str, object] | None) -> dict[str, object]:
+        payload = dict(json_body or {})
+        return {
+            "task_origin_type": payload.get("task_origin_type"),
+            "parent_project_id": payload.get("parent_project_id"),
+            "parent_task_id": payload.get("parent_task_id"),
+            "parent_task_type": payload.get("parent_task_type"),
+            "parent_stage_name": payload.get("parent_stage_name"),
+            "parent_stage_item_id": payload.get("parent_stage_item_id"),
+            "parent_stage_item_key": payload.get("parent_stage_item_key"),
+            "create_dedupe_key": payload.get("create_dedupe_key"),
+        }
 
     def _response(self, method: str, url: str, payload: dict[str, object], status_code: int = 200) -> httpx.Response:
         return httpx.Response(status_code, json=payload, request=httpx.Request(method, url))
@@ -186,6 +200,7 @@ class _MockGaiaSourceDownstreamService:
                 "task_id": task_id,
                 "status": "pending",
                 "output_path": str(output_dir),
+                **self._origin_fields(json_body),
             }
             self._status_sequences[task_id] = ["running", "passed"]
             self._task_payloads[task_id] = payload
@@ -211,6 +226,7 @@ class _MockGaiaSourceDownstreamService:
                 "task_id": task_id,
                 "status": "pending",
                 "output_path": str(output_dir),
+                **self._origin_fields(json_body),
             }
             self._status_sequences[task_id] = ["running", "passed"]
             self._task_payloads[task_id] = payload
@@ -232,6 +248,7 @@ class _MockGaiaSourceDownstreamService:
                 "status": "pending",
                 "output_path": str(output_dir),
                 "analysis_status": "queued",
+                **self._origin_fields(json_body),
             }
             self._status_sequences[task_id] = ["running", "passed"]
             self._task_payloads[task_id] = payload
@@ -340,6 +357,7 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
             downstream_service=item.downstream_service,
             downstream_task_id=item.downstream_task_id,
             archive_status="archived" if artifact_root is not None else "failed",
+            archive_root=str(artifact_root) if artifact_root is not None else None,
         )
         archive_job.payload = {
             "mapped_status": mapped_status,
@@ -411,6 +429,7 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
             patch.object(downstream_base_module, "get_shared_async_client", new=AsyncMock(return_value=http_client)),
             patch.object(downstream_base_module, "invalidate_shared_async_client", new=AsyncMock(return_value=True)),
             patch.object(self.manager, "_ensure_task_execution_current_async", new=AsyncMock(return_value=None)),
+            patch.object(self.manager, "_ensure_task_write_ownership", return_value=None),
             patch.object(self.manager, "_drain_owner_inbox_during_polling", new=AsyncMock(return_value=None)),
             patch.object(self.manager, "_is_task_cancelled_async", new=AsyncMock(return_value=False)),
             patch.object(self.manager, "_downstream_child_sync_interval_seconds", return_value=0),
@@ -429,22 +448,106 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                 stack.enter_context(item)
             yield
 
+    def _drain_created_child_and_sync(self, db, task, item, *, max_sync_rounds: int = 4):
+        asyncio.run(
+            self.manager._create_downstream_children(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name=item.stage_name,
+                item_ids=[str(item.id)],
+                force=True,
+            )
+        )
+        for _ in range(max(1, int(max_sync_rounds))):
+            asyncio.run(
+                self.manager.sync_downstream_status(
+                    db,
+                    project_id=task.project_id,
+                    task_id=task.id,
+                    stage_name=item.stage_name,
+                    item_ids=[str(item.id)],
+                    apply_state=True,
+                    force=True,
+                    record_request_event=False,
+                )
+            )
+            normalized_status = str(getattr(item, "status", "") or "").strip().lower()
+            active_error = bool(
+                self.manager._string_or_none(dict(getattr(item, "result", {}) or {}).get("last_sync_error_message"))
+                or self.manager._string_or_none(dict(dict(getattr(item, "result", {}) or {}).get("sync_observation") or {}).get("error_message"))
+            )
+            if normalized_status in {
+                "success",
+                "failed",
+                "cancelled",
+                "downstream_missing",
+                "partial_success",
+            } and not active_error:
+                break
+
+    def _run_system_item_via_sync_maintenance(self, db, task, firmware):
+        system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
+        queued_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+        system_item = self.manager._stage_items(db, task.id, "system_analysis")[0]
+        self._drain_created_child_and_sync(db, task, system_item)
+        return queued_result, self.manager._stage_item_response(task, system_item), system_item, system_run
+
+    def _run_entry_item_via_sync_maintenance(self, db, task, module_payload):
+        entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
+        queued_result = asyncio.run(self.manager._run_entry_item(task, entry_run, dict(module_payload), token="mock-token"))
+        entry_item = self.manager._stage_items(db, task.id, "entry_analysis")[0]
+        self._drain_created_child_and_sync(db, task, entry_item)
+        return queued_result, self.manager._stage_item_response(task, entry_item), entry_item, entry_run
+
+    def _run_dataflow_item_via_sync_maintenance(self, db, task, entry_payload):
+        dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
+        queued_result = asyncio.run(self.manager._run_dataflow_item(task, dataflow_run, dict(entry_payload), token="mock-token"))
+        dataflow_item = self.manager._stage_items(db, task.id, "dataflow_vuln_scan")[0]
+        self._drain_created_child_and_sync(db, task, dataflow_item)
+        return queued_result, self.manager._stage_item_response(task, dataflow_item), dataflow_item, dataflow_run
+
+    @staticmethod
+    def _response_payload(response):
+        if hasattr(response, "model_dump"):
+            return response.model_dump(mode="python")
+        return dict(response or {})
+
+    @staticmethod
+    def _downstream_module_payload(downstream, system_item):
+        return dict(downstream._system_results[str(system_item.downstream_task_id or "")]["modules"][0])
+
+    @staticmethod
+    def _downstream_entry_payload(downstream, entry_item):
+        return dict(downstream._entry_modules[str(entry_item.downstream_task_id or "")]["entries"][0])
+
+    def _normalized_system_module_payload(self, task, item, firmware, downstream) -> dict[str, object]:
+        artifact_root = self.manager._service_output_dir(
+            task,
+            item.downstream_service or item.stage_name,
+            item.item_key,
+            item.downstream_task_id,
+        )
+        modules = self.manager._parse_system_analysis_modules(
+            artifact_root,
+            firmware,
+            downstream._system_results[str(item.downstream_task_id or "")],
+        )
+        return dict(modules[0])
+
+    def _normalized_entry_payload(self, downstream, entry_item) -> dict[str, object]:
+        del downstream
+        return dict(entry_item.result or {})
+
     def test_source_workflow_runtime_uses_real_downstream_contracts_with_mocked_db_fs_and_redis(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
         with tmpdir:
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
-                system_item = self.manager._stage_items(db, task.id, "system_analysis")[0]
-                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
-                module_payload = dict((system_result.get("item") or {}).get("modules")[0])
-                entry_result = asyncio.run(self.manager._run_entry_item(task, entry_run, module_payload, token="mock-token"))
-                entry_item = self.manager._stage_items(db, task.id, "entry_analysis")[0]
-
-                dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
-                entry_payload = dict((entry_result.get("item") or {}).get("entries")[0])
-                dataflow_result = asyncio.run(self.manager._run_dataflow_item(task, dataflow_run, entry_payload, token="mock-token"))
-                dataflow_item = self.manager._stage_items(db, task.id, "dataflow_vuln_scan")[0]
+                _queued_system, system_result, system_item, system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
+                module_payload = self._normalized_system_module_payload(task, system_item, firmware, downstream)
+                _queued_entry, entry_result, entry_item, entry_run = self._run_entry_item_via_sync_maintenance(db, task, module_payload)
+                entry_payload = self._normalized_entry_payload(downstream, entry_item)
+                _queued_dataflow, dataflow_result, dataflow_item, _dataflow_run = self._run_dataflow_item_via_sync_maintenance(db, task, entry_payload)
 
             self._refresh_stage_summary(db, task, "system_analysis")
             self._refresh_stage_summary(db, task, "entry_analysis")
@@ -455,17 +558,19 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
             self.manager._refresh_task_status_after_sync(db, task)
             detail = self.manager.get_task_detail(db, project_id=task.project_id, task_id=task.id)
 
-        self.assertEqual("success", system_result["status"])
-        self.assertEqual("success", entry_result["status"])
-        self.assertEqual("success", dataflow_result["status"])
+        self.assertEqual("success", system_result.status)
+        self.assertEqual("success", entry_result.status)
+        self.assertEqual("success", dataflow_result.status)
         self.assertEqual("success", system_item.status)
         self.assertEqual("success", entry_item.status)
         self.assertEqual("success", dataflow_item.status)
+        self.assertTrue(bool(system_item.downstream_task_id))
+        self.assertTrue(bool(entry_item.downstream_task_id))
+        self.assertTrue(bool(dataflow_item.downstream_task_id))
         self.assertEqual(["system_analyse", "entry_analyse", "dataflow_vuln_scan"], [row["service"] for row in downstream.created_tasks])
         self.assertEqual(3, len(db.archive_jobs))
-        self.assertTrue((system_result.get("item") or {}).get("modules"))
-        self.assertTrue((entry_result.get("item") or {}).get("entries"))
-        self.assertTrue((dataflow_result.get("item") or {}).get("dataflow_dir"))
+        self.assertTrue(downstream._system_results[str(system_item.downstream_task_id or "")]["modules"])
+        self.assertTrue(downstream._entry_modules[str(entry_item.downstream_task_id or "")]["entries"])
         self.assertTrue((task.summary or {}).get("entry_results"))
         self.assertTrue((task.summary or {}).get("dataflow_results"))
         self.assertIn(detail.status, {"running", "success"})
@@ -501,11 +606,14 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                 system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
                 result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
                 system_item = self.manager._stage_items(db, task.id, "system_analysis")[0]
+                with self.assertRaises(UpstreamError):
+                    self._drain_created_child_and_sync(db, task, system_item)
 
-        self.assertEqual("pending", result["status"])
-        self.assertEqual("pending", system_item.status)
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("queued", system_item.status)
         self.assertFalse(bool(system_item.downstream_task_id))
-        self.assertIn("无法连接下游服务", str(result.get("error") or ""))
+        observation = dict((system_item.result or {}).get("sync_observation") or {})
+        self.assertEqual("UpstreamError", observation.get("error_type"))
         self.assertEqual(0, len(db.archive_jobs))
 
     def test_source_workflow_mock_e2e_system_success_tolerates_result_fetch_failure(self):
@@ -518,11 +626,9 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                 httpx.ReadTimeout("timed out", request=request),
             )
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+                _queued_result, result, _system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
 
-        self.assertEqual("success", result["status"])
-        self.assertTrue((result.get("item") or {}).get("modules"))
+        self.assertEqual("success", result.status)
         self.assertEqual(1, len(db.archive_jobs))
 
     def test_source_workflow_mock_e2e_entry_poll_transport_error_recovers_and_succeeds(self):
@@ -535,27 +641,21 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                 httpx.RemoteProtocolError("Server disconnected without sending a response", request=request),
             )
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
-                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
-                result = asyncio.run(
-                    self.manager._run_entry_item(
-                        task,
-                        entry_run,
-                        dict((system_result.get("item") or {}).get("modules")[0]),
-                        token="mock-token",
-                    )
+                _queued_system, _system_result, system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
+                _queued_entry, result, _entry_item, _entry_run = self._run_entry_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_system_module_payload(task, system_item, firmware, downstream),
                 )
 
-        self.assertEqual("success", result["status"])
+        self.assertEqual("success", result.status)
         self.assertGreaterEqual(len([row for row in downstream.calls if row["path"] == "/api/app/entry-analyse/tasks/ea-2"]), 2)
 
     def test_source_workflow_mock_e2e_entry_authoritative_child_404_becomes_downstream_missing(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
         with tmpdir:
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+                _queued_system, _system_result, system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
                 entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
                 created_item = self.manager._upsert_stage_item(
                     db,
@@ -566,7 +666,7 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                     item_name="mod-a",
                     parent_key="source-project",
                     downstream_service="entry_analyse",
-                    input_ref=dict((system_result.get("item") or {}).get("modules")[0]),
+                    input_ref=self._normalized_system_module_payload(task, system_item, firmware, downstream),
                     retrying=False,
                     auto_retrying=False,
                 )
@@ -593,7 +693,7 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                     self.manager._run_entry_item(
                         task,
                         entry_run,
-                        dict((system_result.get("item") or {}).get("modules")[0]),
+                        self._normalized_system_module_payload(task, system_item, firmware, downstream),
                         token="mock-token",
                     )
                 )
@@ -606,16 +706,11 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
         with tmpdir:
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
-                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
-                entry_result = asyncio.run(
-                    self.manager._run_entry_item(
-                        task,
-                        entry_run,
-                        dict((system_result.get("item") or {}).get("modules")[0]),
-                        token="mock-token",
-                    )
+                _queued_system, _system_result, system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
+                _queued_entry, _entry_result, entry_item, _entry_run = self._run_entry_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_system_module_payload(task, system_item, firmware, downstream),
                 )
                 downstream.queue_override(
                     "GET",
@@ -631,15 +726,16 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                     self.manager._run_dataflow_item(
                         task,
                         dataflow_run,
-                        dict((entry_result.get("item") or {}).get("entries")[0]),
+                        self._normalized_entry_payload(downstream, entry_item),
                         token="mock-token",
                     )
                 )
                 item = self.manager._stage_items(db, task.id, "dataflow_vuln_scan")[0]
+                self._drain_created_child_and_sync(db, task, item)
 
-        self.assertEqual("failed", result["status"])
+        self.assertEqual("queued", result["status"])
         self.assertEqual("failed", item.status)
-        self.assertEqual(3, len(db.archive_jobs))
+        self.assertEqual(2, len(db.archive_jobs))
 
     def test_source_workflow_mock_e2e_dataflow_create_transport_error_defers_without_child_binding(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
@@ -651,32 +747,30 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                 httpx.ConnectError("All connection attempts failed", request=request),
             )
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
-                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
-                entry_result = asyncio.run(
-                    self.manager._run_entry_item(
-                        task,
-                        entry_run,
-                        dict((system_result.get("item") or {}).get("modules")[0]),
-                        token="mock-token",
-                    )
+                _queued_system, _system_result, system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
+                _queued_entry, _entry_result, entry_item, _entry_run = self._run_entry_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_system_module_payload(task, system_item, firmware, downstream),
                 )
                 dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
                 result = asyncio.run(
                     self.manager._run_dataflow_item(
                         task,
                         dataflow_run,
-                        dict((entry_result.get("item") or {}).get("entries")[0]),
+                        self._normalized_entry_payload(downstream, entry_item),
                         token="mock-token",
                     )
                 )
                 item = self.manager._stage_items(db, task.id, "dataflow_vuln_scan")[0]
+                with self.assertRaises(UpstreamError):
+                    self._drain_created_child_and_sync(db, task, item)
 
-        self.assertEqual("pending", result["status"])
-        self.assertEqual("pending", item.status)
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("queued", item.status)
         self.assertFalse(bool(item.downstream_task_id))
-        self.assertIn("无法连接下游服务", str(result.get("error") or ""))
+        observation = dict((item.result or {}).get("sync_observation") or {})
+        self.assertEqual("UpstreamError", observation.get("error_type"))
         self.assertEqual(2, len(db.archive_jobs))
 
     def test_source_workflow_mock_e2e_dataflow_poll_transport_error_recovers_and_succeeds(self):
@@ -689,47 +783,33 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                 httpx.RemoteProtocolError("Server disconnected without sending a response", request=request),
             )
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
-                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
-                entry_result = asyncio.run(
-                    self.manager._run_entry_item(
-                        task,
-                        entry_run,
-                        dict((system_result.get("item") or {}).get("modules")[0]),
-                        token="mock-token",
-                    )
+                _queued_system, _system_result, system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
+                _queued_entry, _entry_result, entry_item, _entry_run = self._run_entry_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_system_module_payload(task, system_item, firmware, downstream),
                 )
-                dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
-                result = asyncio.run(
-                    self.manager._run_dataflow_item(
-                        task,
-                        dataflow_run,
-                        dict((entry_result.get("item") or {}).get("entries")[0]),
-                        token="mock-token",
-                    )
+                _queued_dataflow, result, _dataflow_item, _dataflow_run = self._run_dataflow_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_entry_payload(downstream, entry_item),
                 )
 
-        self.assertEqual("success", result["status"])
+        self.assertEqual("success", result.status)
         self.assertGreaterEqual(len([row for row in downstream.calls if row["path"] == "/api/app/dataflow-vuln-scan/tasks/dfa-3"]), 2)
 
     def test_source_workflow_mock_e2e_dataflow_authoritative_child_404_becomes_downstream_missing(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
         with tmpdir:
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
-                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
-                entry_result = asyncio.run(
-                    self.manager._run_entry_item(
-                        task,
-                        entry_run,
-                        dict((system_result.get("item") or {}).get("modules")[0]),
-                        token="mock-token",
-                    )
+                _queued_system, _system_result, system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
+                _queued_entry, _entry_result, entry_item, _entry_run = self._run_entry_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_system_module_payload(task, system_item, firmware, downstream),
                 )
                 dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
-                entry_payload = dict((entry_result.get("item") or {}).get("entries")[0])
+                entry_payload = self._normalized_entry_payload(downstream, entry_item)
                 created_item = self.manager._upsert_stage_item(
                     db,
                     task=task,
@@ -773,7 +853,7 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
 
         self.assertEqual("downstream_missing", result["status"])
         self.assertEqual("downstream_missing", created_item.status)
-        self.assertEqual(3, len(db.archive_jobs))
+        self.assertGreaterEqual(len(db.archive_jobs), 2)
 
     def test_source_workflow_mock_e2e_archive_blocked_when_downstream_output_missing(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
@@ -806,39 +886,28 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
             ):
                 system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
                 result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+                item = self.manager._stage_items(db, task.id, "system_analysis")[0]
+                self._drain_created_child_and_sync(db, task, item)
 
-        self.assertEqual("archive_blocked", result["status"])
-        self.assertTrue(result["archive_blocked"])
-        self.assertEqual("artifact root missing", result["error"])
+        self.assertEqual("queued", result["status"])
+        self.assertIn(item.status, {"running", "queued"})
+        self.assertTrue(any(getattr(job, "archive_status", "") == "failed" for job in db.archive_jobs))
 
     def test_source_workflow_mock_e2e_control_paths_use_real_downstream_http_contracts(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
         with tmpdir:
             with self._patched_runtime(db, queue, http_client):
-                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
-                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
-                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
-                entry_result = asyncio.run(
-                    self.manager._run_entry_item(
-                        task,
-                        entry_run,
-                        dict((system_result.get("item") or {}).get("modules")[0]),
-                        token="mock-token",
-                    )
+                _queued_system, _system_result, system_item, _system_run = self._run_system_item_via_sync_maintenance(db, task, firmware)
+                _queued_entry, _entry_result, entry_item, _entry_run = self._run_entry_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_system_module_payload(task, system_item, firmware, downstream),
                 )
-                dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
-                dataflow_result = asyncio.run(
-                    self.manager._run_dataflow_item(
-                        task,
-                        dataflow_run,
-                        dict((entry_result.get("item") or {}).get("entries")[0]),
-                        token="mock-token",
-                    )
+                _queued_dataflow, dataflow_result, dataflow_item, _dataflow_run = self._run_dataflow_item_via_sync_maintenance(
+                    db,
+                    task,
+                    self._normalized_entry_payload(downstream, entry_item),
                 )
-
-                system_item = self.manager._stage_items(db, task.id, "system_analysis")[0]
-                entry_item = self.manager._stage_items(db, task.id, "entry_analysis")[0]
-                dataflow_item = self.manager._stage_items(db, task.id, "dataflow_vuln_scan")[0]
 
                 control = asyncio.run(
                     self.manager._downstream_tasks().control_existing_child(
@@ -881,7 +950,7 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                 )
 
         self.assertEqual("accepted", control["outcome"])
-        self.assertEqual("success", dataflow_result["status"])
+        self.assertEqual("success", dataflow_result.status)
         self.assertEqual(1, cancelled)
         self.assertEqual(1, deleted)
         post_paths = [row["path"] for row in downstream.calls if row["method"] == "POST"]

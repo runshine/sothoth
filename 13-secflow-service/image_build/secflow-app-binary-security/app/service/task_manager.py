@@ -1053,6 +1053,14 @@ class TaskManager(
                 observation["replacement_in_progress"] = False
                 result["sync_observation"] = observation
                 stage_item.result = result
+                self._set_downstream_binding_snapshot(
+                    stage_item,
+                    state="created",
+                    last_error=None,
+                    last_error_type=None,
+                    recoverable=None,
+                    message=message,
+                )
             return _mark_downstream_binding_created
         if item == "_lease_filter_available":
             def _lease_filter_available():
@@ -1072,6 +1080,21 @@ class TaskManager(
                 observation["replacement_in_progress"] = False
                 result["sync_observation"] = observation
                 stage_item.result = result
+                binding = dict(self._downstream_binding_snapshot(stage_item) or {})
+                attempts = max(1, int(binding.get("attempts") or 0) + 1)
+                first_attempt_at = self._downstream_binding_time(stage_item, "first_attempt_at") or _now()
+                self._set_downstream_binding_snapshot(
+                    stage_item,
+                    state="creating",
+                    attempts=attempts,
+                    first_attempt_at=first_attempt_at,
+                    last_attempt_at=_now(),
+                    next_retry_at=None,
+                    last_error=None,
+                    last_error_type=None,
+                    recoverable=True,
+                    message="下游创建中",
+                )
             return _mark_downstream_binding_creating
         if item == "_should_recreate_entry_child_from_terminal_status":
             def _should_recreate_entry_child_from_terminal_status(*, retrying, terminal_status):
@@ -6566,6 +6589,13 @@ class TaskManager(
         for entry in workset:
             item = entry["item"]
             operation_name = str(entry.get("operation") or "").strip()
+            if (
+                operation_name != "child_create"
+                and requested_ids
+                and not str(getattr(item, "downstream_task_id", "") or "").strip()
+                and self._downstream_binding_state(item) == "creating"
+            ):
+                operation_name = "child_create"
             if operation_name != "child_create":
                 if str(entry.get("blocked_reason") or "").strip() == "stage_parallelism_exhausted":
                     skipped_count += 1
@@ -6591,28 +6621,56 @@ class TaskManager(
                     )
                 continue
 
-            service, token, payload = self._build_child_create_request_for_item(db, task, item)
-            self._mark_downstream_binding_creating(item)
-            created = await self._downstream_create_task(
-                db,
-                task,
-                item,
-                service=service,
-                token=token,
-                payload=payload,
-            )
-            self._apply_created_downstream_child(
-                db,
-                task,
-                item,
-                created=created,
-                reason=f"{normalize_stage_name(item.stage_name)}_child_create",
-                event_type="downstream_child_created",
-            )
-            self._refresh_stage_run_from_items(db, task, str(item.stage_name or "").strip())
-            db.commit()
-            created_count += 1
-            created_item_ids.append(str(item.id or "").strip())
+            try:
+                service, token, payload = self._build_child_create_request_for_item(db, task, item)
+                self._mark_downstream_binding_creating(item)
+                created = await self._downstream_create_task(
+                    db,
+                    task,
+                    item,
+                    service=service,
+                    token=token,
+                    payload=payload,
+                )
+                self._apply_created_downstream_child(
+                    db,
+                    task,
+                    item,
+                    created=created,
+                    reason=f"{normalize_stage_name(item.stage_name)}_child_create",
+                    event_type="downstream_child_created",
+                )
+                self._refresh_stage_run_from_items(db, task, str(item.stage_name or "").strip())
+                db.commit()
+                created_count += 1
+                created_item_ids.append(str(item.id or "").strip())
+            except Exception as exc:
+                self._set_downstream_binding_snapshot(
+                    item,
+                    state="create_failed",
+                    last_attempt_at=_now(),
+                    last_error=str(exc),
+                    last_error_type=exc.__class__.__name__,
+                    recoverable=True,
+                    message="下游创建失败，等待后续重新尝试",
+                )
+                self._persist_child_sync_observation(
+                    db,
+                    task=task,
+                    item=item,
+                    change_source="child_create",
+                    sync_status="transport_error",
+                    synced_at=_now(),
+                    error_message=str(exc),
+                    error_type=exc.__class__.__name__,
+                    state_applied=False,
+                    extra_payload={
+                        "operation": "child_create",
+                        "downstream_service": str(getattr(item, "downstream_service", "") or "").strip() or None,
+                    },
+                )
+                db.commit()
+                raise
 
         if skipped_count > 0:
             db.commit()
@@ -8917,6 +8975,7 @@ class TaskManager(
         for key, value in updates.items():
             if value is None:
                 continue
+            value = self._normalize_result_payload_value(value)
             if merged_output_ref.get(key) == value:
                 continue
             merged_output_ref[key] = value
@@ -11113,41 +11172,98 @@ class TaskManager(
         mapped_status: str,
         archived_dir: Path | None,
     ) -> None:
-        if item.stage_name != "system_analysis" or item.downstream_service != "system_analyse":
-            return
         if mapped_status != "success":
             return
-        result_payload: dict[str, Any] = {}
-        try:
-            result_payload = await self._downstream_fetch_item_result(item)
-        except Exception:
-            result_payload = {}
-        firmware = self._system_analysis_input_for_item(task, item)
         artifact_root = archived_dir or self._service_output_dir(
             task,
             item.downstream_service or item.stage_name,
             item.item_key,
             item.downstream_task_id,
         )
-        modules = self._parse_system_analysis_modules(artifact_root, firmware, result_payload)
-        self._persist_stage_item_result(
-            task,
-            item,
-            stage_name=item.stage_name,
-            result={
-                **self._lightweight_system_analysis_input(firmware),
-                "modules": self._lightweight_modules_for_storage(modules),
-                "module_count": len(modules),
-                "downstream": self._lightweight_downstream_payload(payload),
-                "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
-                "downstream_status_synced_at": _now().isoformat(),
-            },
-        )
-        item.output_ref = {
-            **(item.output_ref or {}),
-            "artifact_root": str(artifact_root),
-            "archive_root": str(artifact_root),
-        }
+        if item.stage_name == "system_analysis" and item.downstream_service == "system_analyse":
+            result_payload: dict[str, Any] = {}
+            try:
+                result_payload = await self._downstream_fetch_item_result(item)
+            except Exception:
+                result_payload = {}
+            firmware = self._system_analysis_input_for_item(task, item)
+            modules = self._parse_system_analysis_modules(artifact_root, firmware, result_payload)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=item.stage_name,
+                result={
+                    **self._lightweight_system_analysis_input(firmware),
+                    "modules": self._lightweight_modules_for_storage(modules),
+                    "module_count": len(modules),
+                    "downstream": self._lightweight_downstream_payload(payload),
+                    "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
+                    "downstream_status_synced_at": _now().isoformat(),
+                },
+            )
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+            }
+            return
+
+        if item.stage_name == "entry_analysis" and item.downstream_service == "entry_analyse":
+            module_payload = dict(item.input_ref or {})
+            entries = self._parse_entries(artifact_root, module_payload)
+            selected_entry = dict(entries[0]) if entries else {}
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=item.stage_name,
+                result={
+                    **selected_entry,
+                    "entry_count": len(entries),
+                    "entries_preview": self._compact_entry_rows(entries, summary_only=True),
+                    "downstream": self._lightweight_downstream_payload(payload),
+                    "downstream_status_synced_at": _now().isoformat(),
+                },
+            )
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+            }
+            return
+
+        if item.stage_name == "dataflow_vuln_scan" and item.downstream_service == "dataflow_vuln_scan":
+            entry = self._validate_entry_output_contract(dict(item.input_ref or {}), allow_fallback=True)
+            dataflow_dir = self._resolve_dataflow_directory(artifact_root)
+            data_flow_file = self._find_first(
+                dataflow_dir or artifact_root,
+                [r"final_report\.md", r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"],
+            )
+            source_file = self._compress_source_file_hint(
+                str(entry.get("source_file") or entry.get("definition_file") or entry.get("file_name") or "")
+            )
+            result = self._build_dataflow_output_contract(
+                entry,
+                artifact_root=str(artifact_root),
+                archive_root=str(artifact_root),
+                module_input_path=str(entry.get("module_input_path") or ""),
+                source_root_path=str(entry.get("source_root_path") or ""),
+                source_dir=str(entry.get("source_dir") or ""),
+                source_file=source_file,
+                data_flow_file=str(data_flow_file or ""),
+                dataflow_dir=str(dataflow_dir or artifact_root),
+            )
+            result["downstream"] = self._lightweight_downstream_payload(payload)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=item.stage_name,
+                result=result,
+            )
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+            }
 
     def _refresh_firmware_unpack_item_result(
         self,

@@ -1561,41 +1561,54 @@ class TaskDownstreamServiceMixin:
 
         preserved_success_identities: set[str] = set()
         preserved_observe_only_identities: set[str] = set()
+        terminal_preserve_statuses = {
+            "success",
+            "partial_success",
+            "failed",
+            "cancelled",
+            "downstream_missing",
+        }
 
-        def _should_preserve_existing_streaming_item(existing_item: BinarySecurityStageItem) -> bool:
-            if not self._streaming_mode_enabled(task):
-                return False
-            if not self._is_streaming_tail_stage(task, stage_run.stage_name):
-                return False
+        def _should_preserve_existing_seeded_item(existing_item: BinarySecurityStageItem) -> bool:
+            normalized_status = str(existing_item.status or "").strip().lower()
+            if normalized_status in terminal_preserve_statuses:
+                return True
+            if str(existing_item.downstream_task_id or "").strip():
+                return normalized_status in {
+                    "pending",
+                    "queued",
+                    "dispatching",
+                    "running",
+                }
+            if self._downstream_binding_state(existing_item) in {"creating", "created_pending_sync"}:
+                return True
             if self._task_runtime_phase(task) != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
                 return False
             if normalize_stage_name(task.current_stage) != normalize_stage_name(stage_run.stage_name):
                 return False
             if self._task_is_waiting_for_manual_confirmation(task):
                 return False
-            normalized_status = str(existing_item.status or "").strip().lower()
+            if not self._streaming_mode_enabled(task):
+                return False
+            if not self._is_streaming_tail_stage(task, stage_run.stage_name):
+                return False
             if normalized_status not in {
-                "failed",
-                "cancelled",
-                "downstream_missing",
                 "pending",
                 "queued",
                 "dispatching",
                 "running",
-                "success",
-                "partial_success",
             }:
                 return False
             return True
 
         for identity_key, existing_item in existing_items_by_identity.items():
-            if not _should_preserve_existing_streaming_item(existing_item):
+            if not _should_preserve_existing_seeded_item(existing_item):
                 continue
             previous_status = str(existing_item.status or "").strip().lower() or None
             previous_downstream_task_id = str(existing_item.downstream_task_id or "").strip() or None
             observed_at = task_manager_module._now()
             existing_result = self._load_stage_item_result_payload(existing_item)
-            if previous_status in {"success", "partial_success"}:
+            if previous_status in terminal_preserve_statuses:
                 existing_item.stage_run_id = stage_run.id
                 existing_item.updated_at = observed_at
                 preserved_success_identities.add(identity_key)
@@ -2091,6 +2104,73 @@ class TaskDownstreamServiceMixin:
             "item": response_item,
             "deferred_mode": deferred_mode,
             "sync_degraded": True,
+        }
+
+    async def _defer_item_to_sync_maintenance_child_create(
+        self,
+        session: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        operation: str,
+        response_item: dict[str, Any],
+    ) -> dict[str, Any]:
+        if str(item.downstream_task_id or "").strip():
+            return self._defer_item_after_downstream_transport_error(
+                session,
+                task,
+                item,
+                operation=f"{str(operation or '').strip() or 'downstream'}_observe",
+                exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
+                response_item=response_item,
+            )
+        item_id = str(getattr(item, "id", "") or "").strip() or None
+        stage_name = str(getattr(item, "stage_name", "") or "").strip() or None
+        self._mark_downstream_binding_creating(item)
+        item.status = "queued"
+        item.finished_at = None
+        item.error_message = None
+        self._clear_stage_item_sync_observation_errors(item)
+        if item_id:
+            await self._enqueue_task_sync_request(
+                task,
+                db=session,
+                operation="child_create",
+                source="runtime_direct_child_create_redirect",
+                reason=f"{str(operation or '').strip() or 'downstream'}_child_create_redirected_to_sync_maintenance",
+                stage_name=stage_name,
+                item_ids=[item_id],
+                force=True,
+                source_event_type="downstream_child_create_requested",
+                payload={
+                    "redirected_from_runtime": True,
+                    "item_id": item_id,
+                    "item_key": str(getattr(item, "item_key", "") or "").strip() or None,
+                    "downstream_service": str(getattr(item, "downstream_service", "") or "").strip() or None,
+                },
+                priority=10,
+            )
+        self._record_event(
+            session,
+            task,
+            "downstream_child_create_requested",
+            "已将下游子任务创建请求转交 sync maintenance 统一执行",
+            stage_name=stage_name,
+            item=item,
+            payload={
+                "operation": operation,
+                "item_id": item_id,
+                "item_key": str(getattr(item, "item_key", "") or "").strip() or None,
+                "downstream_service": str(getattr(item, "downstream_service", "") or "").strip() or None,
+                "redirected_from_runtime": True,
+            },
+        )
+        session.commit()
+        return {
+            "status": "queued",
+            "item": response_item,
+            "deferred_mode": "sync_maintenance_child_create",
+            "sync_degraded": False,
         }
 
     def _defer_item_after_orchestration_error(

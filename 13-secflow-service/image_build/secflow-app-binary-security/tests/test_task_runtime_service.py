@@ -189,8 +189,6 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
             downstream_service="binary_to_source",
         )
         fake_session = _ModelAwareDb(stage_items=[item])
-        captured_entry_input = {}
-
         with tempfile.TemporaryDirectory() as tmpdir:
             descriptor_root = Path(tmpdir)
             module_dir = descriptor_root / "modules" / "security_policy"
@@ -215,28 +213,6 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
                 "files_list_path": str(files_list),
             }
 
-            def _build_result_payload(_task, _module, payload, archived_dir, *, entry_input, project_id):
-                del _task, _module, payload, archived_dir, project_id
-                captured_entry_input.update(entry_input)
-                return {
-                    "module_key": "module-1",
-                    "module_name": "security_policy",
-                    "task_type": TASK_TYPE_BINARY_MODULE,
-                    "result_items": [{"kind": "source", "result_kind": "entry_candidate"}],
-                    "downstream_result_summary": {"entry_candidate": 1},
-                    "artifact_index_path": str(descriptor_root / "artifact-index.json"),
-                }
-
-            async def _fake_create_task(session, parent_task, stage_item, *, service, token, payload):
-                del session, parent_task, stage_item, token
-                self.assertEqual("binary_to_source", service)
-                self.assertEqual([{"path": "/tmp/bin/module.elf"}], payload["elf_tasks"])
-                return {"task_id": "b2s-child", "status": "pending"}
-
-            async def _fake_poll(*args, **kwargs):
-                del args, kwargs
-                return "success", {"task_id": "b2s-child", "status": "success", "items": []}
-
             with (
                 patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
                 patch.object(self.manager, "_upsert_stage_item", return_value=item),
@@ -248,27 +224,27 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
                 ),
                 patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
                 patch.object(self.manager, "_b2s_execution_mode", return_value=("default", "ghidra")),
-                patch.object(self.manager, "_downstream_create_task", side_effect=_fake_create_task),
-                patch.object(self.manager, "_replace_active_child_binding", new=AsyncMock(return_value=None)),
-                patch.object(self.manager, "_poll_until_terminal", side_effect=_fake_poll),
-                patch.object(self.manager, "_queue_archive_and_wait", new=AsyncMock(return_value=(descriptor_root, None))),
                 patch.object(
                     self.manager,
-                    "_build_b2s_result_payload",
-                    side_effect=_build_result_payload,
-                    create=True,
+                    "_defer_item_to_sync_maintenance_child_create",
+                    new=AsyncMock(
+                        return_value={
+                            "status": "queued",
+                            "item": dict(module),
+                            "deferred_mode": "sync_maintenance_create",
+                        }
+                    ),
                 ),
             ):
                 result = asyncio.run(self.manager._run_b2s_item(task, stage_run, module, token="tok"))
 
-        self.assertEqual("success", result["status"])
-        self.assertEqual("success", item.status)
-        self.assertEqual(str(descriptor_root), captured_entry_input["entry_descriptor_root"])
-        self.assertEqual(str(files_list), captured_entry_input["entry_files_list"])
-        self.assertEqual(str(files_list), captured_entry_input["files_list_path"])
-        self.assertEqual(str(descriptor_root), captured_entry_input["source_root"])
-        self.assertEqual(str(module_dir), captured_entry_input["module_dir"])
-        self.assertEqual("security_policy", result["item"]["entry_module_name"])
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("sync_maintenance_create", result["deferred_mode"])
+        self.assertEqual(str(descriptor_root), result["item"]["entry_descriptor_root"])
+        self.assertEqual(str(files_list), result["item"]["entry_files_list"])
+        self.assertEqual(str(files_list), result["item"]["files_list_path"])
+        self.assertEqual(str(descriptor_root), result["item"]["source_root"])
+        self.assertEqual(str(module_dir), result["item"]["module_dir"])
 
     def test_run_b2s_item_returns_archive_blocked_without_reintroducing_legacy_path(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="b2s-archive")
@@ -294,10 +270,6 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
             "module_dir": "/tmp/src",
         }
 
-        async def _fake_poll(*args, **kwargs):
-            del args, kwargs
-            return "success", {"task_id": "b2s-child", "status": "completed", "items": []}
-
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
@@ -309,21 +281,22 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
             ),
             patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
             patch.object(self.manager, "_b2s_execution_mode", return_value=("default", "ghidra")),
-            patch.object(self.manager, "_downstream_create_task", new=AsyncMock(return_value={"task_id": "b2s-child", "status": "pending"})),
-            patch.object(self.manager, "_replace_active_child_binding", new=AsyncMock(return_value=None)),
-            patch.object(self.manager, "_poll_until_terminal", side_effect=_fake_poll),
             patch.object(
                 self.manager,
-                "_queue_archive_and_wait",
-                new=AsyncMock(return_value=(None, SimpleNamespace(error_message="archive blocked"))),
+                "_defer_item_to_sync_maintenance_child_create",
+                new=AsyncMock(
+                    return_value={
+                        "status": "queued",
+                        "item": module,
+                        "deferred_mode": "sync_maintenance_create",
+                    }
+                ),
             ),
         ):
             result = asyncio.run(self.manager._run_b2s_item(task, stage_run, module, token="tok"))
 
-        self.assertEqual("archive_blocked", result["status"])
-        self.assertTrue(result["archive_blocked"])
-        self.assertEqual("archive blocked", result["error"])
-        self.assertEqual("archive blocked", item.error_message)
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("sync_maintenance_create", result["deferred_mode"])
 
     def test_run_system_analysis_item_retry_adopts_active_child_and_persists_success_projection(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="system-task")

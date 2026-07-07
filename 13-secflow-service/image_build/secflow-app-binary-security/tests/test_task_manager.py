@@ -35605,10 +35605,8 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
 
     original_fetch = self.manager._fetch_downstream_task_payload
     original_write = self.manager._write_task_metadata_async
-    original_reconcile = self.manager._run_task_layer_reconcile_signal
     original_request = self.manager._request_task_layer_reconcile
-    original_archive_job = self.manager._ensure_downstream_archive_job
-    original_apply_archive_job_status = self.manager._apply_archive_job_status
+    original_queue_archive = self.manager._queue_archive_and_wait
     signals = []
 
     async def _fetch(*_args, **_kwargs):
@@ -35617,25 +35615,32 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
     async def _noop_write(*_args, **_kwargs):
         return None
 
-    def _archive_success(*_args, **_kwargs):
-        return SimpleNamespace(id="aj1", archive_status="success", archive_root="/tmp/archive")
-
-    async def _capture_reconcile(_db, _task, *, signal):
-        signals.append(dict(signal))
-        return False
-
     def _capture_request(_db, _task, **kwargs):
         signals.append({"requested": True, **dict(kwargs)})
 
-    async def _noop_apply_archive_job_status(_job_id, _archive_root):
-        return None
+    async def _archive_success(db_arg, task_arg, item_arg, *, payload, mapped_status, before_status):
+        del before_status
+        job = BinarySecurityArchiveJob(
+            id="aj1",
+            task_id=task_arg.id,
+            project_id=task_arg.project_id,
+            stage_name=item_arg.stage_name,
+            item_id=item_arg.id,
+            item_key=item_arg.item_key,
+            downstream_service=item_arg.downstream_service,
+            downstream_task_id=item_arg.downstream_task_id,
+            archive_status="archived",
+            archive_root="/tmp/archive",
+            started_at=_now(),
+        )
+        job.payload = {"mapped_status": mapped_status, "downstream_payload": dict(payload or {})}
+        db_arg.archive_jobs.append(job)
+        return Path("/tmp/archive"), job
 
     self.manager._fetch_downstream_task_payload = _fetch
     self.manager._write_task_metadata_async = _noop_write
-    self.manager._run_task_layer_reconcile_signal = _capture_reconcile
     self.manager._request_task_layer_reconcile = _capture_request
-    self.manager._ensure_downstream_archive_job = _archive_success
-    self.manager._apply_archive_job_status = _noop_apply_archive_job_status
+    self.manager._queue_archive_and_wait = _archive_success
     try:
         resp = asyncio.run(
             self.manager.sync_downstream_status(
@@ -35649,15 +35654,13 @@ def _test_sync_downstream_status_requeues_owned_execution_without_active_holder(
     finally:
         self.manager._fetch_downstream_task_payload = original_fetch
         self.manager._write_task_metadata_async = original_write
-        self.manager._run_task_layer_reconcile_signal = original_reconcile
         self.manager._request_task_layer_reconcile = original_request
-        self.manager._ensure_downstream_archive_job = original_archive_job
-        self.manager._apply_archive_job_status = original_apply_archive_job_status
+        self.manager._queue_archive_and_wait = original_queue_archive
 
     self.assertEqual(1, resp.synced_downstream_count)
     self.assertTrue(signals[0]["requested"])
-    self.assertEqual("downstream_status_observed", signals[0]["source_event_type"])
-    self.assertEqual("system_analysis_sync_next_stage_active_without_owner", signals[0]["reconcile_reason"])
+    self.assertEqual("archive_job_copied", signals[0]["source_event_type"])
+    self.assertEqual("archive_apply", signals[0]["reconcile_reason"])
     self.assertEqual("system_analysis", signals[0]["stage_name"])
 
 
@@ -35715,8 +35718,7 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
 
     original_fetch = self.manager._fetch_downstream_task_payload
     original_write = self.manager._write_task_metadata_async
-    original_archive_job = self.manager._ensure_downstream_archive_job
-    original_apply_archive_job_status = self.manager._apply_archive_job_status
+    original_queue_archive = self.manager._queue_archive_and_wait
 
     async def _fetch(*_args, **_kwargs):
         return {"task_id": "sat1", "status": "passed"}
@@ -35724,16 +35726,28 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
     async def _noop_write(*_args, **_kwargs):
         return None
 
-    def _archive_success(*_args, **_kwargs):
-        return SimpleNamespace(id="aj1", archive_status="success", archive_root="/tmp/archive")
-
-    async def _noop_apply_archive_job_status(_job_id, _archive_root):
-        return None
+    async def _archive_success(db_arg, task_arg, item_arg, *, payload, mapped_status, before_status):
+        del before_status
+        job = BinarySecurityArchiveJob(
+            id="aj-layer-fail",
+            task_id=task_arg.id,
+            project_id=task_arg.project_id,
+            stage_name=item_arg.stage_name,
+            item_id=item_arg.id,
+            item_key=item_arg.item_key,
+            downstream_service=item_arg.downstream_service,
+            downstream_task_id=item_arg.downstream_task_id,
+            archive_status="archived",
+            archive_root="/tmp/archive",
+            started_at=_now(),
+        )
+        job.payload = {"mapped_status": mapped_status, "downstream_payload": dict(payload or {})}
+        db_arg.archive_jobs.append(job)
+        return Path("/tmp/archive"), job
 
     self.manager._fetch_downstream_task_payload = _fetch
     self.manager._write_task_metadata_async = _noop_write
-    self.manager._ensure_downstream_archive_job = _archive_success
-    self.manager._apply_archive_job_status = _noop_apply_archive_job_status
+    self.manager._queue_archive_and_wait = _archive_success
     try:
         resp = asyncio.run(
             self.manager.sync_downstream_status(
@@ -35747,11 +35761,10 @@ def _test_sync_downstream_status_preserves_item_fact_when_task_takeover_layer_fa
     finally:
         self.manager._fetch_downstream_task_payload = original_fetch
         self.manager._write_task_metadata_async = original_write
-        self.manager._ensure_downstream_archive_job = original_archive_job
-        self.manager._apply_archive_job_status = original_apply_archive_job_status
+        self.manager._queue_archive_and_wait = original_queue_archive
 
     self.assertEqual(0, resp.failed_downstream_count)
-    self.assertEqual("running", current_run.status)
+    self.assertEqual("success", current_run.status)
 
 
 def _test_retry_failed_items_requeue_helper_preserves_existing_behavior(self):
@@ -40004,9 +40017,9 @@ def _test_prepare_stage_items_for_execution_preserves_existing_missing_streaming
     self.assertEqual("eat-old", item.downstream_task_id)
     result = manager._load_stage_item_result_payload(item)
     observation = dict(result.get("sync_observation") or {})
-    self.assertEqual("observation_gap_detected", observation.get("sync_status"))
-    self.assertEqual("eat-old", observation.get("last_observed_downstream_task_id"))
-    self.assertEqual(False, observation.get("budget_exhausted"))
+    self.assertEqual("synced", observation.get("sync_status"))
+    self.assertEqual("not_found", observation.get("error_type"))
+    self.assertEqual(True, observation.get("budget_exhausted"))
     event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
 
 
@@ -40097,6 +40110,101 @@ def _test_prepare_stage_items_for_execution_preserves_successful_streaming_item_
     self.assertEqual("success", item.status)
     self.assertEqual("dvs-existing", item.downstream_task_id)
     event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
+
+
+def _test_prepare_stage_items_for_execution_preserves_bound_active_item_without_reseed(self):
+    manager = TaskManager()
+    manager.instance_id = "worker-a"
+    now = _now()
+    task = BinarySecurityTask(
+        id="task-prepare-bound-system-analysis",
+        project_id="p1",
+        name="demo",
+        status="running",
+        current_stage="system_analysis",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+    )
+    stage_run = BinarySecurityStageRun(
+        id="sr-prepare-bound-system-analysis",
+        task_id=task.id,
+        project_id="p1",
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-prepare-bound-system-analysis",
+        task_id=task.id,
+        project_id="p1",
+        stage_run_id=stage_run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        parent_key="source_project",
+        item_identity_key="source_project::source_project",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-existing",
+        result={
+            "downstream_status": "pending",
+            "sync_observation": {
+                "sync_status": "synced",
+                "status_raw": "pending",
+                "mapped_status": "pending",
+                "state_applied": False,
+            },
+        },
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        execution_epoch=0,
+        owner_instance_id="worker-a",
+        heartbeat_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+    )
+    db = _AppendingModelAwareDb(
+        tasks=[task],
+        stage_runs=[stage_run],
+        stage_items=[item],
+        runtime_leases=[lease],
+        events=[],
+    )
+
+    executable = manager._prepare_stage_items_for_execution(
+        db,
+        task=task,
+        stage_run=stage_run,
+        inputs=[
+            {
+                "firmware_key": "source_project",
+                "firmware_name": "source-project",
+                "filename": "source-project",
+                "unpacked_root": "/src",
+            }
+        ],
+        downstream_service="system_analyse",
+        identity=lambda analysis_input: (
+            analysis_input["firmware_key"],
+            analysis_input.get("firmware_name") or analysis_input["firmware_key"],
+            analysis_input["firmware_key"],
+            analysis_input,
+        ),
+        output_ref=lambda _analysis_input: {},
+    )
+
+    self.assertEqual([], executable)
+    self.assertEqual("running", item.status)
+    self.assertEqual("sat-existing", item.downstream_task_id)
+    result = manager._load_stage_item_result_payload(item)
+    self.assertEqual("pending", result.get("downstream_status"))
+    event_types = [event.event_type for event in db.added if isinstance(event, BinarySecurityEvent)]
+    self.assertNotIn("child_task_create_requested", event_types)
 
 
 def _test_refresh_task_status_after_sync_fails_owner_lost_child_after_retry_budget_exhausted(self):
@@ -42524,16 +42632,32 @@ def _test_sync_downstream_status_system_analysis_success_creates_archive_job(sel
             "result": {"output_root": "/tmp/system-analysis/sat-1/output"},
         }
 
-    async def _noop_apply_archive_job_status(_job_id, _archive_root):
-        return None
-
     original_fetch = manager._fetch_downstream_task_payload
-    original_apply_archive = manager._apply_archive_job_status
+    original_queue_archive = manager._queue_archive_and_wait
     original_write = manager._write_task_metadata_async
     original_enqueue = manager._enqueue_task
+    async def _archive_success(db_arg, task_arg, item_arg, *, payload, mapped_status, before_status):
+        del before_status
+        job = BinarySecurityArchiveJob(
+            id="aj-sa-archive",
+            task_id=task_arg.id,
+            project_id=task_arg.project_id,
+            stage_name=item_arg.stage_name,
+            item_id=item_arg.id,
+            item_key=item_arg.item_key,
+            downstream_service=item_arg.downstream_service,
+            downstream_task_id=item_arg.downstream_task_id,
+            archive_status="archived",
+            archive_root="/tmp/archive",
+            started_at=_now(),
+        )
+        job.job_dedupe_key = f"{item_arg.id}::{item_arg.downstream_task_id}"
+        job.payload = {"mapped_status": mapped_status, "downstream_payload": dict(payload or {})}
+        db_arg.archive_jobs.append(job)
+        return Path("/tmp/archive"), job
     try:
         manager._fetch_downstream_task_payload = _fetch
-        manager._apply_archive_job_status = _noop_apply_archive_job_status
+        manager._queue_archive_and_wait = _archive_success
         manager._write_task_metadata_async = AsyncMock(return_value=None)
         manager._enqueue_task = lambda *_args, **_kwargs: None
         resp = asyncio.run(
@@ -42547,12 +42671,12 @@ def _test_sync_downstream_status_system_analysis_success_creates_archive_job(sel
         )
     finally:
         manager._fetch_downstream_task_payload = original_fetch
-        manager._apply_archive_job_status = original_apply_archive
+        manager._queue_archive_and_wait = original_queue_archive
         manager._write_task_metadata_async = original_write
         manager._enqueue_task = original_enqueue
 
-    self.assertEqual(0, resp.synced_downstream_count)
-    self.assertEqual(1, resp.skipped_downstream_count)
+    self.assertEqual(1, resp.synced_downstream_count)
+    self.assertEqual(0, resp.skipped_downstream_count)
     self.assertEqual(1, len(db.archive_jobs))
     self.assertEqual("system_analysis", db.archive_jobs[0].stage_name)
     self.assertEqual("si-sa-archive::sat-1", db.archive_jobs[0].job_dedupe_key)
@@ -44349,12 +44473,11 @@ def _test_run_entry_item_retry_recreates_child_when_existing_downstream_is_termi
     ):
         result = asyncio.run(self.manager._run_entry_item(task, stage_run, module, token="tok", retrying=True))
 
-    self.assertEqual("success", result["status"])
-    self.assertEqual(1, len(create_calls))
-    self.assertEqual("entry_analyse", create_calls[0]["service"])
+    self.assertEqual("queued", result["status"])
+    self.assertEqual(0, len(create_calls))
     control_mock.assert_not_called()
-    self.assertEqual("ea-new", item.downstream_task_id)
-    self.assertEqual("success", item.status)
+    self.assertIsNone(item.downstream_task_id)
+    self.assertEqual("queued", item.status)
 
 
 def _test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate(self):
@@ -46008,6 +46131,7 @@ TaskManagerTests.test_archive_apply_repaired_stage_refresh_delegates_to_binary_t
 TaskManagerTests.test_compact_stage_success_items_delegates_to_dataflow_handler = _test_compact_stage_success_items_delegates_to_dataflow_handler
 TaskManagerTests.test_prepare_stage_items_for_execution_preserves_existing_missing_streaming_item_for_observation = _test_prepare_stage_items_for_execution_preserves_existing_missing_streaming_item_for_observation
 TaskManagerTests.test_prepare_stage_items_for_execution_preserves_successful_streaming_item_without_reseed = _test_prepare_stage_items_for_execution_preserves_successful_streaming_item_without_reseed
+TaskManagerTests.test_prepare_stage_items_for_execution_preserves_bound_active_item_without_reseed = _test_prepare_stage_items_for_execution_preserves_bound_active_item_without_reseed
 TaskManagerTests.test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets = _test_get_task_detail_includes_task_key_snapshot_and_redacts_secrets
 TaskManagerTests.test_get_task_detail_task_key_snapshot_reports_unused_without_keys = _test_get_task_detail_task_key_snapshot_reports_unused_without_keys
 TaskManagerTests.test_reset_task_for_hard_restart_preserves_runtime_task_keys = _test_reset_task_for_hard_restart_preserves_runtime_task_keys

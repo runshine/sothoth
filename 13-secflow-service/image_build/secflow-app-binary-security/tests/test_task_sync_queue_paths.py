@@ -97,6 +97,72 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual(1, len(create_entries))
         self.assertEqual(["si-create-a"], create_entries[0]["item_ids"])
 
+    def test_build_expected_sync_requests_from_db_treats_creating_item_as_active_and_does_not_recreate(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-sync-creating",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"stage_parallelism": {"entry_analysis": 1}}),
+        )
+        creating_item = BinarySecurityStageItem(
+            id="si-creating",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="create-a",
+            status="queued",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            input_ref={
+                "module_key": "create-a",
+                "module_name": "create-a",
+                "source_dir": "/src/a",
+                "artifact_root": "/artifact/a",
+                "entry_descriptor_root": "/entry/a",
+                "entry_files_list": "entries-a.json",
+            },
+            result={
+                "downstream_binding": {"state": "creating", "attempts": 1},
+                "sync_observation": {"binding_state": "creating"},
+            },
+        )
+        waiting_item = BinarySecurityStageItem(
+            id="si-waiting",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="create-b",
+            status="pending",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            input_ref={
+                "module_key": "create-b",
+                "module_name": "create-b",
+                "source_dir": "/src/b",
+                "artifact_root": "/artifact/b",
+                "entry_descriptor_root": "/entry/b",
+                "entry_files_list": "entries-b.json",
+            },
+            result={},
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[creating_item, waiting_item], events=[])
+
+        expected = manager._build_expected_sync_requests_from_db(db, task)
+
+        create_entries = [entry for entry in expected if entry["operation"] == "child_create"]
+        self.assertEqual([], create_entries)
+
     def test_enqueue_task_sync_request_merges_same_dedupe_key(self):
         manager = TaskManager()
         task = BinarySecurityTask(

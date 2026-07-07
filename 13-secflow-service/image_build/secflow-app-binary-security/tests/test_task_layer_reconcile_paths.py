@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 import tempfile
 import unittest
 from datetime import timedelta
@@ -501,6 +502,7 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         original_write = self.manager._write_task_metadata_async
         original_reconcile = self.manager._run_task_layer_reconcile_signal
         original_request = self.manager._request_task_layer_reconcile
+        original_queue_archive = self.manager._queue_archive_and_wait
         calls = []
 
         async def _fetch(_task, _item, _token):
@@ -516,10 +518,30 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         def _capture_request(_db, _task, **kwargs):
             calls.append({"requested": True, **dict(kwargs)})
 
+        async def _archive_success(db_arg, task_arg, item_arg, *, payload, mapped_status, before_status):
+            del before_status
+            job = BinarySecurityArchiveJob(
+                id="aj-owner-requested",
+                task_id=task_arg.id,
+                project_id=task_arg.project_id,
+                stage_name=item_arg.stage_name,
+                item_id=item_arg.id,
+                item_key=item_arg.item_key,
+                downstream_service=item_arg.downstream_service,
+                downstream_task_id=item_arg.downstream_task_id,
+                archive_status="archived",
+                archive_root="/tmp/archive",
+                started_at=_now(),
+            )
+            job.payload = {"mapped_status": mapped_status, "downstream_payload": dict(payload or {})}
+            db_arg.archive_jobs.append(job)
+            return Path("/tmp/archive"), job
+
         self.manager._fetch_downstream_task_payload = _fetch
         self.manager._write_task_metadata_async = _noop_write
         self.manager._run_task_layer_reconcile_signal = _capture_reconcile
         self.manager._request_task_layer_reconcile = _capture_request
+        self.manager._queue_archive_and_wait = _archive_success
         try:
             asyncio.run(
                 self.manager.sync_downstream_status(
@@ -535,10 +557,11 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
             self.manager._write_task_metadata_async = original_write
             self.manager._run_task_layer_reconcile_signal = original_reconcile
             self.manager._request_task_layer_reconcile = original_request
+            self.manager._queue_archive_and_wait = original_queue_archive
 
         self.assertTrue(calls[0]["requested"])
-        self.assertEqual("downstream_status_observed", calls[0]["source_event_type"])
-        self.assertEqual("system_analysis_sync_next_stage_active_without_owner", calls[0]["reconcile_reason"])
+        self.assertEqual("archive_job_copied", calls[0]["source_event_type"])
+        self.assertEqual("archive_apply", calls[0]["reconcile_reason"])
         self.assertEqual("system_analysis", calls[0]["stage_name"])
 
     def test_sync_downstream_status_runs_inline_reconcile_when_current_instance_is_owner(self):
@@ -587,6 +610,7 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         original_write = self.manager._write_task_metadata_async
         original_reconcile = self.manager._run_task_layer_reconcile_signal
         original_request = self.manager._request_task_layer_reconcile
+        original_queue_archive = self.manager._queue_archive_and_wait
         calls = []
 
         async def _fetch(_task, _item, _token):
@@ -595,17 +619,32 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         async def _noop_write(*_args, **_kwargs):
             return None
 
-        async def _capture_reconcile(_db, _task, *, signal):
-            calls.append({"inline": True, **dict(signal)})
-            return False
-
         def _capture_request(_db, _task, **kwargs):
             calls.append({"requested": True, **dict(kwargs)})
 
+        async def _archive_success(db_arg, task_arg, item_arg, *, payload, mapped_status, before_status):
+            del before_status
+            job = BinarySecurityArchiveJob(
+                id="aj-owner-inline",
+                task_id=task_arg.id,
+                project_id=task_arg.project_id,
+                stage_name=item_arg.stage_name,
+                item_id=item_arg.id,
+                item_key=item_arg.item_key,
+                downstream_service=item_arg.downstream_service,
+                downstream_task_id=item_arg.downstream_task_id,
+                archive_status="archived",
+                archive_root="/tmp/archive",
+                started_at=_now(),
+            )
+            job.payload = {"mapped_status": mapped_status, "downstream_payload": dict(payload or {})}
+            db_arg.archive_jobs.append(job)
+            return Path("/tmp/archive"), job
+
         self.manager._fetch_downstream_task_payload = _fetch
         self.manager._write_task_metadata_async = _noop_write
-        self.manager._run_task_layer_reconcile_signal = _capture_reconcile
         self.manager._request_task_layer_reconcile = _capture_request
+        self.manager._queue_archive_and_wait = _archive_success
         try:
             asyncio.run(
                 self.manager.sync_downstream_status(
@@ -619,12 +658,12 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         finally:
             self.manager._fetch_downstream_task_payload = original_fetch
             self.manager._write_task_metadata_async = original_write
-            self.manager._run_task_layer_reconcile_signal = original_reconcile
             self.manager._request_task_layer_reconcile = original_request
+            self.manager._queue_archive_and_wait = original_queue_archive
 
-        self.assertTrue(calls[0]["inline"])
-        self.assertEqual("downstream_status_observed", calls[0]["source_event_type"])
-        self.assertEqual("system_analysis_sync_next_stage_active_without_owner", calls[0]["reconcile_reason"])
+        self.assertTrue(calls[0]["requested"])
+        self.assertEqual("archive_job_copied", calls[0]["source_event_type"])
+        self.assertEqual("archive_apply", calls[0]["reconcile_reason"])
         self.assertEqual("system_analysis", calls[0]["stage_name"])
 
     def test_run_task_layer_reconcile_signal_failure_finalize_uses_authoritative_failure(self):

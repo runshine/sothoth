@@ -4818,24 +4818,12 @@ class TaskRuntimeServiceMixin:
                             response_item=input_file,
                         )
                     else:
-                        self._release_session_connection_before_wait(session)
-                        service, create_token, create_payload = self._build_child_create_request_for_item(
+                        return await self._defer_item_to_sync_maintenance_child_create(
                             session,
                             task,
                             item,
-                            preferred_token=token,
-                            input_ref_override={
-                                **dict(input_file or {}),
-                                "path": str(input_path),
-                            },
-                        )
-                        created = await self._downstream_create_task(
-                            session,
-                            task,
-                            item,
-                            service=service,
-                            token=create_token,
-                            payload=create_payload,
+                            operation="firmware_unpack",
+                            response_item=input_file,
                         )
             if created is not None:
                 self._apply_created_downstream_child(
@@ -4921,7 +4909,7 @@ class TaskRuntimeServiceMixin:
             raise
         except UpstreamError as exc:
             session.rollback()
-            if "item" in locals():
+            if item is not None:
                 return self._defer_item_after_downstream_transport_error(
                     session,
                     task,
@@ -4932,7 +4920,7 @@ class TaskRuntimeServiceMixin:
                 )
             return {"status": "pending", "error": str(exc), "item": input_file, "deferred_mode": "redispatch"}
         except Exception as exc:
-            if "item" in locals() and self._is_retryable_downstream_transport_error(exc):
+            if item is not None and self._is_retryable_downstream_transport_error(exc):
                 session.rollback()
                 return self._defer_item_after_downstream_transport_error(
                     session,
@@ -4942,7 +4930,7 @@ class TaskRuntimeServiceMixin:
                     exc=exc,
                     response_item=input_file,
                 )
-            if "item" in locals() and self._is_recoverable_orchestration_error(exc):
+            if item is not None and self._is_recoverable_orchestration_error(exc):
                 session.rollback()
                 return self._defer_item_after_orchestration_error(
                     session,
@@ -5058,48 +5046,13 @@ class TaskRuntimeServiceMixin:
                         response_item=firmware,
                     )
                 else:
-                    self._release_session_connection_before_wait(session)
-                    service, create_token, create_payload = self._build_child_create_request_for_item(
-                        session,
-                        task,
-                        item,
-                        preferred_token=self._resolve_downstream_token(),
-                        input_ref_override=dict(firmware or {}),
-                    )
-                    created = await self._downstream_create_task(
-                        session,
-                        task,
-                        item,
-                        service=service,
-                        token=create_token,
-                        payload=create_payload,
-                    )
-                    self._apply_created_downstream_child(
-                        session,
-                        task,
-                        item,
-                        created=created,
-                        reason="system_analysis_child_create",
-                        event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                        event_payload={
-                            "strategy": retry_strategy if retrying else None,
-                            "old_downstream_status": retry_strategy_status if retrying else None,
-                        },
-                    )
-                    session.commit()
-                    self._release_session_connection_before_wait(session)
-                    status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    return await self._defer_item_to_sync_maintenance_child_create(
                         session,
                         task,
                         item,
                         operation="system_analysis",
                         response_item=firmware,
-                        fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
-                        success_statuses={"passed", "success"},
-                        failure_statuses={"failed", "error", "cancelled"},
                     )
-                    if deferred is not None:
-                        return deferred
             result_payload = {}
             if status == "success":
                 try:
@@ -5391,49 +5344,13 @@ class TaskRuntimeServiceMixin:
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
-                    b2s_mode, b2s_engine = self._b2s_execution_mode(task)
-                    del b2s_mode, b2s_engine
-                    service, create_token, create_payload = self._build_child_create_request_for_item(
-                        session,
-                        task,
-                        item,
-                        preferred_token=token,
-                        input_ref_override=dict(module or {}),
-                    )
-                    created = await self._downstream_create_task(
-                        session,
-                        task,
-                        item,
-                        service=service,
-                        token=create_token,
-                        payload=create_payload,
-                    )
-                    self._apply_created_downstream_child(
-                        session,
-                        task,
-                        item,
-                        created=created,
-                        reason="binary_to_source_child_create",
-                        event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                        event_payload={
-                            "strategy": retry_strategy if retrying else None,
-                            "old_downstream_status": retry_strategy_status if retrying else None,
-                        },
-                        extra_result_updates={"project_id": task.project_id},
-                    )
-                    session.commit()
-                    status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    return await self._defer_item_to_sync_maintenance_child_create(
                         session,
                         task,
                         item,
                         operation="binary_to_source",
                         response_item=module,
-                        fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                        success_statuses={"success", "partial_success", "completed"},
-                        failure_statuses={"failed", "cancelled"},
                     )
-                    if deferred is not None:
-                        return deferred
             self._merge_stage_item_result_fields(
                 task,
                 item,
@@ -5707,47 +5624,13 @@ class TaskRuntimeServiceMixin:
                             response_item=entry_input if "entry_input" in locals() else module,
                         )
                 else:
-                    service, create_token, create_payload = self._build_child_create_request_for_item(
+                    return await self._defer_item_to_sync_maintenance_child_create(
                         session,
                         task,
                         item,
-                        preferred_token=token,
-                        input_ref_override=dict(entry_input if "entry_input" in locals() else module or {}),
+                        operation="entry_analysis",
+                        response_item=entry_input if "entry_input" in locals() else module,
                     )
-                    created = await self._downstream_create_task(
-                        session,
-                        task,
-                        item,
-                        service=service,
-                        token=create_token,
-                        payload=create_payload,
-                    )
-            if created is not None:
-                self._apply_created_downstream_child(
-                    session,
-                    task,
-                    item,
-                    created=created,
-                    reason="entry_analysis_child_create",
-                    event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                    event_payload={
-                        "strategy": retry_strategy if retrying else None,
-                        "old_downstream_status": retry_strategy_status if retrying else None,
-                    },
-                )
-                session.commit()
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                    session,
-                    task,
-                    item,
-                    operation="entry_analysis",
-                    response_item=entry_input,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                    success_statuses={"passed", "success"},
-                    failure_statuses={"failed", "error", "cancelled"},
-                )
-                if deferred is not None:
-                    return deferred
             service_output = self._materialize_stage_artifact(
                 self._service_output_path(
                     task,
@@ -6141,46 +6024,13 @@ class TaskRuntimeServiceMixin:
                         if deferred is not None:
                             return deferred
                     else:
-                        service, create_token, create_payload = self._build_child_create_request_for_item(
-                            session,
-                            task,
-                            item,
-                            preferred_token=token,
-                            input_ref_override=dict(entry or {}),
-                        )
-                        created = await self._downstream_create_task(
-                            session,
-                            task,
-                            item,
-                            service=service,
-                            token=create_token,
-                            payload=create_payload,
-                        )
-                        self._apply_created_downstream_child(
-                            session,
-                            task,
-                            item,
-                            created=created,
-                            reason="dataflow_vuln_scan_child_create",
-                            event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                            event_payload={
-                                "strategy": retry_strategy if retrying else None,
-                                "old_downstream_status": retry_strategy_status if retrying else None,
-                            },
-                        )
-                        session.commit()
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                        return await self._defer_item_to_sync_maintenance_child_create(
                             session,
                             task,
                             item,
                             operation="dataflow_vuln_scan",
                             response_item=entry,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses=dataflow_success_statuses,
-                            failure_statuses=dataflow_failure_statuses,
                         )
-                        if deferred is not None:
-                            return deferred
             artifact_root = self._service_output_dir(
                 task,
                 item.downstream_service or stage_run.stage_name,
@@ -6292,7 +6142,7 @@ class TaskRuntimeServiceMixin:
                     exc=exc,
                     response_item=entry,
                 )
-            if "item" in locals():
+            if item is not None:
                 session.rollback()
                 item.status = "failed"
                 item.error_message = str(exc)
@@ -6528,55 +6378,19 @@ class TaskRuntimeServiceMixin:
                         response_item=dataflow_result,
                     )
                 elif not (retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item)):
-                    self._mark_downstream_binding_creating(item)
-                    session.commit()
                     dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
                     source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
                     if not dataflow_input_dir:
                         raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
                     if not source_dir:
                         raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
-                    service, create_token, create_payload = self._build_child_create_request_for_item(
+                    return await self._defer_item_to_sync_maintenance_child_create(
                         session,
                         task,
                         item,
-                        preferred_token=token,
-                        input_ref_override=dict(dataflow_result or {}),
+                        operation="dataflow_vuln_scan",
+                        response_item=dataflow_result,
                     )
-                    created = await self._downstream_create_task(
-                        session,
-                        task,
-                        item,
-                        service=service,
-                        token=create_token,
-                        payload=create_payload,
-                    )
-            if created is not None:
-                self._apply_created_downstream_child(
-                    session,
-                    task,
-                    item,
-                    created=created,
-                    reason=f"{stage_run.stage_name}_child_create",
-                    event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                    event_payload={
-                        "strategy": retry_strategy if retrying else None,
-                        "old_downstream_status": retry_strategy_status if retrying else None,
-                    },
-                )
-                session.commit()
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                    session,
-                    task,
-                    item,
-                    operation="dataflow_vuln_scan",
-                    response_item=dataflow_result,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                    success_statuses={"success", "succeeded", "completed"},
-                    failure_statuses={"failed", "cancelled"},
-                )
-                if deferred is not None:
-                    return deferred
             artifacts = await self._downstream_fetch_item_artifacts(item, token or "")
             archive_payload = {**payload, "artifacts": artifacts, "workspace_root": artifacts.get("workspace_root")}
             mapped_status = (
