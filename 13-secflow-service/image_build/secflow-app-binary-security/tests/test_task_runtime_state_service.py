@@ -232,6 +232,26 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(0, task_db_2.commit_count)
         self.assertEqual(1, task_db_2.rollback_count)
 
+    def test_repair_running_lease_invariant_single_task_locked_skips_pending_claim_task(self):
+        task = self._task(
+            status="running",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            summary={
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": _now().isoformat(),
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                }
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[], events=[])
+
+        repaired = self.manager._repair_running_lease_invariant_single_task_locked(db, task.id)
+
+        self.assertFalse(repaired)
+        self.assertEqual("running", task.status)
+        self.assertEqual([], db.events)
+
 
 if __name__ == "__main__":
     unittest.main()

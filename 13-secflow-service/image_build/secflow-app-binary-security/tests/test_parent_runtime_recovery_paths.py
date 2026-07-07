@@ -326,6 +326,58 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertFalse(any(event.event_type == "main_state_write_blocked" for event in db.events))
 
+    def test_reclaim_stale_running_skips_task_waiting_for_pending_claim(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-stale-tail-pending-claim",
+            project_id="p1",
+            name="source",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            summary={
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": _now().isoformat(),
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                }
+            },
+        )
+
+        class _ReclaimDb(_FakeDb):
+            def query(self, model, *args, **kwargs):
+                model_name = getattr(model, "__name__", "")
+                if model_name == "BinarySecurityTask":
+                    return _FakeQuery([task])
+                if model_name == "BinarySecurityStageRun":
+                    return _FakeQuery([])
+                if model_name == "BinarySecurityStageItem":
+                    return _FakeQuery([])
+                if model_name == "BinarySecurityTaskRuntimeLease":
+                    return _FakeQuery([])
+                return _FakeQuery([])
+
+            def flush(self):
+                pass
+
+        db = _ReclaimDb()
+        db.events = []
+        original_loader = manager._load_service_config
+        manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
+        try:
+            reclaimed = manager._reclaim_stale_running_locked(db)
+        finally:
+            manager._load_service_config = original_loader
+
+        self.assertFalse(reclaimed)
+        self.assertEqual("running", task.status)
+        self.assertEqual([], db.events)
+
 
 if __name__ == "__main__":
     unittest.main()

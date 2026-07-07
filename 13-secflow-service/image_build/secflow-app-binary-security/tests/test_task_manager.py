@@ -36758,7 +36758,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
 
     # 非 owner 且 authoritative runtime lease 已失效 → 走 release_for_takeover：置 pending 并重新排队
     self.assertEqual("pending", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+    self.assertIsNone(task.runtime_phase)
     self.assertEqual("idle", task.tail_reconcile_state)
     recovered_events = [event for event in db.events if event.event_type == "streaming_parent_state_recovered"]
     self.assertTrue(recovered_events)

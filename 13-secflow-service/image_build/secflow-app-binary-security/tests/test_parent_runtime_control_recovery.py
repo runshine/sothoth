@@ -144,6 +144,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", task.status)
+        self.assertIsNone(task.runtime_phase)
         self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
         self.assertTrue(
             bool(dict(getattr(task, "summary", None) or {}).get("parent_takeover_pending_claim", {}).get("active"))
@@ -152,6 +153,45 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
             self.fake_task_queue.requeued_tasks,
         )
+
+    def test_owned_execution_requeue_candidate_task_ids_skip_pending_claim_tasks(self):
+        manager = TaskManager()
+        waiting_task = BinarySecurityTask(
+            id="t-waiting-claim",
+            project_id="p1",
+            name="binary-module",
+            status="pending",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root=self._workspace_root("candidate-skip"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+            summary={
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": _now().isoformat(),
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                }
+            },
+        )
+        runnable_task = BinarySecurityTask(
+            id="t-runnable",
+            project_id="p1",
+            name="binary-module",
+            status="running",
+            task_type=TASK_TYPE_BINARY_MODULE,
+            current_stage="binary_to_source",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root=self._workspace_root("candidate-keep"),
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        db = _AppendingModelAwareDb(tasks=[waiting_task, runnable_task], stage_runs=[], stage_items=[], events=[])
+
+        self.assertEqual(["t-runnable"], manager._owned_execution_requeue_candidate_task_ids(db))
 
     def test_requeue_orphaned_owned_execution_single_task_locked_skips_pending_claim_waiting_task(self):
         manager = TaskManager()

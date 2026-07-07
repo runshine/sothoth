@@ -1016,7 +1016,7 @@ class TaskRuntimeServiceMixin:
         from app.service import task_manager as task_manager_module
 
         rows = (
-            db.query(task_manager_module.BinarySecurityTask.id)
+            db.query(task_manager_module.BinarySecurityTask)
             .filter(
                 task_manager_module.BinarySecurityTask.runtime_phase == task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION,
                 task_manager_module.BinarySecurityTask.status.in_(["pending", "running"]),
@@ -1024,9 +1024,11 @@ class TaskRuntimeServiceMixin:
             .all()
         )
         return [
-            str(task_id or "").strip()
-            for (task_id,) in rows
-            if str(task_id or "").strip()
+            str(getattr(task, "id", "") or "").strip()
+            for task in rows
+            if task is not None
+            and str(getattr(task, "id", "") or "").strip()
+            and not self._parent_takeover_pending_claim_active(task)
         ]
 
     def _stale_dispatching_candidate_task_ids(self: TaskManager, db: Session) -> list[str]:
@@ -1104,6 +1106,8 @@ class TaskRuntimeServiceMixin:
         service_config = self._load_service_config(db)
         task = self._lock_task_row_by_id(db, task_id)
         if task is None:
+            return False
+        if self._parent_takeover_pending_claim_active(task):
             return False
         if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
             return False
@@ -1267,6 +1271,8 @@ class TaskRuntimeServiceMixin:
         task = self._lock_task_row_by_id(db, task_id)
         if task is None:
             return False
+        if self._parent_takeover_pending_claim_active(task):
+            return False
         if (
             self._task_has_active_cancel_operation(db, task)
             or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING
@@ -1327,6 +1333,8 @@ class TaskRuntimeServiceMixin:
         repaired = False
         for task in rows:
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
+                continue
+            if self._parent_takeover_pending_claim_active(task):
                 continue
             if self._repair_running_lease_invariant(
                 db,
@@ -2908,6 +2916,8 @@ class TaskRuntimeServiceMixin:
             stage_name = str(task.current_stage or "").strip() or None
             if not stage_name:
                 continue
+            if self._parent_takeover_pending_claim_active(task):
+                continue
             if self._task_runtime_transition_guard_active(task):
                 continue
             if str(task.status or "").strip() == "dispatching":
@@ -2975,6 +2985,8 @@ class TaskRuntimeServiceMixin:
             return False
         reclaimed = False
         for task in stale_rows:
+            if self._parent_takeover_pending_claim_active(task):
+                continue
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
                 continue
             if self._task_runtime_transition_guard_active(task):
@@ -3222,6 +3234,8 @@ class TaskRuntimeServiceMixin:
         for task in released_rows:
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
                 continue
+            if self._parent_takeover_pending_claim_active(task):
+                continue
             lease = self._runtime_lease_for_task(db, task.id)
             if self._runtime_lease_is_active(lease):
                 continue
@@ -3299,6 +3313,8 @@ class TaskRuntimeServiceMixin:
         timeout_seconds = max(int(service_config.dispatch_timeout_seconds or 0), 60)
         for task in stale_rows:
             if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
+                continue
+            if self._parent_takeover_pending_claim_active(task):
                 continue
             lease = self._runtime_lease_for_task(db, task.id)
             if self._runtime_lease_is_active(lease):
