@@ -17,7 +17,7 @@ from app.exception import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-from app.model import BinarySecurityTask, BinarySecurityTaskOperation
+from app.model import BinarySecurityTask, BinarySecurityTaskOperation, normalize_stage_name
 from app.service import task_manager as task_manager_module
 from . import shared as task_shared
 
@@ -1971,16 +1971,27 @@ class TaskOperationServiceMixin:
                 created_item_ids.append(item_id)
                 continue
             try:
+                service, create_token, create_payload = self._build_child_create_request_for_item(
+                    db,
+                    task,
+                    item,
+                    preferred_token=self._service_token(),
+                )
                 created = await self._downstream_create_task(
                     db,
                     task,
                     item,
-                    service=str(item.downstream_service or "").strip(),
-                    token=self._service_token(),
-                    payload=dict(item.input_ref or {}),
+                    service=service,
+                    token=create_token,
+                    payload=create_payload,
                 )
-                item.downstream_task_id = str(created.get("task_id") or item.downstream_task_id or "").strip() or None
-                item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                self._apply_created_downstream_child(
+                    db,
+                    task,
+                    item,
+                    created=created,
+                    reason=f"{normalize_stage_name(item.stage_name)}_retry_prepare_child_create",
+                )
                 self._update_retry_item_action(
                     task,
                     item_id=item_id,
@@ -2088,17 +2099,27 @@ class TaskOperationServiceMixin:
                             verification_status="pending",
                             transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                         )
+                        service, create_token, create_payload = self._build_child_create_request_for_item(
+                            db,
+                            task,
+                            item,
+                            preferred_token=self._service_token(),
+                        )
                         created = await self._downstream_create_task(
                             db,
                             task,
                             item,
-                            service=str(item.downstream_service or "").strip(),
-                            token=self._service_token(),
-                            payload=dict(item.input_ref or {}),
+                            service=service,
+                            token=create_token,
+                            payload=create_payload,
                         )
-                        item.downstream_task_id = str(created.get("task_id") or item.downstream_task_id or "").strip() or None
-                        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-                        self._clear_replacement_in_progress(item)
+                        self._apply_created_downstream_child(
+                            db,
+                            task,
+                            item,
+                            created=created,
+                            reason=f"{normalize_stage_name(item.stage_name)}_retry_verify_child_create",
+                        )
                         self._update_retry_item_action(
                             task,
                             item_id=item_id,

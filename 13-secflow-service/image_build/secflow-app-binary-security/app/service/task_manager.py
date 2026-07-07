@@ -4682,26 +4682,6 @@ class TaskManager(
             decision_reason="runtime_lease_missing_or_expired",
         )
 
-    def _should_enqueue_parent_dispatch_for_task_sync(
-        self,
-        db: Session | None,
-        task: BinarySecurityTask,
-        *,
-        sync_kind: str,
-        force: bool,
-    ) -> bool:
-        normalized_sync_kind = str(sync_kind or "child_sync").strip() or "child_sync"
-        normalized_status = str(getattr(task, "status", "") or "").strip().lower()
-        if self._task_is_hidden_by_delete_queue(task):
-            return False
-        if normalized_status in TASK_TERMINAL_STATUSES and not str(getattr(task, "current_operation_id", "") or "").strip():
-            return False
-        if self._task_has_healthy_active_owner_runtime(db, task):
-            return False
-        if normalized_sync_kind == "child_sync":
-            return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING} or bool(force)
-        return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING, "failed"} or bool(force)
-
     async def _release_task_without_supported_runtime_owner_async(
         self,
         db: Session,
@@ -5999,13 +5979,32 @@ class TaskManager(
                     },
                 )
             raise
-        if self._should_enqueue_parent_dispatch_for_task_sync(
-            db,
-            task,
-            sync_kind=entry["operation"],
-            force=bool(entry["force"]),
-        ):
-            self._enqueue_task(task.id)
+        if db is not None:
+            normalized_status = str(getattr(task, "status", "") or "").strip().lower()
+            if (
+                not self._task_is_hidden_by_delete_queue(task)
+                and normalized_status in {"dispatching", "running", TASK_STATUS_CANCELLING}
+                and not self._task_has_healthy_active_owner_runtime(db, task)
+            ):
+                self._record_event(
+                    db,
+                    task,
+                    "task_sync_request_owner_missing_detected",
+                    "子任务同步请求已保留在任务内队列，但当前缺少健康 owner，等待 runtime/lease 修复后继续处理",
+                    level="warning",
+                    stage_name=entry.get("stage_name"),
+                    payload={
+                        "operation": entry["operation"],
+                        "reason": entry["reason"],
+                        "source": entry["source"],
+                        "source_event_type": entry.get("source_event_type"),
+                        "item_ids": list(entry.get("item_ids") or []),
+                        "archive_job_ids": list(entry.get("archive_job_ids") or []),
+                        "dedupe_key": dedupe_key,
+                        "task_sync_queue_only": True,
+                        "shared_dispatch_enqueued": False,
+                    },
+                )
         return normalized_entry
 
     async def _reconcile_missing_task_sync_requests(self, db: Session, task: BinarySecurityTask) -> int:
@@ -6058,6 +6057,8 @@ class TaskManager(
                     "item_ids": list(entry.get("item_ids") or []),
                     "archive_job_ids": list(entry.get("archive_job_ids") or []),
                     "dedupe_key": dedupe_key,
+                    "task_sync_queue_only": True,
+                    "shared_dispatch_enqueued": False,
                 },
             )
             repaired += 1
@@ -14806,7 +14807,9 @@ class TaskManager(
             }
             self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
             return "running", waiting_summary
-        if not upstream_terminal and accumulated_entries and not executable_entries:
+        if not upstream_terminal and accumulated_entries and (
+            not executable_entries or previous_entries or attempt == 1
+        ):
             self._record_event(
                 db,
                 task,

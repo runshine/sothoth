@@ -111,15 +111,14 @@ class TaskItemSyncServiceMixin:
         candidates = self._task_reconcile_candidate_items(db, task, force=False)
         if not candidates:
             return False
-        return any(
-            self._compute_item_downstream_action(
-                task,
-                item,
-                for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
-            )["action"]
-            in {"create_child", "sync_child"}
-            for item in candidates
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=candidates,
+            force=False,
+            for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
         )
+        return any(entry["operation"] in {"child_create", "child_sync"} for entry in workset)
 
     def _reconcile_authoritative_archive_item(
         self: TaskManager,
@@ -468,6 +467,83 @@ class TaskItemSyncServiceMixin:
             }:
                 candidates.append(item)
         return candidates
+
+    def _build_task_downstream_workset(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        items: list[BinarySecurityStageItem],
+        force: bool = False,
+        for_task_status: str | None = None,
+        now_value: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        stage_active_counts: dict[str, int] = {}
+        all_stage_items = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.downstream_service.isnot(None),
+        ).all()
+        for stage_item in all_stage_items:
+            normalized_stage = str(normalize_stage_name(stage_item.stage_name) or "").strip()
+            if not normalized_stage:
+                continue
+            if not self._child_counts_as_active_for_parallelism(stage_item):
+                continue
+            stage_active_counts[normalized_stage] = stage_active_counts.get(normalized_stage, 0) + 1
+
+        normalized_task_status = (
+            str(for_task_status or getattr(task, "status", "") or "").strip().lower() or None
+        )
+        workset: list[dict[str, Any]] = []
+        for item in items:
+            normalized_stage = str(normalize_stage_name(item.stage_name) or "").strip() or None
+            decision = self._compute_item_downstream_action(
+                task,
+                item,
+                for_task_status=normalized_task_status,
+                now_value=now_value,
+            )
+            missing_recorded_status = self._item_missing_recorded_downstream_status(item)
+            active_child_count = (
+                stage_active_counts.get(normalized_stage or "", 0)
+                if normalized_stage
+                else 0
+            )
+            stage_parallelism = (
+                self._stage_parallelism(task, normalized_stage)
+                if normalized_stage
+                else 0
+            )
+            operation = "noop"
+            blocked_reason: str | None = None
+            if decision["action"] == "create_child":
+                if normalized_stage and active_child_count < stage_parallelism:
+                    operation = "child_create"
+                    stage_active_counts[normalized_stage] = active_child_count + 1
+                else:
+                    blocked_reason = "stage_parallelism_exhausted"
+            elif decision["action"] == "sync_child":
+                operation = "child_sync"
+            elif missing_recorded_status and decision.get("child_bound"):
+                operation = "child_sync"
+                blocked_reason = "missing_recorded_downstream_status"
+
+            workset.append(
+                {
+                    "item": item,
+                    "item_id": str(getattr(item, "id", "") or "").strip() or None,
+                    "stage_name": normalized_stage,
+                    "operation": operation,
+                    "force": bool(force or missing_recorded_status),
+                    "decision": decision,
+                    "reason": decision.get("reason"),
+                    "blocked_reason": blocked_reason,
+                    "missing_recorded_status": missing_recorded_status,
+                    "active_child_count": active_child_count,
+                    "stage_parallelism": stage_parallelism,
+                }
+            )
+        return workset
 
     def _stage_item_sync_observation(self: TaskManager, item: BinarySecurityStageItem) -> dict[str, Any]:
         result = self._load_stage_item_result_payload(item)
@@ -946,7 +1022,25 @@ class TaskItemSyncServiceMixin:
         if status == "pending":
             return True
         if status == "failed":
-            return bool(self._task_reconcile_candidate_items(db, task, force=False, include_failed_terminal_items=False))
+            candidates = self._task_reconcile_candidate_items(
+                db,
+                task,
+                force=False,
+                include_failed_terminal_items=True,
+            )
+            if not candidates:
+                return False
+            workset = self._build_task_downstream_workset(
+                db,
+                task,
+                items=candidates,
+                force=False,
+                for_task_status=status,
+            )
+            return any(
+                str(entry.get("operation") or "").strip() in {"child_create", "child_sync"}
+                for entry in workset
+            )
         if status not in {"dispatching", "running"}:
             return False
         if self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, task.current_stage):
@@ -1721,14 +1815,17 @@ class TaskItemSyncServiceMixin:
         touched_stages: set[str] = set()
         stage_takeover_candidates: set[str] = set()
         auth_token = token or self._service_token()
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=items,
+            force=force,
+            for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
+        )
         ready_items: list[BinarySecurityStageItem] = []
-        for item in items:
-            decision = self._compute_item_downstream_action(
-                task,
-                item,
-                for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
-            )
-            if decision["action"] != "sync_child":
+        for entry in workset:
+            item = entry["item"]
+            if entry["operation"] != "child_sync":
                 self._repair_false_not_started_binding_mismatch(item)
                 skipped_count += 1
                 continue

@@ -111,6 +111,15 @@ class _MockGaiaSourceDownstreamService:
             return sequence.pop(0)
         return sequence[0]
 
+    def _resolve_service_by_task_id(self, task_id: str) -> str:
+        if task_id.startswith("sa-"):
+            return "system_analyse"
+        if task_id.startswith("ea-"):
+            return "entry_analyse"
+        if task_id.startswith("dfa-"):
+            return "dataflow_vuln_scan"
+        raise AssertionError(f"unknown mock downstream task_id: {task_id}")
+
     def _build_system_output(self, task_id: str) -> tuple[Path, dict[str, object]]:
         output_dir = self.root / "system-analyse" / task_id / "output"
         module_dir = output_dir / "modules" / "mod-a"
@@ -234,6 +243,68 @@ class _MockGaiaSourceDownstreamService:
             payload = dict(self._task_payloads[task_id])
             payload["status"] = self._next_status(task_id)
             payload["analysis_status"] = "finished"
+            return self._response(method, url, payload)
+
+        if method == "POST" and path.startswith("/api/app/system-analyse/tasks/") and path.endswith("/restart"):
+            task_id = path.split("/")[-2]
+            payload = dict(self._task_payloads[task_id])
+            payload["status"] = "pending"
+            self._status_sequences[task_id] = ["dispatching", "running", "passed"]
+            return self._response(method, url, payload, status_code=201)
+
+        if method == "POST" and path.startswith("/api/app/entry-analyse/tasks/") and path.endswith("/restart"):
+            task_id = path.split("/")[-2]
+            payload = dict(self._task_payloads[task_id])
+            payload["status"] = "pending"
+            self._status_sequences[task_id] = ["dispatching", "running", "passed"]
+            return self._response(method, url, payload, status_code=201)
+
+        if method == "POST" and path.startswith("/api/app/dataflow-vuln-scan/tasks/") and path.endswith("/restart"):
+            task_id = path.split("/")[-2]
+            payload = dict(self._task_payloads[task_id])
+            payload["status"] = "pending"
+            payload["analysis_status"] = "queued"
+            self._status_sequences[task_id] = ["dispatching", "running", "passed"]
+            return self._response(method, url, payload, status_code=201)
+
+        if method == "POST" and path.startswith("/api/app/system-analyse/tasks/") and path.endswith("/cancel"):
+            task_id = path.split("/")[-2]
+            payload = dict(self._task_payloads[task_id])
+            payload["status"] = "cancelling"
+            self._status_sequences[task_id] = ["cancelling", "cancelled"]
+            return self._response(method, url, payload)
+
+        if method == "POST" and path.startswith("/api/app/entry-analyse/tasks/") and path.endswith("/cancel"):
+            task_id = path.split("/")[-2]
+            payload = dict(self._task_payloads[task_id])
+            payload["status"] = "cancelling"
+            self._status_sequences[task_id] = ["cancelling", "cancelled"]
+            return self._response(method, url, payload)
+
+        if method == "POST" and path.startswith("/api/app/dataflow-vuln-scan/tasks/") and path.endswith("/cancel"):
+            task_id = path.split("/")[-2]
+            payload = dict(self._task_payloads[task_id])
+            payload["status"] = "cancelling"
+            payload["analysis_status"] = "cancelling"
+            self._status_sequences[task_id] = ["cancelling", "cancelled"]
+            return self._response(method, url, payload)
+
+        if method == "DELETE" and (
+            path.startswith("/api/app/system-analyse/tasks/")
+            or path.startswith("/api/app/entry-analyse/tasks/")
+            or path.startswith("/api/app/dataflow-vuln-scan/tasks/")
+        ):
+            task_id = path.rsplit("/", 1)[-1]
+            service = self._resolve_service_by_task_id(task_id)
+            payload = {
+                "task_id": task_id,
+                "status": "deleted",
+                "service": service,
+            }
+            self._task_payloads.pop(task_id, None)
+            self._status_sequences.pop(task_id, None)
+            self._system_results.pop(task_id, None)
+            self._entry_modules.pop(task_id, None)
             return self._response(method, url, payload)
 
         return self._response(method, url, {"error": f"unexpected downstream request: {method} {path}"}, status_code=404)
@@ -739,3 +810,89 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
         self.assertEqual("archive_blocked", result["status"])
         self.assertTrue(result["archive_blocked"])
         self.assertEqual("artifact root missing", result["error"])
+
+    def test_source_workflow_mock_e2e_control_paths_use_real_downstream_http_contracts(self):
+        tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
+        with tmpdir:
+            with self._patched_runtime(db, queue, http_client):
+                system_run = self.manager._ensure_stage_run(db, task, "system_analysis")
+                system_result = asyncio.run(self.manager._run_system_analysis_item(task, system_run, firmware))
+                entry_run = self.manager._ensure_stage_run(db, task, "entry_analysis")
+                entry_result = asyncio.run(
+                    self.manager._run_entry_item(
+                        task,
+                        entry_run,
+                        dict((system_result.get("item") or {}).get("modules")[0]),
+                        token="mock-token",
+                    )
+                )
+                dataflow_run = self.manager._ensure_stage_run(db, task, "dataflow_vuln_scan")
+                dataflow_result = asyncio.run(
+                    self.manager._run_dataflow_item(
+                        task,
+                        dataflow_run,
+                        dict((entry_result.get("item") or {}).get("entries")[0]),
+                        token="mock-token",
+                    )
+                )
+
+                system_item = self.manager._stage_items(db, task.id, "system_analysis")[0]
+                entry_item = self.manager._stage_items(db, task.id, "entry_analysis")[0]
+                dataflow_item = self.manager._stage_items(db, task.id, "dataflow_vuln_scan")[0]
+
+                control = asyncio.run(
+                    self.manager._downstream_tasks().control_existing_child(
+                        db,
+                        stage_name="dataflow_vuln_scan",
+                        task=task,
+                        item=dataflow_item,
+                        token="mock-token",
+                    )
+                )
+                cancelled = asyncio.run(
+                    self.manager._downstream_cancel_refs(
+                        db,
+                        task,
+                        [
+                            {
+                                "service": "entry_analyse",
+                                "project_id": task.project_id,
+                                "task_id": str(entry_item.downstream_task_id or ""),
+                                "stage_name": "entry_analysis",
+                            }
+                        ],
+                        "mock-token",
+                    )
+                )
+                deleted = asyncio.run(
+                    self.manager._downstream_delete_refs(
+                        db,
+                        task,
+                        [
+                            {
+                                "service": "system_analyse",
+                                "project_id": task.project_id,
+                                "task_id": str(system_item.downstream_task_id or ""),
+                                "stage_name": "system_analysis",
+                            }
+                        ],
+                        "mock-token",
+                    )
+                )
+
+        self.assertEqual("accepted", control["outcome"])
+        self.assertEqual("success", dataflow_result["status"])
+        self.assertEqual(1, cancelled)
+        self.assertEqual(1, deleted)
+        post_paths = [row["path"] for row in downstream.calls if row["method"] == "POST"]
+        delete_paths = [row["path"] for row in downstream.calls if row["method"] == "DELETE"]
+        self.assertIn(f"/api/app/dataflow-vuln-scan/tasks/{dataflow_item.downstream_task_id}/restart", post_paths)
+        self.assertIn(f"/api/app/entry-analyse/tasks/{entry_item.downstream_task_id}/cancel", post_paths)
+        self.assertIn(f"/api/app/system-analyse/tasks/{system_item.downstream_task_id}", delete_paths)
+        event_types = [getattr(event, "event_type", "") for event in db.events]
+        self.assertIn("child_task_retry_requested", event_types)
+        self.assertIn("child_task_retry_accepted", event_types)
+        self.assertIn("child_task_cancel_requested", event_types)
+        self.assertIn("child_task_cancel_succeeded", event_types)
+        self.assertIn("child_task_delete_requested", event_types)
+        self.assertIn("child_task_delete_succeeded", event_types)

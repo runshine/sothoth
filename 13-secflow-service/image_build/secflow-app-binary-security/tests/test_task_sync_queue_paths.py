@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from datetime import timedelta
 from types import SimpleNamespace
@@ -20,6 +21,82 @@ def _runtime_lease(task: BinarySecurityTask, owner: str, *, expires_at=None) -> 
 
 
 class TaskSyncQueuePathTests(unittest.TestCase):
+    def test_build_expected_sync_requests_from_db_limits_child_create_by_stage_parallelism(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-sync-parallelism",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"stage_parallelism": {"entry_analysis": 2}}),
+        )
+        active_item = BinarySecurityStageItem(
+            id="si-active",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="active",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-active",
+            result={},
+        )
+        create_item_a = BinarySecurityStageItem(
+            id="si-create-a",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="create-a",
+            status="pending",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            input_ref={
+                "module_key": "create-a",
+                "module_name": "create-a",
+                "source_dir": "/src/a",
+                "artifact_root": "/artifact/a",
+                "entry_descriptor_root": "/entry/a",
+                "entry_files_list": "entries-a.json",
+            },
+            result={},
+        )
+        create_item_b = BinarySecurityStageItem(
+            id="si-create-b",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="create-b",
+            status="pending",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            input_ref={
+                "module_key": "create-b",
+                "module_name": "create-b",
+                "source_dir": "/src/b",
+                "artifact_root": "/artifact/b",
+                "entry_descriptor_root": "/entry/b",
+                "entry_files_list": "entries-b.json",
+            },
+            result={},
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[active_item, create_item_a, create_item_b], events=[])
+
+        expected = manager._build_expected_sync_requests_from_db(db, task)
+
+        create_entries = [entry for entry in expected if entry["operation"] == "child_create"]
+        self.assertEqual(1, len(create_entries))
+        self.assertEqual(["si-create-a"], create_entries[0]["item_ids"])
+
     def test_enqueue_task_sync_request_merges_same_dedupe_key(self):
         manager = TaskManager()
         task = BinarySecurityTask(
@@ -72,7 +149,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual("merge-b", entries[0]["reason"])
         self.assertEqual("child_sync", entries[0]["operation"])
         self.assertEqual(["i1"], entries[0]["item_ids"])
-        self.assertEqual([task.id, task.id], queued)
+        self.assertEqual([], queued)
 
     def test_merge_task_sync_entries_accepts_non_empty_list_and_dict_fields(self):
         merged = task_manager_module.get_task_queue()._merge_task_sync_entries(
@@ -604,6 +681,10 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual(["si-reconcile-1"], entries[0]["item_ids"])
         self.assertEqual("child_sync", entries[0]["operation"])
         self.assertIn("task_sync_request_reconcile_requeued", [event.event_type for event in db.events])
+        reconcile_event = next(event for event in db.events if event.event_type == "task_sync_request_reconcile_requeued")
+        payload = dict(reconcile_event.payload or {})
+        self.assertTrue(payload["task_sync_queue_only"])
+        self.assertFalse(payload["shared_dispatch_enqueued"])
 
     def test_drain_task_sync_queue_failure_does_not_persist_retry_budget_state(self):
         manager = TaskManager()
@@ -823,6 +904,99 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual(1, len(discard_events))
         self.assertEqual(["si-stale-existing"], discard_events[0].payload.get("existing_item_ids"))
         self.assertEqual("acked_as_stale_noop", discard_events[0].payload.get("disposition"))
+
+    def test_process_task_sync_entry_blocking_creates_child_and_records_sync_events(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-sync-create-exec",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy_json=json.dumps({"stage_parallelism": {"entry_analysis": 2}}),
+        )
+        item = BinarySecurityStageItem(
+            id="si-create-exec",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-a",
+            item_name="module-a",
+            status="pending",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            input_ref={
+                "module_key": "module-a",
+                "module_name": "module-a",
+                "source_dir": "/src/module-a",
+                "artifact_root": "/artifact/module-a",
+                "entry_descriptor_root": "/entry/module-a",
+                "entry_files_list": "entries.json",
+            },
+            result={},
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_items=[item],
+            events=[],
+            runtime_leases=[_runtime_lease(task, manager.instance_id)],
+        )
+
+        class _FakeDownstreamTasks:
+            async def create_child_task(self, _db, _task, _item, *, service, token, payload, event_payload):
+                del _db, _task, _item, event_payload
+                return {
+                    "task_id": "eat-created-1",
+                    "status": "running",
+                    "service": service,
+                    "token_used": token,
+                    "payload": dict(payload),
+                }
+
+        original_get_session_factory = task_manager_module.get_session_factory
+        original_downstream_tasks = manager._downstream_tasks
+        original_active_delete_operation = manager._active_delete_operation
+        original_derive_downstream_work_key = manager._derive_downstream_work_key
+        original_configure_runtime_session = manager._configure_runtime_session_fast_lock_wait_timeout
+        try:
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            manager._downstream_tasks = lambda: _FakeDownstreamTasks()
+            manager._active_delete_operation = lambda *_args, **_kwargs: None
+            async def _fake_derive_downstream_work_key(**_kwargs):
+                return {}
+            manager._derive_downstream_work_key = _fake_derive_downstream_work_key
+            manager._configure_runtime_session_fast_lock_wait_timeout = lambda *_args, **_kwargs: None
+
+            manager._process_task_sync_entry_blocking(
+                task.project_id,
+                task.id,
+                "child_create",
+                "entry_analysis",
+                [item.id],
+                False,
+            )
+        finally:
+            task_manager_module.get_session_factory = original_get_session_factory
+            manager._downstream_tasks = original_downstream_tasks
+            manager._active_delete_operation = original_active_delete_operation
+            manager._derive_downstream_work_key = original_derive_downstream_work_key
+            manager._configure_runtime_session_fast_lock_wait_timeout = original_configure_runtime_session
+
+        self.assertEqual("eat-created-1", item.downstream_task_id)
+        self.assertEqual("running", item.status)
+        sync_event_types = [row.event_type for row in db.sync_events]
+        sync_operations = [row.operation for row in db.sync_events]
+        self.assertIn("requested", sync_event_types)
+        self.assertIn("applied", sync_event_types)
+        self.assertTrue(all(operation == "downstream_create" for operation in sync_operations))
+        self.assertGreaterEqual(len(sync_event_types), 3)
 
 
 if __name__ == "__main__":

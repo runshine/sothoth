@@ -4679,14 +4679,11 @@ class TaskRuntimeServiceMixin:
                     session.commit()
                     active_payload = None
             if active_payload is not None:
-                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
-                item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
-                item.started_at = item.started_at or _now()
-                self._merge_stage_item_result_fields(
+                self._apply_observed_active_downstream_child(
                     task,
                     item,
-                    stage_name=stage_run.stage_name,
-                    updates={"project_id": task.project_id},
+                    payload=active_payload,
+                    extra_result_updates={"project_id": task.project_id},
                 )
                 self._commit_stage_item_active_state(session, task, stage_run)
                 self._release_session_connection_before_wait(session)
@@ -4718,14 +4715,11 @@ class TaskRuntimeServiceMixin:
                         created = dict(control.get("payload") or {})
                     elif outcome == "already_running":
                         payload = dict(control.get("payload") or {})
-                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
-                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        item.started_at = item.started_at or _now()
-                        self._merge_stage_item_result_fields(
+                        self._apply_observed_active_downstream_child(
                             task,
                             item,
-                            stage_name=stage_run.stage_name,
-                            updates={"project_id": task.project_id},
+                            payload=payload,
+                            extra_result_updates={"project_id": task.project_id},
                         )
                         self._commit_stage_item_active_state(session, task, stage_run)
                         self._release_session_connection_before_wait(session)
@@ -4744,12 +4738,11 @@ class TaskRuntimeServiceMixin:
                         created = None
                     elif outcome == "already_terminal":
                         payload = dict(control.get("payload") or {})
-                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        self._merge_stage_item_result_fields(
+                        self._apply_observed_downstream_ref_binding(
                             task,
                             item,
-                            stage_name=stage_run.stage_name,
-                            updates={"project_id": task.project_id},
+                            payload=payload,
+                            extra_result_updates={"project_id": task.project_id},
                         )
                         session.commit()
                         status = self._status_from_downstream_payload(payload, success_statuses={"success"})
@@ -4826,46 +4819,37 @@ class TaskRuntimeServiceMixin:
                         )
                     else:
                         self._release_session_connection_before_wait(session)
+                        service, create_token, create_payload = self._build_child_create_request_for_item(
+                            session,
+                            task,
+                            item,
+                            preferred_token=token,
+                            input_ref_override={
+                                **dict(input_file or {}),
+                                "path": str(input_path),
+                            },
+                        )
                         created = await self._downstream_create_task(
                             session,
                             task,
                             item,
-                            service="firmware_unpacker",
-                            token=token,
-                            payload={
-                                "firmware_path": str(input_path),
-                                "origin": _downstream_origin_payload(task, item),
-                            },
+                            service=service,
+                            token=create_token,
+                            payload=create_payload,
                         )
             if created is not None:
-                item.status = "running"
-                self._bind_created_downstream_child(
-                    item,
-                    new_downstream_task_id=created.get("task_id") or created.get("id"),
-                    reason="firmware_unpack_child_create",
-                )
-                item.started_at = _now()
-                self._merge_stage_item_result_fields(
-                    task,
-                    item,
-                    stage_name=stage_run.stage_name,
-                    updates={"project_id": task.project_id},
-                )
-                self._record_downstream_item_disposition(
+                self._apply_created_downstream_child(
                     session,
                     task,
                     item,
+                    created=created,
+                    reason="firmware_unpack_child_create",
                     event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                    message="已创建新的下游子任务",
-                    payload={
-                        "stage_name": item.stage_name,
-                        "item_id": item.id,
-                        "item_key": item.item_key,
-                        "old_downstream_task_id": None,
-                        "new_downstream_task_id": item.downstream_task_id,
+                    event_payload={
                         "strategy": retry_strategy if retrying else None,
                         "old_downstream_status": retry_strategy_status if retrying else None,
                     },
+                    extra_result_updates={"project_id": task.project_id},
                 )
                 session.commit()
                 self._release_session_connection_before_wait(session)
@@ -5044,10 +5028,11 @@ class TaskRuntimeServiceMixin:
                     session.commit()
                     active_payload = None
             if active_payload is not None:
-                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
-                item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
-                item.started_at = item.started_at or _now()
-                item.error_message = None
+                self._apply_observed_active_downstream_child(
+                    task,
+                    item,
+                    payload=active_payload,
+                )
                 self._commit_stage_item_active_state(session, task, stage_run)
                 self._release_session_connection_before_wait(session)
                 status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
@@ -5074,39 +5059,29 @@ class TaskRuntimeServiceMixin:
                     )
                 else:
                     self._release_session_connection_before_wait(session)
+                    service, create_token, create_payload = self._build_child_create_request_for_item(
+                        session,
+                        task,
+                        item,
+                        preferred_token=self._resolve_downstream_token(),
+                        input_ref_override=dict(firmware or {}),
+                    )
                     created = await self._downstream_create_task(
                         session,
                         task,
                         item,
-                        service="system_analyse",
-                        token=self._resolve_downstream_token(),
-                        payload={
-                            "task_name": f"{task.name}-{firmware['firmware_name']}-system-analysis",
-                            "input_path": firmware["unpacked_root"],
-                            "origin": _downstream_origin_payload(task, item),
-                            "analysis_mode": self._task_type(task),
-                        },
+                        service=service,
+                        token=create_token,
+                        payload=create_payload,
                     )
-                    self._bind_created_downstream_child(
-                        item,
-                        new_downstream_task_id=created.get("task_id") or created.get("id"),
-                        reason="system_analysis_child_create",
-                    )
-                    item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-                    item.started_at = item.started_at or _now()
-                    item.error_message = None
-                    self._record_downstream_item_disposition(
+                    self._apply_created_downstream_child(
                         session,
                         task,
                         item,
+                        created=created,
+                        reason="system_analysis_child_create",
                         event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                        message="已创建新的下游子任务",
-                        payload={
-                            "stage_name": item.stage_name,
-                            "item_id": item.id,
-                            "item_key": item.item_key,
-                            "old_downstream_task_id": None,
-                            "new_downstream_task_id": item.downstream_task_id,
+                        event_payload={
                             "strategy": retry_strategy if retrying else None,
                             "old_downstream_status": retry_strategy_status if retrying else None,
                         },
@@ -5235,7 +5210,8 @@ class TaskRuntimeServiceMixin:
                 )
             if "item" in locals():
                 session.rollback()
-                item = session.merge(item)
+                if hasattr(session, "merge"):
+                    item = session.merge(item)
                 item.status = "failed"
                 item.error_message = str(exc)
                 item.finished_at = _now()
@@ -5318,12 +5294,12 @@ class TaskRuntimeServiceMixin:
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None
             if active_payload is not None:
-                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or item.status
-                item.downstream_task_id = (
-                    active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
+                self._apply_observed_active_downstream_child(
+                    task,
+                    item,
+                    payload=active_payload,
+                    fallback_status=str(item.status or "running") or "running",
                 )
-                item.started_at = item.started_at or _now()
-                item.error_message = None
                 self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
                     session,
@@ -5349,8 +5325,12 @@ class TaskRuntimeServiceMixin:
                     outcome = str(control.get("outcome") or "")
                     if outcome == "accepted":
                         created = dict(control.get("payload") or {})
-                        item.downstream_task_id = created.get("id") or item.downstream_task_id
-                        item.status = "running"
+                        self._apply_observed_active_downstream_child(
+                            task,
+                            item,
+                            payload=created,
+                            extra_result_updates={"project_id": task.project_id},
+                        )
                         self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
                             session,
@@ -5366,8 +5346,12 @@ class TaskRuntimeServiceMixin:
                             return deferred
                     elif outcome == "already_running":
                         payload = dict(control.get("payload") or {})
-                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                        self._apply_observed_active_downstream_child(
+                            task,
+                            item,
+                            payload=payload,
+                            extra_result_updates={"project_id": task.project_id},
+                        )
                         self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
                             session,
@@ -5383,7 +5367,7 @@ class TaskRuntimeServiceMixin:
                             return deferred
                     elif outcome == "already_terminal":
                         payload = dict(control.get("payload") or {})
-                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        self._apply_observed_downstream_ref_binding(task, item, payload=payload)
                         session.commit()
                         status = self._status_from_downstream_payload(
                             payload,
@@ -5408,49 +5392,34 @@ class TaskRuntimeServiceMixin:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
                 else:
                     b2s_mode, b2s_engine = self._b2s_execution_mode(task)
+                    del b2s_mode, b2s_engine
+                    service, create_token, create_payload = self._build_child_create_request_for_item(
+                        session,
+                        task,
+                        item,
+                        preferred_token=token,
+                        input_ref_override=dict(module or {}),
+                    )
                     created = await self._downstream_create_task(
                         session,
                         task,
                         item,
-                        service="binary_to_source",
-                        token=token,
-                        payload={
-                            "name": f"{task.name}-{module['module_name']}",
-                            "elf_tasks": elf_tasks,
-                            "origin": _downstream_origin_payload(task, item),
-                            "mode": b2s_mode,
-                            "engine": b2s_engine,
-                        },
+                        service=service,
+                        token=create_token,
+                        payload=create_payload,
                     )
-                    self._bind_created_downstream_child(
-                        item,
-                        new_downstream_task_id=created.get("task_id") or created.get("id"),
-                        reason="binary_to_source_child_create",
-                    )
-                    self._merge_stage_item_result_fields(
-                        task,
-                        item,
-                        stage_name=stage_run.stage_name,
-                        updates={"project_id": task.project_id},
-                    )
-                    item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-                    item.started_at = item.started_at or _now()
-                    item.error_message = None
-                    self._record_downstream_item_disposition(
+                    self._apply_created_downstream_child(
                         session,
                         task,
                         item,
+                        created=created,
+                        reason="binary_to_source_child_create",
                         event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                        message="已创建新的下游子任务",
-                        payload={
-                            "stage_name": item.stage_name,
-                            "item_id": item.id,
-                            "item_key": item.item_key,
-                            "old_downstream_task_id": None,
-                            "new_downstream_task_id": item.downstream_task_id,
+                        event_payload={
                             "strategy": retry_strategy if retrying else None,
                             "old_downstream_status": retry_strategy_status if retrying else None,
                         },
+                        extra_result_updates={"project_id": task.project_id},
                     )
                     session.commit()
                     status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
@@ -5679,9 +5648,10 @@ class TaskRuntimeServiceMixin:
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None
             if active_payload is not None:
-                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
-                item.downstream_task_id = (
-                    active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
+                self._apply_observed_active_downstream_child(
+                    task,
+                    item,
+                    payload=active_payload,
                 )
                 self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
@@ -5737,46 +5707,30 @@ class TaskRuntimeServiceMixin:
                             response_item=entry_input if "entry_input" in locals() else module,
                         )
                 else:
-                    input_contract = self._build_entry_analysis_input_contract(entry_input)
+                    service, create_token, create_payload = self._build_child_create_request_for_item(
+                        session,
+                        task,
+                        item,
+                        preferred_token=token,
+                        input_ref_override=dict(entry_input if "entry_input" in locals() else module or {}),
+                    )
                     created = await self._downstream_create_task(
                         session,
                         task,
                         item,
-                        service="entry_analyse",
-                        token=token,
-                        payload={
-                            "task_name": f"{task.name}-{entry_input['module_name']}-entry",
-                            "input_path": input_contract["module_dir"],
-                            "module_name": entry_input["module_name"],
-                            "source_path": input_contract["source_root"],
-                            "origin": {
-                                **_downstream_origin_payload(task, item),
-                                "input_contract": input_contract,
-                                "entry_descriptor_root": entry_input.get("entry_descriptor_root"),
-                                "entry_files_list": entry_input.get("entry_files_list"),
-                            },
-                        },
+                        service=service,
+                        token=create_token,
+                        payload=create_payload,
                     )
             if created is not None:
-                created_task_id = str(created.get("task_id") or "").strip()
-                current_downstream_task_id = str(item.downstream_task_id or "").strip()
-                if created_task_id and (
-                    not current_downstream_task_id or current_downstream_task_id == created_task_id
-                ):
-                    item.downstream_task_id = created_task_id
-                item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-                self._record_downstream_item_disposition(
+                self._apply_created_downstream_child(
                     session,
                     task,
                     item,
+                    created=created,
+                    reason="entry_analysis_child_create",
                     event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                    message="已创建新的下游子任务",
-                    payload={
-                        "stage_name": item.stage_name,
-                        "item_id": item.id,
-                        "item_key": item.item_key,
-                        "old_downstream_task_id": None,
-                        "new_downstream_task_id": item.downstream_task_id,
+                    event_payload={
                         "strategy": retry_strategy if retrying else None,
                         "old_downstream_status": retry_strategy_status if retrying else None,
                     },
@@ -6057,8 +6011,11 @@ class TaskRuntimeServiceMixin:
             dataflow_success_statuses = {"passed", "success", "completed_limited"}
             dataflow_failure_statuses = {"failed", "error", "cancelled", "invalid_input"}
             if active_payload is not None:
-                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
-                item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
+                self._apply_observed_active_downstream_child(
+                    task,
+                    item,
+                    payload=active_payload,
+                )
                 self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
                     session,
@@ -6088,8 +6045,11 @@ class TaskRuntimeServiceMixin:
                     outcome = str(control.get("outcome") or "")
                     if outcome == "accepted":
                         created = dict(control.get("payload") or {})
-                        item.downstream_task_id = created.get("task_id") or item.downstream_task_id
-                        item.status = "running"
+                        self._apply_observed_active_downstream_child(
+                            task,
+                            item,
+                            payload=created,
+                        )
                         self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
                             session,
@@ -6105,8 +6065,11 @@ class TaskRuntimeServiceMixin:
                             return deferred
                     elif outcome == "already_running":
                         payload = dict(control.get("payload") or {})
-                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
-                        item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
+                        self._apply_observed_active_downstream_child(
+                            task,
+                            item,
+                            payload=payload,
+                        )
                         self._commit_stage_item_active_state(session, task, stage_run)
                         status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
                             session,
@@ -6122,7 +6085,7 @@ class TaskRuntimeServiceMixin:
                             return deferred
                     elif outcome == "already_terminal":
                         payload = dict(control.get("payload") or {})
-                        item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
+                        self._apply_observed_downstream_ref_binding(task, item, payload=payload)
                         session.commit()
                         status = self._status_from_downstream_payload(payload, success_statuses=dataflow_success_statuses)
                     elif outcome == "not_found":
@@ -6178,53 +6141,29 @@ class TaskRuntimeServiceMixin:
                         if deferred is not None:
                             return deferred
                     else:
+                        service, create_token, create_payload = self._build_child_create_request_for_item(
+                            session,
+                            task,
+                            item,
+                            preferred_token=token,
+                            input_ref_override=dict(entry or {}),
+                        )
                         created = await self._downstream_create_task(
                             session,
                             task,
                             item,
-                            service="dataflow_vuln_scan",
-                            token=self._resolve_downstream_token(token),
-                            payload={
-                                "task_name": f"{task.name}-{entry['function_name']}-scan",
-                                "module_input_path": module_input_path,
-                                "source_root_path": source_root_path,
-                                "prompt_content": prompt,
-                                "origin": _downstream_origin_payload(task, item),
-                                "source_file": normalized_source_file,
-                                "function_name": entry["function_name"],
-                                "line_hint": line_hint,
-                                "definition_kind": definition_kind,
-                                "taint_params": taint_params,
-                                "function_description": str(entry.get("function_description") or ""),
-                                "function_description_source": str(entry.get("function_description_source") or ""),
-                                "entry_reason": str(entry.get("entry_reason") or ""),
-                                "entry_reason_source": str(entry.get("entry_reason_source") or ""),
-                                "taint_mode": "explicit" if taint_params else "no_explicit_taint",
-                                "taint_params_missing": not bool(taint_params),
-                                "taint_details": [
-                                    dict(detail)
-                                    for detail in (entry.get("taint_details") or [])
-                                    if isinstance(detail, dict)
-                                ],
-                            },
+                            service=service,
+                            token=create_token,
+                            payload=create_payload,
                         )
-                        self._bind_created_downstream_child(
-                            item,
-                            new_downstream_task_id=created.get("task_id") or created.get("id"),
-                            reason="dataflow_vuln_scan_child_create",
-                        )
-                        self._record_downstream_item_disposition(
+                        self._apply_created_downstream_child(
                             session,
                             task,
                             item,
+                            created=created,
+                            reason="dataflow_vuln_scan_child_create",
                             event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                            message="已创建新的下游子任务",
-                            payload={
-                                "stage_name": item.stage_name,
-                                "item_id": item.id,
-                                "item_key": item.item_key,
-                                "old_downstream_task_id": None,
-                                "new_downstream_task_id": item.downstream_task_id,
+                            event_payload={
                                 "strategy": retry_strategy if retrying else None,
                                 "old_downstream_status": retry_strategy_status if retrying else None,
                             },
@@ -6460,25 +6399,14 @@ class TaskRuntimeServiceMixin:
                         },
                     )
                     if created is not None:
-                        self._bind_created_downstream_child(
-                            item,
-                            new_downstream_task_id=created.get("task_id") or created.get("id"),
-                            reason="dataflow_vuln_scan_recreate_child_create",
-                        )
-                        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-                        self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
-                        self._record_downstream_item_disposition(
+                        self._apply_created_downstream_child(
                             session,
                             task,
                             item,
+                            created=created,
+                            reason="dataflow_vuln_scan_recreate_child_create",
                             event_type="retry_item_new_child_created",
-                            message="已创建新的下游子任务",
-                            payload={
-                                "stage_name": item.stage_name,
-                                "item_id": item.id,
-                                "item_key": item.item_key,
-                                "old_downstream_task_id": None,
-                                "new_downstream_task_id": item.downstream_task_id,
+                            event_payload={
                                 "strategy": retry_strategy,
                                 "old_downstream_status": retry_strategy_status,
                             },
@@ -6562,9 +6490,13 @@ class TaskRuntimeServiceMixin:
                 elif retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
                     active_payload = None
             if active_payload is not None:
-                item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
-                item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "pending"
-                self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
+                self._apply_observed_active_downstream_child(
+                    task,
+                    item,
+                    payload=active_payload,
+                    fallback_status="pending",
+                    binding_message="下游已创建，状态待同步",
+                )
                 self._commit_stage_item_active_state(session, task, stage_run)
                 status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
                     session,
@@ -6604,39 +6536,30 @@ class TaskRuntimeServiceMixin:
                         raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
                     if not source_dir:
                         raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
+                    service, create_token, create_payload = self._build_child_create_request_for_item(
+                        session,
+                        task,
+                        item,
+                        preferred_token=token,
+                        input_ref_override=dict(dataflow_result or {}),
+                    )
                     created = await self._downstream_create_task(
                         session,
                         task,
                         item,
-                        service="dataflow_vuln_scan",
-                        token=token,
-                        payload={
-                            "title": f"{task.name}-{dataflow_result['function_name']}-scan",
-                            "data_flow_path": dataflow_input_dir,
-                            "source_dir": source_dir,
-                            "origin": _downstream_origin_payload(task, item),
-                        },
+                        service=service,
+                        token=create_token,
+                        payload=create_payload,
                     )
             if created is not None:
-                self._bind_created_downstream_child(
-                    item,
-                    new_downstream_task_id=created.get("task_id") or created.get("id"),
-                    reason=f"{stage_run.stage_name}_child_create",
-                )
-                item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-                self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
-                self._record_downstream_item_disposition(
+                self._apply_created_downstream_child(
                     session,
                     task,
                     item,
+                    created=created,
+                    reason=f"{stage_run.stage_name}_child_create",
                     event_type="retry_item_new_child_created" if retrying else "downstream_child_created",
-                    message="已创建新的下游子任务",
-                    payload={
-                        "stage_name": item.stage_name,
-                        "item_id": item.id,
-                        "item_key": item.item_key,
-                        "old_downstream_task_id": None,
-                        "new_downstream_task_id": item.downstream_task_id,
+                    event_payload={
                         "strategy": retry_strategy if retrying else None,
                         "old_downstream_status": retry_strategy_status if retrying else None,
                     },

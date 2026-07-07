@@ -483,6 +483,103 @@ class TaskDownstreamServiceMixin:
         item.downstream_task_id = new_task_id
         self._clear_replacement_in_progress(item)
 
+    def _apply_created_downstream_child(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        created: dict[str, Any],
+        reason: str,
+        event_type: str = "downstream_child_created",
+        event_payload: dict[str, Any] | None = None,
+        binding_message: str | None = "下游已创建，状态待同步",
+        extra_result_updates: dict[str, Any] | None = None,
+        set_started_at: bool = True,
+    ) -> None:
+        old_downstream_task_id = str(item.downstream_task_id or "").strip() or None
+        new_downstream_task_id = created.get("task_id") or created.get("id")
+        self._bind_created_downstream_child(
+            item,
+            new_downstream_task_id=new_downstream_task_id,
+            reason=reason,
+        )
+        if extra_result_updates:
+            self._merge_stage_item_result_fields(
+                task,
+                item,
+                stage_name=item.stage_name,
+                updates=extra_result_updates,
+            )
+        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+        if set_started_at:
+            item.started_at = item.started_at or task_manager_module._now()
+        item.finished_at = None
+        item.error_message = None
+        if binding_message is not None:
+            self._mark_downstream_binding_created(item, message=binding_message)
+        self._record_downstream_item_disposition(
+            db,
+            task,
+            item,
+            event_type=event_type,
+            message="已创建新的下游子任务",
+            payload={
+                "stage_name": item.stage_name,
+                "item_id": item.id,
+                "item_key": item.item_key,
+                "old_downstream_task_id": old_downstream_task_id,
+                "new_downstream_task_id": item.downstream_task_id,
+                **dict(event_payload or {}),
+            },
+        )
+
+    def _apply_observed_active_downstream_child(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any],
+        fallback_status: str = "running",
+        binding_message: str | None = "下游已恢复为活跃状态，等待后续同步",
+        extra_result_updates: dict[str, Any] | None = None,
+    ) -> None:
+        observed_task_id = str(payload.get("task_id") or payload.get("id") or item.downstream_task_id or "").strip() or None
+        if observed_task_id:
+            item.downstream_task_id = observed_task_id
+        item.status = self._map_downstream_status(str(payload.get("status") or "")) or str(fallback_status or "running")
+        item.started_at = item.started_at or task_manager_module._now()
+        item.finished_at = None
+        item.error_message = None
+        if extra_result_updates:
+            self._merge_stage_item_result_fields(
+                task,
+                item,
+                stage_name=item.stage_name,
+                updates=extra_result_updates,
+            )
+        if binding_message is not None:
+            self._mark_downstream_binding_created(item, message=binding_message)
+
+    def _apply_observed_downstream_ref_binding(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        payload: dict[str, Any],
+        extra_result_updates: dict[str, Any] | None = None,
+    ) -> None:
+        observed_task_id = str(payload.get("task_id") or payload.get("id") or item.downstream_task_id or "").strip() or None
+        if observed_task_id:
+            item.downstream_task_id = observed_task_id
+        if extra_result_updates:
+            self._merge_stage_item_result_fields(
+                task,
+                item,
+                stage_name=item.stage_name,
+                updates=extra_result_updates,
+            )
+
     def _should_suppress_dataflow_signature_rebuild(
         self,
         *,
@@ -1692,87 +1789,13 @@ class TaskDownstreamServiceMixin:
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
-        normalized_status = str(item.status or "").strip().lower()
-        if str(item.downstream_task_id or "").strip():
-            if normalized_status in {"running", "dispatching", "failed", "cancelled", "cancelling"}:
-                try:
-                    payload = await self._fetch_downstream_task_payload(task, item, token or "")
-                except Exception:
-                    payload = None
-                mapped = self._map_downstream_status(str((payload or {}).get("status") or ""))
-                if payload and mapped in {"queued", "running", "dispatching", "cancelling"}:
-                    return {"outcome": "already_running", "payload": payload}
-                if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
-                    return {"outcome": "already_running", "payload": payload}
-                if (
-                    normalize_stage_name(stage_name) == "dataflow_vuln_scan"
-                    and normalized_status in {"failed", "cancelled", "downstream_missing"}
-                    and (payload is None or mapped in {None, "success", "partial_success", "failed", "cancelled", "downstream_missing"})
-                ):
-                    return {
-                        "outcome": "already_terminal",
-                        "payload": payload or {
-                            "task_id": str(item.downstream_task_id or "").strip(),
-                            "status": mapped or normalized_status,
-                        },
-                        "retry_outcome": "already_terminal",
-                    }
-            if normalized_status not in {"running", "dispatching"}:
-                if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and normalized_status in {"failed", "cancelled", "downstream_missing"}:
-                    return {
-                        "outcome": "already_terminal",
-                        "payload": {
-                            "task_id": str(item.downstream_task_id or "").strip(),
-                            "status": normalized_status,
-                        },
-                        "retry_outcome": "already_terminal",
-                    }
-                try:
-                    payload = await self._invoke_existing_downstream_retry(
-                        stage_name,
-                        task=task,
-                        item=item,
-                        token=token,
-                    )
-                    return {"outcome": "accepted", "payload": payload}
-                except ValidationError as exc:
-                    message = self._extract_downstream_error_text(exc) or str(exc)
-                    if self._is_already_running_control_conflict(message):
-                        try:
-                            active_payload = await self._fetch_downstream_task_payload(task, item, token or "")
-                        except Exception:
-                            active_payload = None
-                        mapped = self._map_downstream_status(str((active_payload or {}).get("status") or ""))
-                        if active_payload and mapped == "running":
-                            return {"outcome": "already_running", "payload": active_payload}
-                    return {
-                        "outcome": "invalid_transition",
-                        "retry_outcome": "invalid_transition",
-                        "error_message": message,
-                        "http_status": self._extract_http_status_from_exception(exc),
-                    }
-                except UpstreamError as exc:
-                    return {
-                        "outcome": "transport_error",
-                        "retry_outcome": "transport_error",
-                        "error_message": self._extract_downstream_error_text(exc) or str(exc),
-                        "http_status": self._extract_http_status_from_exception(exc),
-                    }
-        try:
-            return await self._downstream_tasks().control_existing_child(
-                None,
-                stage_name=stage_name,
-                task=task,
-                item=item,
-                token=token,
-            )
-        except UpstreamError as exc:
-            return {
-                "outcome": "transport_error",
-                "retry_outcome": "transport_error",
-                "error_message": self._extract_downstream_error_text(exc) or str(exc),
-                "http_status": self._extract_http_status_from_exception(exc),
-            }
+        return await self._downstream_tasks().control_existing_child(
+            None,
+            stage_name=stage_name,
+            task=task,
+            item=item,
+            token=token,
+        )
 
     def _record_downstream_item_disposition(
         self,

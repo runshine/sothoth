@@ -15634,18 +15634,11 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             status="failed",
         )
 
-        async def fake_retry(*args, **kwargs):
+        async def fake_control(*args, **kwargs):
             del args, kwargs
-            raise ValidationError('{"detail":"任务仍在运行中，请先取消后再重启"}')
+            return {"outcome": "already_running", "payload": {"task_id": "ea-1", "status": "running"}}
 
-        async def fake_fetch(*args, **kwargs):
-            del args, kwargs
-            return {"task_id": "ea-1", "status": "running"}
-
-        with (
-            patch.object(self.manager, "_invoke_existing_downstream_retry", side_effect=fake_retry),
-            patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch),
-        ):
+        with patch.object(self.manager._downstream_tasks(), "control_existing_child", side_effect=fake_control):
             result = asyncio.run(
                 self.manager._control_existing_downstream_task(
                     "entry_analysis",
@@ -15685,11 +15678,11 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             status="running",
         )
 
-        async def fake_fetch(*args, **kwargs):
+        async def fake_control(*args, **kwargs):
             del args, kwargs
-            return {"task_id": "dfa-1", "status": "running"}
+            return {"outcome": "already_running", "payload": {"task_id": "dfa-1", "status": "running"}}
 
-        with patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch):
+        with patch.object(self.manager._downstream_tasks(), "control_existing_child", side_effect=fake_control):
             result = asyncio.run(
                 self.manager._control_existing_downstream_task(
                     "dataflow_vuln_scan",
@@ -15729,11 +15722,11 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             status="running",
         )
 
-        async def fake_fetch(*args, **kwargs):
+        async def fake_control(*args, **kwargs):
             del args, kwargs
-            return {"task_id": "dfa-1", "status": "running"}
+            return {"outcome": "already_running", "payload": {"task_id": "dfa-1", "status": "running"}}
 
-        with patch.object(self.manager, "_fetch_downstream_task_payload", side_effect=fake_fetch):
+        with patch.object(self.manager._downstream_tasks(), "control_existing_child", side_effect=fake_control):
             result = asyncio.run(
                 self.manager._control_existing_downstream_task(
                     "dataflow_vuln_scan",
@@ -15772,11 +15765,14 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             status="failed",
         )
 
-        async def fake_retry(*args, **kwargs):
+        async def fake_control(*args, **kwargs):
             del args, kwargs
-            raise UpstreamError("无法连接下游服务: All connection attempts failed")
+            return {
+                "outcome": "transport_error",
+                "error_message": "无法连接下游服务: All connection attempts failed",
+            }
 
-        with patch.object(self.manager, "_invoke_existing_downstream_retry", side_effect=fake_retry):
+        with patch.object(self.manager._downstream_tasks(), "control_existing_child", side_effect=fake_control):
             result = asyncio.run(
                 self.manager._control_existing_downstream_task(
                     "entry_analysis",
@@ -39025,6 +39021,48 @@ def _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child(
     self.assertEqual([], manager._task_reconcile_candidate_items(db, task, include_failed_terminal_items=False))
 
 
+def _test_task_needs_downstream_reconcile_includes_failed_task_with_terminal_child_needing_apply(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-failed-terminal-needs-apply",
+        project_id="p1",
+        status="failed",
+        current_stage="firmware_unpack",
+        last_error="Task owner pod lost",
+    )
+    item = BinarySecurityStageItem(
+        id="si-failed-terminal-needs-apply",
+        task_id="task-failed-terminal-needs-apply",
+        project_id="p1",
+        stage_run_id="sr-failed-terminal-needs-apply",
+        stage_name="firmware_unpack",
+        item_key="fw.bin",
+        status="running",
+        downstream_service="firmware_unpacker",
+        downstream_task_id="fu-failed-terminal-needs-apply",
+        error_message="Task owner pod lost",
+        result={
+            "downstream_status": "success",
+            "downstream": {"status": "success"},
+            "sync_status": "observed",
+            "sync_observation": {
+                "sync_status": "observed",
+                "mapped_status": "success",
+                "downstream_status": "success",
+                "state_applied": False,
+                "last_result": "success",
+                "last_synced_at": _now().isoformat(),
+            },
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item])
+    self.assertTrue(manager._task_needs_downstream_reconcile(db, task))
+    candidates = manager._task_reconcile_candidate_items(db, task, include_failed_terminal_items=True)
+    self.assertEqual(["si-failed-terminal-needs-apply"], [str(candidate.id) for candidate in candidates])
+    workset = manager._build_task_downstream_workset(db, task, items=candidates, force=False, for_task_status="failed")
+    self.assertEqual("child_sync", workset[0]["operation"])
+
+
 def _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -43809,6 +43847,7 @@ TaskManagerTests.test_record_event_skips_duplicate_owned_execution_takeover_requ
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_locally_owned_running_task = _test_task_needs_downstream_reconcile_skips_locally_owned_running_task
 TaskManagerTests.test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items = _test_task_needs_downstream_reconcile_allows_locally_owned_running_task_with_stale_active_items
 TaskManagerTests.test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child = _test_task_needs_downstream_reconcile_skips_failed_task_with_terminal_child
+TaskManagerTests.test_task_needs_downstream_reconcile_includes_failed_task_with_terminal_child_needing_apply = _test_task_needs_downstream_reconcile_includes_failed_task_with_terminal_child_needing_apply
 TaskManagerTests.test_persist_child_sync_observation_reuses_observation_but_still_records_sync_event = _test_persist_child_sync_observation_reuses_observation_but_still_records_sync_event
 TaskManagerTests.test_persist_child_sync_observation_refreshes_last_attempt_at_for_periodic_sync_round = _test_persist_child_sync_observation_refreshes_last_attempt_at_for_periodic_sync_round
 TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_active_operation_ignores_expired_claim_lease
