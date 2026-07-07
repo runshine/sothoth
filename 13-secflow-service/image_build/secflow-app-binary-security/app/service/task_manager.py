@@ -11775,6 +11775,15 @@ class TaskManager(
         running_status: str = "running",
         preserve_active_status: bool = False,
     ) -> BinarySecurityStageItem:
+        def _should_preserve_existing_bound_child_state(stage_item: BinarySecurityStageItem) -> bool:
+            if retrying or auto_retrying:
+                return False
+            normalized_status = str(stage_item.status or "").strip().lower()
+            if str(stage_item.downstream_task_id or "").strip():
+                return normalized_status in {"pending", "queued", "dispatching", "running"}
+            binding_state = self._downstream_binding_state(stage_item)
+            return binding_state in {"creating", "created_pending_sync"}
+
         identity_key = build_stage_item_identity_key(item_key, parent_key)
         item = self._find_stage_item(
             db,
@@ -11810,16 +11819,20 @@ class TaskManager(
             item.item_name = item_name
             item.parent_key = parent_key
             item.item_identity_key = identity_key
-            keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(item)
+            preserve_bound_child_state = _should_preserve_existing_bound_child_state(item)
+            keep_existing_active = preserve_bound_child_state or (
+                preserve_active_status and self._should_preserve_streaming_item_status(item)
+            )
             item.status = item.status if keep_existing_active else running_status
             item.downstream_service = downstream_service
-            self._reset_child_runtime_payload(
-                item,
-                payload={},
-                keep_error=False,
-                reset_started_at=False,
-                reset_finished_at=True,
-            )
+            if not preserve_bound_child_state:
+                self._reset_child_runtime_payload(
+                    item,
+                    payload={},
+                    keep_error=False,
+                    reset_started_at=False,
+                    reset_finished_at=True,
+                )
             if not keep_existing_active:
                 item.started_at = self._stage_item_started_at(running_status)
                 self._ensure_stage_item_first_started_at(item)
@@ -11851,16 +11864,20 @@ class TaskManager(
                 existing.item_name = item_name
                 existing.parent_key = parent_key
                 existing.item_identity_key = identity_key
-                keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(existing)
+                preserve_bound_child_state = _should_preserve_existing_bound_child_state(existing)
+                keep_existing_active = preserve_bound_child_state or (
+                    preserve_active_status and self._should_preserve_streaming_item_status(existing)
+                )
                 existing.status = existing.status if keep_existing_active else running_status
                 existing.downstream_service = downstream_service
-                self._reset_child_runtime_payload(
-                    existing,
-                    payload={},
-                    keep_error=False,
-                    reset_started_at=False,
-                    reset_finished_at=True,
-                )
+                if not preserve_bound_child_state:
+                    self._reset_child_runtime_payload(
+                        existing,
+                        payload={},
+                        keep_error=False,
+                        reset_started_at=False,
+                        reset_finished_at=True,
+                    )
                 if not keep_existing_active:
                     existing.started_at = self._stage_item_started_at(running_status)
                     self._ensure_stage_item_first_started_at(existing)

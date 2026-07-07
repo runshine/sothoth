@@ -35390,6 +35390,8 @@ def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):
         running_status="pending",
     )
 
+    self.assertEqual("eat-1", refreshed.downstream_task_id)
+    self.assertEqual("running", refreshed.status)
     self.assertEqual("synced", refreshed.result.get("sync_status"))
     self.assertIn("sync_observation", refreshed.result)
     self.assertEqual("running", refreshed.result.get("downstream_status"))
