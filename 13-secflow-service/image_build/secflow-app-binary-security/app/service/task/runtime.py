@@ -1065,10 +1065,23 @@ class TaskRuntimeServiceMixin:
         task_query = db.query(task_manager_module.BinarySecurityTask).filter(
             task_manager_module.BinarySecurityTask.id == str(task_id or "").strip()
         )
-        with_for_update = getattr(task_query, "with_for_update", None)
-        if callable(with_for_update):
-            task_query = with_for_update()
+        task_query = self._query_with_fast_task_row_lock(task_query)
         return task_query.first()
+
+    def _query_with_fast_task_row_lock(self: TaskManager, task_query):
+        with_for_update = getattr(task_query, "with_for_update", None)
+        if not callable(with_for_update):
+            return task_query
+        for kwargs in ({"skip_locked": True}, {"nowait": True}, {}):
+            try:
+                return with_for_update(**kwargs) if kwargs else with_for_update()
+            except TypeError:
+                continue
+            except Exception:
+                if kwargs:
+                    continue
+                raise
+        return task_query
 
     def _requeue_orphaned_owned_execution_single_task_locked(self: TaskManager, db: Session, task_id: str) -> bool:
         task = self._lock_task_row_by_id(db, task_id)
@@ -1358,6 +1371,7 @@ class TaskRuntimeServiceMixin:
             try:
                 with task_manager_module.observe_scheduler_loop("task_dispatch"):
                     self._mark_loop_heartbeat("task_dispatch")
+                    self._configure_runtime_session_fast_lock_wait_timeout(db)
                     self._run_parent_reclaim_pass(db)
                     service_config = self._load_service_config(db)
                     local_active_count = self._local_active_runtime_count()
@@ -2018,9 +2032,7 @@ class TaskRuntimeServiceMixin:
         task_query = db.query(task_manager_module.BinarySecurityTask).filter(
             task_manager_module.BinarySecurityTask.id == task_id
         )
-        with_for_update = getattr(task_query, "with_for_update", None)
-        if callable(with_for_update):
-            task_query = with_for_update()
+        task_query = self._query_with_fast_task_row_lock(task_query)
         task = task_query.first()
         if task is None:
             self._log_dispatch_claim_blocked(task_id, reason="task_row_missing")

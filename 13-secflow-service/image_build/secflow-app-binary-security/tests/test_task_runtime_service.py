@@ -90,6 +90,21 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
     def setUp(self):
         self.manager = TaskManager()
 
+    def test_query_with_fast_task_row_lock_falls_back_when_skip_locked_not_supported(self):
+        calls = []
+
+        class _FakeQuery:
+            def with_for_update(self, **kwargs):
+                calls.append(dict(kwargs))
+                if kwargs:
+                    raise TypeError("unexpected kwargs")
+                return "locked-query"
+
+        result = self.manager._query_with_fast_task_row_lock(_FakeQuery())
+
+        self.assertEqual("locked-query", result)
+        self.assertEqual([{"skip_locked": True}, {"nowait": True}, {}], calls)
+
     def _task(self, *, task_type=TASK_TYPE_BINARY, name="task"):
         return BinarySecurityTask(
             id="task-1",
