@@ -3217,7 +3217,6 @@ class TaskRuntimeServiceMixin:
                     item_db.close()
             return reclaimed
 
-        service_config = self._load_service_config(db)
         stale_rows = (
             db.query(task_manager_module.BinarySecurityTask)
             .filter(
@@ -3229,166 +3228,16 @@ class TaskRuntimeServiceMixin:
             return False
         reclaimed = False
         for task in stale_rows:
-            if self._parent_takeover_pending_claim_active(task):
-                continue
-            if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
-                continue
-            if self._task_runtime_transition_guard_active(task):
-                continue
-            lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
+            lease, _runtime_lease_owner, _runtime_lease_expires_at = self._runtime_lease_context(db, task)
             if self._runtime_lease_is_active(lease):
                 continue
-            active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
-            dispatch_reference_at = getattr(task, "updated_at", None) or getattr(task, "started_at", None) or getattr(task, "created_at", None)
-            dispatch_elapsed_seconds = task_manager_module._elapsed_seconds_since(dispatch_reference_at)
-            startup_window_seconds = max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
-            protected_dispatching_window = bool(
-                active_item_count > 0
-                and dispatch_elapsed_seconds is not None
-                and dispatch_elapsed_seconds <= startup_window_seconds
-            )
-            if protected_dispatching_window:
-                continue
-            if dispatch_elapsed_seconds is None or dispatch_elapsed_seconds < service_config.dispatch_timeout_seconds:
-                continue
-            handle_state = self._local_runtime_handle_state(task.id)
-            if dispatch_elapsed_seconds is not None and dispatch_elapsed_seconds > startup_window_seconds:
-                if active_item_count > 0 and self._release_streaming_parent_for_takeover_locked(
-                    db,
-                    task,
-                    runtime_lease_owner=runtime_lease_owner,
-                    runtime_lease_expires_at=runtime_lease_expires_at,
-                    reason="dispatching_runtime_lease_missing_with_active_tail",
-                    signal_takeover=True,
-                ):
-                    self._record_event(
-                        db,
-                        task,
-                        "dispatching_runtime_lease_missing_released",
-                        "dispatching owner 缺少有效 runtime lease，父任务已释放并重新排队等待接管",
-                        level="warning",
-                        stage_name=task.current_stage,
-                        payload={
-                            "runtime_lease_owner": runtime_lease_owner,
-                            "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
-                            "dispatch_reference_at": task_manager_module._isoformat_or_none(dispatch_reference_at),
-                            "local_handle_state": handle_state,
-                            "active_item_count": active_item_count,
-                            "has_downstream_refs": has_downstream_refs,
-                            "reclaim_reason": "dispatching_runtime_lease_missing_with_active_tail",
-                        },
-                    )
-                    reclaimed = True
-                    continue
-            if active_item_count > 0 and self._release_streaming_parent_for_takeover_locked(
+            changed = self._release_task_without_supported_runtime_owner(
                 db,
                 task,
-                runtime_lease_owner=runtime_lease_owner,
-                runtime_lease_expires_at=runtime_lease_expires_at,
-                reason="dispatching_owner_lost_with_active_tail",
-                signal_takeover=True,
-            ):
-                task_manager_module.observe_runtime_lease_owner_mismatch("dispatching_with_active_tail_owner_lost")
-                reclaimed = True
-                continue
-            failure_ctx = self._current_stage_authoritative_failure_context(db, task)
-            if failure_ctx is None:
-                failure_ctx = self._earlier_stage_authoritative_failure_context(db, task)
-            if failure_ctx is None:
-                stage_runs = db.query(task_manager_module.BinarySecurityStageRun).filter(
-                    task_manager_module.BinarySecurityStageRun.task_id == task.id
-                ).all()
-                current_stage_name = str(task.current_stage or "").strip()
-                current_stage_run = next(
-                    (run for run in stage_runs if str(getattr(run, "stage_name", "") or "").strip() == current_stage_name),
-                    None,
-                )
-                should_terminalize_failed_stage = False
-                if current_stage_run is not None:
-                    stage_error_text = " ".join(
-                        str(part or "").strip()
-                        for part in (
-                            getattr(current_stage_run, "last_error", None),
-                            getattr(current_stage_run, "error_message", None),
-                            getattr(current_stage_run, "reason", None),
-                        )
-                        if str(part or "").strip()
-                    ).lower()
-                    should_terminalize_failed_stage = (
-                        str(getattr(current_stage_run, "status", "") or "").strip() == "failed"
-                        and (
-                            "task owner pod lost" in stage_error_text
-                            or "owner pod lost" in stage_error_text
-                            or self._is_terminal_business_stage_failure(task, current_stage_run)
-                        )
-                    )
-                if current_stage_run is not None and should_terminalize_failed_stage:
-                    snapshot = self._stage_failure_snapshot(task, current_stage_run)
-                    failure_ctx = {
-                        "stage_name": current_stage_name,
-                        "stage_run": current_stage_run,
-                        "failure_code": snapshot.get("failure_code"),
-                        "failure_category": snapshot.get("failure_category"),
-                        "failure_message": snapshot.get("failure_message") or snapshot.get("error") or getattr(current_stage_run, "last_error", None),
-                        "reason": "stale_dispatching_stage_run_failed",
-                    }
-            if failure_ctx is not None:
-                self._finalize_task_after_authoritative_failure(
-                    db,
-                    task,
-                    failure_ctx=failure_ctx,
-                    previous_status="dispatching",
-                )
-                reclaimed = True
-                continue
-            reclaimed_to_pending = self._apply_lease_loss_requeue_state(
-                db,
-                task,
-                reason="调度超时，任务回收并重新进入队列",
-                status="pending",
-                stage_name=task.current_stage,
-                last_error=None,
-                source="runtime_worker",
-                allow_reclaim_write=True,
+                active_operation=None,
+                reason="stale_dispatching_runtime_lease_missing_or_expired",
             )
-            if reclaimed_to_pending:
-                task_manager_module.observe_dispatch_reclaim("dispatch_timeout")
-                self._record_event(
-                    db,
-                    task,
-                    "dispatch_reclaimed",
-                    "调度超时，任务已回收并重新进入队列",
-                    level="warning",
-                    stage_name=task.current_stage,
-                    payload={
-                        "runtime_lease_owner": runtime_lease_owner,
-                        "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
-                        "dispatch_reference_at": task_manager_module._isoformat_or_none(dispatch_reference_at),
-                        "active_stage_name": active_stage_name or task.current_stage,
-                        "active_item_count": active_item_count,
-                        "reclaim_reason": "dispatch_timeout",
-                        "has_downstream_refs": has_downstream_refs,
-                    },
-                )
-            else:
-                self._record_event(
-                    db,
-                    task,
-                    "dispatch_reclaim_blocked",
-                    "调度超时后尝试回收任务，但主状态写入被阻断",
-                    level="warning",
-                    stage_name=task.current_stage,
-                    payload={
-                        "runtime_lease_owner": runtime_lease_owner,
-                        "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
-                        "dispatch_reference_at": task_manager_module._isoformat_or_none(dispatch_reference_at),
-                        "active_stage_name": active_stage_name or task.current_stage,
-                        "active_item_count": active_item_count,
-                        "reclaim_reason": "dispatch_timeout",
-                        "has_downstream_refs": has_downstream_refs,
-                    },
-                )
-            reclaimed = True
+            reclaimed = bool(changed) or reclaimed
         if reclaimed:
             db.flush()
         return reclaimed
