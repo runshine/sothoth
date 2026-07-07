@@ -118,6 +118,98 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
             self.manager._refresh_terminal_item_result_from_downstream = original_refresh
         return signal_snapshots
 
+    def test_kg_entry_fetch_accumulates_entries_until_upstream_terminal(self):
+        task = _kg_source_task(summary={"input_dir": "/tmp/kg-incremental"})
+        kg_run = BinarySecurityStageRun(
+            id="sr-kg-incremental",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="knowledge_graph_entry_fetch",
+            sequence_no=1,
+            status="running",
+            started_at=_now(),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[kg_run], stage_items=[], archive_jobs=[], events=[])
+
+        responses = iter(
+            [
+                (
+                    [
+                        {
+                            "entry_key": "src-1",
+                            "source_id": "src-1",
+                            "function_id": "fn-1",
+                            "function_name": "sink",
+                            "source_file": "src/a.c",
+                            "definition_file": "src/a.c",
+                            "definition_line": 10,
+                            "module_key": "knowledge_graph_source_project",
+                            "module_name": "source-project",
+                            "source_root_path": "/tmp/kg-incremental",
+                            "module_input_path": "/tmp/kg-incremental",
+                            "source_file_exists": True,
+                        }
+                    ],
+                    self._kg_meta(
+                        graph_status="building",
+                        identification_state="running",
+                        attack_status="running",
+                        raw_entry_count=1,
+                        selected_entry_count=1,
+                        returned_item_count=1,
+                    ),
+                ),
+                (
+                    [
+                        {
+                            "entry_key": "src-2",
+                            "source_id": "src-2",
+                            "function_id": "fn-2",
+                            "function_name": "helper",
+                            "source_file": "src/b.c",
+                            "definition_file": "src/b.c",
+                            "definition_line": 20,
+                            "module_key": "knowledge_graph_source_project",
+                            "module_name": "source-project",
+                            "source_root_path": "/tmp/kg-incremental",
+                            "module_input_path": "/tmp/kg-incremental",
+                            "source_file_exists": True,
+                        }
+                    ],
+                    self._kg_meta(
+                        graph_status="success",
+                        identification_state="done",
+                        attack_status="done",
+                        raw_entry_count=2,
+                        selected_entry_count=1,
+                        returned_item_count=1,
+                    ),
+                ),
+            ]
+        )
+
+        async def _fake_fetch(_task):
+            return next(responses)
+
+        self.manager._fetch_knowledge_graph_entry_results = _fake_fetch
+
+        first_status, first_summary = asyncio.run(
+            self.manager._stage_knowledge_graph_entry_fetch(db, task, kg_run, token=None, retry_existing=False)
+        )
+        self.assertEqual("running", first_status)
+        self.assertEqual("waiting_for_upstream_terminal", first_summary["status"])
+        self.assertEqual(["src-1"], [entry["entry_key"] for entry in self.manager._effective_entry_inputs(task, db)])
+
+        second_status, second_summary = asyncio.run(
+            self.manager._stage_knowledge_graph_entry_fetch(db, task, kg_run, token=None, retry_existing=False)
+        )
+        self.assertEqual("success", second_status)
+        self.assertEqual(2, second_summary["entry_count"])
+        self.assertEqual(
+            ["src-1", "src-2"],
+            [entry["entry_key"] for entry in self.manager._effective_entry_inputs(task, db)],
+        )
+
     def _persist_stage_item_result(self, item: BinarySecurityStageItem, *, payload: dict):
         item.result = dict(payload)
 
@@ -1143,8 +1235,28 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
                     "completion_state": "success",
                     "completion_ready": True,
                     "entries": [
-                        {"entry_key": "src-1", "function_name": "sink", "module_key": "knowledge-graph-source-project"},
-                        {"entry_key": "src-2", "function_name": "helper", "module_key": "knowledge-graph-source-project"},
+                        {
+                            "entry_key": "src-1",
+                            "function_name": "sink",
+                            "module_key": "knowledge-graph-source-project",
+                            "module_name": "source-project",
+                            "source_root_path": "/tmp/kg-retry-failed-items",
+                            "module_input_path": "/tmp/kg-retry-failed-items",
+                            "source_file": "src/a.c",
+                            "definition_file": "src/a.c",
+                            "definition_line": 10,
+                        },
+                        {
+                            "entry_key": "src-2",
+                            "function_name": "helper",
+                            "module_key": "knowledge-graph-source-project",
+                            "module_name": "source-project",
+                            "source_root_path": "/tmp/kg-retry-failed-items",
+                            "module_input_path": "/tmp/kg-retry-failed-items",
+                            "source_file": "src/b.c",
+                            "definition_file": "src/b.c",
+                            "definition_line": 20,
+                        },
                     ],
                     "entry_count": 2,
                 }
@@ -1191,6 +1303,12 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
             "entry_key": "src-1",
             "function_name": "sink",
             "module_key": "knowledge-graph-source-project",
+            "module_name": "source-project",
+            "source_root_path": "/tmp/kg-retry-failed-items",
+            "module_input_path": "/tmp/kg-retry-failed-items",
+            "source_file": "src/a.c",
+            "definition_file": "src/a.c",
+            "definition_line": 10,
         }
         df_success = BinarySecurityStageItem(
             id="si-df-retry-failed-items-b",
@@ -1210,6 +1328,12 @@ class KgSourceWorkflowE2ETests(unittest.TestCase):
             "entry_key": "src-2",
             "function_name": "helper",
             "module_key": "knowledge-graph-source-project",
+            "module_name": "source-project",
+            "source_root_path": "/tmp/kg-retry-failed-items",
+            "module_input_path": "/tmp/kg-retry-failed-items",
+            "source_file": "src/b.c",
+            "definition_file": "src/b.c",
+            "definition_line": 20,
         }
         operation = BinarySecurityTaskOperation(
             id="op-retry-failed-items-kg",
