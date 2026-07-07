@@ -92,6 +92,37 @@ class TaskRuntimeLeaseWatchdogTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(manager._stop_runtime_lease_watchdog)
         self.assertFalse(manager._lease_watchdog_alive())
 
+    def test_watchdog_records_per_task_lifecycle_events(self):
+        manager = TaskManager()
+        recorded: list[tuple[str, str, dict]] = []
+        manager._record_task_runtime_lifecycle_event = lambda task_id, *, event_type, message, source, level="info", payload=None: recorded.append(
+            (
+                task_id,
+                event_type,
+                {
+                    "message": message,
+                    "source": source,
+                    "level": level,
+                    **dict(payload or {}),
+                },
+            )
+        )
+
+        manager._reconcile_runtime_lease_watchdog_task_lifecycle({"task-1"}, interval_seconds=15)
+        manager._reconcile_runtime_lease_watchdog_task_lifecycle({"task-1"}, interval_seconds=15)
+        manager._reconcile_runtime_lease_watchdog_task_lifecycle(set(), interval_seconds=15, stopping=True)
+
+        self.assertEqual(
+            [
+                ("task-1", "runtime_lease_watchdog_started"),
+                ("task-1", "runtime_lease_watchdog_exited"),
+            ],
+            [(task_id, event_type) for task_id, event_type, _payload in recorded],
+        )
+        self.assertEqual(15, recorded[0][2]["interval_seconds"])
+        self.assertEqual("watchdog_stopped", recorded[1][2]["reason"])
+        self.assertEqual("warning", recorded[1][2]["level"])
+
     async def test_runtime_session_fast_lock_timeout_is_best_effort(self):
         manager = TaskManager()
         session = _FakeSession(task=None)

@@ -815,6 +815,7 @@ class TaskManager(
         self._lease_watchdog_last_tick_at: datetime | None = None
         self._lease_watchdog_last_success_at: datetime | None = None
         self._lease_watchdog_last_error: str | None = None
+        self._lease_watchdog_observed_task_ids: set[str] = set()
         self._max_stage_item_worker_count = max(
             1,
             int(
@@ -1341,10 +1342,13 @@ class TaskManager(
 
     def _stage_item_sync_stale_seconds(self) -> int:
         configured = int(getattr(self.cfg.scheduler, "stage_item_sync_stale_seconds", 300) or 300)
+        periodic_sync_upper_bound_seconds = max(
+            60,
+            int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 60) or 60),
+        )
         return max(
             30,
-            configured,
-            int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 30) or 30) * 3,
+            min(configured, periodic_sync_upper_bound_seconds),
         )
 
     def _stage_orchestration_max_consecutive_errors(self) -> int:
@@ -1934,6 +1938,14 @@ class TaskManager(
                 with self._lease_watchdog_state_lock:
                     self._lease_watchdog_last_tick_at = tick_at
                 handles = self._watchdog_runtime_handle_snapshot()
+                self._reconcile_runtime_lease_watchdog_task_lifecycle(
+                    {
+                        str(getattr(handle, "task_id", "") or "").strip()
+                        for handle in handles
+                        if str(getattr(handle, "task_id", "") or "").strip()
+                    },
+                    interval_seconds=interval_seconds,
+                )
                 for handle in handles:
                     task_id = str(getattr(handle, "task_id", "") or "").strip()
                     if not task_id:
@@ -1995,6 +2007,7 @@ class TaskManager(
                         self._lease_watchdog_last_error = None
                 self._lease_watchdog_stop_event.wait(interval_seconds)
         finally:
+            self._reconcile_runtime_lease_watchdog_task_lifecycle(set(), interval_seconds=interval_seconds, stopping=True)
             logger.info("binary-security runtime lease watchdog stopped")
 
     async def _run_event_loop_lag_monitor(self) -> None:
@@ -2445,6 +2458,108 @@ class TaskManager(
             )
             return True
 
+    def _record_task_runtime_lifecycle_event(
+        self,
+        task_id: str,
+        *,
+        event_type: str,
+        message: str,
+        source: str,
+        level: str = "info",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return
+        db = get_session_factory()()
+        try:
+            self._configure_runtime_session_fast_lock_wait_timeout(db)
+            task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == normalized_task_id).first()
+            if task is None:
+                db.rollback()
+                return
+            self._record_event(
+                db,
+                task,
+                event_type,
+                message,
+                level=level,
+                stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                payload={
+                    "task_id": normalized_task_id,
+                    "source": str(source or "").strip() or None,
+                    **dict(payload or {}),
+                },
+            )
+            db.commit()
+        except Exception:
+            with suppress(Exception):
+                db.rollback()
+            logger.exception(
+                "binary-security failed to record sync maintenance lifecycle event: task_id=%s event_type=%s source=%s",
+                normalized_task_id,
+                event_type,
+                source,
+            )
+        finally:
+            db.close()
+
+    def _record_sync_maintenance_lifecycle_event(
+        self,
+        task_id: str,
+        *,
+        event_type: str,
+        message: str,
+        source: str,
+        level: str = "info",
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        self._record_task_runtime_lifecycle_event(
+            task_id,
+            event_type=event_type,
+            message=message,
+            source=source,
+            level=level,
+            payload=payload,
+        )
+
+    def _reconcile_runtime_lease_watchdog_task_lifecycle(
+        self,
+        current_task_ids: set[str],
+        *,
+        interval_seconds: int,
+        stopping: bool = False,
+    ) -> None:
+        normalized_task_ids = {str(task_id or "").strip() for task_id in current_task_ids if str(task_id or "").strip()}
+        with self._lease_watchdog_state_lock:
+            previous_task_ids = set(self._lease_watchdog_observed_task_ids)
+            self._lease_watchdog_observed_task_ids = set(normalized_task_ids)
+        started_task_ids = sorted(normalized_task_ids - previous_task_ids)
+        exited_task_ids = sorted(previous_task_ids - normalized_task_ids)
+        for task_id in started_task_ids:
+            self._record_task_runtime_lifecycle_event(
+                task_id,
+                event_type="runtime_lease_watchdog_started",
+                message="runtime lease watchdog 已开始为当前任务维护全局续租",
+                source="runtime_lease_watchdog",
+                payload={"interval_seconds": interval_seconds},
+            )
+        exit_reason = "watchdog_stopped" if stopping else "task_no_longer_watchdog_eligible"
+        exit_message = (
+            "runtime lease watchdog 已停止为当前任务维护全局续租"
+            if stopping
+            else "runtime lease watchdog 已停止为当前任务维护全局续租，任务已不再满足续租条件"
+        )
+        for task_id in exited_task_ids:
+            self._record_task_runtime_lifecycle_event(
+                task_id,
+                event_type="runtime_lease_watchdog_exited",
+                message=exit_message,
+                source="runtime_lease_watchdog",
+                level="warning",
+                payload={"reason": exit_reason},
+            )
+
     async def _run_task_heartbeat(self, task_id: str) -> None:
         interval_seconds = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
         failure_count = 0
@@ -2483,6 +2598,14 @@ class TaskManager(
             int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
         )
         logger.info("binary-security sync maintenance worker started: task_id=%s", task_id)
+        await asyncio.to_thread(
+            self._record_sync_maintenance_lifecycle_event,
+            task_id,
+            event_type="task_sync_maintenance_started",
+            message="任务下游同步维护线程已启动",
+            source="sync_maintenance_loop",
+            payload={"interval_seconds": interval_seconds},
+        )
         try:
             while self._running:
                 handle = self._runtime_handle(task_id)
@@ -2521,12 +2644,26 @@ class TaskManager(
                 await asyncio.sleep(interval_seconds)
         finally:
             handle = self._runtime_handle(task_id)
+            exit_payload = {
+                "cancel_requested": bool(getattr(handle, "cancel_requested", False)) if handle is not None else None,
+                "runner_done": bool(handle.runner_task.done()) if handle is not None else None,
+                "heartbeat_done": bool(handle.heartbeat_task.done()) if handle is not None and handle.heartbeat_task is not None else None,
+            }
+            await asyncio.to_thread(
+                self._record_sync_maintenance_lifecycle_event,
+                task_id,
+                event_type="task_sync_maintenance_exited",
+                message="任务下游同步维护线程已退出",
+                source="sync_maintenance_loop",
+                level="warning",
+                payload=exit_payload,
+            )
             logger.info(
                 "binary-security sync maintenance worker exiting: task_id=%s cancel_requested=%s runner_done=%s heartbeat_done=%s source=sync_maintenance_loop",
                 task_id,
-                bool(getattr(handle, "cancel_requested", False)) if handle is not None else None,
-                bool(handle.runner_task.done()) if handle is not None else None,
-                bool(handle.heartbeat_task.done()) if handle is not None and handle.heartbeat_task is not None else None,
+                exit_payload["cancel_requested"],
+                exit_payload["runner_done"],
+                exit_payload["heartbeat_done"],
             )
 
     def _run_task_sync_maintenance_thread_worker(
@@ -2539,6 +2676,13 @@ class TaskManager(
             int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
         )
         logger.info("binary-security sync maintenance worker started: task_id=%s", task_id)
+        self._record_sync_maintenance_lifecycle_event(
+            task_id,
+            event_type="task_sync_maintenance_started",
+            message="任务下游同步维护线程已启动",
+            source="sync_maintenance_thread",
+            payload={"interval_seconds": interval_seconds},
+        )
         try:
             while self._running and not stop_event.is_set():
                 handle = self._runtime_handle(task_id)
@@ -2574,12 +2718,25 @@ class TaskManager(
                 stop_event.wait(interval_seconds)
         finally:
             handle = self._runtime_handle(task_id)
+            exit_payload = {
+                "cancel_requested": bool(getattr(handle, "cancel_requested", False)) if handle is not None else None,
+                "runner_done": bool(handle.runner_task.done()) if handle is not None else None,
+                "heartbeat_done": bool(handle.heartbeat_task.done()) if handle is not None and handle.heartbeat_task is not None else None,
+            }
+            self._record_sync_maintenance_lifecycle_event(
+                task_id,
+                event_type="task_sync_maintenance_exited",
+                message="任务下游同步维护线程已退出",
+                source="sync_maintenance_thread",
+                level="warning",
+                payload=exit_payload,
+            )
             logger.info(
                 "binary-security sync maintenance worker exiting: task_id=%s cancel_requested=%s runner_done=%s heartbeat_done=%s source=sync_maintenance_thread",
                 task_id,
-                bool(getattr(handle, "cancel_requested", False)) if handle is not None else None,
-                bool(handle.runner_task.done()) if handle is not None else None,
-                bool(handle.heartbeat_task.done()) if handle is not None and handle.heartbeat_task is not None else None,
+                exit_payload["cancel_requested"],
+                exit_payload["runner_done"],
+                exit_payload["heartbeat_done"],
             )
 
     def _verify_local_runtime_lease_or_abort(

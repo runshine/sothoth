@@ -3664,6 +3664,141 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
 
+    async def test_run_task_keeps_runtime_alive_when_non_terminal_task_still_requires_downstream_sync(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-needs-downstream-sync",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("run-task-keeps-runtime-alive-when-non-terminal-task-still-requires-downstream-sync"),
+            runtime_phase="owned_execution",
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+        order: list[str] = []
+        signal_calls = {"count": 0}
+
+        async def _run_current_task_operation(_task_id):
+            order.append("operation")
+            return False
+
+        async def _run_task_runtime_signals(_task_id):
+            order.append("signal")
+            signal_calls["count"] += 1
+            if signal_calls["count"] >= 2:
+                task.status = "success"
+            return False
+
+        async def _execute_task(_task_id):
+            order.append("execute")
+            task.status = "pending"
+            return None
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: runtime_lease
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager._build_expected_sync_requests_from_db = lambda *_args, **_kwargs: [
+            {"operation": "child_sync", "stage_name": "entry_analysis", "item_ids": ["item-1"]}
+        ]
+        manager.cfg.scheduler.stage_poll_interval_seconds = 0
+
+        async def _fast_sleep(_seconds, result=None):
+            return result
+
+        with (
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+            patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep),
+        ):
+            await manager._run_task(task.id)
+
+        self.assertEqual(
+            ["operation", "signal", "execute", "signal"],
+            order,
+        )
+        self.assertFalse(any(event.event_type == "task_runtime_runner_keepalive_exited" for event in db.events))
+
+    async def test_run_task_records_keepalive_exit_reason_to_timeline(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-records-exit-reason",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("run-task-records-keepalive-exit-reason-to-timeline"),
+            runtime_phase="owned_execution",
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+
+        async def _run_current_task_operation(_task_id):
+            return False
+
+        async def _run_task_runtime_signals(_task_id):
+            return False
+
+        async def _execute_task(_task_id):
+            task.status = "paused"
+            return None
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: runtime_lease
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager._build_expected_sync_requests_from_db = lambda *_args, **_kwargs: []
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task(task.id)
+
+        keepalive_exit_events = [event for event in db.events if event.event_type == "task_runtime_runner_keepalive_exited"]
+        self.assertTrue(keepalive_exit_events)
+        self.assertEqual("non_terminal_but_not_keepalive_eligible", keepalive_exit_events[-1].payload.get("reason"))
+
     async def test_run_task_keeps_runtime_alive_for_stage_start_transition_guard(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
@@ -4838,6 +4973,28 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             },
         )()
         self.assertFalse(manager._item_downstream_sync_stale(item))
+
+    def test_item_downstream_sync_stale_forces_periodic_sync_within_60_seconds_budget(self):
+        manager = TaskManager()
+        manager.cfg.scheduler.stage_item_sync_stale_seconds = 300
+        manager.cfg.scheduler.downstream_reconcile_interval_seconds = 60
+        item = type(
+            "Item",
+            (),
+            {
+                "status": "running",
+                "downstream_task_id": "child-1",
+                "result": {
+                    "downstream_status_synced_at": (_now() - timedelta(hours=1)).isoformat(),
+                    "last_sync_attempt_at": (_now() - timedelta(seconds=61)).isoformat(),
+                    "sync_observation": {
+                        "last_attempt_at": (_now() - timedelta(seconds=61)).isoformat(),
+                        "last_success_at": (_now() - timedelta(hours=1)).isoformat(),
+                    },
+                },
+            },
+        )()
+        self.assertTrue(manager._item_downstream_sync_stale(item))
 
     def test_aggregate_stage_items_holds_pending_when_sync_degraded(self):
         manager = TaskManager()
