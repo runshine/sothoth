@@ -1423,7 +1423,7 @@ class TaskRuntimeServiceMixin:
                 with task_manager_module.observe_scheduler_loop("task_dispatch"):
                     self._mark_loop_heartbeat("task_dispatch")
                     self._configure_runtime_session_fast_lock_wait_timeout(db)
-                    self._run_parent_reclaim_pass(db)
+                    self._run_parent_reclaim_pass_for_dispatch(db)
                     service_config = self._load_service_config(db)
                     local_active_count = self._local_active_runtime_count()
                     local_slots = max(
@@ -1456,7 +1456,7 @@ class TaskRuntimeServiceMixin:
                                 local_slots,
                             )
                         if task_id:
-                            claimed_id = self._dispatch_task_by_id(db, task_id)
+                            claimed_id = await self._dispatch_task_by_id_for_dispatch_loop(db, task_id)
                             decision = self._dispatch_claim_decision() or {}
                             if claimed_id:
                                 task = (
@@ -1547,6 +1547,58 @@ class TaskRuntimeServiceMixin:
             finally:
                 with suppress(Exception):
                     db.close()
+
+    def _run_parent_reclaim_pass_for_dispatch(self: TaskManager, db: Session) -> None:
+        try:
+            self._run_parent_reclaim_pass(
+                db,
+                include_owned_execution_takeover_requeue=False,
+            )
+        except TypeError as exc:
+            if "include_owned_execution_takeover_requeue" not in str(exc):
+                raise
+            self._run_parent_reclaim_pass(db)
+
+    async def _dispatch_task_by_id_for_dispatch_loop(self: TaskManager, db: Session, task_id: str) -> str | None:
+        dispatch_method = getattr(self, "_dispatch_task_by_id")
+        if (
+            getattr(dispatch_method, "__self__", None) is self
+            and getattr(dispatch_method, "__func__", None) is getattr(type(self), "_dispatch_task_by_id", None)
+        ):
+            return await self._dispatch_task_by_id_async(db, task_id)
+        claimed = dispatch_method(db, task_id)
+        if inspect.isawaitable(claimed):
+            claimed = await claimed
+        return claimed
+
+    async def _release_task_without_supported_runtime_owner_for_async_path(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        active_operation=None,
+        reason: str,
+    ) -> bool:
+        release_method = getattr(self, "_release_task_without_supported_runtime_owner")
+        if (
+            getattr(release_method, "__self__", None) is self
+            and getattr(release_method, "__func__", None) is getattr(type(self), "_release_task_without_supported_runtime_owner", None)
+        ):
+            return await self._release_task_without_supported_runtime_owner_async(
+                db,
+                task,
+                active_operation=active_operation,
+                reason=reason,
+            )
+        released = release_method(
+            db,
+            task,
+            active_operation=active_operation,
+            reason=reason,
+        )
+        if inspect.isawaitable(released):
+            released = await released
+        return bool(released)
 
     def _record_dispatch_lock_conflict_after_rollback(
         self: TaskManager,
@@ -2099,7 +2151,7 @@ class TaskRuntimeServiceMixin:
             db.commit()
         return claimed_ids
 
-    def _dispatch_task_by_id(self: TaskManager, db: Session, task_id: str) -> str | None:
+    async def _dispatch_task_by_id_async(self: TaskManager, db: Session, task_id: str) -> str | None:
         from app.service import task_manager as task_manager_module
 
         self._set_dispatch_claim_decision(
@@ -2277,7 +2329,7 @@ class TaskRuntimeServiceMixin:
                     should_requeue=False,
                 )
                 return None
-        if operation_requires_runtime_handle and self._release_task_without_supported_runtime_owner(
+        if operation_requires_runtime_handle and await self._release_task_without_supported_runtime_owner_for_async_path(
             db,
             task,
             active_operation=current_operation,
@@ -2297,7 +2349,7 @@ class TaskRuntimeServiceMixin:
             task,
             active_operation=current_operation,
         ):
-            self._release_task_without_supported_runtime_owner(
+            await self._release_task_without_supported_runtime_owner_for_async_path(
                 db,
                 task,
                 active_operation=current_operation,
@@ -2343,7 +2395,7 @@ class TaskRuntimeServiceMixin:
                     str(getattr(current_operation, "status", "") or "").strip().lower() if current_operation is not None else None,
                     runtime_lease_owner,
                 )
-                if self._release_task_without_supported_runtime_owner(
+                if await self._release_task_without_supported_runtime_owner_for_async_path(
                     db,
                     task,
                     active_operation=current_operation,
@@ -2466,7 +2518,7 @@ class TaskRuntimeServiceMixin:
                 return None
             if nonpending_takeover_decision.allow_claim:
                 previous_runtime_lease_owner = nonpending_takeover_decision.runtime_lease_owner
-                released = self._release_task_without_supported_runtime_owner(
+                released = await self._release_task_without_supported_runtime_owner_for_async_path(
                     db,
                     task,
                     active_operation=current_operation,
@@ -2477,7 +2529,7 @@ class TaskRuntimeServiceMixin:
                     and previous_runtime_lease_owner is None
                     and not nonpending_takeover_decision.runtime_lease_active
                 ):
-                    released = self._release_task_without_supported_runtime_owner(
+                    released = await self._release_task_without_supported_runtime_owner_for_async_path(
                         db,
                         task,
                         active_operation=current_operation,
@@ -2715,13 +2767,6 @@ class TaskRuntimeServiceMixin:
             self._clear_pending_shared_dispatch_signal(task)
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
             db.commit()
-            self._set_dispatch_claim_decision(
-                task_id=task_id,
-                claimed_task_id=task_id,
-                blocked_reason=None,
-                should_requeue=False,
-            )
-            return task_id
         except OperationalError as exc:
             if not self._is_retryable_lock_error(exc):
                 raise
@@ -2830,6 +2875,17 @@ class TaskRuntimeServiceMixin:
                 should_requeue=True,
             )
             return None
+        self._set_dispatch_claim_decision(
+            task_id=task_id,
+            claimed_task_id=task_id,
+            blocked_reason=None,
+            should_requeue=False,
+        )
+        return task_id
+
+    def _dispatch_task_by_id(self: TaskManager, db: Session, task_id: str) -> str | None:
+        return self._run_async_blocking(self._dispatch_task_by_id_async(db, task_id))
+
         self._log_dispatch_claim_blocked(
             task_id,
             reason="claim_update_filter_rejected_row",
