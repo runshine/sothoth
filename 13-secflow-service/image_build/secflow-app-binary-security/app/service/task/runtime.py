@@ -3749,8 +3749,8 @@ class TaskRuntimeServiceMixin:
                         )
                         should_remain_active = bool(authoritative_context_active or should_keep_alive)
                     if not should_remain_active:
-                        task_manager_module.logger.warning(
-                            "binary-security run_task keepalive loop exiting after execute pass: "
+                        task_manager_module.logger.info(
+                            "binary-security run_task keepalive loop entering idle wait after execute pass: "
                             "task_id=%s reason=%s status=%s runtime_phase=%s stage=%s authoritative_context_active=%s",
                             task_id,
                             str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
@@ -3759,20 +3759,6 @@ class TaskRuntimeServiceMixin:
                             str(getattr(task_after_execute, "current_stage", "") or "").strip() or None,
                             authoritative_context_active,
                         )
-                        self._record_runtime_runner_exit_event(
-                            runtime_db,
-                            task_after_execute,
-                            event_type="task_runtime_runner_keepalive_exited",
-                            message="本地 runner 已完成当前执行轮次，当前任务不再满足继续保活条件",
-                            source="run_task_keepalive_post_execute",
-                            reason=str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
-                            payload={
-                                "authoritative_context_active": authoritative_context_active,
-                                **dict(keepalive_detail or {}),
-                            },
-                        )
-                        runtime_db.commit()
-                        break
                 finally:
                     runtime_db.close()
                 db.close()
@@ -3819,8 +3805,8 @@ class TaskRuntimeServiceMixin:
                     )
                     if authoritative_context_active or should_keep_alive:
                         continue
-                    task_manager_module.logger.warning(
-                        "binary-security run_task keepalive loop exiting after signal pass: "
+                    task_manager_module.logger.info(
+                        "binary-security run_task keepalive loop entering idle wait after signal pass: "
                         "task_id=%s reason=%s status=%s runtime_phase=%s stage=%s authoritative_context_active=%s",
                         task_id,
                         str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
@@ -3829,20 +3815,6 @@ class TaskRuntimeServiceMixin:
                         str(getattr(task_after_signals, "current_stage", "") or "").strip() or None,
                         authoritative_context_active,
                     )
-                    self._record_runtime_runner_exit_event(
-                        runtime_db,
-                        task_after_signals,
-                        event_type="task_runtime_runner_keepalive_exited",
-                        message="本地 runner 已完成当前执行轮次，signal 处理后当前任务不再满足继续保活条件",
-                        source="run_task_keepalive_post_signal",
-                        reason=str((keepalive_detail or {}).get("reason") or "keepalive_not_required"),
-                        payload={
-                            "authoritative_context_active": authoritative_context_active,
-                            **dict(keepalive_detail or {}),
-                        },
-                    )
-                    runtime_db.commit()
-                    break
                 finally:
                     runtime_db.close()
         except task_manager_module.StaleTaskExecution:

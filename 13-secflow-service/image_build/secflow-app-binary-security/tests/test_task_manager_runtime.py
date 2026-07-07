@@ -646,6 +646,89 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             await heartbeat_task
         manager._workers.pop("task-1", None)
 
+    async def test_run_task_keeps_runner_alive_during_idle_keepalive_window(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("run-task-idle-keepalive"),
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+        heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="heartbeat")
+        sync_handle = _FakeSyncMaintenanceThreadHandle()
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        loop_counter = {"count": 0}
+
+        async def _fast_sleep(_seconds, result=None):
+            loop_counter["count"] += 1
+            if loop_counter["count"] >= 2:
+                raise asyncio.CancelledError
+            return result
+
+        async def _execute_task(*_args, **_kwargs):
+            task.status = "running"
+            return None
+
+        manager._workers["task-1"] = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=current_task,
+            heartbeat_task=heartbeat_task,
+            sync_maintenance_task=sync_handle,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+            owner_active=True,
+        )
+        manager._run_current_task_operation = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._run_task_runtime_signals = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._execute_task = _execute_task
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_transition_guard_active = lambda *_args, **_kwargs: False
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager._task_should_keep_runtime_runner_alive = (
+            lambda *_args, **_kwargs: (False, {"reason": "idle_keepalive_expected"})
+        )
+
+        with (
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+            patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep),
+        ):
+            with suppress(asyncio.CancelledError):
+                await manager._run_task("task-1")
+
+        handle = manager._workers.get("task-1")
+        self.assertIsNotNone(handle)
+        self.assertTrue(handle.owner_active)
+        self.assertFalse(heartbeat_task.done())
+        self.assertFalse(sync_handle.cancelled())
+        self.assertFalse(
+            any(event.event_type == "task_runtime_runner_keepalive_exited" for event in db.events)
+        )
+
+        handle.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+        manager._workers.pop("task-1", None)
+
     async def test_task_heartbeat_handoffs_active_serial_control_operation(self):
         manager = TaskManager()
         manager._running = True
