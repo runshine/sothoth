@@ -362,6 +362,7 @@ class _FakeTaskSyncQueue:
         self.entries_by_task: dict[str, list[dict[str, object]]] = {}
         self.repair_locks: dict[str, str] = {}
         self.parent_takeover_locks: dict[str, str] = {}
+        self.dispatch_claim_locks: dict[str, str] = {}
         self.owner_signals: dict[tuple[str, str], dict[str, object]] = {}
         self.pushed_tasks: list[dict[str, object]] = []
         self.delete_tasks: list[dict[str, object]] = []
@@ -537,6 +538,22 @@ class _FakeTaskSyncQueue:
         if self.parent_takeover_locks.get(task_id) != str(owner_token):
             return False
         self.parent_takeover_locks.pop(task_id, None)
+        return True
+
+    async def acquire_dispatch_claim_lock(self, task_id: str, owner_token: str, *, ttl_seconds: int = 30, context: str = "test"):
+        del ttl_seconds, context
+        task_id = str(task_id)
+        if task_id in self.dispatch_claim_locks:
+            return False
+        self.dispatch_claim_locks[task_id] = str(owner_token)
+        return True
+
+    async def release_dispatch_claim_lock(self, task_id: str, owner_token: str, *, context: str = "test"):
+        del context
+        task_id = str(task_id)
+        if self.dispatch_claim_locks.get(task_id) != str(owner_token):
+            return False
+        self.dispatch_claim_locks.pop(task_id, None)
         return True
 
     def refresh(self, obj):

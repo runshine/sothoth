@@ -35,6 +35,14 @@ class ParentTakeoverLock:
     instance_id: str | None = None
 
 
+@dataclass(frozen=True)
+class DispatchClaimLock:
+    task_id: str
+    lock_token: str
+    ttl_seconds: int
+    instance_id: str | None = None
+
+
 class RedisSelfHealingClientHelper:
     def __init__(
         self,
@@ -745,6 +753,10 @@ class TaskQueue:
         prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
         return f"{prefix}:parent_takeover_lock:{str(task_id or '').strip()}"
 
+    def _dispatch_claim_lock_key(self, task_id: str) -> str:
+        prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
+        return f"{prefix}:dispatch_claim_lock:{str(task_id or '').strip()}"
+
     async def acquire_parent_takeover_lock(
         self,
         task_id: str,
@@ -794,6 +806,60 @@ class TaskQueue:
         return bool(
             await self._execute_with_client_rebuild_forever(
                 "release_parent_takeover_lock",
+                context=context,
+                fn=_release,
+            )
+        )
+
+    async def acquire_dispatch_claim_lock(
+        self,
+        task_id: str,
+        *,
+        owner_token: str,
+        ttl_seconds: int = 30,
+        context: str = "dispatch_claim_lock",
+    ) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner_token = str(owner_token or "").strip()
+        if not normalized_task_id or not normalized_owner_token:
+            return False
+        lock_key = self._dispatch_claim_lock_key(normalized_task_id)
+        return bool(
+            await self._execute_with_client_rebuild_forever(
+                "acquire_dispatch_claim_lock",
+                context=context,
+                fn=lambda client: client.set(
+                    lock_key,
+                    normalized_owner_token,
+                    ex=max(1, int(ttl_seconds or 30)),
+                    nx=True,
+                ),
+            )
+        )
+
+    async def release_dispatch_claim_lock(
+        self,
+        task_id: str,
+        owner_token: str,
+        *,
+        context: str = "dispatch_claim_unlock",
+    ) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_owner_token = str(owner_token or "").strip()
+        if not normalized_task_id or not normalized_owner_token:
+            return False
+        lock_key = self._dispatch_claim_lock_key(normalized_task_id)
+
+        async def _release(client: Redis):
+            current = await client.get(lock_key)
+            if str(current or "").strip() != normalized_owner_token:
+                return False
+            await client.delete(lock_key)
+            return True
+
+        return bool(
+            await self._execute_with_client_rebuild_forever(
+                "release_dispatch_claim_lock",
                 context=context,
                 fn=_release,
             )

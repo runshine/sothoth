@@ -166,7 +166,7 @@ from app.service.fileserver import get_fileserver_client
 from app.service.security import app_task_root, ensure_dir, validate_task_id
 from app.service.state_event_inbox_metrics_snapshot import get_state_event_inbox_metrics_snapshot_store
 from app.service.readless_sync import ReadlessSyncStats, run_readless_sync_loop
-from app.service.task_queue import ParentTakeoverLock, get_task_queue
+from app.service.task_queue import DispatchClaimLock, ParentTakeoverLock, get_task_queue
 from app.service.task.archive import TaskArchiveServiceMixin
 from app.service.task.contracts import TaskContractServiceMixin
 from app.service.task.control import TaskControlServiceMixin
@@ -681,6 +681,7 @@ class TaskRuntimeHandle:
     runner_generation: int = 0
     last_wakeup_at: datetime | None = None
     sync_maintenance_in_progress: bool = False
+    dispatch_claim_lock: DispatchClaimLock | None = None
 
     def done(self) -> bool:
         heartbeat_done = self.heartbeat_task is None or self.heartbeat_task.done()
@@ -737,6 +738,14 @@ class ParentTakeoverAttemptResult:
     acquired: bool
     task_id: str
     lock: ParentTakeoverLock | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DispatchClaimAttemptResult:
+    acquired: bool
+    task_id: str
+    lock: DispatchClaimLock | None = None
     reason: str | None = None
 
 
@@ -2379,7 +2388,12 @@ class TaskManager(
             return True
         return not self._should_continue_parent_lease_heartbeat(db, task, handle)
 
-    async def _start_task_runtime(self, task_id: str) -> bool:
+    async def _start_task_runtime(
+        self,
+        task_id: str,
+        *,
+        dispatch_claim_lock: DispatchClaimLock | None = None,
+    ) -> bool:
         from app.service import task_manager as task_manager_module
 
         normalized_task_id = str(task_id or "").strip()
@@ -2417,6 +2431,7 @@ class TaskManager(
                 execution_token=None,
                 lease_owner_instance_id=str(self.instance_id or "").strip() or None,
                 sync_maintenance_task=sync_maintenance_task,
+                dispatch_claim_lock=dispatch_claim_lock,
             )
             self._workers[normalized_task_id] = handle
             sync_maintenance_task.thread.start()
@@ -3160,6 +3175,84 @@ class TaskManager(
 
     def _parent_takeover_lock_ttl_seconds(self) -> int:
         return 60
+
+    def _dispatch_claim_lock_ttl_seconds(self) -> int:
+        return 30
+
+    async def _acquire_dispatch_claim_lock_async(
+        self,
+        task_id: str,
+        *,
+        context: str,
+    ) -> DispatchClaimAttemptResult:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return DispatchClaimAttemptResult(acquired=False, task_id=normalized_task_id, reason="missing_task_id")
+        owner_token = f"{str(self.instance_id or '').strip() or 'unknown'}:{uuid.uuid4().hex}"
+        queue = get_task_queue()
+        acquire_method = getattr(queue, "acquire_dispatch_claim_lock", None)
+        if callable(acquire_method):
+            acquired = bool(
+                await acquire_method(
+                    normalized_task_id,
+                    owner_token=owner_token,
+                    ttl_seconds=self._dispatch_claim_lock_ttl_seconds(),
+                    context=context,
+                )
+            )
+            if not acquired:
+                return DispatchClaimAttemptResult(
+                    acquired=False,
+                    task_id=normalized_task_id,
+                    reason="dispatch_claim_lock_contended",
+                )
+        return DispatchClaimAttemptResult(
+            acquired=True,
+            task_id=normalized_task_id,
+            lock=DispatchClaimLock(
+                task_id=normalized_task_id,
+                lock_token=owner_token,
+                ttl_seconds=self._dispatch_claim_lock_ttl_seconds(),
+                instance_id=str(self.instance_id or "").strip() or None,
+            ),
+        )
+
+    async def _release_dispatch_claim_lock_async(
+        self,
+        lock: DispatchClaimLock | None,
+        *,
+        context: str,
+    ) -> bool:
+        if lock is None:
+            return False
+        queue = get_task_queue()
+        release_method = getattr(queue, "release_dispatch_claim_lock", None)
+        if not callable(release_method):
+            return True
+        return bool(
+            await release_method(
+                lock.task_id,
+                lock.lock_token,
+                context=context,
+            )
+        )
+
+    async def _release_dispatch_claim_lock_for_task_async(
+        self,
+        task_id: str,
+        *,
+        context: str,
+    ) -> bool:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        lock: DispatchClaimLock | None = None
+        async with self._worker_lock:
+            handle = self._workers.get(normalized_task_id)
+            if handle is not None:
+                lock = handle.dispatch_claim_lock
+                handle.dispatch_claim_lock = None
+        return await self._release_dispatch_claim_lock_async(lock, context=context)
 
     async def _acquire_parent_takeover_lock_async(
         self,

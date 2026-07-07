@@ -285,6 +285,27 @@ class TaskQueueTests(unittest.TestCase):
         self.assertTrue(released)
         self.assertTrue(reacquired)
 
+    def test_dispatch_claim_lock_acquire_and_release(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            acquired = await queue.acquire_dispatch_claim_lock("task-1", owner_token="owner-1", ttl_seconds=30)
+            duplicate = await queue.acquire_dispatch_claim_lock("task-1", owner_token="owner-2", ttl_seconds=30)
+            released_mismatch = await queue.release_dispatch_claim_lock("task-1", "owner-2")
+            released = await queue.release_dispatch_claim_lock("task-1", "owner-1")
+            reacquired = await queue.acquire_dispatch_claim_lock("task-1", owner_token="owner-3", ttl_seconds=30)
+            return acquired, duplicate, released_mismatch, released, reacquired
+
+        acquired, duplicate, released_mismatch, released, reacquired = asyncio.run(_exercise())
+
+        self.assertTrue(acquired)
+        self.assertFalse(duplicate)
+        self.assertFalse(released_mismatch)
+        self.assertTrue(released)
+        self.assertTrue(reacquired)
+
     def test_dedupe_orphans_reports_set_without_list(self):
         queue = TaskQueue()
         fake = _FakeRedis()
