@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 import unittest
+import uuid
 from datetime import timedelta, datetime
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -23,7 +24,7 @@ from app.model import (
     TASK_TYPE_SOURCE,
 )
 from app.service import task_manager as task_manager_module
-from app.service.task_manager import StaleTaskExecution, TaskManager, _now
+from app.service.task_manager import StaleTaskExecution, TaskManager, UpstreamError, _now
 from app.service.task_queue import REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, REDIS_SOCKET_TIMEOUT_SECONDS, TaskQueue
 from test_task_manager import _FakeTaskSyncQueue, _ModelAwareDb
 
@@ -2740,7 +2741,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_source="project_filesystem",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=f"/tmp/ws-{uuid.uuid4().hex}",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         db = _ModelAwareDb(tasks=[task], events=[])
@@ -4046,20 +4047,25 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _sleep(_seconds):
             return None
 
-        async def _fetch():
+        def _load_snapshot(*_args, **_kwargs):
             calls["count"] += 1
             if calls["count"] == 1:
                 raise OperationalError("stmt", {}, RuntimeError("connection refused"))
-            return {"status": "success"}
+            return {
+                "item_status": "success",
+                "payload": {"status": "success", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._record_polled_child_sync_failure = _record_failure
         manager._run_current_task_operation = _cancelled
+        manager._load_local_polled_item_snapshot = _load_snapshot
+        manager._request_authoritative_child_sync_during_wait = AsyncMock()
 
         with patch("app.service.task_manager.asyncio.sleep", _sleep):
             status, payload = await manager._poll_until_terminal(
-                _fetch,
+                None,
                 success_statuses={"success"},
                 failure_statuses={"failed", "cancelled"},
                 task=task,
@@ -4067,7 +4073,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual("success", status)
-        self.assertEqual({"status": "success"}, payload)
+        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
         self.assertEqual(2, calls["count"])
         self.assertEqual(1, len(failures))
         self.assertEqual("db_connection_refused", failures[0]["error_type"])
@@ -4084,16 +4090,18 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         def _record_failure(**kwargs):
             failures.append(kwargs)
 
-        async def _fetch():
+        def _load_snapshot(*_args, **_kwargs):
             raise RuntimeError("任务 task-1 当前 owned_execution runtime lease owner 已变更")
 
         manager._ensure_task_execution_current_async = _ensure
         manager._record_polled_child_sync_failure = _record_failure
         manager._run_current_task_operation = _ensure
+        manager._load_local_polled_item_snapshot = _load_snapshot
+        manager._request_authoritative_child_sync_during_wait = AsyncMock()
 
         with self.assertRaises(StaleTaskExecution):
             await manager._poll_until_terminal(
-                _fetch,
+                None,
                 success_statuses={"success"},
                 failure_statuses={"failed", "cancelled"},
                 task=task,
@@ -4107,8 +4115,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         task = BinarySecurityTask(id="task-1", project_id="project-1")
         item = type("Item", (), {"id": "item-1", "downstream_task_id": "child-1"})()
         operation_passes: list[str] = []
-        fetch_calls: list[str] = []
-
         async def _ensure(_task):
             return None
 
@@ -4119,16 +4125,19 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             operation_passes.append(task_id)
             return len(operation_passes) == 1
 
-        async def _fetch():
-            fetch_calls.append("fetch")
-            return {"status": "success"}
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "success",
+                "payload": {"status": "success", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _run_operation
+        manager._load_local_polled_item_snapshot = _load_snapshot
 
         status, payload = await manager._poll_until_terminal(
-            _fetch,
+            None,
             success_statuses={"success"},
             failure_statuses={"failed", "cancelled"},
             task=task,
@@ -4136,11 +4145,10 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual("success", status)
-        self.assertEqual({"status": "success"}, payload)
+        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
         self.assertEqual(["task-1", "task-1"], operation_passes)
-        self.assertEqual(["fetch"], fetch_calls)
 
-    async def test_poll_until_terminal_logs_waiting_progress_for_long_running_child(self):
+    async def test_poll_until_terminal_defers_immediately_for_nonterminal_local_authoritative_state(self):
         manager = TaskManager()
         task = BinarySecurityTask(id="task-1", project_id="project-1", current_stage="dataflow_vuln_scan")
         item = type(
@@ -4153,7 +4161,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
                 "downstream_task_id": "child-1",
             },
         )()
-        fetch_calls = 0
 
         async def _ensure(_task):
             return None
@@ -4161,42 +4168,28 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _cancelled(_task_id):
             return False
 
-        async def _fetch():
-            nonlocal fetch_calls
-            fetch_calls += 1
-            if fetch_calls == 1:
-                return {"status": "running", "task_id": "child-1"}
-            return {"status": "success", "task_id": "child-1"}
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "running",
+                "payload": {"status": "running", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _cancelled
         manager._refresh_polled_child_sync_snapshot = lambda **_kwargs: None
+        manager._load_local_polled_item_snapshot = _load_snapshot
 
-        with (
-            patch("app.service.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)),
-            patch("app.service.task_manager.logger.info") as info_log,
-        ):
-            status, payload = await manager._poll_until_terminal(
-                _fetch,
-                success_statuses={"success"},
-                failure_statuses={"failed", "cancelled"},
-                task=task,
-                item=item,
-            )
-
-        self.assertEqual("success", status)
-        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
-        waiting_calls = [
-            call
-            for call in info_log.call_args_list
-            if call.args and call.args[0] == "binary-security downstream poll waiting: task_id=%s stage=%s item_id=%s item_key=%s downstream_task_id=%s downstream_status=%s poll_count=%s waited_seconds=%s"
-        ]
-        self.assertEqual(1, len(waiting_calls))
-        self.assertEqual(
-            ("task-1", "dataflow_vuln_scan", "item-1", "entry-1", "child-1", "running", 1),
-            waiting_calls[0].args[1:8],
+        status, payload = await manager._poll_until_terminal(
+            None,
+            success_statuses={"success"},
+            failure_statuses={"failed", "cancelled"},
+            task=task,
+            item=item,
         )
+
+        self.assertEqual("running", status)
+        self.assertEqual({"status": "running", "task_id": "child-1"}, payload)
 
     async def test_poll_until_terminal_treats_completed_limited_as_success(self):
         manager = TaskManager()
@@ -4209,15 +4202,19 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _cancelled(_task_id):
             return False
 
-        async def _fetch():
-            return {"status": "completed_limited", "task_id": "child-1"}
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "success",
+                "payload": {"status": "completed_limited", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _cancelled
+        manager._load_local_polled_item_snapshot = _load_snapshot
 
         status, payload = await manager._poll_until_terminal(
-            _fetch,
+            None,
             success_statuses={"passed", "success", "completed_limited"},
             failure_statuses={"failed", "cancelled", "invalid_input"},
             task=task,
@@ -4226,6 +4223,54 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("success", status)
         self.assertEqual({"status": "completed_limited", "task_id": "child-1"}, payload)
+
+    async def test_poll_until_terminal_runs_fetch_and_operation_drain_via_async_bridge_thread_handoff(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        item = type("Item", (), {"id": "item-1", "downstream_task_id": "child-1"})()
+        bridge_calls: list[str] = []
+        operation_calls: list[str] = []
+
+        async def _ensure(_task):
+            return None
+
+        async def _cancelled(_task_id):
+            return False
+
+        async def _run_operation(_task_id: str) -> bool:
+            operation_calls.append("run")
+            return False
+
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "success",
+                "payload": {"status": "success", "task_id": "child-1"},
+            }
+
+        def _fake_bridge(coro):
+            code = getattr(coro, "cr_code", None)
+            bridge_calls.append(code.co_name if code is not None else type(coro).__name__)
+            return asyncio.run(coro)
+
+        manager._ensure_task_execution_current_async = _ensure
+        manager._is_task_cancelled_async = _cancelled
+        manager._run_current_task_operation = _run_operation
+        manager._run_async_blocking = _fake_bridge
+        manager._record_polled_child_sync_failure = lambda **_kwargs: None
+        manager._load_local_polled_item_snapshot = _load_snapshot
+
+        status, payload = await manager._poll_until_terminal(
+            None,
+            success_statuses={"success"},
+            failure_statuses={"failed", "cancelled"},
+            task=task,
+            item=item,
+        )
+
+        self.assertEqual("success", status)
+        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
+        self.assertEqual(["_run_operation"], bridge_calls)
+        self.assertEqual(["run"], operation_calls)
 
     async def test_ensure_task_execution_current_async_uses_normalized_legacy_tail_phase(self):
         manager = TaskManager()

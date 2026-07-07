@@ -35,6 +35,88 @@ class TaskDownstreamServiceMixin:
     CHILD_TRANSITION_DESTRUCTIVE_REBUILD = "destructive_rebuild"
     _ARCHIVE_NONBLOCKING_STATUSES = frozenset({"superseded", "ignored"})
 
+    def _defer_item_with_previous_authoritative_result(
+        self: TaskManager,
+        session: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        operation: str,
+        response_item: dict[str, Any],
+        local_status: str | None,
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        observed_status = str(local_status or item.status or "").strip().lower() or "pending"
+        if observed_status in {"dispatching", "queued"}:
+            returned_status = "pending"
+        elif observed_status in {"running", "pending"}:
+            returned_status = observed_status
+        else:
+            returned_status = "pending"
+        item.status = "running" if str(item.downstream_task_id or "").strip() else item.status
+        item.finished_at = None
+        self._mark_stage_item_sync_observation(
+            item,
+            sync_status="observed",
+            synced_at=task_manager_module._now(),
+            error_message=None,
+            error_type=None,
+            http_status=None,
+            status_raw=str((payload or {}).get("status") or observed_status),
+            mapped_status=observed_status,
+            downstream_status=str((payload or {}).get("status") or observed_status),
+            state_applied=False,
+            downstream_payload=payload,
+            clear_error_state=False,
+        )
+        session.commit()
+        previous_result = dict(self._load_stage_item_result_payload(item) or {})
+        returned_item = dict(response_item or {})
+        if previous_result:
+            returned_item = {
+                **returned_item,
+                **previous_result,
+            }
+        return {
+            "status": returned_status,
+            "error": None,
+            "item": returned_item,
+            "deferred_mode": "authoritative_sync",
+            "sync_degraded": False,
+            "authoritative_waiting": True,
+        }
+
+    async def _poll_item_until_local_terminal_or_defer(
+        self: TaskManager,
+        session: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        operation: str,
+        response_item: dict[str, Any],
+        fetcher,
+        success_statuses: set[str],
+        failure_statuses: set[str],
+    ) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+        status, payload = await self._poll_until_terminal(
+            fetcher,
+            success_statuses=success_statuses,
+            failure_statuses=failure_statuses,
+            task=task,
+            item=item,
+        )
+        if str(status or "").strip().lower() in {"pending", "queued", "dispatching", "running"}:
+            return None, None, self._defer_item_with_previous_authoritative_result(
+                session,
+                task,
+                item,
+                operation=operation,
+                response_item=response_item,
+                local_status=status,
+                payload=payload,
+            )
+        return status, payload, None
+
     def _increment_stage_item_rebuild_rerun_count(
         self: TaskManager,
         item: BinarySecurityStageItem,

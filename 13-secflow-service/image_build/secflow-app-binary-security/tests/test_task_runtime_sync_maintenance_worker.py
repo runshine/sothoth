@@ -131,6 +131,54 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(processed.is_set())
 
+    async def test_sync_maintenance_services_periodic_db_fact_reconcile_before_queue_drain(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        handle = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=asyncio.current_task(),
+            heartbeat_task=None,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+        )
+        manager._workers["task-1"] = handle
+        manager._verify_local_runtime_lease_or_abort = lambda *_args, **_kwargs: task_manager_module._RuntimeLeaseOwnershipDecision(
+            should_continue=True,
+            runtime_lease_present=True,
+            runtime_lease_active=True,
+            runtime_lease_owner="worker-a",
+            local_handle_alive=True,
+        )
+        calls: list[str] = []
+
+        async def _reconcile(_task_id):
+            calls.append("reconcile")
+            return 1
+
+        async def _drain(*_args, **_kwargs):
+            calls.append("drain")
+            return False
+
+        manager._reconcile_periodic_task_sync_requests = _reconcile
+        manager._drain_local_runtime_sync_queue_once = _drain
+
+        fake_queue = type(
+            "_FakeQueue",
+            (),
+            {
+                "consume_owner_signal": AsyncMock(return_value=None),
+            },
+        )()
+        with patch("app.service.task_manager.get_task_queue", return_value=fake_queue):
+            processed = await manager._service_local_runtime_sync_maintenance("task-1")
+
+        self.assertTrue(processed)
+        self.assertEqual(["reconcile", "drain"], calls)
+
     async def test_sync_maintenance_worker_thread_does_not_exit_only_because_runner_task_is_done(self):
         manager = TaskManager()
         manager._running = True
@@ -215,6 +263,40 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             [("project-1", "task-1", "entry_analysis", ["item-1"], True)],
             calls,
         )
+
+    async def test_process_task_sync_entry_blocking_uses_async_bridge_instead_of_direct_asyncio_run(self):
+        manager = TaskManager()
+        bridge_calls: list[str] = []
+
+        class _FakeSession:
+            def close(self):
+                return None
+
+        async def _fake_sync(*_args, **_kwargs):
+            return None
+
+        def _fake_bridge(coro):
+            bridge_calls.append(type(coro).__name__)
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+        manager.sync_downstream_status = _fake_sync
+        manager._run_async_blocking = _fake_bridge
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: _FakeSession()):
+            await asyncio.to_thread(
+                manager._process_task_sync_entry_blocking,
+                "project-1",
+                "task-1",
+                "child_sync",
+                "entry_analysis",
+                ["item-1"],
+                False,
+            )
+
+        self.assertEqual(["coroutine"], bridge_calls)
 
     async def test_sync_maintenance_worker_exits_after_lease_loss(self):
         manager = TaskManager()
