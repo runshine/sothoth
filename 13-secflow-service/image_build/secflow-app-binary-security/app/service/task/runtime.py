@@ -3192,20 +3192,47 @@ class TaskRuntimeServiceMixin:
         if isinstance(db, Session):
             session_factory = task_manager_module.get_session_factory()
             reclaimed = False
-            for task_id in self._stale_dispatching_candidate_task_ids(db):
+            candidate_task_ids = self._stale_dispatching_candidate_task_ids(db)
+            if candidate_task_ids:
+                task_manager_module.logger.info(
+                    "binary-security stale dispatching reclaim pass candidates: candidate_count=%s task_ids=%s",
+                    len(candidate_task_ids),
+                    candidate_task_ids,
+                )
+            for index, task_id in enumerate(candidate_task_ids, start=1):
+                task_manager_module.logger.info(
+                    "binary-security stale dispatching reclaim candidate started: index=%s candidate_count=%s task_id=%s",
+                    index,
+                    len(candidate_task_ids),
+                    task_id,
+                )
                 item_db = session_factory()
                 try:
                     item_reclaimed = self._reclaim_stale_dispatching_single_task_locked(item_db, task_id)
                     if item_reclaimed:
                         item_db.commit()
                         reclaimed = True
+                        task_manager_module.logger.info(
+                            "binary-security stale dispatching reclaim candidate finished: index=%s candidate_count=%s task_id=%s reclaimed=true",
+                            index,
+                            len(candidate_task_ids),
+                            task_id,
+                        )
                     else:
                         item_db.rollback()
+                        task_manager_module.logger.info(
+                            "binary-security stale dispatching reclaim candidate finished: index=%s candidate_count=%s task_id=%s reclaimed=false",
+                            index,
+                            len(candidate_task_ids),
+                            task_id,
+                        )
                 except OperationalError as exc:
                     item_db.rollback()
                     if self._is_retryable_lock_error(exc):
                         task_manager_module.logger.info(
-                            "binary-security stale dispatching reclaim deferred by lock conflict: task_id=%s",
+                            "binary-security stale dispatching reclaim deferred by lock conflict: index=%s candidate_count=%s task_id=%s",
+                            index,
+                            len(candidate_task_ids),
                             task_id,
                         )
                         continue
