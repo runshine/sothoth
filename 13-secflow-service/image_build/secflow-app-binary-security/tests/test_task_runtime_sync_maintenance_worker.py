@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.service import task_manager as task_manager_module
+from app.service import http_client as http_client_module
 from app.service.task_manager import TaskManager, _now
 
 
@@ -224,6 +225,59 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(heartbeat_task, return_exceptions=True)
 
         self.assertEqual(1, processed_calls["count"])
+
+    async def test_sync_maintenance_thread_reuses_single_loop_for_multiple_passes(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="hb")
+        stop_event = threading.Event()
+        handle = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=asyncio.current_task(),
+            heartbeat_task=heartbeat_task,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+        )
+        manager._workers["task-1"] = handle
+        manager._verify_local_runtime_lease_or_abort = lambda *_args, **_kwargs: task_manager_module._RuntimeLeaseOwnershipDecision(
+            should_continue=True,
+            runtime_lease_present=True,
+            runtime_lease_active=True,
+            runtime_lease_owner="worker-a",
+            local_handle_alive=True,
+        )
+        loop_ids: list[int] = []
+        call_count = {"count": 0}
+
+        async def _local_service(_task_id: str) -> bool:
+            call_count["count"] += 1
+            client = await http_client_module.get_shared_async_client("sync-maint-test", timeout=3)
+            self.assertFalse(client.is_closed)
+            loop_ids.append(id(asyncio.get_running_loop()))
+            if call_count["count"] >= 2:
+                manager._running = False
+                stop_event.set()
+            return True
+
+        manager._service_local_runtime_sync_maintenance = _local_service
+
+        try:
+            await asyncio.to_thread(
+                manager._run_task_sync_maintenance_thread_worker,
+                "task-1",
+                stop_event,
+            )
+        finally:
+            stop_event.set()
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+        self.assertGreaterEqual(len(loop_ids), 2)
+        self.assertEqual(1, len(set(loop_ids)))
 
     async def test_process_task_sync_entry_blocking_runs_child_sync_with_thread_owned_session(self):
         manager = TaskManager()

@@ -231,6 +231,7 @@ from app.service.task.shared import (
 )
 from app.service.task_queue import get_task_queue
 from app.service.http_client import get_shared_async_client
+from app.service.http_client import close_async_clients_for_current_loop
 from app.service.stages.registry import get_binary_security_stage_registry
 from app.service.knowledge_graph_audit import get_knowledge_graph_audit_client
 from app.service.llm_gateway import LLMGatewayWorkKeyIssueError, get_llm_gateway_client
@@ -706,6 +707,8 @@ class TaskRuntimeThreadHandle:
     stop_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
     cancel_requested: bool = False
+    loop_ready: threading.Event = field(default_factory=threading.Event)
+    event_loop: asyncio.AbstractEventLoop | None = None
 
     def done(self) -> bool:
         return self.done_event.is_set() or not self.thread.is_alive()
@@ -2273,11 +2276,33 @@ class TaskManager(
         thread_name = f"binary-security-sync-maintenance-{normalized_task_id}"
         stop_event = threading.Event()
         done_event = threading.Event()
+        loop_ready = threading.Event()
+        handle = TaskRuntimeThreadHandle(
+            name=thread_name,
+            thread=None,  # type: ignore[arg-type]
+            stop_event=stop_event,
+            done_event=done_event,
+            loop_ready=loop_ready,
+        )
 
         def _worker() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            handle.event_loop = loop
+            handle.loop_ready.set()
             try:
-                self._run_task_sync_maintenance_thread_worker(normalized_task_id, stop_event)
+                self._run_task_sync_maintenance_thread_worker(normalized_task_id, stop_event, loop)
             finally:
+                try:
+                    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.run_until_complete(close_async_clients_for_current_loop())
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
                 done_event.set()
 
         thread = threading.Thread(
@@ -2285,12 +2310,7 @@ class TaskManager(
             name=thread_name,
             daemon=True,
         )
-        handle = TaskRuntimeThreadHandle(
-            name=thread_name,
-            thread=thread,
-            stop_event=stop_event,
-            done_event=done_event,
-        )
+        handle.thread = thread
         return handle
 
     def _request_local_worker_control_wakeup_nowait(
@@ -2700,7 +2720,13 @@ class TaskManager(
         self,
         task_id: str,
         stop_event: threading.Event,
+        loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
+        owns_loop = False
+        if loop is None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            owns_loop = True
         interval_seconds = max(
             1,
             int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
@@ -2733,7 +2759,13 @@ class TaskManager(
                 if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
                     return
                 try:
-                    processed = self._service_local_runtime_sync_maintenance_blocking(task_id)
+                    service_blocking = self._service_local_runtime_sync_maintenance_blocking
+                    try:
+                        processed = service_blocking(task_id, loop=loop)
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'loop'" not in str(exc):
+                            raise
+                        processed = service_blocking(task_id)
                     if processed:
                         self._mark_runtime_handle_sync_progress(task_id)
                 except StaleTaskExecution:
@@ -2745,6 +2777,8 @@ class TaskManager(
                     )
                     stop_event.wait(2)
                     continue
+                if not self._running or stop_event.is_set():
+                    return
                 stop_event.wait(interval_seconds)
         finally:
             handle = self._runtime_handle(task_id)
@@ -2768,6 +2802,17 @@ class TaskManager(
                 exit_payload["runner_done"],
                 exit_payload["heartbeat_done"],
             )
+            if owns_loop:
+                try:
+                    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                    for current in pending:
+                        current.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.run_until_complete(close_async_clients_for_current_loop())
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
 
     def _verify_local_runtime_lease_or_abort(
         self,
@@ -2899,7 +2944,26 @@ class TaskManager(
         finally:
             handle.sync_maintenance_in_progress = False
 
-    def _service_local_runtime_sync_maintenance_blocking(self, task_id: str) -> bool:
+    def _service_local_runtime_sync_maintenance_blocking(
+        self,
+        task_id: str,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> bool:
+        target_loop = loop
+        if target_loop is not None and not target_loop.is_closed():
+            try:
+                current_loop = asyncio.get_event_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is target_loop and not target_loop.is_running():
+                return bool(target_loop.run_until_complete(self._service_local_runtime_sync_maintenance(task_id)))
+            if target_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._service_local_runtime_sync_maintenance(task_id),
+                    target_loop,
+                )
+                return bool(future.result())
         return asyncio.run(self._service_local_runtime_sync_maintenance(task_id))
 
     async def _reconcile_periodic_task_sync_requests(self, task_id: str) -> int:
