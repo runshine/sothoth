@@ -1481,76 +1481,100 @@ class TaskRuntimeServiceMixin:
                                 local_slots,
                             )
                         if task_id:
-                            claimed_id = await self._dispatch_task_by_id_for_dispatch_loop(db, task_id)
-                            decision = self._dispatch_claim_decision() or {}
-                            if claimed_id:
-                                task = (
-                                    db.query(task_manager_module.BinarySecurityTask)
-                                    .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
-                                    .first()
-                                )
-                                runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_log_view(db, task)
-                                task_manager_module.logger.info(
-                                    "binary-security dispatch claimed task and is attempting runtime start: "
-                                    "task_id=%s queue_task_id=%s status=%s runtime_phase=%s runtime_lease_owner=%s "
-                                    "current_operation_id=%s runtime_lease_expires_at=%s",
-                                    claimed_id,
+                            claim_attempt = await self._acquire_dispatch_claim_lock_async(
+                                task_id,
+                                context="dispatch_claim_lock",
+                            )
+                            if not claim_attempt.acquired:
+                                await self._cooldown_unclaimed_dispatch_task_after_pop(
+                                    db,
                                     task_id,
-                                    str(getattr(task, "status", "") or "").strip() if task is not None else "",
-                                    str(self._task_runtime_phase(task)) if task is not None else "",
-                                    runtime_lease_owner,
-                                    str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else "",
-                                    runtime_lease_expires_at,
+                                    reason=str(claim_attempt.reason or "dispatch_claim_lock_contended").strip() or None,
+                                    cooldown_seconds=self._dispatch_claim_handoff_cooldown_seconds(),
                                 )
-                                started = await self._start_task_runtime(claimed_id)
-                                if started:
-                                    task_manager_module.logger.info(
-                                        "binary-security dispatch successfully handed task to local runtime: "
-                                        "task_id=%s queue_task_id=%s local_handle_present=%s",
-                                        claimed_id,
-                                        task_id,
-                                        self._runtime_handle(claimed_id) is not None,
-                                    )
-                                else:
+                                continue
+                            dispatch_claim_lock = claim_attempt.lock
+                            try:
+                                claimed_id = await self._dispatch_task_by_id_for_dispatch_loop(db, task_id)
+                                decision = self._dispatch_claim_decision() or {}
+                                if claimed_id:
                                     task = (
                                         db.query(task_manager_module.BinarySecurityTask)
                                         .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
                                         .first()
                                     )
-                                    current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else ""
-                                    current_status = str(getattr(task, "status", "") or "").strip() if task is not None else ""
-                                    runtime_lease_owner, _runtime_lease_expires_at = self._runtime_lease_log_view(db, task)
-                                    runtime_phase = str(self._task_runtime_phase(task)) if task is not None else ""
-                                    handle = self._runtime_handle(claimed_id)
-                                    task_manager_module.logger.warning(
-                                        "binary-security dispatch claimed task but runtime start returned false: task_id=%s queue_task_id=%s "
-                                        "status=%s runtime_phase=%s runtime_lease_owner=%s current_operation_id=%s "
-                                        "local_handle_present=%s local_handle_done=%s local_handle_cancel_requested=%s",
+                                    runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_log_view(db, task)
+                                    task_manager_module.logger.info(
+                                        "binary-security dispatch claimed task and is attempting runtime start: "
+                                        "task_id=%s queue_task_id=%s status=%s runtime_phase=%s runtime_lease_owner=%s "
+                                        "current_operation_id=%s runtime_lease_expires_at=%s",
                                         claimed_id,
                                         task_id,
-                                        current_status,
-                                        runtime_phase,
+                                        str(getattr(task, "status", "") or "").strip() if task is not None else "",
+                                        str(self._task_runtime_phase(task)) if task is not None else "",
                                         runtime_lease_owner,
-                                        current_operation_id,
-                                        handle is not None,
-                                        handle.done() if handle is not None else None,
-                                        getattr(handle, "cancel_requested", None) if handle is not None else None,
+                                        str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else "",
+                                        runtime_lease_expires_at,
                                     )
-                            else:
-                                if decision.get("cooldown_seconds"):
-                                    await self._cooldown_unclaimed_dispatch_task_after_pop(
-                                        db,
-                                        task_id,
-                                        reason=str(decision.get("blocked_reason", "") or "").strip() or None,
-                                        cooldown_seconds=int(decision.get("cooldown_seconds") or 0),
+                                    started = await self._start_task_runtime_for_dispatch_loop(
+                                        claimed_id,
+                                        dispatch_claim_lock=dispatch_claim_lock,
                                     )
-                                elif bool(decision.get("should_requeue", True)):
-                                    await self._requeue_unclaimed_dispatch_task(db, task_id)
+                                    if started:
+                                        dispatch_claim_lock = None
+                                        task_manager_module.logger.info(
+                                            "binary-security dispatch successfully handed task to local runtime: "
+                                            "task_id=%s queue_task_id=%s local_handle_present=%s",
+                                            claimed_id,
+                                            task_id,
+                                            self._runtime_handle(claimed_id) is not None,
+                                        )
+                                    else:
+                                        task = (
+                                            db.query(task_manager_module.BinarySecurityTask)
+                                            .filter(task_manager_module.BinarySecurityTask.id == claimed_id)
+                                            .first()
+                                        )
+                                        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() if task is not None else ""
+                                        current_status = str(getattr(task, "status", "") or "").strip() if task is not None else ""
+                                        runtime_lease_owner, _runtime_lease_expires_at = self._runtime_lease_log_view(db, task)
+                                        runtime_phase = str(self._task_runtime_phase(task)) if task is not None else ""
+                                        handle = self._runtime_handle(claimed_id)
+                                        task_manager_module.logger.warning(
+                                            "binary-security dispatch claimed task but runtime start returned false: task_id=%s queue_task_id=%s "
+                                            "status=%s runtime_phase=%s runtime_lease_owner=%s current_operation_id=%s "
+                                            "local_handle_present=%s local_handle_done=%s local_handle_cancel_requested=%s",
+                                            claimed_id,
+                                            task_id,
+                                            current_status,
+                                            runtime_phase,
+                                            runtime_lease_owner,
+                                            current_operation_id,
+                                            handle is not None,
+                                            handle.done() if handle is not None else None,
+                                            getattr(handle, "cancel_requested", None) if handle is not None else None,
+                                        )
                                 else:
-                                    await self._drop_unclaimed_dispatch_task_after_pop(
-                                        db,
-                                        task_id,
-                                        reason=str(decision.get("blocked_reason", "") or "").strip() or None,
+                                    if decision.get("cooldown_seconds"):
+                                        await self._cooldown_unclaimed_dispatch_task_after_pop(
+                                            db,
+                                            task_id,
+                                            reason=str(decision.get("blocked_reason", "") or "").strip() or None,
+                                            cooldown_seconds=int(decision.get("cooldown_seconds") or 0),
+                                        )
+                                    elif bool(decision.get("should_requeue", True)):
+                                        await self._requeue_unclaimed_dispatch_task(db, task_id)
+                                    else:
+                                        await self._drop_unclaimed_dispatch_task_after_pop(
+                                            db,
+                                            task_id,
+                                            reason=str(decision.get("blocked_reason", "") or "").strip() or None,
+                                        )
+                            finally:
+                                if dispatch_claim_lock is not None:
+                                    await self._release_dispatch_claim_lock_async(
+                                        dispatch_claim_lock,
+                                        context="dispatch_claim_loop_exit",
                                     )
                     else:
                         task_manager_module.logger.info(
@@ -1595,6 +1619,28 @@ class TaskRuntimeServiceMixin:
         if inspect.isawaitable(claimed):
             claimed = await claimed
         return claimed
+
+    async def _start_task_runtime_for_dispatch_loop(
+        self: TaskManager,
+        task_id: str,
+        *,
+        dispatch_claim_lock=None,
+    ) -> bool:
+        start_method = getattr(self, "_start_task_runtime")
+        if (
+            getattr(start_method, "__self__", None) is self
+            and getattr(start_method, "__func__", None) is getattr(type(self), "_start_task_runtime", None)
+        ):
+            return bool(
+                await self._start_task_runtime(
+                    task_id,
+                    dispatch_claim_lock=dispatch_claim_lock,
+                )
+            )
+        started = start_method(task_id)
+        if inspect.isawaitable(started):
+            started = await started
+        return bool(started)
 
     async def _release_task_without_supported_runtime_owner_for_async_path(
         self: TaskManager,
@@ -2788,7 +2834,6 @@ class TaskRuntimeServiceMixin:
             task.status = next_task_status
             task.runtime_phase = task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION
             task.updated_at = started_at
-            self._clear_parent_takeover_pending_claim(task)
             self._clear_pending_shared_dispatch_signal(task)
             self._upsert_runtime_lease(db, task, now_value=started_at, owner_instance_id=self.instance_id)
             db.commit()
@@ -3825,7 +3870,12 @@ class TaskRuntimeServiceMixin:
                         "has_downstream_refs": has_downstream_refs,
                     },
                 )
+            self._clear_parent_takeover_pending_claim(task)
             db.commit()
+            await self._release_dispatch_claim_lock_for_task_async(
+                task_id,
+                context="run_task_active_execution_committed",
+            )
             active_commit_succeeded = True
             async with self._worker_lock:
                 handle = self._workers.get(task.id)
@@ -4115,6 +4165,15 @@ class TaskRuntimeServiceMixin:
                 task_id,
                 reason="runner_task_exited",
             )
+            with suppress(Exception):
+                await self._release_dispatch_claim_lock_for_task_async(
+                    task_id,
+                    context=(
+                        "run_task_after_active_execution_committed"
+                        if active_commit_succeeded
+                        else "run_task_before_active_execution_committed"
+                    ),
+                )
             async with self._worker_lock:
                 handle = self._workers.get(task_id)
             preserve_local_runtime_holder = False

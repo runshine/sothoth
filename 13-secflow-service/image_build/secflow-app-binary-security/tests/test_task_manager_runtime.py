@@ -1326,6 +1326,66 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("dispatch_claim_requeue_cooldown_started", [row.event_type for row in db.events])
         self.assertIn("dispatch_claim_cooldown", task.summary)
 
+    async def test_dispatch_loop_starts_cooldown_when_dispatch_claim_lock_is_contended(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.cfg.queue.enabled = True
+        manager.cfg.queue.block_timeout_seconds = 1
+        requeued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            def __init__(self):
+                self._popped = False
+
+            async def pop_task(self, _timeout_seconds, context=None):
+                del context
+                if not self._popped:
+                    self._popped = True
+                    return "task-1"
+                manager._running = False
+                return None
+
+            async def force_requeue_task(self, task_id, *, context=None):
+                requeued.append((task_id, context))
+
+            async def acquire_dispatch_claim_lock(self, task_id, *, owner_token, ttl_seconds=30, context=None):
+                del task_id, owner_token, ttl_seconds, context
+                return False
+
+        async def _reconcile(_db):
+            return None
+
+        async def _observe(_db):
+            return None
+
+        manager._reconcile_work_queues = _reconcile
+        manager._observe_runtime_metrics = _observe
+        manager._run_parent_reclaim_pass = lambda _db: (False, False, False, False, False, False, False, False)
+
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-dispatch-claim-lock-contended",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+
+        with (
+            patch("app.service.task_manager.get_task_queue", return_value=_Queue()),
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+        ):
+            await asyncio.wait_for(manager._dispatch_loop(), timeout=2)
+
+        self.assertEqual([], requeued)
+        self.assertIn("dispatch_claim_requeue_cooldown_started", [row.event_type for row in db.events])
+        cooldown_event = next(row for row in db.events if row.event_type == "dispatch_claim_requeue_cooldown_started")
+        self.assertEqual("dispatch_claim_lock_contended", dict(cooldown_event.payload or {}).get("reason"))
+
     async def test_dispatch_loop_skips_pop_when_local_worker_concurrency_is_full(self):
         manager = TaskManager()
         manager._running = True
@@ -1798,6 +1858,36 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             },
             manager._dispatch_claim_decision(),
         )
+
+    def test_dispatch_task_by_id_keeps_parent_takeover_pending_claim_until_active_execution_commit(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        task = BinarySecurityTask(
+            id="task-pending-claim-preserved",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-pending-claim-preserved",
+        )
+        task.summary = {
+            "parent_takeover_pending_claim": {
+                "active": True,
+                "released_at": _now().isoformat(),
+                "released_by_instance_id": "worker-old",
+            }
+        }
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[])
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertEqual(task.id, claimed)
+        self.assertEqual("dispatching", task.status)
+        self.assertTrue(dict(task.summary or {}).get("parent_takeover_pending_claim", {}).get("active"))
+        self.assertEqual("worker-new", db.runtime_leases[0].owner_instance_id)
 
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
@@ -3426,6 +3516,77 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreaterEqual(authoritative_context_checks["count"], 1)
         self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
+
+    async def test_run_task_clears_parent_takeover_pending_claim_after_active_execution_commit(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-clears-pending-claim",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("run-task-clears-parent-takeover-pending-claim"),
+            runtime_phase="owned_execution",
+        )
+        task.summary = {
+            "parent_takeover_pending_claim": {
+                "active": True,
+                "released_at": _now().isoformat(),
+                "released_by_instance_id": "worker-old",
+            }
+        }
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+        signal_calls = {"count": 0}
+
+        async def _run_current_task_operation(_task_id):
+            return False
+
+        async def _run_task_runtime_signals(_task_id):
+            signal_calls["count"] += 1
+            if signal_calls["count"] >= 2:
+                task.status = "success"
+            return False
+
+        async def _execute_task(_task_id):
+            return None
+
+        async def _fast_sleep(_seconds, result=None):
+            return result
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: runtime_lease
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: None
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+
+        with (
+            patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+            patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep),
+        ):
+            await manager._run_task(task.id)
+
+        self.assertNotIn("parent_takeover_pending_claim", dict(task.summary or {}))
 
     async def test_run_task_keeps_runtime_alive_while_owned_execution_waits_for_sync_maintenance(self):
         manager = TaskManager()

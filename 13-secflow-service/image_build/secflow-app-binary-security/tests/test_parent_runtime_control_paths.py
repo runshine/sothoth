@@ -325,7 +325,9 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         self.assertFalse(task.cleanup_snapshot.get("delete_queued"))
         self.assertFalse(task.cleanup_snapshot.get("delete_in_progress"))
         self.assertEqual("local-worker", db.runtime_leases[0].owner_instance_id)
-        self.assertNotIn("parent_takeover_pending_claim", dict(getattr(task, "summary", None) or {}))
+        self.assertTrue(
+            dict(getattr(task, "summary", None) or {}).get("parent_takeover_pending_claim", {}).get("active")
+        )
         self.assertTrue(any(event.event_type == "stale_delete_queue_hidden_state_cleared" for event in db.events))
 
     def test_dispatch_task_by_id_keeps_hidden_when_active_delete_queue_operation_exists(self):
