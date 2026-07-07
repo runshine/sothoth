@@ -4440,6 +4440,8 @@ class TaskManager(
             return False
         if self._task_has_supported_runtime_owner(db, task, active_operation=active_operation):
             return False
+        if self._parent_takeover_pending_claim_active(task):
+            return False
         if guard.preserve:
             self._record_event(
                 db,
@@ -4503,8 +4505,8 @@ class TaskManager(
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         observed_owner = str(decision.runtime_lease_owner or "").strip() or None
-        with self._savepoint(db):
-            try:
+        try:
+            with self._savepoint(db):
                 refreshed_snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
                 refreshed_decision = self._can_reopen_parent_task_after_lease_loss(db, task, reason=reason)
                 if refreshed_snapshot.runtime_lease_active or not refreshed_decision.allowed:
@@ -4527,7 +4529,7 @@ class TaskManager(
                         db,
                         task.id,
                         owner_instance_id=observed_owner,
-                        swallow_lock_error=True,
+                        swallow_lock_error=False,
                     )
                     if observed_owner
                     else RuntimeLeaseClearResult(
@@ -4537,24 +4539,6 @@ class TaskManager(
                         task_id=task.id,
                     )
                 )
-                if clear_result.status == "lease_locked_retry_later":
-                    db.rollback()
-                    self._record_event(
-                        db,
-                        task,
-                        "parent_takeover_recovery_deferred_by_db_lock",
-                        "stale parent recovery 在清理 runtime lease 时遇到可重试 DB 锁冲突，本轮整体延后",
-                        level="warning",
-                        stage_name=task.current_stage,
-                        payload={
-                            "reason": reason,
-                            "task_id": str(task.id or "").strip() or None,
-                            "clear_status": clear_result.status,
-                            "clear_error_message": clear_result.error_message,
-                            "runtime_lease_owner": observed_owner,
-                        },
-                    )
-                    return False
                 if previous_status in {"running", "dispatching"}:
                     self._apply_release_for_takeover_main_state(
                         db,
@@ -4665,11 +4649,37 @@ class TaskManager(
                         },
                     )
                 return True
-            finally:
-                await self._release_parent_takeover_lock_async(
-                    takeover_attempt.lock,
-                    context="parent_runtime_release_for_takeover",
-                )
+        except OperationalError as exc:
+            if not self._is_retryable_lock_error(exc):
+                raise
+            clear_result = RuntimeLeaseClearResult(
+                status="lease_locked_retry_later",
+                deleted_count=0,
+                owner_instance_id=observed_owner,
+                task_id=task.id,
+                error_message=str(exc),
+            )
+            self._record_event(
+                db,
+                task,
+                "parent_takeover_recovery_deferred_by_db_lock",
+                "stale parent recovery 在清理 runtime lease 时遇到可重试 DB 锁冲突，本轮整体延后",
+                level="warning",
+                stage_name=task.current_stage,
+                payload={
+                    "reason": reason,
+                    "task_id": str(task.id or "").strip() or None,
+                    "clear_status": clear_result.status,
+                    "clear_error_message": clear_result.error_message,
+                    "runtime_lease_owner": observed_owner,
+                },
+            )
+            return False
+        finally:
+            await self._release_parent_takeover_lock_async(
+                takeover_attempt.lock,
+                context="parent_runtime_release_for_takeover",
+            )
 
     def _release_task_without_supported_runtime_owner(
         self,

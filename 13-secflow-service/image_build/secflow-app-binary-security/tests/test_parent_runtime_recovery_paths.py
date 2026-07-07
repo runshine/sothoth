@@ -326,7 +326,7 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertFalse(any(event.event_type == "main_state_write_blocked" for event in db.events))
 
-    def test_reclaim_stale_running_skips_task_waiting_for_pending_claim(self):
+    def test_reclaim_stale_running_requeues_running_task_even_with_pending_claim_marker(self):
         manager = TaskManager()
         task = BinarySecurityTask(
             id="task-stale-tail-pending-claim",
@@ -367,16 +367,20 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
 
         db = _ReclaimDb()
         db.events = []
+        enqueued = []
         original_loader = manager._load_service_config
+        original_enqueue = manager._enqueue_task
         manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
+        manager._enqueue_task = lambda task_id: enqueued.append(task_id)
         try:
             reclaimed = manager._reclaim_stale_running_locked(db)
         finally:
             manager._load_service_config = original_loader
+            manager._enqueue_task = original_enqueue
 
-        self.assertFalse(reclaimed)
+        self.assertTrue(reclaimed)
         self.assertEqual("running", task.status)
-        self.assertEqual([], db.events)
+        self.assertEqual([task.id], enqueued)
 
 
 if __name__ == "__main__":
