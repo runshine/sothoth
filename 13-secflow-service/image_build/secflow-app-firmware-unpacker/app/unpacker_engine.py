@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from app.logging_utils import log_event
-from app.preprocess import detect_format, run_preprocess
+from app.preprocess import detect_format, run_preprocess, run_recursive_preprocess
 from app.skill_store import DEFAULT_PROMOTION_THRESHOLD, save_candidate_skill
 from app.subprocess_utils import StreamingLineSink, run_streaming_process
 from app.tool_dispatcher import dispatch_tool_by_magic, ensure_dispatcher_environment
@@ -1693,9 +1693,29 @@ def run_unpack(
         )
 
     if pre_result.get("success"):
+        recursive_pre_result = {"rounds": 0, "expanded_count": 0}
+        try:
+            recursive_pre_result = run_recursive_preprocess(
+                output_path,
+                log_dir=global_round_dir,
+                cancel_check=cancel_check,
+                register_cancel_hook=register_cancel_hook,
+            )
+        except Exception as exc:
+            log_event(
+                log,
+                logging.WARNING,
+                "recursive pre-process exception",
+                event="recursive_preprocess_exception",
+                error=str(exc),
+            )
         return {
             "status": "success",
-            "message": f"Extracted by quick pre-process: {pre_result['method']}",
+            "message": (
+                f"Extracted by quick pre-process: {pre_result['method']}; "
+                f"recursive pre-process expanded {int(recursive_pre_result.get('expanded_count') or 0)} item(s) "
+                f"in {int(recursive_pre_result.get('rounds') or 0)} round(s)"
+            ),
             "rounds": 0,
         }
 

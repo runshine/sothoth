@@ -683,7 +683,9 @@ class TaskRuntimeHandle:
     sync_maintenance_in_progress: bool = False
 
     def done(self) -> bool:
-        return self.runner_task.done()
+        heartbeat_done = self.heartbeat_task is None or self.heartbeat_task.done()
+        sync_maintenance_done = self.sync_maintenance_task is None or self.sync_maintenance_task.done()
+        return self.runner_task.done() and heartbeat_done and sync_maintenance_done
 
     def cancel(self, reason: str | None = None) -> None:
         self.cancel_requested = True
@@ -2433,7 +2435,7 @@ class TaskManager(
         failure_count = 0
         while self._running:
             handle = self._runtime_handle(task_id)
-            if handle is None or handle.cancel_requested or handle.runner_task.done():
+            if handle is None or handle.cancel_requested or handle.release_requested or handle.takeover_observed:
                 return
             try:
                 if await self._handoff_active_serial_control_operation_from_runtime(task_id):
@@ -2472,7 +2474,6 @@ class TaskManager(
                 if (
                     handle is None
                     or handle.cancel_requested
-                    or handle.runner_task.done()
                     or handle.release_requested
                     or handle.takeover_observed
                 ):
@@ -2529,7 +2530,6 @@ class TaskManager(
                 if (
                     handle is None
                     or handle.cancel_requested
-                    or handle.runner_task.done()
                     or handle.release_requested
                     or handle.takeover_observed
                 ):
@@ -2662,10 +2662,11 @@ class TaskManager(
         handle = self._runtime_handle(normalized_task_id)
         if (
             handle is None
-            or handle.done()
             or handle.cancel_requested
             or not handle.active_commit_succeeded
             or not handle.lease_established
+            or handle.release_requested
+            or handle.takeover_observed
             or handle.sync_maintenance_in_progress
         ):
             return False
@@ -2679,11 +2680,13 @@ class TaskManager(
             consume_reason = str(owner_signal_payload.get("context") or "owner_signal").strip() or "owner_signal"
         handle.sync_maintenance_in_progress = True
         try:
+            proactively_enqueued = await self._reconcile_periodic_task_sync_requests(normalized_task_id)
             processed = await self._drain_local_runtime_sync_queue_once(
                 normalized_task_id,
                 reason=consume_reason or "periodic_reconcile",
                 max_passes=1,
             )
+            processed = bool(processed or proactively_enqueued)
             if processed:
                 logger.info(
                     "binary-security local runtime sync maintenance processed queued sync requests: task_id=%s reason=%s",
@@ -2696,6 +2699,31 @@ class TaskManager(
 
     def _service_local_runtime_sync_maintenance_blocking(self, task_id: str) -> bool:
         return asyncio.run(self._service_local_runtime_sync_maintenance(task_id))
+
+    async def _reconcile_periodic_task_sync_requests(self, task_id: str) -> int:
+        session = get_session_factory()()
+        try:
+            self._configure_runtime_session_fast_lock_wait_timeout(session)
+            task = session.query(BinarySecurityTask).filter(BinarySecurityTask.id == task_id).first()
+            if task is None:
+                return 0
+            lease = self._runtime_lease_for_task(session, task_id)
+            if not (
+                self._runtime_lease_is_active(lease)
+                and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
+            ):
+                return 0
+            repaired = await self._reconcile_missing_task_sync_requests(session, task)
+            if repaired:
+                session.commit()
+                logger.info(
+                    "binary-security local runtime sync maintenance enqueued periodic sync requests: task_id=%s repaired=%s",
+                    task_id,
+                    repaired,
+                )
+            return repaired
+        finally:
+            session.close()
 
     async def _drain_local_runtime_sync_queue_once(
         self,
@@ -6086,7 +6114,7 @@ class TaskManager(
             if operation == "child_create":
                 self._enqueue_task(task_id)
                 return
-            asyncio.run(
+            self._run_async_blocking(
                 self.sync_downstream_status(
                     sync_db,
                     project_id=project_id,
@@ -13603,13 +13631,83 @@ class TaskManager(
 
     async def _drain_owner_inbox_during_polling(self, task: BinarySecurityTask) -> None:
         operation_passes = 0
-        while await self._run_current_task_operation(task.id):
+        while await asyncio.to_thread(
+            self._run_async_blocking,
+            self._run_current_task_operation(task.id),
+        ):
             operation_passes += 1
         if operation_passes <= 0:
             return
         if await self._is_task_cancelled_async(task.id):
             return
         await self._ensure_task_execution_current_async(task)
+
+    def _load_local_polled_item_snapshot(
+        self,
+        project_id: str,
+        task_id: str,
+        item_id: str,
+    ) -> dict[str, Any]:
+        session = get_session_factory()()
+        try:
+            task = self._task_or_404(session, project_id, task_id)
+            item = (
+                session.query(BinarySecurityStageItem)
+                .filter(
+                    BinarySecurityStageItem.task_id == task_id,
+                    BinarySecurityStageItem.id == item_id,
+                )
+                .first()
+            )
+            if item is None:
+                raise NotFoundError("阶段子任务不存在")
+            normalized_status = (
+                self._normalize_downstream_status(item.status)
+                or str(item.status or "").strip().lower()
+                or "pending"
+            )
+            result_payload = self._load_stage_item_result_payload(item)
+            downstream_payload = dict(result_payload.get("downstream") or {})
+            payload_status = (
+                str(downstream_payload.get("status") or "").strip().lower()
+                or self._string_or_none(result_payload.get("downstream_status"))
+                or normalized_status
+            )
+            payload = {
+                **downstream_payload,
+                "status": payload_status,
+                "task_id": str(
+                    downstream_payload.get("task_id")
+                    or downstream_payload.get("id")
+                    or item.downstream_task_id
+                    or ""
+                ).strip()
+                or None,
+                "id": str(
+                    downstream_payload.get("id")
+                    or downstream_payload.get("task_id")
+                    or item.downstream_task_id
+                    or ""
+                ).strip()
+                or None,
+            }
+            if normalized_status in {"failed", "cancelled", "downstream_missing"}:
+                payload["error"] = (
+                    payload.get("error")
+                    or payload.get("error_message")
+                    or str(item.error_message or "").strip()
+                    or None
+                )
+            return {
+                "task_status": str(task.status or "").strip().lower() or None,
+                "item_status": normalized_status,
+                "payload": payload,
+                "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                "stage_name": str(item.stage_name or "").strip() or None,
+                "item_key": str(item.item_key or "").strip() or None,
+            }
+        finally:
+            session.close()
 
     async def _poll_until_terminal(self, fetcher, *, success_statuses: set[str], failure_statuses: set[str], task: BinarySecurityTask, item: BinarySecurityStageItem | None = None):
         poll_started_at = _now()
@@ -13619,25 +13717,45 @@ class TaskManager(
             try:
                 await self._ensure_task_execution_current_async(task)
                 await self._drain_owner_inbox_during_polling(task)
-                payload = await fetcher()
+                if item is None:
+                    payload = await asyncio.to_thread(
+                        self._run_async_blocking,
+                        fetcher(),
+                    )
+                    mapped_status = self._map_downstream_status(str(payload.get("status") or "")) or str(payload.get("status") or "").lower()
+                else:
+                    local_snapshot = await asyncio.to_thread(
+                        self._load_local_polled_item_snapshot,
+                        str(task.project_id or "").strip(),
+                        str(task.id or "").strip(),
+                        str(item.id or "").strip(),
+                    )
+                    payload = dict(local_snapshot.get("payload") or {})
+                    mapped_status = str(local_snapshot.get("item_status") or "").strip().lower()
                 await self._ensure_task_execution_current_async(task)
                 poll_count += 1
                 status = str(payload.get("status") or "").lower()
-                if status in success_statuses:
+                effective_status = mapped_status or self._map_downstream_status(status) or status
+                if status in success_statuses or effective_status == "success":
                     return "success", payload
-                if status in failure_statuses:
-                    mapped_status = self._map_downstream_status(status)
-                    if mapped_status == "cancelled":
+                if status in failure_statuses or effective_status in {"failed", "cancelled", "downstream_missing"}:
+                    if effective_status == "cancelled":
                         return "cancelled", payload
-                    if mapped_status == "downstream_missing":
+                    if effective_status == "downstream_missing":
                         return "downstream_missing", payload
                     return "failed", payload
                 if item is not None:
+                    return (
+                        effective_status
+                        if effective_status in {"pending", "queued", "dispatching", "running"}
+                        else "pending"
+                    ), payload
+                if item is not None and fetcher is not None:
                     await asyncio.to_thread(
                         self._refresh_polled_child_sync_snapshot,
                         task_id=task.id,
                         item_id=item.id,
-                        payload=dict(payload),
+                        payload=dict(payload) if payload else {"status": effective_status or status},
                     )
                 now_value = _now()
                 should_log_wait = (
@@ -13658,14 +13776,17 @@ class TaskManager(
                             or ""
                         ).strip()
                         or None,
-                        status or None,
+                        status or effective_status or None,
                         poll_count,
                         max(0, int((now_value - poll_started_at).total_seconds())),
                     )
                     last_wait_log_at = now_value
                 if await self._is_task_cancelled_async(task.id):
                     if item and item.downstream_task_id:
-                        await self._cancel_downstream(item, self._service_token())
+                        await asyncio.to_thread(
+                            self._run_async_blocking,
+                            self._cancel_downstream(item, self._service_token()),
+                        )
                     return "cancelled", payload
                 await asyncio.sleep(self._downstream_child_sync_interval_seconds())
             except StaleTaskExecution:

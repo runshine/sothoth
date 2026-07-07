@@ -311,6 +311,29 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
         return tmpdir, root, task, db, queue, downstream, http_client, firmware
 
     def _runtime_patches(self, db, queue, http_client):
+        original_poll_item_helper = self.manager._poll_item_until_local_terminal_or_defer
+
+        async def _poll_item_via_mock_downstream(
+            session,
+            task,
+            item,
+            *,
+            operation: str,
+            response_item: dict[str, object],
+            fetcher,
+            success_statuses: set[str],
+            failure_statuses: set[str],
+        ):
+            del session, operation, response_item
+            status, payload = await self.manager._poll_until_terminal(
+                fetcher,
+                success_statuses=success_statuses,
+                failure_statuses=failure_statuses,
+                task=task,
+                item=None,
+            )
+            return status, payload, None
+
         return [
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
             patch.object(task_manager_module, "get_task_queue", return_value=queue),
@@ -323,6 +346,7 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
             patch.object(self.manager, "_stage_downstream_sync_backoff_base_seconds", return_value=0),
             patch.object(self.manager, "_queue_archive_and_wait", new=AsyncMock(side_effect=self._queue_archive_passthrough)),
             patch.object(self.manager, "_streaming_mode_enabled", return_value=False),
+            patch.object(self.manager, "_poll_item_until_local_terminal_or_defer", side_effect=_poll_item_via_mock_downstream),
         ]
 
     @contextmanager

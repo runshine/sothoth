@@ -2,6 +2,7 @@ import asyncio
 import json
 import threading
 import unittest
+import uuid
 from datetime import timedelta, datetime
 from contextlib import nullcontext, suppress
 from pathlib import Path
@@ -23,7 +24,7 @@ from app.model import (
     TASK_TYPE_SOURCE,
 )
 from app.service import task_manager as task_manager_module
-from app.service.task_manager import StaleTaskExecution, TaskManager, _now
+from app.service.task_manager import StaleTaskExecution, TaskManager, UpstreamError, _now
 from app.service.task_queue import REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, REDIS_SOCKET_TIMEOUT_SECONDS, TaskQueue
 from test_task_manager import _FakeTaskSyncQueue, _ModelAwareDb
 
@@ -504,6 +505,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._execute_task = lambda *_args, **_kwargs: asyncio.sleep(0)
         manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
         manager._task_runtime_transition_guard_active = lambda *_args, **_kwargs: False
+        manager._task_should_remain_owned_without_active_runner = lambda *_args, **_kwargs: False
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             with suppress(asyncio.CancelledError):
@@ -512,6 +514,68 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(heartbeat_cancelled.is_set())
         self.assertTrue(sync_maintenance_cancelled.is_set())
         self.assertNotIn("task-1", manager._workers)
+
+    async def test_run_task_finally_keeps_runtime_companions_when_owner_should_remain_active(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("run-task-finally-keeps-runtime-companions"),
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+        heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="heartbeat")
+        sync_handle = _FakeSyncMaintenanceThreadHandle()
+        current_task = asyncio.current_task()
+        assert current_task is not None
+
+        manager._workers["task-1"] = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=current_task,
+            heartbeat_task=heartbeat_task,
+            sync_maintenance_task=sync_handle,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+            owner_active=True,
+        )
+        manager._run_current_task_operation = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._run_task_runtime_signals = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._execute_task = lambda *_args, **_kwargs: asyncio.sleep(0)
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_transition_guard_active = lambda *_args, **_kwargs: False
+        manager._task_should_remain_owned_without_active_runner = lambda *_args, **_kwargs: True
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task("task-1")
+
+        handle = manager._workers.get("task-1")
+        self.assertIsNotNone(handle)
+        self.assertTrue(handle.owner_active)
+        self.assertFalse(heartbeat_task.done())
+        self.assertFalse(sync_handle.cancelled())
+
+        handle.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+        manager._workers.pop("task-1", None)
 
     async def test_task_heartbeat_handoffs_active_serial_control_operation(self):
         manager = TaskManager()
@@ -585,6 +649,51 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(task.id, False)], cancelled)
         self.assertEqual([task.id], enqueued)
         self.assertTrue(any(event.event_type == "runtime_yielded_for_serial_control_operation" for event in db.events))
+
+    async def test_task_heartbeat_keeps_running_after_runner_exit_when_owner_still_active(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        runner_task = asyncio.create_task(asyncio.sleep(0), name="runner-done")
+        await asyncio.gather(runner_task, return_exceptions=True)
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        handle = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=runner_task,
+            heartbeat_task=current_task,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+            owner_active=True,
+        )
+        manager._workers["task-1"] = handle
+        verify_calls = {"count": 0}
+
+        async def _handoff(_task_id):
+            return False
+
+        def _verify(_task_id, source):
+            verify_calls["count"] += 1
+            manager._running = False
+            return task_manager_module._RuntimeLeaseOwnershipDecision(
+                should_continue=True,
+                runtime_lease_present=True,
+                runtime_lease_active=True,
+                runtime_lease_owner="worker-a",
+                local_handle_alive=True,
+            )
+
+        manager._handoff_active_serial_control_operation_from_runtime = _handoff
+        manager._verify_local_runtime_lease_or_abort = _verify
+
+        with patch("app.service.task_manager.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            await manager._run_task_heartbeat("task-1")
+
+        self.assertEqual(1, verify_calls["count"])
+        sleep_mock.assert_awaited()
 
     def test_recover_loop_db_error_disposes_engine_for_operational_and_timeout_errors(self):
         manager = TaskManager()
@@ -1204,6 +1313,51 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._dispatch_claim_decision(),
         )
 
+    def test_dispatch_task_by_id_requeues_when_task_row_is_locked_but_still_exists(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="locked-task",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        original_query_with_lock = manager._query_with_fast_task_row_lock
+        original_exists_without_lock = manager._task_row_exists_without_lock
+
+        class _LockedTaskQuery:
+            def first(self):
+                return None
+
+        manager._query_with_fast_task_row_lock = lambda _query: _LockedTaskQuery()
+        manager._task_row_exists_without_lock = lambda _db, _task_id: True
+        try:
+            with patch("app.service.task_manager.logger.info") as log_info:
+                claimed = manager._dispatch_task_by_id(db, task.id)
+        finally:
+            manager._query_with_fast_task_row_lock = original_query_with_lock
+            manager._task_row_exists_without_lock = original_exists_without_lock
+
+        self.assertIsNone(claimed)
+        self.assertTrue(
+            any("binary-security dispatch claim blocked:" in str(call.args[0]) for call in log_info.call_args_list)
+        )
+        self.assertEqual(
+            {
+                "task_id": "locked-task",
+                "claimed_task_id": None,
+                "blocked_reason": "task_row_locked_retry_later",
+                "should_requeue": True,
+                "cooldown_seconds": None,
+            },
+            manager._dispatch_claim_decision(),
+        )
+
     def test_dispatch_task_by_id_marks_running_owned_task_as_drop_after_pop(self):
         manager = TaskManager()
         task = BinarySecurityTask(
@@ -1471,6 +1625,44 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._dispatch_claim_decision(),
         )
 
+    def test_dispatch_task_by_id_requeues_when_stale_owner_release_is_deferred(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        task = BinarySecurityTask(
+            id="task-running-release-deferred",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-release-deferred",
+            runtime_phase="owned_execution",
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-old",
+            heartbeat_at=_now() - timedelta(minutes=2),
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[expired_lease])
+        manager._release_task_without_supported_runtime_owner = lambda *_args, **_kwargs: False
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": None,
+                "blocked_reason": "dispatch_claim_blocked_stale_owner_release_failed",
+                "should_requeue": True,
+                "cooldown_seconds": manager._dispatch_claim_handoff_cooldown_seconds(),
+            },
+            manager._dispatch_claim_decision(),
+        )
+
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -1521,7 +1713,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         requeued: list[str] = []
         prepared: list[str] = []
 
-        self.manager._force_requeue_delete_task = lambda task_id: requeued.append(task_id)
+        self.manager._force_requeue_delete_task = lambda task_id, context=None: requeued.append(task_id)
 
         async def _prepare(_db, _task):
             prepared.append(_task.id)
@@ -2549,7 +2741,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             firmware_source="project_filesystem",
             firmware_path="/tmp/fw.bin",
             output_root="/tmp/out",
-            workspace_root="/tmp/ws",
+            workspace_root=f"/tmp/ws-{uuid.uuid4().hex}",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         db = _ModelAwareDb(tasks=[task], events=[])
@@ -3855,20 +4047,25 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _sleep(_seconds):
             return None
 
-        async def _fetch():
+        def _load_snapshot(*_args, **_kwargs):
             calls["count"] += 1
             if calls["count"] == 1:
                 raise OperationalError("stmt", {}, RuntimeError("connection refused"))
-            return {"status": "success"}
+            return {
+                "item_status": "success",
+                "payload": {"status": "success", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._record_polled_child_sync_failure = _record_failure
         manager._run_current_task_operation = _cancelled
+        manager._load_local_polled_item_snapshot = _load_snapshot
+        manager._request_authoritative_child_sync_during_wait = AsyncMock()
 
         with patch("app.service.task_manager.asyncio.sleep", _sleep):
             status, payload = await manager._poll_until_terminal(
-                _fetch,
+                None,
                 success_statuses={"success"},
                 failure_statuses={"failed", "cancelled"},
                 task=task,
@@ -3876,7 +4073,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual("success", status)
-        self.assertEqual({"status": "success"}, payload)
+        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
         self.assertEqual(2, calls["count"])
         self.assertEqual(1, len(failures))
         self.assertEqual("db_connection_refused", failures[0]["error_type"])
@@ -3893,16 +4090,18 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         def _record_failure(**kwargs):
             failures.append(kwargs)
 
-        async def _fetch():
+        def _load_snapshot(*_args, **_kwargs):
             raise RuntimeError("任务 task-1 当前 owned_execution runtime lease owner 已变更")
 
         manager._ensure_task_execution_current_async = _ensure
         manager._record_polled_child_sync_failure = _record_failure
         manager._run_current_task_operation = _ensure
+        manager._load_local_polled_item_snapshot = _load_snapshot
+        manager._request_authoritative_child_sync_during_wait = AsyncMock()
 
         with self.assertRaises(StaleTaskExecution):
             await manager._poll_until_terminal(
-                _fetch,
+                None,
                 success_statuses={"success"},
                 failure_statuses={"failed", "cancelled"},
                 task=task,
@@ -3916,8 +4115,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         task = BinarySecurityTask(id="task-1", project_id="project-1")
         item = type("Item", (), {"id": "item-1", "downstream_task_id": "child-1"})()
         operation_passes: list[str] = []
-        fetch_calls: list[str] = []
-
         async def _ensure(_task):
             return None
 
@@ -3928,16 +4125,19 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             operation_passes.append(task_id)
             return len(operation_passes) == 1
 
-        async def _fetch():
-            fetch_calls.append("fetch")
-            return {"status": "success"}
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "success",
+                "payload": {"status": "success", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _run_operation
+        manager._load_local_polled_item_snapshot = _load_snapshot
 
         status, payload = await manager._poll_until_terminal(
-            _fetch,
+            None,
             success_statuses={"success"},
             failure_statuses={"failed", "cancelled"},
             task=task,
@@ -3945,11 +4145,10 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual("success", status)
-        self.assertEqual({"status": "success"}, payload)
+        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
         self.assertEqual(["task-1", "task-1"], operation_passes)
-        self.assertEqual(["fetch"], fetch_calls)
 
-    async def test_poll_until_terminal_logs_waiting_progress_for_long_running_child(self):
+    async def test_poll_until_terminal_defers_immediately_for_nonterminal_local_authoritative_state(self):
         manager = TaskManager()
         task = BinarySecurityTask(id="task-1", project_id="project-1", current_stage="dataflow_vuln_scan")
         item = type(
@@ -3962,7 +4161,6 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
                 "downstream_task_id": "child-1",
             },
         )()
-        fetch_calls = 0
 
         async def _ensure(_task):
             return None
@@ -3970,42 +4168,28 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _cancelled(_task_id):
             return False
 
-        async def _fetch():
-            nonlocal fetch_calls
-            fetch_calls += 1
-            if fetch_calls == 1:
-                return {"status": "running", "task_id": "child-1"}
-            return {"status": "success", "task_id": "child-1"}
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "running",
+                "payload": {"status": "running", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _cancelled
         manager._refresh_polled_child_sync_snapshot = lambda **_kwargs: None
+        manager._load_local_polled_item_snapshot = _load_snapshot
 
-        with (
-            patch("app.service.task_manager.asyncio.sleep", new=AsyncMock(return_value=None)),
-            patch("app.service.task_manager.logger.info") as info_log,
-        ):
-            status, payload = await manager._poll_until_terminal(
-                _fetch,
-                success_statuses={"success"},
-                failure_statuses={"failed", "cancelled"},
-                task=task,
-                item=item,
-            )
-
-        self.assertEqual("success", status)
-        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
-        waiting_calls = [
-            call
-            for call in info_log.call_args_list
-            if call.args and call.args[0] == "binary-security downstream poll waiting: task_id=%s stage=%s item_id=%s item_key=%s downstream_task_id=%s downstream_status=%s poll_count=%s waited_seconds=%s"
-        ]
-        self.assertEqual(1, len(waiting_calls))
-        self.assertEqual(
-            ("task-1", "dataflow_vuln_scan", "item-1", "entry-1", "child-1", "running", 1),
-            waiting_calls[0].args[1:8],
+        status, payload = await manager._poll_until_terminal(
+            None,
+            success_statuses={"success"},
+            failure_statuses={"failed", "cancelled"},
+            task=task,
+            item=item,
         )
+
+        self.assertEqual("running", status)
+        self.assertEqual({"status": "running", "task_id": "child-1"}, payload)
 
     async def test_poll_until_terminal_treats_completed_limited_as_success(self):
         manager = TaskManager()
@@ -4018,15 +4202,19 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         async def _cancelled(_task_id):
             return False
 
-        async def _fetch():
-            return {"status": "completed_limited", "task_id": "child-1"}
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "success",
+                "payload": {"status": "completed_limited", "task_id": "child-1"},
+            }
 
         manager._ensure_task_execution_current_async = _ensure
         manager._is_task_cancelled_async = _cancelled
         manager._run_current_task_operation = _cancelled
+        manager._load_local_polled_item_snapshot = _load_snapshot
 
         status, payload = await manager._poll_until_terminal(
-            _fetch,
+            None,
             success_statuses={"passed", "success", "completed_limited"},
             failure_statuses={"failed", "cancelled", "invalid_input"},
             task=task,
@@ -4035,6 +4223,54 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual("success", status)
         self.assertEqual({"status": "completed_limited", "task_id": "child-1"}, payload)
+
+    async def test_poll_until_terminal_runs_fetch_and_operation_drain_via_async_bridge_thread_handoff(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1")
+        item = type("Item", (), {"id": "item-1", "downstream_task_id": "child-1"})()
+        bridge_calls: list[str] = []
+        operation_calls: list[str] = []
+
+        async def _ensure(_task):
+            return None
+
+        async def _cancelled(_task_id):
+            return False
+
+        async def _run_operation(_task_id: str) -> bool:
+            operation_calls.append("run")
+            return False
+
+        def _load_snapshot(*_args, **_kwargs):
+            return {
+                "item_status": "success",
+                "payload": {"status": "success", "task_id": "child-1"},
+            }
+
+        def _fake_bridge(coro):
+            code = getattr(coro, "cr_code", None)
+            bridge_calls.append(code.co_name if code is not None else type(coro).__name__)
+            return asyncio.run(coro)
+
+        manager._ensure_task_execution_current_async = _ensure
+        manager._is_task_cancelled_async = _cancelled
+        manager._run_current_task_operation = _run_operation
+        manager._run_async_blocking = _fake_bridge
+        manager._record_polled_child_sync_failure = lambda **_kwargs: None
+        manager._load_local_polled_item_snapshot = _load_snapshot
+
+        status, payload = await manager._poll_until_terminal(
+            None,
+            success_statuses={"success"},
+            failure_statuses={"failed", "cancelled"},
+            task=task,
+            item=item,
+        )
+
+        self.assertEqual("success", status)
+        self.assertEqual({"status": "success", "task_id": "child-1"}, payload)
+        self.assertEqual(["_run_operation"], bridge_calls)
+        self.assertEqual(["run"], operation_calls)
 
     async def test_ensure_task_execution_current_async_uses_normalized_legacy_tail_phase(self):
         manager = TaskManager()

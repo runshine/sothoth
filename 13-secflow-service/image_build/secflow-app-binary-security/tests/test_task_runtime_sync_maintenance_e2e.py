@@ -1,7 +1,7 @@
 import asyncio
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
@@ -247,6 +247,7 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
             )
 
             with patch.object(task_manager_module, "get_task_queue", return_value=fake_queue):
+                manager_b._reconcile_periodic_task_sync_requests = AsyncMock(return_value=0)
                 created_a = await manager_a._start_task_runtime("task-source-1")
                 await asyncio.sleep(0)
                 await manager_a._cancel_local_worker("task-source-1")

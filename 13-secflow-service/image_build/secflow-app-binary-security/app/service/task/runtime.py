@@ -17,6 +17,33 @@ if TYPE_CHECKING:
 
 
 class TaskRuntimeServiceMixin:
+    def _delete_queue_stalled_after_seconds(self: TaskManager) -> int:
+        return max(30, int(getattr(self.cfg.queue, "block_timeout_seconds", 5) or 5) * 6)
+
+    def _delete_operation_is_stalled(
+        self: TaskManager,
+        task,
+        *,
+        now_value=None,
+        stale_after_seconds: int | None = None,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        delete_state = self._task_delete_queue_state(task)
+        if not (delete_state.get("delete_in_progress") or self._task_is_hidden_by_delete_queue(task)):
+            return False
+        reference_at = (
+            task_manager_module._parse_iso_datetime(delete_state.get("delete_last_progress_at"))
+            or task_manager_module._parse_iso_datetime(delete_state.get("delete_started_at"))
+            or task_manager_module._parse_iso_datetime(delete_state.get("delete_requested_at"))
+            or getattr(task, "updated_at", None)
+        )
+        if reference_at is None:
+            return False
+        stale_after = max(1, int(stale_after_seconds or self._delete_queue_stalled_after_seconds()))
+        current_now = now_value or task_manager_module._now()
+        return reference_at <= current_now - timedelta(seconds=stale_after)
+
     def _runtime_lease_log_view(self: TaskManager, db: Session | None, task) -> tuple[str | None, str | None]:
         from app.service import task_manager as task_manager_module
 
@@ -507,6 +534,12 @@ class TaskRuntimeServiceMixin:
         delete_position = delete_positions.get(task_id)
         if delete_position is not None:
             return True
+        self._mark_task_delete_progress(
+            task,
+            operation_id=str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+            step=f"reenqueued:{enqueue_context}",
+            force_delete=force_delete,
+        )
         await queue.force_requeue_delete_task(task_id, context=enqueue_context)
         delete_positions[task_id] = len(delete_positions) + 1
         self._record_event(
@@ -569,7 +602,7 @@ class TaskRuntimeServiceMixin:
                 level="info",
                 payload=self._delete_queue_consume_decision_payload(delete_takeover_decision),
             )
-            self._force_requeue_delete_task(task.id)
+            self._force_requeue_delete_task(task.id, context="delete_queue_active_blocker")
             db.commit()
             return
         started_at = task_manager_module._now()
@@ -630,6 +663,12 @@ class TaskRuntimeServiceMixin:
                     operation.status = "failed"
                     operation.error_message = str(exc)
                     operation.finished_at = task_manager_module._now()
+                self._mark_task_delete_progress(
+                    refreshed,
+                    operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+                    step="terminal_failure",
+                    force_delete=force_delete,
+                )
                 self._record_event(
                     db,
                     refreshed,
@@ -1082,6 +1121,18 @@ class TaskRuntimeServiceMixin:
                     continue
                 raise
         return task_query
+
+    def _task_row_exists_without_lock(self: TaskManager, db: Session, task_id: str) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return False
+        return bool(
+            db.query(task_manager_module.BinarySecurityTask.id)
+            .filter(task_manager_module.BinarySecurityTask.id == normalized_task_id)
+            .first()
+        )
 
     def _requeue_orphaned_owned_execution_single_task_locked(self: TaskManager, db: Session, task_id: str) -> bool:
         task = self._lock_task_row_by_id(db, task_id)
@@ -1673,6 +1724,68 @@ class TaskRuntimeServiceMixin:
             if self._dispatch_claim_cooldown_active(task):
                 continue
             self._clear_dispatch_claim_cooldown(task)
+            active_delete_operation = self._active_delete_queue_operation(db, task)
+            delete_operation_stalled = (
+                active_delete_operation is not None
+                and self._delete_operation_is_stalled(task, now_value=now_value)
+            )
+            if delete_operation_stalled and active_delete_operation is not None:
+                operation_payload = dict(getattr(active_delete_operation, "request_payload", None) or {})
+                if not bool(operation_payload.get("force_delete") or operation_payload.get("force")):
+                    operation_payload.update(
+                        {
+                            "force": True,
+                            "force_delete": True,
+                            "auto_force_delete_fallback": True,
+                            "force_delete_fallback_reason": "delete_queue_stalled_reconcile",
+                            "blocking_step": "delete_queue_stalled_reconcile",
+                        }
+                    )
+                    active_delete_operation.request_payload = operation_payload
+                self._mark_task_delete_progress(
+                    task,
+                    operation_id=str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                    step="stalled_reconcile_reenqueue",
+                    force_delete=True,
+                )
+                self._record_event(
+                    db,
+                    task,
+                    "task_delete_stalled_reconcile_detected",
+                    "检测到删除长期无进展，已升级为强制删除并准备重新入 delete queue",
+                    level="warning",
+                    payload={
+                        "task_id": normalized_task_id,
+                        "operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                        "force_delete": True,
+                        "auto_force_delete_fallback": True,
+                        "blocking_step": "delete_queue_stalled_reconcile",
+                        "enqueue_context": "delete_queue_stalled_reconcile",
+                    },
+                )
+                delete_positions.pop(normalized_task_id, None)
+                delete_signal_handled = await self._ensure_delete_queue_signal(
+                    db,
+                    task,
+                    queue,
+                    delete_positions,
+                    enqueue_context="delete_queue_stalled_reconcile",
+                )
+                if delete_signal_handled:
+                    self._record_event(
+                        db,
+                        task,
+                        "task_delete_stalled_force_requeued",
+                        "删除长期无进展任务已重新放回 delete queue",
+                        level="warning",
+                        payload={
+                            "task_id": normalized_task_id,
+                            "operation_id": str(getattr(active_delete_operation, "id", "") or "").strip() or None,
+                            "force_delete": True,
+                            "enqueue_context": "delete_queue_stalled_reconcile",
+                        },
+                    )
+                    continue
             delete_signal_handled = await self._ensure_delete_queue_signal(
                 db,
                 task,
@@ -1680,7 +1793,6 @@ class TaskRuntimeServiceMixin:
                 delete_positions,
                 enqueue_context="delete_queue_reconcile",
             )
-            active_delete_operation = self._active_delete_queue_operation(db, task)
             if delete_signal_handled and active_delete_operation is not None:
                 if current_status == "pending":
                     delete_position = delete_positions.get(normalized_task_id)
@@ -2035,12 +2147,14 @@ class TaskRuntimeServiceMixin:
         task_query = self._query_with_fast_task_row_lock(task_query)
         task = task_query.first()
         if task is None:
-            self._log_dispatch_claim_blocked(task_id, reason="task_row_missing")
+            task_row_exists = self._task_row_exists_without_lock(db, task_id)
+            blocked_reason = "task_row_locked_retry_later" if task_row_exists else "task_row_missing"
+            self._log_dispatch_claim_blocked(task_id, reason=blocked_reason)
             self._set_dispatch_claim_decision(
                 task_id=task_id,
                 claimed_task_id=None,
-                blocked_reason="task_row_missing",
-                should_requeue=False,
+                blocked_reason=blocked_reason,
+                should_requeue=task_row_exists,
             )
             return None
         if self._task_is_hidden_by_delete_queue(task):
@@ -2380,7 +2494,8 @@ class TaskRuntimeServiceMixin:
                         task_id=task_id,
                         claimed_task_id=None,
                         blocked_reason="dispatch_claim_blocked_stale_owner_release_failed",
-                        should_requeue=False,
+                        should_requeue=True,
+                        cooldown_seconds=self._dispatch_claim_handoff_cooldown_seconds(),
                     )
                     return None
                 current_status = str(getattr(task, "status", "") or "").strip().lower()
@@ -3915,6 +4030,7 @@ class TaskRuntimeServiceMixin:
             )
             async with self._worker_lock:
                 handle = self._workers.get(task_id)
+            preserve_local_runtime_holder = False
             cleanup_db = session_factory()
             try:
                 cleanup_completed = False
@@ -3929,6 +4045,7 @@ class TaskRuntimeServiceMixin:
                         task,
                         handle,
                     )
+                preserve_local_runtime_holder = bool(has_local_runtime_holder)
                 if (
                     task is not None
                     and not has_local_runtime_holder
@@ -4009,6 +4126,10 @@ class TaskRuntimeServiceMixin:
             async with self._worker_lock:
                 current_handle = self._workers.get(task_id)
                 if current_handle is not None and current_handle.runner_task is asyncio.current_task():
+                    if preserve_local_runtime_holder:
+                        current_handle.owner_active = True
+                        current_handle.last_runner_exit_at = task_manager_module._now()
+                        return
                     current_handle.owner_active = False
                     if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
                         current_handle.heartbeat_task.cancel()
@@ -4016,8 +4137,8 @@ class TaskRuntimeServiceMixin:
                             await current_handle.heartbeat_task
                     if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
                         current_handle.sync_maintenance_task.cancel()
-                        with suppress(asyncio.CancelledError, Exception):
-                            await current_handle.sync_maintenance_task
+                        with suppress(Exception):
+                            await asyncio.to_thread(current_handle.sync_maintenance_task.join, 5.0)
                     self._workers.pop(task_id, None)
                 elif current_handle is not None and not bool(current_handle.owner_active):
                     if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
@@ -4026,8 +4147,8 @@ class TaskRuntimeServiceMixin:
                             await current_handle.heartbeat_task
                     if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
                         current_handle.sync_maintenance_task.cancel()
-                        with suppress(asyncio.CancelledError, Exception):
-                            await current_handle.sync_maintenance_task
+                        with suppress(Exception):
+                            await asyncio.to_thread(current_handle.sync_maintenance_task.join, 5.0)
                     self._workers.pop(task_id, None)
             if owner_registered and not self._has_local_task_execution_owner(task_id):
                 self._release_task_execution_owner(task_id, "primary_task_worker")
@@ -4539,13 +4660,18 @@ class TaskRuntimeServiceMixin:
                 )
                 self._commit_stage_item_active_state(session, task, stage_run)
                 self._release_session_connection_before_wait(session)
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="firmware_unpack",
+                    response_item=input_file,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success"},
                     failure_statuses={"failed", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
                 created = None
             else:
                 if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
@@ -4573,13 +4699,18 @@ class TaskRuntimeServiceMixin:
                         )
                         self._commit_stage_item_active_state(session, task, stage_run)
                         self._release_session_connection_before_wait(session)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="firmware_unpack",
+                            response_item=input_file,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success"},
                             failure_statuses={"failed", "cancelled"},
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                         created = None
                     elif outcome == "already_terminal":
                         payload = dict(control.get("payload") or {})
@@ -4641,13 +4772,18 @@ class TaskRuntimeServiceMixin:
                         )
                         session.commit()
                         self._release_session_connection_before_wait(session)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="firmware_unpack",
+                            response_item=input_file,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success"},
                             failure_statuses={"failed", "cancelled"},
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                         created = None
                     elif str(item.downstream_task_id or "").strip():
                         return self._defer_item_after_downstream_transport_error(
@@ -4703,13 +4839,18 @@ class TaskRuntimeServiceMixin:
                 )
                 session.commit()
                 self._release_session_connection_before_wait(session)
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="firmware_unpack",
+                    response_item=input_file,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success"},
                     failure_statuses={"failed", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
             mapped_status = (
                 "success"
                 if status == "success"
@@ -4879,13 +5020,18 @@ class TaskRuntimeServiceMixin:
                 item.error_message = None
                 self._commit_stage_item_active_state(session, task, stage_run)
                 self._release_session_connection_before_wait(session)
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, None),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="system_analysis",
+                    response_item=firmware,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
                     success_statuses={"passed", "success"},
                     failure_statuses={"failed", "error", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
             else:
                 if str(item.downstream_task_id or "").strip():
                     return self._defer_item_after_downstream_transport_error(
@@ -4937,13 +5083,18 @@ class TaskRuntimeServiceMixin:
                     )
                     session.commit()
                     self._release_session_connection_before_wait(session)
-                    status, payload = await self._poll_until_terminal(
-                        lambda: self._downstream_fetch_item_payload(task, item, None),
+                    status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                        session,
+                        task,
+                        item,
+                        operation="system_analysis",
+                        response_item=firmware,
+                        fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
                         success_statuses={"passed", "success"},
                         failure_statuses={"failed", "error", "cancelled"},
-                        task=task,
-                        item=item,
                     )
+                    if deferred is not None:
+                        return deferred
             result_payload = {}
             if status == "success":
                 try:
@@ -5144,13 +5295,18 @@ class TaskRuntimeServiceMixin:
                 item.started_at = item.started_at or _now()
                 item.error_message = None
                 self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="binary_to_source",
+                    response_item=module,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success", "partial_success", "completed"},
                     failure_statuses={"failed", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
             else:
                 if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     control = await self._downstream_control_existing_task(
@@ -5166,25 +5322,35 @@ class TaskRuntimeServiceMixin:
                         item.downstream_task_id = created.get("id") or item.downstream_task_id
                         item.status = "running"
                         self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="binary_to_source",
+                            response_item=module,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "partial_success", "completed"},
                             failure_statuses={"failed", "cancelled"},
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                     elif outcome == "already_running":
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
                         self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="binary_to_source",
+                            response_item=module,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "partial_success", "completed"},
                             failure_statuses={"failed", "cancelled"},
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                     elif outcome == "already_terminal":
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
@@ -5257,13 +5423,18 @@ class TaskRuntimeServiceMixin:
                         },
                     )
                     session.commit()
-                    status, payload = await self._poll_until_terminal(
-                        lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                    status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                        session,
+                        task,
+                        item,
+                        operation="binary_to_source",
+                        response_item=module,
+                        fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                         success_statuses={"success", "partial_success", "completed"},
                         failure_statuses={"failed", "cancelled"},
-                        task=task,
-                        item=item,
                     )
+                    if deferred is not None:
+                        return deferred
             self._merge_stage_item_result_fields(
                 task,
                 item,
@@ -5483,13 +5654,18 @@ class TaskRuntimeServiceMixin:
                     active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 )
                 self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="entry_analysis",
+                    response_item=entry_input,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"passed", "success"},
                     failure_statuses={"failed", "error", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
                 created = None
             else:
                 if str(item.downstream_task_id or "").strip():
@@ -5508,13 +5684,18 @@ class TaskRuntimeServiceMixin:
                         "cancelled",
                         "downstream_missing",
                     }:
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="entry_analysis",
+                            response_item=entry_input if "entry_input" in locals() else module,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"passed", "success"},
                             failure_statuses={"failed", "error", "cancelled"},
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                         created = None
                     else:
                         return self._defer_item_after_downstream_transport_error(
@@ -5571,13 +5752,18 @@ class TaskRuntimeServiceMixin:
                     },
                 )
                 session.commit()
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="entry_analysis",
+                    response_item=entry_input,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"passed", "success"},
                     failure_statuses={"failed", "error", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
             service_output = self._materialize_stage_artifact(
                 self._service_output_path(
                     task,
@@ -5844,13 +6030,18 @@ class TaskRuntimeServiceMixin:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "running"
                 item.downstream_task_id = active_payload.get("task_id") or active_payload.get("id") or item.downstream_task_id
                 self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, None),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="dataflow_vuln_scan",
+                    response_item=entry,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
                     success_statuses=dataflow_success_statuses,
                     failure_statuses=dataflow_failure_statuses,
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
             else:
                 if retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
                     session.commit()
@@ -5870,25 +6061,35 @@ class TaskRuntimeServiceMixin:
                         item.downstream_task_id = created.get("task_id") or item.downstream_task_id
                         item.status = "running"
                         self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="dataflow_vuln_scan",
+                            response_item=entry,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses=dataflow_success_statuses,
                             failure_statuses=dataflow_failure_statuses,
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                     elif outcome == "already_running":
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
                         item.status = self._map_downstream_status(str(payload.get("status") or "")) or "running"
                         self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="dataflow_vuln_scan",
+                            response_item=entry,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses=dataflow_success_statuses,
                             failure_statuses=dataflow_failure_statuses,
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                     elif outcome == "already_terminal":
                         payload = dict(control.get("payload") or {})
                         item.downstream_task_id = payload.get("task_id") or payload.get("id") or item.downstream_task_id
@@ -5934,13 +6135,18 @@ class TaskRuntimeServiceMixin:
                             },
                         )
                         session.commit()
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="dataflow_vuln_scan",
+                            response_item=entry,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses=dataflow_success_statuses,
                             failure_statuses=dataflow_failure_statuses,
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                     else:
                         created = await self._downstream_create_task(
                             session,
@@ -5994,13 +6200,18 @@ class TaskRuntimeServiceMixin:
                             },
                         )
                         session.commit()
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, None),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="dataflow_vuln_scan",
+                            response_item=entry,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
                             success_statuses=dataflow_success_statuses,
                             failure_statuses=dataflow_failure_statuses,
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
             artifact_root = self._service_output_dir(
                 task,
                 item.downstream_service or stage_run.stage_name,
@@ -6243,13 +6454,18 @@ class TaskRuntimeServiceMixin:
                             },
                         )
                         session.commit()
-                        status, payload = await self._poll_until_terminal(
-                            lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                            session,
+                            task,
+                            item,
+                            operation="dataflow_vuln_scan",
+                            response_item=dataflow_result,
+                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                             success_statuses={"success", "succeeded", "completed"},
                             failure_statuses={"failed", "cancelled"},
-                            task=task,
-                            item=item,
                         )
+                        if deferred is not None:
+                            return deferred
                         artifacts = await self._downstream_fetch_item_artifacts(item, token or "")
                         archive_payload = {
                             **payload,
@@ -6320,13 +6536,18 @@ class TaskRuntimeServiceMixin:
                 item.status = self._map_downstream_status(str(active_payload.get("status") or "")) or "pending"
                 self._mark_downstream_binding_created(item, message="下游已创建，状态待同步")
                 self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="dataflow_vuln_scan",
+                    response_item=dataflow_result,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success", "succeeded", "completed"},
                     failure_statuses={"failed", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
                 created = None
             else:
                 if retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
@@ -6391,13 +6612,18 @@ class TaskRuntimeServiceMixin:
                     },
                 )
                 session.commit()
-                status, payload = await self._poll_until_terminal(
-                    lambda: self._downstream_fetch_item_payload(task, item, token or ""),
+                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                    session,
+                    task,
+                    item,
+                    operation="dataflow_vuln_scan",
+                    response_item=dataflow_result,
+                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
                     success_statuses={"success", "succeeded", "completed"},
                     failure_statuses={"failed", "cancelled"},
-                    task=task,
-                    item=item,
                 )
+                if deferred is not None:
+                    return deferred
             artifacts = await self._downstream_fetch_item_artifacts(item, token or "")
             archive_payload = {**payload, "artifacts": artifacts, "workspace_root": artifacts.get("workspace_root")}
             mapped_status = (

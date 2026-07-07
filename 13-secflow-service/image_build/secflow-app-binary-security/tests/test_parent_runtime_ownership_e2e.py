@@ -161,7 +161,7 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
         requeued = []
-        manager._force_requeue_delete_task = lambda task_id: requeued.append(task_id)
+        manager._force_requeue_delete_task = lambda task_id, context=None: requeued.append(task_id)
 
         asyncio.run(manager._consume_delete_queue_task(db, task.id))
 
