@@ -42071,7 +42071,7 @@ def _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty(self):
     ):
         asyncio.run(manager._dispatch_loop())
 
-    reclaim_pass.assert_called_once_with(db)
+        reclaim_pass.assert_called_once_with(db, include_owned_execution_takeover_requeue=False)
 
 
 def _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_after_startup_window(self):

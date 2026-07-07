@@ -215,6 +215,40 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
     def _workspace_root(self, name: str) -> str:
         return f"/tmp/{name}"
 
+    async def test_dispatch_loop_entrypoint_uses_async_default_impl_without_sync_bridge(self):
+        manager = TaskManager()
+        db = _ModelAwareDb(tasks=[], events=[], state_events=[])
+        async_calls: list[str] = []
+
+        async def _fake_async(_db, _task_id):
+            async_calls.append("async")
+            return "task-1"
+
+        manager._dispatch_task_by_id_async = _fake_async
+        manager._run_async_blocking = lambda _coro: (_ for _ in ()).throw(AssertionError("sync bridge should not be used"))
+
+        claimed = await manager._dispatch_task_by_id_for_dispatch_loop(db, "task-1")
+
+        self.assertEqual("task-1", claimed)
+        self.assertEqual(["async"], async_calls)
+
+    async def test_async_release_helper_uses_async_default_impl_without_sync_bridge(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(id="task-1", project_id="project-1", name="task")
+        db = _ModelAwareDb(tasks=[task], events=[], state_events=[])
+        manager._run_async_blocking = lambda _coro: (_ for _ in ()).throw(AssertionError("sync bridge should not be used"))
+        manager._release_task_without_supported_runtime_owner_async = AsyncMock(return_value=True)
+
+        released = await manager._release_task_without_supported_runtime_owner_for_async_path(
+            db,
+            task,
+            active_operation=None,
+            reason="test_async_release",
+        )
+
+        self.assertTrue(released)
+        manager._release_task_without_supported_runtime_owner_async.assert_awaited_once()
+
     async def test_start_stops_partially_started_loops_when_seed_work_queues_fails(self):
         manager = TaskManager()
         manager.cfg.queue.redis_url = "redis://redis.example:6379/0"
