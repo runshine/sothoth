@@ -4618,17 +4618,6 @@ class TaskManager(
                 allow_claim=False,
                 decision_reason="active_runtime_lease",
             )
-        if snapshot.supported_control_operation_active:
-            return _StaleParentRuntimeTakeoverDecision(
-                runtime_lease_active=False,
-                runtime_lease_owner=snapshot.runtime_lease_owner,
-                local_handle_alive=snapshot.local_handle_alive,
-                supported_control_operation_active=True,
-                allow_takeover=False,
-                allow_reenqueue=False,
-                allow_claim=False,
-                decision_reason="supported_control_operation_active",
-            )
         return _StaleParentRuntimeTakeoverDecision(
             runtime_lease_active=False,
             runtime_lease_owner=snapshot.runtime_lease_owner,
@@ -4637,7 +4626,7 @@ class TaskManager(
             allow_takeover=True,
             allow_reenqueue=True,
             allow_claim=True,
-            decision_reason="runtime_lease_expired_without_local_owner",
+            decision_reason="runtime_lease_missing_or_expired",
         )
 
     def _should_enqueue_parent_dispatch_for_task_sync(
@@ -4671,26 +4660,7 @@ class TaskManager(
         snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
         active_runtime_lease_owner = snapshot.runtime_lease_owner if snapshot.runtime_lease_active else None
         guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
-        if guard.preserve and snapshot.supported_control_operation_active:
-            self._record_event(
-                db,
-                task,
-                "task_owner_release_deferred_for_control_operation_takeover",
-                "检测到控制操作仍由有效 runtime lease 持有，本次不释放 owner",
-                level="info",
-                stage_name=task.current_stage,
-                payload={
-                    "reason": reason,
-                    "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
-                    "active_runtime_lease_owner": active_runtime_lease_owner,
-                    "operation_runtime": self._operation_runtime_snapshot(active_operation),
-                    **self._parent_runtime_ownership_snapshot_payload(snapshot, reason=reason),
-                },
-            )
-            return False
         if self._task_has_supported_runtime_owner(db, task, active_operation=active_operation):
-            return False
-        if self._parent_takeover_pending_claim_active(task):
             return False
         if guard.preserve:
             self._record_event(
@@ -4773,6 +4743,15 @@ class TaskManager(
                             **self._parent_runtime_ownership_snapshot_payload(refreshed_snapshot, reason=reason),
                         },
                     )
+                    return False
+                if self._parent_takeover_pending_claim_active(task):
+                    if str(getattr(task, "status", "") or "").strip().lower() == "pending":
+                        await self._enqueue_task_and_wait(
+                            task.id,
+                            context="released_takeover_reconcile",
+                            timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+                            force_requeue=True,
+                        )
                     return False
                 clear_result = (
                     self._clear_runtime_lease(

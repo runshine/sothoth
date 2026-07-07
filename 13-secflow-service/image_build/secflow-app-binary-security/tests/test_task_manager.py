@@ -42504,7 +42504,9 @@ def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_it
     self.assertTrue(changed)
     self.assertEqual("pending", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
-    self.assertTrue(any(event.event_type == "running_execution_released_for_takeover" for event in db.events))
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("task_runtime_released_without_local_owner", event_types)
+    self.assertIn("parent_takeover_recovery_committed", event_types)
 
 
 def _test_release_for_takeover_main_state_clears_owner(self):

@@ -2981,9 +2981,11 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         reclaimed = self.manager._reclaim_stale_running_locked(db)
 
         self.assertTrue(reclaimed)
-        self.assertEqual("running", task.status)
-        self.assertEqual(["task-1"], enqueued)
-        self.assertIn("running_without_active_lease_requeued", [row.event_type for row in db.events])
+        self.assertEqual("pending", task.status)
+        self.assertEqual([], enqueued)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("task_runtime_released_without_local_owner", event_types)
+        self.assertIn("parent_takeover_recovery_committed", event_types)
 
     async def test_dispatch_loop_does_not_log_crash_for_redis_timeout_empty_poll(self):
         manager = TaskManager()

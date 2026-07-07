@@ -245,7 +245,10 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
 
         self.assertFalse(reclaimed)
         self.assertEqual("pending", task.status)
-        self.assertEqual([], self.fake_task_queue.requeued_tasks)
+        self.assertEqual(
+            [{"task_id": task.id, "context": "released_takeover_reconcile"}],
+            self.fake_task_queue.requeued_tasks,
+        )
         self.assertFalse(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
 
     def test_owner_drift_requeue_can_be_claimed_and_runtime_restarted(self):

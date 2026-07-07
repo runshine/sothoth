@@ -126,7 +126,7 @@ class TaskRuntimeServiceMixin:
         if not bool(snapshot.get("active")):
             return False
         status = str(getattr(task, "status", "") or "").strip().lower()
-        return status in {"pending", "dispatching"}
+        return status in {"pending", "dispatching", "cancelling"}
 
     def _clear_parent_takeover_pending_claim(self: TaskManager, task) -> None:
         summary = dict(getattr(task, "summary", None) or {})
@@ -1323,11 +1323,7 @@ class TaskRuntimeServiceMixin:
         stage_name = str(task.current_stage or "").strip() or None
         if not stage_name:
             return False
-        if self._task_runtime_transition_guard_active(task):
-            return False
         if str(task.status or "").strip() == "dispatching":
-            return False
-        if self._parent_takeover_pending_claim_active(task):
             return False
         lease = self._runtime_lease_for_task(db, task.id)
         if self._runtime_lease_is_active(lease):
@@ -1347,182 +1343,24 @@ class TaskRuntimeServiceMixin:
         return changed
 
     def _reclaim_stale_dispatching_single_task_locked(self: TaskManager, db: Session, task_id: str) -> bool:
-        from app.service import task_manager as task_manager_module
-
-        service_config = self._load_service_config(db)
         task = self._lock_task_row_by_id(db, task_id)
         if task is None:
             return False
-        if self._parent_takeover_pending_claim_active(task):
-            return False
-        if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
-            return False
-        if self._task_runtime_transition_guard_active(task):
-            return False
-        lease, runtime_lease_owner, runtime_lease_expires_at = self._runtime_lease_context(db, task)
+        lease, _runtime_lease_owner, _runtime_lease_expires_at = self._runtime_lease_context(db, task)
         if self._runtime_lease_is_active(lease):
             return False
-        active_stage_name, active_item_count, has_downstream_refs = self._streaming_tail_active_context(db, task)
-        dispatch_reference_at = getattr(task, "updated_at", None) or getattr(task, "started_at", None) or getattr(task, "created_at", None)
-        dispatch_elapsed_seconds = task_manager_module._elapsed_seconds_since(dispatch_reference_at)
-        startup_window_seconds = max(5, int(self._STATE_TRANSITION_GUARD_TTL_SECONDS or 30))
-        protected_dispatching_window = bool(
-            active_item_count > 0
-            and dispatch_elapsed_seconds is not None
-            and dispatch_elapsed_seconds <= startup_window_seconds
+        return bool(
+            self._release_task_without_supported_runtime_owner(
+                db,
+                task,
+                active_operation=None,
+                reason="stale_dispatching_runtime_lease_missing_or_expired",
+            )
         )
-        if protected_dispatching_window:
-            return False
-        if dispatch_elapsed_seconds is None or dispatch_elapsed_seconds < service_config.dispatch_timeout_seconds:
-            return False
-        handle_state = self._local_runtime_handle_state(task.id)
-        if dispatch_elapsed_seconds is not None and dispatch_elapsed_seconds > startup_window_seconds:
-            if active_item_count > 0 and self._release_streaming_parent_for_takeover_locked(
-                db,
-                task,
-                runtime_lease_owner=runtime_lease_owner,
-                runtime_lease_expires_at=runtime_lease_expires_at,
-                reason="dispatching_runtime_lease_missing_with_active_tail",
-                signal_takeover=True,
-            ):
-                self._record_event(
-                    db,
-                    task,
-                    "dispatching_runtime_lease_missing_released",
-                    "dispatching owner 缺少有效 runtime lease，父任务已释放并重新排队等待接管",
-                    level="warning",
-                    stage_name=task.current_stage,
-                    payload={
-                        "runtime_lease_owner": runtime_lease_owner,
-                        "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
-                        "dispatch_reference_at": task_manager_module._isoformat_or_none(dispatch_reference_at),
-                        "local_handle_state": handle_state,
-                        "active_item_count": active_item_count,
-                        "has_downstream_refs": has_downstream_refs,
-                        "reclaim_reason": "dispatching_runtime_lease_missing_with_active_tail",
-                    },
-                )
-                return True
-        if active_item_count > 0 and self._release_streaming_parent_for_takeover_locked(
-            db,
-            task,
-            runtime_lease_owner=runtime_lease_owner,
-            runtime_lease_expires_at=runtime_lease_expires_at,
-            reason="dispatching_owner_lost_with_active_tail",
-            signal_takeover=True,
-        ):
-            task_manager_module.observe_runtime_lease_owner_mismatch("dispatching_with_active_tail_owner_lost")
-            return True
-        failure_ctx = self._current_stage_authoritative_failure_context(db, task)
-        if failure_ctx is None:
-            failure_ctx = self._earlier_stage_authoritative_failure_context(db, task)
-        if failure_ctx is None:
-            stage_runs = db.query(task_manager_module.BinarySecurityStageRun).filter(
-                task_manager_module.BinarySecurityStageRun.task_id == task.id
-            ).all()
-            current_stage_name = str(task.current_stage or "").strip()
-            current_stage_run = next(
-                (run for run in stage_runs if str(getattr(run, "stage_name", "") or "").strip() == current_stage_name),
-                None,
-            )
-            should_terminalize_failed_stage = False
-            if current_stage_run is not None:
-                stage_error_text = " ".join(
-                    str(part or "").strip()
-                    for part in (
-                        getattr(current_stage_run, "last_error", None),
-                        getattr(current_stage_run, "error_message", None),
-                        getattr(current_stage_run, "reason", None),
-                    )
-                    if str(part or "").strip()
-                ).lower()
-                should_terminalize_failed_stage = (
-                    str(getattr(current_stage_run, "status", "") or "").strip() == "failed"
-                    and (
-                        "task owner pod lost" in stage_error_text
-                        or "owner pod lost" in stage_error_text
-                        or self._is_terminal_business_stage_failure(task, current_stage_run)
-                    )
-                )
-            if current_stage_run is not None and should_terminalize_failed_stage:
-                snapshot = self._stage_failure_snapshot(task, current_stage_run)
-                failure_ctx = {
-                    "stage_name": current_stage_name,
-                    "stage_run": current_stage_run,
-                    "failure_code": snapshot.get("failure_code"),
-                    "failure_category": snapshot.get("failure_category"),
-                    "failure_message": snapshot.get("failure_message") or snapshot.get("error") or getattr(current_stage_run, "last_error", None),
-                    "reason": "stale_dispatching_stage_run_failed",
-                }
-        if failure_ctx is not None:
-            self._finalize_task_after_authoritative_failure(
-                db,
-                task,
-                failure_ctx=failure_ctx,
-                previous_status="dispatching",
-            )
-            return True
-        reclaimed_to_pending = self._apply_lease_loss_requeue_state(
-            db,
-            task,
-            reason="调度超时，任务回收并重新进入队列",
-            status="pending",
-            stage_name=task.current_stage,
-            last_error=None,
-            source="runtime_worker",
-            allow_reclaim_write=True,
-        )
-        if reclaimed_to_pending:
-            task_manager_module.observe_dispatch_reclaim("dispatch_timeout")
-            self._record_event(
-                db,
-                task,
-                "dispatch_reclaimed",
-                "调度超时，任务已回收并重新进入队列",
-                level="warning",
-                stage_name=task.current_stage,
-                payload={
-                    "runtime_lease_owner": runtime_lease_owner,
-                    "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
-                    "dispatch_reference_at": task_manager_module._isoformat_or_none(dispatch_reference_at),
-                    "active_stage_name": active_stage_name or task.current_stage,
-                    "active_item_count": active_item_count,
-                    "reclaim_reason": "dispatch_timeout",
-                    "has_downstream_refs": has_downstream_refs,
-                },
-            )
-        else:
-            self._record_event(
-                db,
-                task,
-                "dispatch_reclaim_blocked",
-                "调度超时后尝试回收任务，但主状态写入被阻断",
-                level="warning",
-                stage_name=task.current_stage,
-                payload={
-                    "runtime_lease_owner": runtime_lease_owner,
-                    "runtime_lease_expires_at": task_manager_module._isoformat_or_none(runtime_lease_expires_at),
-                    "dispatch_reference_at": task_manager_module._isoformat_or_none(dispatch_reference_at),
-                    "active_stage_name": active_stage_name or task.current_stage,
-                    "active_item_count": active_item_count,
-                    "reclaim_reason": "dispatch_timeout",
-                    "has_downstream_refs": has_downstream_refs,
-                },
-            )
-        return True
 
     def _repair_running_lease_invariant_single_task_locked(self: TaskManager, db: Session, task_id: str) -> bool:
-        from app.service import task_manager as task_manager_module
-
         task = self._lock_task_row_by_id(db, task_id)
         if task is None:
-            return False
-        if self._parent_takeover_pending_claim_active(task):
-            return False
-        if (
-            self._task_has_active_cancel_operation(db, task)
-            or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING
-        ):
             return False
         changed = self._repair_running_lease_invariant(
             db,
@@ -1578,10 +1416,6 @@ class TaskRuntimeServiceMixin:
         )
         repaired = False
         for task in rows:
-            if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
-                continue
-            if self._parent_takeover_pending_claim_active(task):
-                continue
             if self._repair_running_lease_invariant(
                 db,
                 task,
@@ -3642,64 +3476,16 @@ class TaskRuntimeServiceMixin:
             return False
         requeued = False
         for task in released_rows:
-            if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
-                continue
-            if self._parent_takeover_pending_claim_active(task):
-                continue
             lease = self._runtime_lease_for_task(db, task.id)
             if self._runtime_lease_is_active(lease):
                 continue
-            if self._has_local_task_execution_owner(task.id) or self._task_has_active_streaming_stage_workers(task.id):
-                continue
-            if str(getattr(task, "current_operation_id", "") or "").strip():
-                continue
-            runtime_lease_owner = str(lease.owner_instance_id or "").strip() or None if lease is not None else None
-            runtime_lease_expires_at = lease.lease_expires_at if lease is not None else None
-            if self._release_streaming_parent_for_takeover_locked(
+            changed = self._release_task_without_supported_runtime_owner(
                 db,
                 task,
-                runtime_lease_owner=runtime_lease_owner,
-                runtime_lease_expires_at=runtime_lease_expires_at,
-                reason="released_running_without_owner_with_active_tail",
-            ):
-                task_manager_module.observe_runtime_lease_owner_mismatch("released_running_with_active_tail")
-                requeued = True
-                continue
-            stage_name = task.current_stage or self._stage_sequence_for_task(task)[0]
-            active_items = db.query(task_manager_module.BinarySecurityStageItem).filter(
-                task_manager_module.BinarySecurityStageItem.task_id == task.id,
-                task_manager_module.BinarySecurityStageItem.stage_name == stage_name,
-                task_manager_module.BinarySecurityStageItem.status.in_(["pending", "queued", "running"]),
-            ).all()
-            has_downstream_refs = any(str(item.downstream_task_id or "").strip() for item in active_items)
-            if active_items or has_downstream_refs:
-                continue
-            self._apply_task_main_state_update(
-                db,
-                task,
-                source="runtime_worker",
-                reason="释放后的运行任务重新纳入待调度队列",
-                status="pending",
-                stage_name=stage_name,
-                last_error=None,
+                active_operation=None,
+                reason="released_running_runtime_lease_missing_or_expired",
             )
-            task.updated_at = task_manager_module._now()
-            task_manager_module.observe_running_requeue("released_without_owner")
-            self._record_event(
-                db,
-                task,
-                "running_execution_requeued",
-                "已将释放后的运行任务重新纳入待调度队列，等待新的 worker 安全接管",
-                level="warning",
-                stage_name=stage_name,
-                payload={
-                    "stage_name": stage_name,
-                    "active_item_count": len(active_items),
-                    "runtime_lease_owner": None,
-                    "runtime_lease_stale": True,
-                },
-            )
-            requeued = True
+            requeued = bool(changed) or requeued
         if requeued:
             db.flush()
         return requeued
@@ -3707,7 +3493,6 @@ class TaskRuntimeServiceMixin:
     def _reclaim_stale_running_locked(self: TaskManager, db: Session) -> bool:
         from app.service import task_manager as task_manager_module
 
-        service_config = self._load_service_config(db)
         stale_rows = (
             db.query(task_manager_module.BinarySecurityTask)
             .filter(task_manager_module.BinarySecurityTask.status == "running")
@@ -3716,141 +3501,17 @@ class TaskRuntimeServiceMixin:
         if not stale_rows:
             return False
         reclaimed = False
-        local_workers = {
-            task_id for task_id, worker in self._workers.items()
-            if not worker.done()
-        }
-        timeout_seconds = max(int(service_config.dispatch_timeout_seconds or 0), 60)
         for task in stale_rows:
-            if self._task_has_active_cancel_operation(db, task) or str(task.status or "").strip() == task_manager_module.TASK_STATUS_CANCELLING:
-                continue
-            if self._parent_takeover_pending_claim_active(task):
-                continue
             lease = self._runtime_lease_for_task(db, task.id)
             if self._runtime_lease_is_active(lease):
                 continue
-            if task.id in local_workers:
-                continue
-            if self._release_streaming_parent_for_takeover_locked(
+            changed = self._release_task_without_supported_runtime_owner(
                 db,
                 task,
-                runtime_lease_owner=str(getattr(lease, "owner_instance_id", "") or "").strip() or None if lease is not None else None,
-                runtime_lease_expires_at=getattr(lease, "lease_expires_at", None) if lease is not None else None,
-                reason="stale_running_without_active_runtime_lease",
-            ):
-                reclaimed = True
-                continue
-            current_stage_name = str(task.current_stage or "").strip()
-            runnable_work_exists = bool(
-                current_stage_name
-                and self._should_requeue_for_owned_execution(
-                    db,
-                    task,
-                    next_stage=current_stage_name,
-                    next_stage_status="running",
-                )
+                active_operation=None,
+                reason="stale_running_runtime_lease_missing_or_expired",
             )
-            if not runnable_work_exists and str(getattr(task, "current_operation_id", "") or "").strip():
-                runnable_work_exists = True
-            if not runnable_work_exists and self._is_streaming_tail_stage(task, current_stage_name):
-                runnable_work_exists = bool(
-                    self._tail_requires_execution_takeover(db, task)
-                    or self._tail_has_runnable_unbound_work(db, task)
-                )
-            if runnable_work_exists:
-                task_manager_module.observe_running_requeue("stale_running_without_active_runtime_lease")
-                self._record_event(
-                    db,
-                    task,
-                    "running_without_active_lease_requeued",
-                    "检测到 running 任务缺少有效租约，但当前仍有可执行工作，已保留 running 并重新排队等待 owner 接管",
-                    level="warning",
-                    stage_name=current_stage_name or None,
-                    payload={
-                        "reason": "stale_running_without_active_runtime_lease",
-                        "runtime_phase": self._task_runtime_phase(task),
-                        "previous_task_status": "running",
-                        "runtime_lease_owner": str(getattr(lease, "owner_instance_id", "") or "").strip() or None if lease is not None else None,
-                        "runtime_lease_expires_at": getattr(lease, "lease_expires_at", None) if lease is not None else None,
-                        "repair_action": "running_requeue_owned_execution",
-                        "source": "reclaim_stale_running",
-                    },
-                )
-                self._enqueue_task(task.id)
-                reclaimed = True
-                continue
-            reference_time = task.updated_at or task.started_at
-            elapsed_seconds = task_manager_module._elapsed_seconds_since(reference_time)
-            if elapsed_seconds is None or elapsed_seconds < timeout_seconds:
-                continue
-            failure_ctx = self._current_stage_authoritative_failure_context(db, task)
-            if failure_ctx is None:
-                failure_ctx = self._earlier_stage_authoritative_failure_context(db, task)
-            if failure_ctx is not None:
-                self._finalize_task_after_authoritative_failure(
-                    db,
-                    task,
-                    failure_ctx=failure_ctx,
-                    previous_status="running",
-                )
-                reclaimed = True
-                continue
-            stage_runs = db.query(task_manager_module.BinarySecurityStageRun).filter(
-                task_manager_module.BinarySecurityStageRun.task_id == task.id
-            ).all()
-            current_stage_run = next(
-                (
-                    run
-                    for run in stage_runs
-                    if str(getattr(run, "stage_name", "") or "").strip() == str(task.current_stage or "").strip()
-                ),
-                None,
-            )
-            if current_stage_run is not None:
-                current_stage_run.status = "failed"
-                current_stage_run.finished_at = current_stage_run.finished_at or task_manager_module._now()
-                current_stage_run.last_error = str(getattr(current_stage_run, "last_error", None) or "任务运行心跳超时").strip()
-            current_stage_name = str(task.current_stage or "").strip()
-            active_items = db.query(task_manager_module.BinarySecurityStageItem).filter(
-                task_manager_module.BinarySecurityStageItem.task_id == task.id,
-                task_manager_module.BinarySecurityStageItem.stage_name == current_stage_name,
-            ).all()
-            for item in active_items:
-                item_status = str(item.status or "").strip()
-                if item_status in {"pending", "queued", "dispatching", "running"}:
-                    item.status = "failed"
-                    item.finished_at = item.finished_at or task_manager_module._now()
-                    item.error_message = item.error_message or "任务运行心跳超时"
-            self._apply_terminal_state_update(
-                db,
-                task,
-                reason="任务运行心跳超时，任务失败",
-                status="failed",
-                stage_name=current_stage_name or None,
-                runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
-                finished_at=task.finished_at or task_manager_module._now(),
-                last_error=task.last_error or "任务运行心跳超时",
-                source="runtime_worker",
-            )
-            self._record_event(
-                db,
-                task,
-                "dispatching_state_force_terminalized",
-                "检测到当前阶段已进入终态失败，父任务已自动结束 dispatching 收口",
-                level="warning",
-                stage_name=current_stage_name or None,
-                payload={"previous_status": "running", "reason": "stale_running_timeout"},
-            )
-            self._record_event(
-                db,
-                task,
-                "task_finalized_after_child_failure",
-                "下游子任务已终态失败，父任务已直接收口为 failed",
-                level="warning",
-                stage_name=current_stage_name or None,
-                payload={"stage_name": current_stage_name or None, "requeue_suppressed": True},
-            )
-            reclaimed = True
+            reclaimed = bool(changed) or reclaimed
         if reclaimed:
             db.flush()
         return reclaimed
