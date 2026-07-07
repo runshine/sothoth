@@ -169,30 +169,45 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
                 return super().query(model, *args, **kwargs)
 
         db = _RunTaskCleanupDb(tasks=[task], stage_items=[item], events=[], runtime_leases=[lease])
+        signal_calls = {"count": 0}
 
         async def _tail_execute(_task_id):
             task.status = "running"
             task.tail_reconcile_state = "idle"
             manager._set_task_runtime_phase(task, TASK_RUNTIME_PHASE_OWNED_EXECUTION)
 
+        async def _run_task_runtime_signals(_task_id):
+            signal_calls["count"] += 1
+            if signal_calls["count"] >= 3:
+                task.status = "success"
+            return False
+
+        async def _fast_sleep(_seconds, result=None):
+            return result
+
         original_factory = task_manager_module.get_session_factory
         original_execute = manager._execute_task
         original_active_context = manager._task_has_authoritative_active_stage_context
+        original_run_task_runtime_signals = manager._run_task_runtime_signals
         try:
             task_manager_module.get_session_factory = lambda: (lambda: db)
             manager._execute_task = _tail_execute
+            manager._run_task_runtime_signals = _run_task_runtime_signals
             manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
-            asyncio.run(manager._run_task(task.id))
+            manager.cfg.scheduler.stage_poll_interval_seconds = 0
+            with patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep):
+                asyncio.run(manager._run_task(task.id))
         finally:
             task_manager_module.get_session_factory = original_factory
             manager._execute_task = original_execute
             manager._task_has_authoritative_active_stage_context = original_active_context
+            manager._run_task_runtime_signals = original_run_task_runtime_signals
 
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
-        self.assertEqual("running", task.status)
-        self.assertEqual(1, len(db.runtime_leases))
+        self.assertEqual("success", task.status)
+        self.assertEqual(0, len(db.runtime_leases))
         self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
-        self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
+        self.assertGreaterEqual(signal_calls["count"], 3)
 
     def test_run_task_finally_requeues_nonstreaming_runtime_without_active_owner(self):
         manager = TaskManager()
@@ -243,29 +258,44 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
                 return super().query(model, *args, **kwargs)
 
         db = _RunTaskCleanupDb(tasks=[task], stage_runs=[stage_run], runtime_leases=[lease], events=[])
+        signal_calls = {"count": 0}
 
         async def _noop_execute(_task_id):
             task.status = "running"
             return None
 
+        async def _run_task_runtime_signals(_task_id):
+            signal_calls["count"] += 1
+            if signal_calls["count"] >= 3:
+                task.status = "success"
+            return False
+
+        async def _fast_sleep(_seconds, result=None):
+            return result
+
         original_factory = task_manager_module.get_session_factory
         original_execute = manager._execute_task
         original_active_context = manager._task_has_authoritative_active_stage_context
+        original_run_task_runtime_signals = manager._run_task_runtime_signals
         try:
             task_manager_module.get_session_factory = lambda: (lambda: db)
             manager._execute_task = _noop_execute
+            manager._run_task_runtime_signals = _run_task_runtime_signals
             manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
-            asyncio.run(manager._run_task(task.id))
+            manager.cfg.scheduler.stage_poll_interval_seconds = 0
+            with patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep):
+                asyncio.run(manager._run_task(task.id))
         finally:
             task_manager_module.get_session_factory = original_factory
             manager._execute_task = original_execute
             manager._task_has_authoritative_active_stage_context = original_active_context
+            manager._run_task_runtime_signals = original_run_task_runtime_signals
 
-        self.assertEqual("running", task.status)
+        self.assertEqual("success", task.status)
         self.assertEqual("system_analysis", task.current_stage)
-        self.assertEqual(1, len(db.runtime_leases))
+        self.assertEqual(0, len(db.runtime_leases))
         self.assertFalse(any(event.event_type == "owned_execution_takeover_requeued" for event in db.events))
-        self.assertTrue(any(event.event_type == "parent_runtime_reopen_suppressed_active_lease" for event in db.events))
+        self.assertGreaterEqual(signal_calls["count"], 3)
 
     def test_reclaim_stale_running_streaming_tail_requeues_for_takeover(self):
         manager = TaskManager()

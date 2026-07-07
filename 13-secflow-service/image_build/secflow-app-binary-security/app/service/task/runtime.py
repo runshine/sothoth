@@ -159,6 +159,28 @@ class TaskRuntimeServiceMixin:
         decision = getattr(self, "_last_dispatch_claim_decision", None)
         return dict(decision or {}) if decision else None
 
+    def _task_should_keep_runtime_runner_alive(
+        self: TaskManager,
+        db: Session,
+        task,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if task is None:
+            return False
+        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if current_status in task_manager_module.TASK_TERMINAL_STATUSES:
+            return False
+        if current_status not in {
+            "running",
+            "dispatching",
+            task_manager_module.TASK_STATUS_CANCELLING,
+        }:
+            return False
+        if str(self._task_runtime_phase(task) or "").strip() != task_manager_module.TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return False
+        return self._task_runtime_owner_matches_current_instance(db, task)
+
     def _task_is_runtime_owner_handoff_pending(self: TaskManager, db: Session, task) -> bool:
         from app.service import task_manager as task_manager_module
 
@@ -1515,15 +1537,15 @@ class TaskRuntimeServiceMixin:
                                         getattr(handle, "cancel_requested", None) if handle is not None else None,
                                     )
                             else:
-                                if bool(decision.get("should_requeue", True)):
-                                    await self._requeue_unclaimed_dispatch_task(db, task_id)
-                                elif decision.get("cooldown_seconds"):
+                                if decision.get("cooldown_seconds"):
                                     await self._cooldown_unclaimed_dispatch_task_after_pop(
                                         db,
                                         task_id,
                                         reason=str(decision.get("blocked_reason", "") or "").strip() or None,
                                         cooldown_seconds=int(decision.get("cooldown_seconds") or 0),
                                     )
+                                elif bool(decision.get("should_requeue", True)):
+                                    await self._requeue_unclaimed_dispatch_task(db, task_id)
                                 else:
                                     await self._drop_unclaimed_dispatch_task_after_pop(
                                         db,
@@ -3934,7 +3956,10 @@ class TaskRuntimeServiceMixin:
                             runtime_db.commit()
                         should_remain_active = True
                     else:
-                        should_remain_active = authoritative_context_active
+                        should_remain_active = bool(
+                            authoritative_context_active
+                            or self._task_should_keep_runtime_runner_alive(runtime_db, task_after_execute)
+                        )
                     if not should_remain_active:
                         break
                 finally:
@@ -3977,7 +4002,10 @@ class TaskRuntimeServiceMixin:
                             )
                             runtime_db.commit()
                         continue
-                    if authoritative_context_active:
+                    if authoritative_context_active or self._task_should_keep_runtime_runner_alive(
+                        runtime_db,
+                        task_after_signals,
+                    ):
                         continue
                     break
                 finally:
