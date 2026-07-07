@@ -10,7 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from redis.exceptions import TimeoutError as RedisTimeoutError
-from sqlalchemy.exc import OperationalError, TimeoutError as SATimeoutError
+from sqlalchemy.exc import InvalidRequestError, OperationalError, TimeoutError as SATimeoutError
 
 from app.model import (
     BinarySecurityStageItem,
@@ -4007,6 +4007,67 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(any(event.event_type == "task_runtime_runner_keepalive_exited" for event in db.events))
 
+    async def test_run_task_restarts_local_runtime_after_recoverable_execute_exception(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-run-recoverable-exception",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("run-task-restarts-local-runtime-after-recoverable-execute-exception"),
+            runtime_phase="owned_execution",
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[runtime_lease])
+        restart_runtime = AsyncMock(return_value=True)
+
+        async def _run_current_task_operation(_task_id):
+            return False
+
+        async def _run_task_runtime_signals(_task_id):
+            return False
+
+        async def _execute_task(_task_id):
+            raise RuntimeError("transient execute failure")
+
+        manager._run_current_task_operation = _run_current_task_operation
+        manager._run_task_runtime_signals = _run_task_runtime_signals
+        manager._execute_task = _execute_task
+        manager._restart_local_runtime_for_active_owner = restart_runtime
+        manager._task_execution_owners = {}
+        manager._register_task_execution_owner = lambda *_args, **_kwargs: True
+        manager._release_task_execution_owner = lambda *_args, **_kwargs: None
+        manager._service_role = lambda: "worker"
+        manager._lease_is_active = lambda *_args, **_kwargs: True
+        manager._next_lease_expiry = lambda *_args, **_kwargs: _now() + timedelta(minutes=5)
+        manager._upsert_runtime_lease = lambda *_args, **_kwargs: runtime_lease
+        manager._clear_task_abnormal_reason_snapshot = lambda *_args, **_kwargs: None
+        manager._bind_execution_token = lambda *_args, **_kwargs: "token-1"
+        manager._dispatch_token_for_task = lambda *_args, **_kwargs: "token-1"
+        manager._streaming_tail_active_context = lambda *_args, **_kwargs: (None, 0, False)
+        manager._is_streaming_tail_stage = lambda *_args, **_kwargs: False
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_owner_matches_current_instance = lambda *_args, **_kwargs: True
+        manager._release_dispatch_claim_lock_for_task_async = AsyncMock(return_value=None)
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task(task.id)
+
+        restart_runtime.assert_awaited_once_with(task.id, replace_current_runner=True)
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("task_runtime_execution_recoverable_exception", event_types)
+        self.assertNotIn("task_failed", event_types)
+
     async def test_run_task_does_not_record_keepalive_exit_while_idle_runtime_stays_owned(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
@@ -5613,6 +5674,84 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual("failed", task.status)
         self.assertEqual(1, len(task.summary.get("input_files") or []))
         self.assertEqual("fw.bin", task.summary["input_files"][0]["filename"])
+
+    def test_execute_task_reloads_task_after_stage_handler_detaches_original_instance(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-detached-after-stage-handler",
+            project_id="project-1",
+            name="task",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_path="/tmp/fw.bin",
+            firmware_source="project_filesystem",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-detached-task",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        stage_run = BinarySecurityStageRun(
+            task_id=task.id,
+            stage_name="entry_analysis",
+            sequence_no=1,
+            status="running",
+        )
+
+        class _DetachedRefreshDb(_ModelAwareDb):
+            def refresh(self, obj):
+                if obj is not self.tasks[0]:
+                    raise InvalidRequestError("Instance is not persistent within this Session")
+                return obj
+
+        db = _DetachedRefreshDb(tasks=[task], stage_runs=[stage_run], events=[], runtime_leases=[runtime_lease])
+        applied_tasks = []
+
+        async def _fake_stage_handler(db_arg, task_arg, stage_run_arg, token, retry_existing=False):
+            del stage_run_arg, token, retry_existing
+            replacement = BinarySecurityTask(
+                id=task_arg.id,
+                project_id=task_arg.project_id,
+                name=task_arg.name,
+                status=task_arg.status,
+                current_stage=task_arg.current_stage,
+                task_type=task_arg.task_type,
+                firmware_path=task_arg.firmware_path,
+                firmware_source=task_arg.firmware_source,
+                output_root=task_arg.output_root,
+                workspace_root=task_arg.workspace_root,
+                runtime_phase=task_arg.runtime_phase,
+            )
+            replacement.summary = dict(task_arg.summary or {})
+            db_arg.tasks[0] = replacement
+            return "success", {"items": []}
+
+        async def _fake_apply_terminal(db_arg, task_arg, **kwargs):
+            del db_arg, kwargs
+            applied_tasks.append(task_arg)
+
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: db),
+            patch.object(manager, "_service_token", return_value=None),
+            patch.object(manager, "_bind_execution_token"),
+            patch.object(manager, "_stage_sequence_for_task", return_value=["entry_analysis"]),
+            patch.object(manager, "_missing_entry_results_failure_context", return_value=None),
+            patch.object(manager, "_source_entry_analysis_barrier_enabled", return_value=False),
+            patch.object(manager, "_stage_enabled", return_value=True),
+            patch.object(manager, "_stage_start_ready", return_value=True),
+            patch.object(manager, "_run_stage_executor", new=_fake_stage_handler),
+            patch.object(manager, "_apply_stage_worker_terminal_direct_locked", new=_fake_apply_terminal),
+            patch.object(manager, "_record_event"),
+        ):
+            asyncio.run(manager._execute_task(task.id))
+
+        self.assertEqual(1, len(applied_tasks))
+        self.assertIs(db.tasks[0], applied_tasks[0])
 
 
 if __name__ == "__main__":

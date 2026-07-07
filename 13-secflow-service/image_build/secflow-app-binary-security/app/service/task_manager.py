@@ -2328,14 +2328,38 @@ class TaskManager(
         handle.release_requested = False
         return True
 
-    async def _restart_local_runtime_for_active_owner(self, task_id: str) -> bool:
+    async def _restart_local_runtime_for_active_owner(
+        self,
+        task_id: str,
+        *,
+        replace_current_runner: bool = False,
+    ) -> bool:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return False
         async with self._worker_lock:
             existing = self._workers.get(normalized_task_id)
-            if existing is not None and not existing.done() and not existing.cancel_requested:
+            current_runner = asyncio.current_task()
+            replacing_live_runner = bool(
+                replace_current_runner
+                and existing is not None
+                and getattr(existing, "runner_task", None) is current_runner
+            )
+            if existing is not None and not existing.done() and not existing.cancel_requested and not replacing_live_runner:
                 return False
+            if existing is not None:
+                heartbeat_task = getattr(existing, "heartbeat_task", None)
+                if heartbeat_task is not None and not heartbeat_task.done():
+                    heartbeat_task.cancel()
+                sync_maintenance_task = getattr(existing, "sync_maintenance_task", None)
+                if sync_maintenance_task is not None and not sync_maintenance_task.done():
+                    sync_maintenance_task.cancel()
+                if (
+                    not replacing_live_runner
+                    and getattr(existing, "runner_task", None) is not None
+                    and not existing.runner_task.done()
+                ):
+                    existing.runner_task.cancel()
             runner_task = asyncio.create_task(
                 self._run_task(normalized_task_id),
                 name=f"binary-security-{normalized_task_id}-restart",

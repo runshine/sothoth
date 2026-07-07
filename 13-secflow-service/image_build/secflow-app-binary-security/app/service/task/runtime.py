@@ -8,7 +8,7 @@ from contextlib import suppress
 from typing import TYPE_CHECKING
 
 from sqlalchemy import func
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError, OperationalError
 from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.orm import Session
 
@@ -3828,11 +3828,6 @@ class TaskRuntimeServiceMixin:
             )
             with suppress(Exception):
                 db.rollback()
-            async with self._worker_lock:
-                handle = self._workers.get(task_id)
-                if handle is not None:
-                    handle.cancel_requested = True
-                    handle.cancel_requested_reason = "active_commit_failed" if not active_commit_succeeded else "runtime_execution_failed"
             task = db.query(task_manager_module.BinarySecurityTask).filter(
                 task_manager_module.BinarySecurityTask.id == task_id
             ).first()
@@ -3912,7 +3907,49 @@ class TaskRuntimeServiceMixin:
                     and task.status in {"dispatching", "running"}
                 )
                 if not same_execution:
+                    async with self._worker_lock:
+                        handle = self._workers.get(task_id)
+                        if handle is not None:
+                            handle.cancel_requested = True
+                            handle.cancel_requested_reason = (
+                                "active_commit_failed" if not active_commit_succeeded else "runtime_execution_failed"
+                            )
                     return
+                if active_commit_succeeded:
+                    self._record_event(
+                        db,
+                        task,
+                        "task_runtime_execution_recoverable_exception",
+                        "本地 runner 遇到可恢复异常，已保留任务并尝试在当前 owner 下自动重启执行协程",
+                        level="warning",
+                        stage_name=task.current_stage,
+                        payload={
+                            "error": str(exc),
+                            "error_type": exc.__class__.__name__,
+                            "runtime_lease_owner": failure_snapshot.runtime_lease_owner,
+                            "execution_token": execution_token or current_token,
+                        },
+                    )
+                    db.commit()
+                    restarted = await self._restart_local_runtime_for_active_owner(
+                        task_id,
+                        replace_current_runner=True,
+                    )
+                    if restarted:
+                        return
+                    task_manager_module.logger.warning(
+                        "binary-security recoverable runner restart could not be scheduled; falling back to owner-fact failure path: "
+                        "task_id=%s execution_token=%s",
+                        task_id,
+                        execution_token or current_token,
+                    )
+                async with self._worker_lock:
+                    handle = self._workers.get(task_id)
+                    if handle is not None:
+                        handle.cancel_requested = True
+                        handle.cancel_requested_reason = (
+                            "active_commit_failed" if not active_commit_succeeded else "runtime_execution_failed"
+                        )
                 await self._apply_task_execution_failed_payload_locked(
                     db,
                     task,
@@ -4297,6 +4334,12 @@ class TaskRuntimeServiceMixin:
                 elif task_retry_mode and existing_stage_items:
                     retry_existing = True
                 status, summary = await handler(db, task, stage_run, token, retry_existing=retry_existing)
+                refreshed_task = db.query(task_manager_module.BinarySecurityTask).filter(
+                    task_manager_module.BinarySecurityTask.id == task_id
+                ).first()
+                if refreshed_task is None:
+                    return
+                task = refreshed_task
                 execution_token = self._dispatch_token_for_task(db, task)
                 await self._apply_stage_worker_terminal_direct_locked(
                     db,
@@ -4353,7 +4396,14 @@ class TaskRuntimeServiceMixin:
                         )
                         db.commit()
                 if hasattr(db, "refresh"):
-                    db.refresh(task)
+                    try:
+                        db.refresh(task)
+                    except InvalidRequestError:
+                        task = db.query(task_manager_module.BinarySecurityTask).filter(
+                            task_manager_module.BinarySecurityTask.id == task_id
+                        ).first()
+                        if task is None:
+                            return
                 if str(task.status or "").strip() in task_manager_module.TASK_TERMINAL_STATUSES:
                     return
         finally:
