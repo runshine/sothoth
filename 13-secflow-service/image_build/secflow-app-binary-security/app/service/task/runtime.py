@@ -4116,8 +4116,16 @@ class TaskRuntimeServiceMixin:
                         with suppress(Exception):
                             await asyncio.to_thread(current_handle.sync_maintenance_task.join, 5.0)
                     self._workers.pop(task_id, None)
-            if owner_registered and not self._has_local_task_execution_owner(task_id):
-                self._release_task_execution_owner(task_id, "primary_task_worker")
+            if owner_registered:
+                current_handle = self._runtime_handle(task_id)
+                keep_owner_registration = bool(
+                    current_handle is not None
+                    and bool(getattr(current_handle, "owner_active", False))
+                    and not bool(getattr(current_handle, "release_requested", False))
+                    and not bool(getattr(current_handle, "takeover_observed", False))
+                )
+                if not keep_owner_registration:
+                    self._release_task_execution_owner(task_id, "primary_task_worker")
             db.close()
 
     async def _execute_task(self: TaskManager, task_id: str) -> None:
