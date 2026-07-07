@@ -791,7 +791,7 @@ class TaskManager(
         self._event_loop_lag_monitor_task: asyncio.Task | None = None
         self._event_loop_last_tick_at: datetime | None = None
         self._event_loop_last_lag_seconds: float = 0.0
-        self._event_loop_stall_threshold_seconds = 5.0
+        self._event_loop_stall_threshold_seconds = 10.0
         self._event_loop_last_stall_at: datetime | None = None
         self._last_stale_operation_requeue_at: datetime | None = None
         self._queue_reconcile_observation_state: dict[tuple[str, str], dict[str, Any]] = {}
@@ -6668,58 +6668,6 @@ class TaskManager(
                         db.rollback()
                 time.sleep(self._db_pool_timeout_backoff_seconds(attempt))
 
-    def _enable_task_scoped_session_commit_retry(
-        self,
-        session: Session,
-        task: BinarySecurityTask,
-        *,
-        event_type: str,
-        message: str,
-        stage_name_getter: Callable[[], str | None] | None = None,
-        item_getter: Callable[[], BinarySecurityStageItem | None] | None = None,
-        extra_payload_getter: Callable[[], dict[str, Any] | None] | None = None,
-    ) -> Session:
-        original_commit = getattr(session, "commit", None)
-        if original_commit is None or getattr(session, "_binary_security_commit_retry_wrapped", False):
-            return session
-
-        def _wrapped_commit() -> None:
-            attempt = 0
-            while True:
-                try:
-                    original_commit()
-                    return
-                except Exception as exc:
-                    if not self._is_db_pool_timeout_error(exc):
-                        raise
-                    attempt += 1
-                    current_item = item_getter() if item_getter is not None else None
-                    current_stage_name = (
-                        stage_name_getter()
-                        if stage_name_getter is not None
-                        else str(getattr(current_item, "stage_name", "") or "").strip() or None
-                    )
-                    extra_payload = dict(extra_payload_getter() or {}) if extra_payload_getter is not None else {}
-                    try:
-                        self._record_db_pool_timeout_waiting_event(
-                            session,
-                            task,
-                            event_type=event_type,
-                            message=message,
-                            attempt=attempt,
-                            error=exc,
-                            stage_name=current_stage_name,
-                            item=current_item,
-                            extra_payload=extra_payload,
-                        )
-                        original_commit()
-                    except Exception:
-                        session.rollback()
-                    time.sleep(self._db_pool_timeout_backoff_seconds(attempt))
-
-        session.commit = _wrapped_commit  # type: ignore[method-assign]
-        setattr(session, "_binary_security_commit_retry_wrapped", True)
-        return session
 
     def _module_selection_mode(self, task: BinarySecurityTask) -> str:
         mode = str((task.policy or {}).get("module_selection_mode") or MODULE_SELECTION_MODE_AUTO).strip()

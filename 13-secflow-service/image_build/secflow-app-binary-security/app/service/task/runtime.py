@@ -4457,19 +4457,6 @@ class TaskRuntimeServiceMixin:
 
         session = get_session_factory()()
         item = None
-        session = self._enable_task_scoped_session_commit_retry(
-            session,
-            task,
-            event_type="task_stage_item_db_pool_timeout_waiting",
-            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
-            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
-            item_getter=lambda: item,
-            extra_payload_getter=lambda: {
-                "batch_writeback": False,
-                "stage_item_runner": "firmware_unpack",
-                "task_id": str(task.id or "").strip() or None,
-            },
-        )
         try:
             firmware_key = input_file["firmware_key"]
             input_path = Path(str(input_file.get("path") or Path(task.workspace_root) / "input" / input_file["filename"]))
@@ -4815,19 +4802,6 @@ class TaskRuntimeServiceMixin:
 
         session = get_session_factory()()
         item = None
-        session = self._enable_task_scoped_session_commit_retry(
-            session,
-            task,
-            event_type="task_stage_item_db_pool_timeout_waiting",
-            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
-            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
-            item_getter=lambda: item,
-            extra_payload_getter=lambda: {
-                "batch_writeback": False,
-                "stage_item_runner": "system_analysis",
-                "task_id": str(task.id or "").strip() or None,
-            },
-        )
         try:
             item = self._upsert_stage_item(
                 session,
@@ -5097,19 +5071,6 @@ class TaskRuntimeServiceMixin:
 
         session = get_session_factory()()
         item = None
-        session = self._enable_task_scoped_session_commit_retry(
-            session,
-            task,
-            event_type="task_stage_item_db_pool_timeout_waiting",
-            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
-            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
-            item_getter=lambda: item,
-            extra_payload_getter=lambda: {
-                "batch_writeback": False,
-                "stage_item_runner": "binary_to_source",
-                "task_id": str(task.id or "").strip() or None,
-            },
-        )
         try:
             entry_input = self._normalize_entry_analysis_module_input(task, module)
             item = self._upsert_stage_item(
@@ -5451,19 +5412,6 @@ class TaskRuntimeServiceMixin:
 
         session = get_session_factory()()
         item = None
-        session = self._enable_task_scoped_session_commit_retry(
-            session,
-            task,
-            event_type="task_stage_item_db_pool_timeout_waiting",
-            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
-            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
-            item_getter=lambda: item,
-            extra_payload_getter=lambda: {
-                "batch_writeback": False,
-                "stage_item_runner": "entry_analysis",
-                "task_id": str(task.id or "").strip() or None,
-            },
-        )
         try:
             entry_input = self._normalize_entry_analysis_module_input(task, module)
             item = self._upsert_stage_item(
@@ -5759,19 +5707,6 @@ class TaskRuntimeServiceMixin:
 
         session = get_session_factory()()
         item = None
-        session = self._enable_task_scoped_session_commit_retry(
-            session,
-            task,
-            event_type="task_stage_item_db_pool_timeout_waiting",
-            message="单任务阶段子项写回命中数据库连接池超限，已等待并退避后重试",
-            stage_name_getter=lambda: str(stage_run.stage_name or "").strip() or None,
-            item_getter=lambda: item,
-            extra_payload_getter=lambda: {
-                "batch_writeback": False,
-                "stage_item_runner": "dataflow_vuln_scan",
-                "task_id": str(task.id or "").strip() or None,
-            },
-        )
         try:
             try:
                 entry = self._validate_entry_output_contract(entry)
