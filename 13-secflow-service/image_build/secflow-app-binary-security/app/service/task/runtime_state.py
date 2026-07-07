@@ -847,7 +847,7 @@ class TaskRuntimeStateServiceMixin:
         reason: str,
         status: str | None = None,
         stage_name: str | None = None,
-        runtime_phase: Any = _MAIN_STATE_UNSET,
+        runtime_phase: str | None = None,
         finished_at: Any = _MAIN_STATE_UNSET,
         last_error: Any = _MAIN_STATE_UNSET,
         clear_runtime_owner: bool = False,
@@ -874,7 +874,7 @@ class TaskRuntimeStateServiceMixin:
             return False
         before_state = self._parent_task_state_snapshot(task)
         attempted_status = str(status or "").strip() or None
-        effective_runtime_phase = self._task_runtime_phase(task) if runtime_phase is self._MAIN_STATE_UNSET else runtime_phase
+        effective_runtime_phase = runtime_phase if runtime_phase is not None else self._task_runtime_phase(task)
         normalized_downgrade_reason_category = (
             str(downgrade_reason_category or "").strip()
             or self._infer_running_to_pending_reason_category(
@@ -959,7 +959,7 @@ class TaskRuntimeStateServiceMixin:
             )
         if stage_name is not None:
             task.current_stage = stage_name
-        if runtime_phase is not self._MAIN_STATE_UNSET:
+        if runtime_phase is not None:
             self._set_task_runtime_phase(task, runtime_phase)
         if finished_at is not self._MAIN_STATE_UNSET:
             task.finished_at = finished_at
@@ -1015,7 +1015,7 @@ class TaskRuntimeStateServiceMixin:
         reason: str,
         source: str,
         stage_name: str | None = None,
-        runtime_phase: Any = _MAIN_STATE_UNSET,
+        runtime_phase: str | None = None,
         finished_at: Any = _MAIN_STATE_UNSET,
         last_error: Any = _MAIN_STATE_UNSET,
         clear_runtime_owner: bool = False,
@@ -1052,7 +1052,7 @@ class TaskRuntimeStateServiceMixin:
         reason: str,
         status: str | None = None,
         stage_name: str | None = None,
-        runtime_phase: Any = TASK_RUNTIME_PHASE_TERMINAL,
+        runtime_phase: str | None = TASK_RUNTIME_PHASE_TERMINAL,
         finished_at: Any = None,
         last_error: Any = None,
         record_blocked_event: bool = True,
@@ -1081,7 +1081,7 @@ class TaskRuntimeStateServiceMixin:
         reason: str,
         status: str | None = None,
         stage_name: str | None = None,
-        runtime_phase: Any = TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        runtime_phase: str | None = TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         finished_at: Any = None,
         last_error: Any = None,
         record_blocked_event: bool = True,
@@ -1109,7 +1109,7 @@ class TaskRuntimeStateServiceMixin:
         reason: str,
         status: str | None = None,
         stage_name: str | None = None,
-        runtime_phase: Any = None,
+        runtime_phase: str | None = TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         finished_at: Any = None,
         last_error: Any = None,
         record_blocked_event: bool = True,
@@ -2190,10 +2190,7 @@ class TaskRuntimeStateServiceMixin:
             return TASK_RUNTIME_PHASE_TERMINAL
         return TASK_RUNTIME_PHASE_OWNED_EXECUTION
 
-    def _set_task_runtime_phase(self: TaskManager, task: BinarySecurityTask, phase: str | None) -> None:
-        if phase is None:
-            task.runtime_phase = None
-            return
+    def _set_task_runtime_phase(self: TaskManager, task: BinarySecurityTask, phase: str) -> None:
         normalized = str(phase or "").strip() or TASK_RUNTIME_PHASE_OWNED_EXECUTION
         task.runtime_phase = normalized
 

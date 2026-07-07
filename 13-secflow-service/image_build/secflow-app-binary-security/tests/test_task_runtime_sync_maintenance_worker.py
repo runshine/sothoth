@@ -102,6 +102,45 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(processed.is_set())
 
+    async def test_process_task_sync_entry_blocking_runs_child_sync_with_thread_owned_session(self):
+        manager = TaskManager()
+        calls: list[tuple[str, str, str | None, list[str], bool]] = []
+
+        class _FakeSession:
+            def close(self):
+                return None
+
+        async def _fake_sync(
+            _db,
+            *,
+            project_id,
+            task_id,
+            stage_name=None,
+            item_ids=None,
+            force=False,
+            **kwargs,
+        ):
+            del _db, kwargs
+            calls.append((project_id, task_id, stage_name, list(item_ids or []), force))
+            return None
+
+        manager.sync_downstream_status = _fake_sync
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: _FakeSession()):
+            await asyncio.to_thread(
+                manager._process_task_sync_entry_blocking,
+                "project-1",
+                "task-1",
+                "child_sync",
+                "entry_analysis",
+                ["item-1"],
+                True,
+            )
+
+        self.assertEqual(
+            [("project-1", "task-1", "entry_analysis", ["item-1"], True)],
+            calls,
+        )
+
     async def test_sync_maintenance_worker_exits_after_lease_loss(self):
         manager = TaskManager()
         manager._running = True

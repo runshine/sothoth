@@ -2582,7 +2582,7 @@ class TaskManager(
             processed = await self._drain_local_runtime_sync_queue_once(
                 normalized_task_id,
                 reason=consume_reason or "periodic_reconcile",
-                max_passes=5,
+                max_passes=1,
             )
             if processed:
                 logger.info(
@@ -5750,9 +5750,11 @@ class TaskManager(
         )
 
     async def _drain_task_sync_queue(self, db: Session, task: BinarySecurityTask) -> bool:
-        await self._repair_task_sync_queue_on_runtime_start(db, task)
-        await self._reconcile_missing_task_sync_requests(db, task)
         entry = await get_task_queue().pop_task_sync_request(task.id, context="task_sync_pop")
+        if entry is None:
+            await self._repair_task_sync_queue_on_runtime_start(db, task)
+            await self._reconcile_missing_task_sync_requests(db, task)
+            entry = await get_task_queue().pop_task_sync_request(task.id, context="task_sync_pop")
         if entry is None:
             return False
         queue_item_id = str(entry.get("queue_item_id") or "").strip()
@@ -5762,25 +5764,15 @@ class TaskManager(
         force = bool(entry.get("force"))
         operation = str(entry.get("operation") or entry.get("sync_kind") or "child_sync").strip() or "child_sync"
         try:
-            sync_db = get_session_factory()()
-            try:
-                self._configure_runtime_session_fast_lock_wait_timeout(sync_db)
-                if operation == "child_create":
-                    self._enqueue_task(task.id)
-                else:
-                    await self.sync_downstream_status(
-                        sync_db,
-                        project_id=task.project_id,
-                        task_id=task.id,
-                        stage_name=stage_name,
-                        item_ids=item_ids or None,
-                        force=force,
-                        token=self._service_token(),
-                        record_request_event=False,
-                        apply_state=True,
-                    )
-            finally:
-                sync_db.close()
+            await asyncio.to_thread(
+                self._process_task_sync_entry_blocking,
+                str(task.project_id or "").strip(),
+                str(task.id or "").strip(),
+                operation,
+                stage_name,
+                item_ids,
+                force,
+            )
             await get_task_queue().ack_task_sync_request(
                 task.id,
                 queue_item_id=queue_item_id,
@@ -5975,6 +5967,37 @@ class TaskManager(
                 },
             )
             raise
+
+    def _process_task_sync_entry_blocking(
+        self,
+        project_id: str,
+        task_id: str,
+        operation: str,
+        stage_name: str | None,
+        item_ids: list[str] | None,
+        force: bool,
+    ) -> None:
+        sync_db = get_session_factory()()
+        try:
+            self._configure_runtime_session_fast_lock_wait_timeout(sync_db)
+            if operation == "child_create":
+                self._enqueue_task(task_id)
+                return
+            asyncio.run(
+                self.sync_downstream_status(
+                    sync_db,
+                    project_id=project_id,
+                    task_id=task_id,
+                    stage_name=stage_name,
+                    item_ids=item_ids or None,
+                    force=force,
+                    token=self._service_token(),
+                    record_request_event=False,
+                    apply_state=True,
+                )
+            )
+        finally:
+            sync_db.close()
 
     def _resolve_task_sync_entry_item_targets(
         self,

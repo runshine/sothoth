@@ -202,7 +202,7 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
                 manager._run_task_sync_maintenance = _run_sync_maintenance
                 manager._touch_task_heartbeat = lambda *_args, **_kwargs: None
 
-            async def _fake_drain(task_id, *, reason, max_passes=5):
+            async def _fake_drain(task_id, *, reason, max_passes=1):
                 drain_calls.append((str(task_id), str(reason), int(max_passes)))
                 return True
 
@@ -239,7 +239,7 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
         self.assertTrue(created_a)
         self.assertTrue(created_b)
         self.assertTrue(processed)
-        self.assertEqual([("task-source-1", "owner_reconcile_signal_enqueue", 5)], drain_calls)
+        self.assertEqual([("task-source-1", "owner_reconcile_signal_enqueue", 1)], drain_calls)
         self.assertNotIn(("worker-b", "task-source-1"), fake_queue.owner_signals)
 
     def test_watchdog_forces_local_abort_after_lease_loss_e2e(self):

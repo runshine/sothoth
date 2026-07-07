@@ -144,7 +144,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", task.status)
-        self.assertIsNone(task.runtime_phase)
+        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
         self.assertTrue(
             bool(dict(getattr(task, "summary", None) or {}).get("parent_takeover_pending_claim", {}).get("active"))

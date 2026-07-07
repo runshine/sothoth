@@ -36758,7 +36758,7 @@ def _test_worker_recovers_dispatching_streaming_parent_to_pending_without_tail_l
 
     # 非 owner 且 authoritative runtime lease 已失效 → 走 release_for_takeover：置 pending 并重新排队
     self.assertEqual("pending", task.status)
-    self.assertIsNone(task.runtime_phase)
+    self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
     self.assertEqual("idle", task.tail_reconcile_state)
     recovered_events = [event for event in db.events if event.event_type == "streaming_parent_state_recovered"]
     self.assertTrue(recovered_events)
@@ -46242,7 +46242,7 @@ def _test_local_runtime_sync_maintenance_drains_due_task_sync_requests(self):
         original_helper = manager._drain_local_runtime_sync_queue_once
         helper_calls: list[tuple[str, str, int]] = []
 
-        async def _fake_helper(task_id, *, reason, max_passes=5):
+        async def _fake_helper(task_id, *, reason, max_passes=1):
             helper_calls.append((str(task_id), str(reason), int(max_passes)))
             return True
 
@@ -46259,7 +46259,7 @@ def _test_local_runtime_sync_maintenance_drains_due_task_sync_requests(self):
         ):
             processed = asyncio.run(manager._service_local_runtime_sync_maintenance(task.id))
         self.assertTrue(processed)
-        self.assertEqual([(task.id, "periodic_reconcile", 5)], helper_calls)
+        self.assertEqual([(task.id, "periodic_reconcile", 1)], helper_calls)
     finally:
         manager._drain_local_runtime_sync_queue_once = original_helper
         manager._workers.pop(task.id, None)

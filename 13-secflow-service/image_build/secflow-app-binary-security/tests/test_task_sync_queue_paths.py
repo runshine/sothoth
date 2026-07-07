@@ -197,22 +197,23 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         ]
         calls = []
         original_get_queue = task_manager_module.get_task_queue
-        original_sync = manager.sync_downstream_status
+        original_process = manager._process_task_sync_entry_blocking
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
-            async def _fake_sync(_db, *, project_id, task_id, stage_name=None, item_ids=None, force=False, **kwargs):
-                del _db, project_id, task_id, kwargs
+            def _fake_process(project_id, task_id, operation, stage_name=None, item_ids=None, force=False):
+                del project_id, task_id
+                self.assertEqual("child_sync", operation)
                 calls.append(("sync", stage_name, list(item_ids or []), force))
-                return SimpleNamespace(task_id=task.id, accepted=True, status="accepted", action="sync", message="ok")
+                return None
 
-            manager.sync_downstream_status = _fake_sync
+            manager._process_task_sync_entry_blocking = _fake_process
             manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
             changed = asyncio.run(manager._drain_task_sync_queue(db, task))
         finally:
             task_manager_module.get_task_queue = original_get_queue
-            manager.sync_downstream_status = original_sync
+            manager._process_task_sync_entry_blocking = original_process
             manager._repair_task_sync_queue_on_runtime_start = original_repair
 
         self.assertTrue(changed)
@@ -254,21 +255,21 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             }
         ]
         original_get_queue = task_manager_module.get_task_queue
-        original_sync = manager.sync_downstream_status
+        original_process = manager._process_task_sync_entry_blocking
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
-            async def _fake_sync(*_args, **_kwargs):
+            def _fake_process(*_args, **_kwargs):
                 raise UpstreamError("boom")
 
-            manager.sync_downstream_status = _fake_sync
+            manager._process_task_sync_entry_blocking = _fake_process
             manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
             with self.assertRaises(UpstreamError):
                 asyncio.run(manager._drain_task_sync_queue(db, task))
         finally:
             task_manager_module.get_task_queue = original_get_queue
-            manager.sync_downstream_status = original_sync
+            manager._process_task_sync_entry_blocking = original_process
             manager._repair_task_sync_queue_on_runtime_start = original_repair
 
         entries = fake_queue.entries_by_task[task.id]
@@ -312,22 +313,22 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             }
         ]
         original_get_queue = task_manager_module.get_task_queue
-        original_sync = manager.sync_downstream_status
+        original_process = manager._process_task_sync_entry_blocking
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         original_reconcile = manager._reconcile_missing_task_sync_requests
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
-            async def _fake_sync(*_args, **_kwargs):
+            def _fake_process(*_args, **_kwargs):
                 raise task_manager_module.NotFoundError("阶段子任务不存在")
 
-            manager.sync_downstream_status = _fake_sync
+            manager._process_task_sync_entry_blocking = _fake_process
             manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
             manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
             changed = asyncio.run(manager._drain_task_sync_queue(db, task))
         finally:
             task_manager_module.get_task_queue = original_get_queue
-            manager.sync_downstream_status = original_sync
+            manager._process_task_sync_entry_blocking = original_process
             manager._repair_task_sync_queue_on_runtime_start = original_repair
             manager._reconcile_missing_task_sync_requests = original_reconcile
 
@@ -389,22 +390,22 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             }
         ]
         original_get_queue = task_manager_module.get_task_queue
-        original_sync = manager.sync_downstream_status
+        original_process = manager._process_task_sync_entry_blocking
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         original_reconcile = manager._reconcile_missing_task_sync_requests
         try:
             task_manager_module.get_task_queue = lambda: fake_queue
 
-            async def _fake_sync(*_args, **_kwargs):
+            def _fake_process(*_args, **_kwargs):
                 raise task_manager_module.NotFoundError("阶段子任务不存在")
 
-            manager.sync_downstream_status = _fake_sync
+            manager._process_task_sync_entry_blocking = _fake_process
             manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
             manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
             changed = asyncio.run(manager._drain_task_sync_queue(db, task))
         finally:
             task_manager_module.get_task_queue = original_get_queue
-            manager.sync_downstream_status = original_sync
+            manager._process_task_sync_entry_blocking = original_process
             manager._repair_task_sync_queue_on_runtime_start = original_repair
             manager._reconcile_missing_task_sync_requests = original_reconcile
 
@@ -453,7 +454,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         ]
         acked: list[tuple[str, str, str | None, str | None]] = []
         original_get_queue = task_manager_module.get_task_queue
-        original_sync = manager.sync_downstream_status
+        original_process = manager._process_task_sync_entry_blocking
         original_repair = manager._repair_task_sync_queue_on_runtime_start
         original_reconcile = manager._reconcile_missing_task_sync_requests
         try:
@@ -468,18 +469,18 @@ class TaskSyncQueuePathTests(unittest.TestCase):
 
             fake_queue.ack_task_sync_request = _fake_ack
 
-            async def _fake_sync(*args, **kwargs):
+            def _fake_process(*args, **kwargs):
                 del args, kwargs
                 raise task_manager_module.NotFoundError("阶段子任务不存在")
 
-            manager.sync_downstream_status = _fake_sync
+            manager._process_task_sync_entry_blocking = _fake_process
             manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
             manager._reconcile_missing_task_sync_requests = AsyncMock(return_value=0)
 
             changed = asyncio.run(manager._drain_task_sync_queue(db, task))
         finally:
             task_manager_module.get_task_queue = original_get_queue
-            manager.sync_downstream_status = original_sync
+            manager._process_task_sync_entry_blocking = original_process
             manager._repair_task_sync_queue_on_runtime_start = original_repair
             manager._reconcile_missing_task_sync_requests = original_reconcile
 
@@ -489,6 +490,75 @@ class TaskSyncQueuePathTests(unittest.TestCase):
             [("task-sync-missing-single", "tsq-missing-single", "child_sync:entry_analysis:si-missing", "task_sync_ack_terminal_discard")],
             acked,
         )
+
+    def test_drain_task_sync_queue_runs_blocking_helper_via_to_thread(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-thread-helper",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
+        fake_queue = _FakeTaskSyncQueue()
+        fake_queue.entries_by_task[task.id] = [
+            {
+                "queue_item_id": "tsq-thread-1",
+                "dedupe_key": "child_sync:entry_analysis:i-thread",
+                "operation": "child_sync",
+                "source": "test",
+                "reason": "thread",
+                "source_event_type": "downstream_status_observed",
+                "stage_name": "entry_analysis",
+                "item_ids": ["i-thread"],
+                "archive_job_ids": [],
+                "force": False,
+                "requested_at": _now().isoformat(),
+                "last_requested_at": _now().isoformat(),
+                "priority": 10,
+                "payload": {},
+            }
+        ]
+        original_get_queue = task_manager_module.get_task_queue
+        original_process = manager._process_task_sync_entry_blocking
+        original_repair = manager._repair_task_sync_queue_on_runtime_start
+        original_to_thread = task_manager_module.asyncio.to_thread
+        thread_calls = []
+        helper_calls = []
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+
+            async def _fake_to_thread(fn, *args, **kwargs):
+                thread_calls.append(getattr(fn, "__name__", str(fn)))
+                return fn(*args, **kwargs)
+
+            def _fake_process(project_id, task_id, operation, stage_name=None, item_ids=None, force=False):
+                helper_calls.append((project_id, task_id, operation, stage_name, list(item_ids or []), force))
+                return None
+
+            manager._process_task_sync_entry_blocking = _fake_process
+            manager._repair_task_sync_queue_on_runtime_start = AsyncMock(return_value=0)
+            task_manager_module.asyncio.to_thread = _fake_to_thread
+            changed = asyncio.run(manager._drain_task_sync_queue(db, task))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            manager._process_task_sync_entry_blocking = original_process
+            manager._repair_task_sync_queue_on_runtime_start = original_repair
+            task_manager_module.asyncio.to_thread = original_to_thread
+
+        self.assertTrue(changed)
+        self.assertIn("_fake_process", thread_calls)
+        self.assertEqual(
+            [("p1", task.id, "child_sync", "entry_analysis", ["i-thread"], False)],
+            helper_calls,
+        )
+        self.assertEqual([], fake_queue.entries_by_task[task.id])
 
     def test_reconcile_missing_task_sync_requests_requeues_due_db_fact(self):
         manager = TaskManager()
