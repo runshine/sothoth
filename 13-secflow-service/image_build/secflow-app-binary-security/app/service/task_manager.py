@@ -2097,6 +2097,20 @@ class TaskManager(
     def _has_local_task_execution_owner(self, task_id: str) -> bool:
         return self._task_execution_owner_count(task_id) > 0
 
+    def _local_runtime_owner_alive(self, task_id: str) -> bool:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return False
+        if bool(handle.cancel_requested) or bool(handle.release_requested) or bool(handle.takeover_observed):
+            return False
+        if not bool(handle.owner_active):
+            return False
+        if self._has_local_task_execution_owner(task_id):
+            return True
+        if bool(handle.active_commit_succeeded) and bool(handle.lease_established):
+            return True
+        return not handle.done()
+
     def _runtime_handle(self, task_id: str) -> TaskRuntimeHandle | None:
         return self._workers.get(str(task_id or "").strip())
 
@@ -4250,7 +4264,7 @@ class TaskManager(
     ) -> _RuntimeLeaseOwnershipDecision:
         normalized_task_id = str(task_id or "").strip()
         normalized_expected_owner = str(expected_owner or self.instance_id or "").strip() or None
-        local_handle_alive = bool(self._has_local_task_execution_owner(normalized_task_id))
+        local_handle_alive = bool(self._local_runtime_owner_alive(normalized_task_id))
         if not normalized_task_id:
             return _RuntimeLeaseOwnershipDecision(
                 should_continue=False,
@@ -4332,7 +4346,7 @@ class TaskManager(
                 return _RuntimeLeaseOwnershipDecision(
                     should_continue=False,
                     abort_reason="runtime_lease_verification_failed",
-                    local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+                    local_handle_alive=bool(self._local_runtime_owner_alive(task_id)),
                     verification_error=str(exc),
                 )
             except Exception as exc:
@@ -4342,7 +4356,7 @@ class TaskManager(
                 return _RuntimeLeaseOwnershipDecision(
                     should_continue=False,
                     abort_reason="runtime_lease_verification_failed",
-                    local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+                    local_handle_alive=bool(self._local_runtime_owner_alive(task_id)),
                     verification_error=str(exc),
                 )
             last_decision = decision
@@ -4353,7 +4367,7 @@ class TaskManager(
         return last_decision or _RuntimeLeaseOwnershipDecision(
             should_continue=False,
             abort_reason="runtime_lease_verification_failed",
-            local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+            local_handle_alive=bool(self._local_runtime_owner_alive(task_id)),
         )
 
     def _local_runtime_handle_state(self, task_id: str) -> str:

@@ -2331,7 +2331,7 @@ class TaskRuntimeServiceMixin:
         )
         local_handle = self._runtime_handle(task_id)
         local_handle_present = local_handle is not None
-        local_handle_done = bool(local_handle.done()) if local_handle is not None else False
+        local_handle_done = not self._local_runtime_owner_alive(task_id) if local_handle is not None else False
         local_handle_cancel_requested = bool(getattr(local_handle, "cancel_requested", False)) if local_handle is not None else False
         same_owner_active_lease = bool(
             self._task_has_supported_runtime_owner(db, task, active_operation=current_operation)
