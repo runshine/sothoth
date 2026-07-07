@@ -13,7 +13,7 @@ from app.model import (
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
-from test_task_manager import _AppendingModelAwareDb, _ModelAwareDb
+from test_task_manager import _AppendingModelAwareDb, _FakeTaskSyncQueue, _ModelAwareDb
 
 
 class ParentRuntimeLeaseGuardTests(unittest.TestCase):
@@ -223,12 +223,16 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
             patch.object(manager, "_streaming_tail_active_context", return_value=(None, 0, False)),
             patch.object(manager, "_current_stage_authoritative_failure_context", return_value=None),
             patch.object(manager, "_earlier_stage_authoritative_failure_context", return_value=None),
+            patch.object(task_manager_module, "get_task_queue", return_value=_FakeTaskSyncQueue()),
         ):
             reclaimed = manager._reclaim_stale_dispatching_single_task_locked(db, task.id)
 
         self.assertTrue(reclaimed)
         self.assertEqual("pending", task.status)
-        self.assertTrue(any(event.event_type == "dispatch_reclaimed" for event in db.events))
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("task_runtime_released_without_local_owner", event_types)
+        self.assertIn("parent_takeover_recovery_committed", event_types)
+        self.assertTrue(dict(task.summary or {}).get("parent_takeover_pending_claim", {}).get("active"))
 
     def test_reclaim_stale_running_skips_stale_row_when_runtime_lease_active(self):
         manager = TaskManager()

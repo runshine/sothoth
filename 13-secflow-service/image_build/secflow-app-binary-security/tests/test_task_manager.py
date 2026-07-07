@@ -41989,15 +41989,16 @@ def _test_reclaim_stale_dispatching_skips_failed_streaming_task(self):
         patch.object(manager, "_runtime_lease_context", return_value=(None, None, None)),
         patch.object(manager, "_streaming_tail_active_context", return_value=(None, 0, False)),
         patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True),
+        patch("app.service.task_manager.get_task_queue", return_value=_FakeTaskSyncQueue()),
     ):
         reclaimed = manager._reclaim_stale_dispatching_locked(db)
 
     self.assertTrue(reclaimed)
-    self.assertEqual("failed", task.status)
-    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
+    self.assertEqual("pending", task.status)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("dispatching_state_force_terminalized", event_types)
-    self.assertIn("task_finalized_after_child_failure", event_types)
+    self.assertIn("task_runtime_released_without_local_owner", event_types)
+    self.assertIn("parent_takeover_recovery_committed", event_types)
+    self.assertTrue(dict(task.summary or {}).get("parent_takeover_pending_claim", {}).get("active"))
 
 
 def _test_reclaim_stale_dispatching_protects_active_tail_with_live_owner(self):
@@ -42066,18 +42067,17 @@ def _test_reclaim_stale_dispatching_releases_owner_lost_active_tail(self):
         patch.object(manager, "_runtime_lease_context", return_value=(None, "worker-old-runtime", _now() - timedelta(minutes=4))),
         patch.object(manager, "_runtime_lease_is_active", return_value=False),
         patch.object(manager, "_streaming_tail_active_context", return_value=("entry_analysis", 2, True)),
+        patch("app.service.task_manager.get_task_queue", return_value=_FakeTaskSyncQueue()),
     ):
         reclaimed = manager._reclaim_stale_dispatching_locked(db)
 
     self.assertTrue(reclaimed)
     self.assertEqual("pending", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
-    release_event = next(event for event in db.events if event.event_type == "dispatching_execution_released_for_takeover")
-    self.assertEqual("dispatching", (release_event.payload or {}).get("previous_status"))
-    self.assertEqual("dispatching_runtime_lease_missing_with_active_tail", (release_event.payload or {}).get("requeue_reason"))
-    takeover_event = next(event for event in db.events if event.event_type == "owned_execution_takeover_requeued")
-    self.assertEqual("signal_owned_execution", (takeover_event.payload or {}).get("takeover_action"))
-    self.assertEqual("dispatching_runtime_lease_missing_with_active_tail", (takeover_event.payload or {}).get("takeover_reason"))
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("task_runtime_released_without_local_owner", event_types)
+    self.assertIn("parent_takeover_recovery_committed", event_types)
+    self.assertTrue(dict(task.summary or {}).get("parent_takeover_pending_claim", {}).get("active"))
 
 
 def _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_main_state(self):
@@ -42105,15 +42105,18 @@ def _test_reclaim_stale_dispatching_recovers_stale_non_owner_without_blocked_mai
         patch.object(manager, "_runtime_lease_is_active", return_value=False),
         patch.object(manager, "_streaming_tail_active_context", return_value=(None, 0, False)),
         patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=False),
+        patch("app.service.task_manager.get_task_queue", return_value=_FakeTaskSyncQueue()),
     ):
         reclaimed = manager._reclaim_stale_dispatching_locked(db)
 
     self.assertTrue(reclaimed)
     self.assertEqual("pending", task.status)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("dispatch_reclaimed", event_types)
+    self.assertIn("task_runtime_released_without_local_owner", event_types)
+    self.assertIn("parent_takeover_recovery_committed", event_types)
     self.assertNotIn("dispatch_reclaim_blocked", event_types)
     self.assertNotIn("main_state_write_blocked", event_types)
+    self.assertTrue(dict(task.summary or {}).get("parent_takeover_pending_claim", {}).get("active"))
 
 
 def _test_dispatch_loop_runs_parent_reclaim_even_when_queue_is_empty(self):
@@ -42193,15 +42196,16 @@ def _test_reclaim_stale_dispatching_releases_runtime_lease_missing_local_owner_a
         patch.object(manager, "_runtime_lease_context", return_value=(None, None, _now() - timedelta(minutes=5))),
         patch.object(manager, "_runtime_lease_is_active", return_value=False),
         patch.object(manager, "_streaming_tail_active_context", return_value=("entry_analysis", 2, True)),
+        patch("app.service.task_manager.get_task_queue", return_value=_FakeTaskSyncQueue()),
     ):
         reclaimed = manager._reclaim_stale_dispatching_locked(db)
 
     self.assertTrue(reclaimed)
     self.assertEqual("pending", task.status)
-    self.assertTrue(any(event.event_type == "dispatching_runtime_lease_missing_released" for event in db.events))
-    takeover_event = next(event for event in db.events if event.event_type == "owned_execution_takeover_requeued")
-    self.assertEqual("signal_owned_execution", (takeover_event.payload or {}).get("takeover_action"))
-    self.assertEqual("dispatching_runtime_lease_missing_with_active_tail", (takeover_event.payload or {}).get("takeover_reason"))
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("task_runtime_released_without_local_owner", event_types)
+    self.assertIn("parent_takeover_recovery_committed", event_types)
+    self.assertTrue(dict(task.summary or {}).get("parent_takeover_pending_claim", {}).get("active"))
 
 
 def _test_sync_downstream_status_does_not_record_recovery_event_for_failed_terminal_child(self):
