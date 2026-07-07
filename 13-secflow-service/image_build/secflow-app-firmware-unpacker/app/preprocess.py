@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
@@ -16,6 +17,20 @@ from app.subprocess_utils import run_streaming_process
 from app.time_utils import isoformat_local, now_local
 
 log = logging.getLogger("unpacker.service")
+
+RECURSIVE_PREPROCESS_MAX_ROUNDS = 2
+RECURSIVE_PREPROCESS_FORMATS = {
+    "tar",
+    "zip",
+    "gzip",
+    "bzip2",
+    "xz",
+    "zstd",
+    "lzop",
+    "lzma",
+    "7zip",
+    "cab",
+}
 
 
 def _kill_process_tree(proc: subprocess.Popen) -> None:
@@ -85,6 +100,49 @@ def _write_stage_log(log_dir, stage_entries: list[dict]) -> None:
             continue
         lines.append(f"[{stamp}] {json.dumps(entry, ensure_ascii=False)}")
     Path(log_dir, "preprocess.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _write_recursive_stage_log(log_dir, stage_entries: list[dict]) -> None:
+    if log_dir is None:
+        return
+    Path(log_dir, "preprocess_recursive.json").write_text(
+        json.dumps(stage_entries, indent=2),
+        encoding="utf-8",
+    )
+    lines: list[str] = []
+    for entry in stage_entries:
+        stamp = isoformat_local(now_local()) or ""
+        step = str(entry.get("step") or "").strip()
+        if step == "round_started":
+            lines.append(f"[{stamp}] round_started round={entry.get('round')}")
+            continue
+        if step == "candidate":
+            lines.append(
+                f"[{stamp}] candidate round={entry.get('round')} path={entry.get('path')} fmt={entry.get('fmt')}"
+            )
+            continue
+        if step == "expanded":
+            lines.append(
+                f"[{stamp}] expanded round={entry.get('round')} path={entry.get('path')} fmt={entry.get('fmt')} output_dir={entry.get('output_dir')} deleted_source={entry.get('deleted_source')}"
+            )
+            continue
+        if step == "failed":
+            lines.append(
+                f"[{stamp}] failed round={entry.get('round')} path={entry.get('path')} fmt={entry.get('fmt')} error={entry.get('error')}"
+            )
+            continue
+        if step == "round_completed":
+            lines.append(
+                f"[{stamp}] round_completed round={entry.get('round')} expanded_count={entry.get('expanded_count')}"
+            )
+            continue
+        if step == "result":
+            lines.append(
+                f"[{stamp}] result rounds={entry.get('rounds')} expanded_count={entry.get('expanded_count')}"
+            )
+            continue
+        lines.append(f"[{stamp}] {json.dumps(entry, ensure_ascii=False)}")
+    Path(log_dir, "preprocess_recursive.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def detect_format(firmware_path: str) -> dict:
@@ -203,7 +261,8 @@ def run_preprocess(
     stage_entries = []
     info = detect_format(firmware_path)
     fmt = info["fmt"]
-    firmware_name = Path(firmware_path).name
+    firmware_file = Path(firmware_path)
+    firmware_name = firmware_file.name
     os.makedirs(output_path, exist_ok=True)
 
     stage_entries.append(
@@ -296,6 +355,39 @@ def run_preprocess(
             returncode=proc.returncode,
         )
         return None
+
+    is_shared_object_name = firmware_file.name.endswith(".so") or any(
+        suffix.startswith(".so.") for suffix in firmware_file.suffixes
+    )
+    if fmt == "elf" or is_shared_object_name:
+        target = Path(output_path) / firmware_file.name
+        method = "already executable artifact"
+        log_event(
+            log,
+            logging.DEBUG,
+            "[Stage1] treating ELF/shared object as terminal artifact",
+            event="preprocess_try_tool",
+            tool=method,
+            firmware=firmware_name,
+        )
+        try:
+            shutil.copy2(firmware_file, target)
+            _record(
+                method,
+                success=True,
+                extra={"output_file": str(target), "size": target.stat().st_size},
+            )
+            return _success(method)
+        except Exception as exc:
+            _record(method, extra={"error": str(exc)})
+            log_event(
+                log,
+                logging.DEBUG,
+                "[Stage1] treating ELF/shared object as terminal artifact failed",
+                event="preprocess_tool_fail",
+                tool=method,
+                error=str(exc),
+            )
 
     if fmt == "tar":
         log_event(
@@ -565,9 +657,117 @@ def run_preprocess(
     return {"success": False, "method": None}
 
 
+def run_recursive_preprocess(
+    root_dir: str,
+    *,
+    log_dir=None,
+    max_rounds: int = RECURSIVE_PREPROCESS_MAX_ROUNDS,
+    cancel_check: Optional[Callable[[], bool]] = None,
+    register_cancel_hook: Optional[Callable[[Callable[[], None] | None], None]] = None,
+) -> dict:
+    """Recursively expand common archive/compressed files under a directory."""
+    root_path = Path(root_dir)
+    stage_entries: list[dict] = []
+    expanded_total = 0
+    attempted: set[tuple[str, int, int]] = set()
+    failed_once: set[tuple[str, int, int]] = set()
+
+    def _should_cancel() -> None:
+        if cancel_check and cancel_check():
+            raise RuntimeError("recursive preprocess cancelled")
+
+    if not root_path.exists() or not root_path.is_dir():
+        result = {"rounds": 0, "expanded_count": 0, "skipped": True}
+        stage_entries.append({"step": "result", **result})
+        _write_recursive_stage_log(log_dir, stage_entries)
+        return result
+
+    for round_id in range(1, max(1, int(max_rounds or 0)) + 1):
+        _should_cancel()
+        round_expanded = 0
+        stage_entries.append({"step": "round_started", "round": round_id})
+        for path in sorted(root_path.rglob("*")):
+            _should_cancel()
+            if not path.is_file():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            fingerprint = (str(path), int(stat.st_size), int(stat.st_mtime))
+            if fingerprint in attempted or fingerprint in failed_once:
+                continue
+            info = detect_format(str(path))
+            fmt = str(info.get("fmt") or "").strip()
+            if fmt not in RECURSIVE_PREPROCESS_FORMATS:
+                continue
+            stage_entries.append(
+                {
+                    "step": "candidate",
+                    "round": round_id,
+                    "path": str(path),
+                    "fmt": fmt,
+                }
+            )
+            child_output_dir = str(path.parent / f"{path.name}.expanded")
+            attempted.add(fingerprint)
+            result = run_preprocess(
+                str(path),
+                child_output_dir,
+                log_dir=None,
+                cancel_check=cancel_check,
+                register_cancel_hook=register_cancel_hook,
+            )
+            if result.get("success"):
+                deleted_source = False
+                try:
+                    path.unlink()
+                    deleted_source = True
+                except OSError:
+                    deleted_source = False
+                round_expanded += 1
+                expanded_total += 1
+                stage_entries.append(
+                    {
+                        "step": "expanded",
+                        "round": round_id,
+                        "path": str(path),
+                        "fmt": fmt,
+                        "method": result.get("method"),
+                        "output_dir": child_output_dir,
+                        "deleted_source": deleted_source,
+                    }
+                )
+            else:
+                failed_once.add(fingerprint)
+                stage_entries.append(
+                    {
+                        "step": "failed",
+                        "round": round_id,
+                        "path": str(path),
+                        "fmt": fmt,
+                        "error": "no_supported_preprocess_tool_succeeded",
+                    }
+                )
+        stage_entries.append(
+            {
+                "step": "round_completed",
+                "round": round_id,
+                "expanded_count": round_expanded,
+            }
+        )
+        if round_expanded == 0:
+            break
+
+    result = {"rounds": round_id, "expanded_count": expanded_total}
+    stage_entries.append({"step": "result", **result})
+    _write_recursive_stage_log(log_dir, stage_entries)
+    return result
+
+
 def run_quick_preprocess(firmware_path: str, output_path: str, log_dir=None) -> dict:
     """Backward-compatible alias for the Stage 1 deterministic preprocessor."""
     return run_preprocess(firmware_path, output_path, log_dir=log_dir)
 
 
-__all__ = ["detect_format", "run_preprocess", "run_quick_preprocess"]
+__all__ = ["detect_format", "run_preprocess", "run_quick_preprocess", "run_recursive_preprocess"]
