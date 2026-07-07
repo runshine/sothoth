@@ -7,6 +7,30 @@ from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
 
 
+class _FakeSyncMaintenanceThreadHandle:
+    def __init__(self, name: str = "sync-thread"):
+        self._name = name
+        self._done = False
+        self._cancelled = False
+
+    def done(self):
+        return self._done
+
+    def cancel(self):
+        self._cancelled = True
+        self._done = True
+
+    def cancelled(self):
+        return self._cancelled
+
+    def get_name(self):
+        return self._name
+
+    def join(self, timeout=None):
+        self._done = True
+        return None
+
+
 class _FakeQuery:
     def __init__(self, task):
         self._task = task
@@ -98,7 +122,7 @@ class TaskRuntimeLeaseWatchdogTests(unittest.IsolatedAsyncioTestCase):
         )
         runner_task = asyncio.create_task(asyncio.sleep(3600), name="runner")
         heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="heartbeat")
-        sync_task = asyncio.create_task(asyncio.sleep(3600), name="sync")
+        sync_task = _FakeSyncMaintenanceThreadHandle(name="sync")
         handle = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
             runner_task=runner_task,
@@ -136,7 +160,7 @@ class TaskRuntimeLeaseWatchdogTests(unittest.IsolatedAsyncioTestCase):
             manager._lease_watchdog_stop_event.set()
             await asyncio.to_thread(manager._stop_runtime_lease_watchdog)
             handle.cancel()
-            await asyncio.gather(runner_task, heartbeat_task, sync_task, return_exceptions=True)
+            await asyncio.gather(runner_task, heartbeat_task, return_exceptions=True)
 
         self.assertIsNotNone(handle.last_lease_refresh_at)
 
@@ -158,7 +182,7 @@ class TaskRuntimeLeaseWatchdogTests(unittest.IsolatedAsyncioTestCase):
         events: list[tuple[str, dict]] = []
         runner_task = asyncio.create_task(asyncio.sleep(3600), name="runner")
         heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="heartbeat")
-        sync_task = asyncio.create_task(asyncio.sleep(3600), name="sync")
+        sync_task = _FakeSyncMaintenanceThreadHandle(name="sync")
         handle = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
             runner_task=runner_task,
@@ -184,7 +208,7 @@ class TaskRuntimeLeaseWatchdogTests(unittest.IsolatedAsyncioTestCase):
                 decision = manager._verify_local_runtime_lease_or_abort("task-1", "runtime_lease_watchdog")
                 await asyncio.sleep(0)
         finally:
-            await asyncio.gather(runner_task, heartbeat_task, sync_task, return_exceptions=True)
+            await asyncio.gather(runner_task, heartbeat_task, return_exceptions=True)
 
         self.assertEqual("runtime_lease_missing", decision.abort_reason)
         self.assertTrue(handle.cancel_requested)

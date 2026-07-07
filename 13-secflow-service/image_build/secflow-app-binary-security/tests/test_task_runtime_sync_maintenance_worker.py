@@ -1,9 +1,34 @@
 import asyncio
+import threading
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
+
+
+class _FakeSyncMaintenanceThreadHandle:
+    def __init__(self, name: str = "sync-thread"):
+        self._name = name
+        self._done = False
+        self._cancelled = False
+
+    def done(self):
+        return self._done
+
+    def cancel(self):
+        self._cancelled = True
+        self._done = True
+
+    def cancelled(self):
+        return self._cancelled
+
+    def get_name(self):
+        return self._name
+
+    def join(self, timeout=None):
+        self._done = True
+        return None
 
 
 class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
@@ -61,11 +86,11 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
         manager._service_local_runtime_sync_maintenance.assert_not_awaited()
         sleep_mock.assert_awaited()
 
-    async def test_sync_maintenance_worker_invokes_task_sync_maintenance(self):
+    async def test_sync_maintenance_worker_thread_invokes_task_sync_maintenance(self):
         manager = TaskManager()
         manager._running = True
         manager.instance_id = "worker-a"
-        processed = asyncio.Event()
+        processed = threading.Event()
         heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="hb")
         handle = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
@@ -86,16 +111,19 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             local_handle_alive=True,
         )
 
-        async def _service(_task_id):
+        def _service(_task_id):
             processed.set()
             manager._running = False
             return True
 
-        manager._service_local_runtime_sync_maintenance = _service
+        manager._service_local_runtime_sync_maintenance_blocking = _service
 
         try:
-            with patch("app.service.task_manager.asyncio.sleep", new=AsyncMock()):
-                await manager._run_task_sync_maintenance("task-1")
+            await asyncio.to_thread(
+                manager._run_task_sync_maintenance_thread_worker,
+                "task-1",
+                threading.Event(),
+            )
         finally:
             heartbeat_task.cancel()
             await asyncio.gather(heartbeat_task, return_exceptions=True)
@@ -145,10 +173,11 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
         manager = TaskManager()
         manager._running = True
         manager.instance_id = "worker-a"
+        runner_task = asyncio.create_task(asyncio.sleep(3600), name="runner")
         heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="hb")
         handle = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
-            runner_task=asyncio.current_task(),
+            runner_task=runner_task,
             heartbeat_task=heartbeat_task,
             claimed_at=_now(),
             execution_token="exec-1",
@@ -168,31 +197,28 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
         )
 
         try:
-            with patch("app.service.task_manager.asyncio.sleep", new=AsyncMock()):
-                await manager._run_task_sync_maintenance("task-1")
+            await asyncio.to_thread(
+                manager._run_task_sync_maintenance_thread_worker,
+                "task-1",
+                threading.Event(),
+            )
         finally:
+            runner_task.cancel()
             heartbeat_task.cancel()
-            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            await asyncio.gather(runner_task, heartbeat_task, return_exceptions=True)
 
         manager._service_local_runtime_sync_maintenance.assert_not_awaited()
 
     async def test_cancel_local_worker_cancels_sync_maintenance_worker(self):
         manager = TaskManager()
         manager._running = True
-        cancelled = asyncio.Event()
-
-        async def _sync_maintenance():
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
+        sync_handle = _FakeSyncMaintenanceThreadHandle()
 
         handle = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
             runner_task=asyncio.create_task(asyncio.sleep(3600), name="runner"),
             heartbeat_task=asyncio.create_task(asyncio.sleep(3600), name="heartbeat"),
-            sync_maintenance_task=asyncio.create_task(_sync_maintenance(), name="sync"),
+            sync_maintenance_task=sync_handle,
             claimed_at=_now(),
             execution_token="exec-1",
             lease_owner_instance_id="worker-a",
@@ -202,7 +228,6 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         await manager._cancel_local_worker("task-1")
 
-        self.assertTrue(cancelled.is_set())
         self.assertTrue(handle.runner_task.cancelled())
         self.assertTrue(handle.heartbeat_task.cancelled())
         self.assertTrue(handle.sync_maintenance_task.cancelled())
@@ -221,18 +246,17 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             started.append(f"heartbeat:{task_id}")
             await asyncio.sleep(3600)
 
-        async def _run_sync_maintenance(task_id):
-            started.append(f"sync:{task_id}")
-            await asyncio.sleep(3600)
+        manager._start_runtime_sync_maintenance_thread = lambda task_id: (
+            started.append(f"sync:{task_id}") or _FakeSyncMaintenanceThreadHandle(name=f"sync:{task_id}")
+        )
 
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
-        manager._run_task_sync_maintenance = _run_sync_maintenance
 
         old_runner = asyncio.create_task(asyncio.sleep(0), name="old-runner")
         await asyncio.gather(old_runner, return_exceptions=True)
         old_heartbeat = asyncio.create_task(asyncio.sleep(3600), name="old-heartbeat")
-        old_sync = asyncio.create_task(asyncio.sleep(3600), name="old-sync")
+        old_sync = _FakeSyncMaintenanceThreadHandle(name="old-sync")
         existing = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
             runner_task=old_runner,
@@ -263,12 +287,12 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.gather(
                 manager._workers["task-1"].runner_task,
                 manager._workers["task-1"].heartbeat_task,
-                manager._workers["task-1"].sync_maintenance_task,
                 return_exceptions=True,
             )
+            manager._workers["task-1"].sync_maintenance_task.join()
             old_heartbeat.cancel()
             old_sync.cancel()
-            await asyncio.gather(old_heartbeat, old_sync, return_exceptions=True)
+            await asyncio.gather(old_heartbeat, return_exceptions=True)
 
     async def test_sync_maintenance_worker_exception_does_not_cancel_runner_or_block_control_handoff(self):
         manager = TaskManager()
@@ -309,21 +333,26 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
                 local_handle_alive=True,
             )
 
-        async def _service(_task_id):
+        def _service(_task_id):
             raise RuntimeError("boom")
 
         async def _handoff(_task_id):
             return True
 
         manager._verify_local_runtime_lease_or_abort = _verify
-        manager._service_local_runtime_sync_maintenance = _service
+        manager._service_local_runtime_sync_maintenance_blocking = _service
         manager._handoff_active_serial_control_operation_from_runtime = _handoff
         manager._touch_task_heartbeat = lambda *_args, **_kwargs: None
 
         runner_cancelled_before_cleanup = None
         try:
-            with patch("app.service.task_manager.asyncio.sleep", new=AsyncMock()):
-                await manager._run_task_sync_maintenance("task-1")
+            stop_event = threading.Event()
+            with patch.object(stop_event, "wait", side_effect=lambda _timeout=None: setattr(manager, "_running", False) or False):
+                await asyncio.to_thread(
+                    manager._run_task_sync_maintenance_thread_worker,
+                    "task-1",
+                    stop_event,
+                )
             handed_off = await manager._handoff_active_serial_control_operation_from_runtime("task-1")
             runner_cancelled_before_cleanup = handle.runner_task.cancelled()
         finally:

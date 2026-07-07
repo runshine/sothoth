@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import unittest
 from datetime import timedelta, datetime
 from contextlib import nullcontext, suppress
@@ -25,6 +26,33 @@ from app.service import task_manager as task_manager_module
 from app.service.task_manager import StaleTaskExecution, TaskManager, _now
 from app.service.task_queue import REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS, REDIS_SOCKET_TIMEOUT_SECONDS, TaskQueue
 from test_task_manager import _FakeTaskSyncQueue, _ModelAwareDb
+
+
+class _FakeSyncMaintenanceThreadHandle:
+    def __init__(self, name: str = "sync-thread"):
+        self._name = name
+        self._done = False
+        self._cancelled = False
+        self._on_cancel = None
+
+    def done(self):
+        return self._done
+
+    def cancel(self):
+        self._cancelled = True
+        self._done = True
+        if self._on_cancel is not None:
+            self._on_cancel()
+
+    def cancelled(self):
+        return self._cancelled
+
+    def get_name(self):
+        return self._name
+
+    def join(self, timeout=None):
+        self._done = True
+        return None
 
 
 class TaskManagerRuntimeStatusTests(unittest.TestCase):
@@ -339,7 +367,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager = TaskManager()
         started: list[str] = []
         heartbeat_started = asyncio.Event()
-        sync_maintenance_started = asyncio.Event()
         async def _run_task(task_id):
             started.append(f"runner:{task_id}")
             await asyncio.sleep(0)
@@ -349,19 +376,18 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             heartbeat_started.set()
             await asyncio.sleep(3600)
 
-        async def _run_sync_maintenance(task_id):
-            started.append(f"sync:{task_id}")
-            sync_maintenance_started.set()
-            await asyncio.sleep(3600)
-
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
-        manager._run_task_sync_maintenance = _run_sync_maintenance
+        manager._start_runtime_sync_maintenance_thread = lambda task_id: (
+            started.append(f"sync:{task_id}") or task_manager_module.TaskRuntimeThreadHandle(
+                name=f"sync:{task_id}",
+                thread=threading.Thread(target=lambda: None, name=f"sync:{task_id}"),
+            )
+        )
 
         created = await manager._start_task_runtime("task-1")
         self.assertTrue(created)
         await asyncio.wait_for(heartbeat_started.wait(), timeout=1)
-        await asyncio.wait_for(sync_maintenance_started.wait(), timeout=1)
 
         handle = manager._workers.get("task-1")
         self.assertIsNotNone(handle)
@@ -376,7 +402,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(
             handle.runner_task,
             handle.heartbeat_task,
-            handle.sync_maintenance_task,
             return_exceptions=True,
         )
         manager._workers.pop("task-1", None)
@@ -408,13 +433,9 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             del task_id
             await asyncio.sleep(3600)
 
-        async def _run_sync_maintenance(task_id):
-            del task_id
-            await asyncio.sleep(3600)
-
         manager._run_task = _run_task
         manager._run_task_heartbeat = _run_heartbeat
-        manager._run_task_sync_maintenance = _run_sync_maintenance
+        manager._start_runtime_sync_maintenance_thread = lambda task_id: _FakeSyncMaintenanceThreadHandle(name=f"sync:{task_id}")
         created = await manager._start_task_runtime("task-1")
 
         self.assertTrue(created)
@@ -427,7 +448,6 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(
             handle.runner_task,
             handle.heartbeat_task,
-            handle.sync_maintenance_task,
             return_exceptions=True,
         )
         manager._workers.pop("task-1", None)
@@ -466,18 +486,14 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
                 heartbeat_cancelled.set()
                 raise
 
-        async def _sync_maintenance():
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                sync_maintenance_cancelled.set()
-                raise
+        sync_handle = _FakeSyncMaintenanceThreadHandle()
+        sync_handle._on_cancel = lambda: sync_maintenance_cancelled.set()
 
         manager._workers["task-1"] = task_manager_module.TaskRuntimeHandle(
             task_id="task-1",
             runner_task=asyncio.current_task(),
             heartbeat_task=asyncio.create_task(_heartbeat()),
-            sync_maintenance_task=asyncio.create_task(_sync_maintenance()),
+            sync_maintenance_task=sync_handle,
             claimed_at=_now(),
             execution_token=None,
             lease_owner_instance_id="worker-a",

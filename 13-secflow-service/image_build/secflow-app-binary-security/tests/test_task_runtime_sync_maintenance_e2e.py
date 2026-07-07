@@ -1,10 +1,35 @@
 import asyncio
+import threading
 import unittest
 from unittest.mock import patch
 
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
 from test_task_manager import _FakeTaskSyncQueue
+
+
+class _FakeSyncMaintenanceThreadHandle:
+    def __init__(self, name: str = "sync-thread"):
+        self._name = name
+        self._done = False
+        self._cancelled = False
+
+    def done(self):
+        return self._done
+
+    def cancel(self):
+        self._cancelled = True
+        self._done = True
+
+    def cancelled(self):
+        return self._cancelled
+
+    def get_name(self):
+        return self._name
+
+    def join(self, timeout=None):
+        self._done = True
+        return None
 
 
 class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
@@ -16,6 +41,7 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
             manager._runtime_loop = asyncio.get_running_loop()
             refresh_count = 0
             release_event = asyncio.Event()
+            release_blocker = threading.Event()
             maintenance_started = asyncio.Event()
             runner_task = asyncio.create_task(asyncio.sleep(3600), name="runner")
             handle = task_manager_module.TaskRuntimeHandle(
@@ -30,13 +56,13 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
             )
             manager._workers["task-1"] = handle
 
-            async def _service(_task_id):
+            def _service(_task_id):
                 maintenance_started.set()
-                await release_event.wait()
+                release_blocker.wait()
                 manager._running = False
                 return True
 
-            manager._service_local_runtime_sync_maintenance = _service
+            manager._service_local_runtime_sync_maintenance_blocking = _service
             manager._runtime_watchdog_interval_seconds = lambda: 1
             manager._verify_local_runtime_lease_or_abort = lambda *_args, **_kwargs: task_manager_module._RuntimeLeaseOwnershipDecision(
                 should_continue=True,
@@ -87,20 +113,29 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
                 handle.last_lease_refresh_at = _now()
                 if refresh_count >= 2:
                     manager._runtime_loop.call_soon_threadsafe(release_event.set)
+                    release_blocker.set()
                 return True
 
-            sync_task = asyncio.create_task(manager._run_task_sync_maintenance("task-1"), name="sync")
-            handle.sync_maintenance_task = sync_task
+            stop_event = threading.Event()
             try:
                 manager._write_task_heartbeat = _write
                 with patch("app.service.task_manager.get_session_factory", return_value=lambda: _FakeSession()):
                     manager._start_runtime_lease_watchdog()
+                    sync_thread = asyncio.to_thread(
+                        manager._run_task_sync_maintenance_thread_worker,
+                        "task-1",
+                        stop_event,
+                    )
+                    sync_task = asyncio.create_task(sync_thread)
+                    handle.sync_maintenance_task = _FakeSyncMaintenanceThreadHandle(name="sync")
                     await asyncio.wait_for(release_event.wait(), timeout=3)
             finally:
                 manager._running = False
+                stop_event.set()
                 manager._lease_watchdog_stop_event.set()
                 await asyncio.to_thread(manager._stop_runtime_lease_watchdog)
                 release_event.set()
+                release_blocker.set()
                 for task in (sync_task, runner_task):
                     if not task.done():
                         task.cancel()
@@ -129,14 +164,12 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
                 started.append(f"heartbeat:{task_id}")
                 await asyncio.sleep(3600)
 
-            async def _run_sync_maintenance(task_id):
-                started.append(f"sync:{task_id}")
-                await asyncio.sleep(3600)
-
             for manager in (manager_a, manager_b):
                 manager._run_task = _run_task
                 manager._run_task_heartbeat = _run_heartbeat
-                manager._run_task_sync_maintenance = _run_sync_maintenance
+                manager._start_runtime_sync_maintenance_thread = lambda task_id: (
+                    started.append(f"sync:{task_id}") or _FakeSyncMaintenanceThreadHandle(name=f"sync:{task_id}")
+                )
                 manager._touch_task_heartbeat = lambda *_args, **_kwargs: None
 
             created_a = await manager_a._start_task_runtime("task-1")
@@ -164,9 +197,9 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
                 await asyncio.gather(
                     handle_b.runner_task,
                     handle_b.heartbeat_task,
-                    handle_b.sync_maintenance_task,
                     return_exceptions=True,
                 )
+                handle_b.sync_maintenance_task.join()
 
         created_a, created_b, old_sync_cancelled, new_sync_present, new_sync_distinct, started, _handle_b = asyncio.run(_exercise())
         self.assertTrue(created_a)
@@ -193,13 +226,10 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
             async def _run_heartbeat(_task_id):
                 await asyncio.sleep(3600)
 
-            async def _run_sync_maintenance(_task_id):
-                await asyncio.sleep(3600)
-
             for manager in (manager_a, manager_b):
                 manager._run_task = _run_task
                 manager._run_task_heartbeat = _run_heartbeat
-                manager._run_task_sync_maintenance = _run_sync_maintenance
+                manager._start_runtime_sync_maintenance_thread = lambda _task_id: _FakeSyncMaintenanceThreadHandle(name="sync")
                 manager._touch_task_heartbeat = lambda *_args, **_kwargs: None
 
             async def _fake_drain(task_id, *, reason, max_passes=1):
@@ -230,9 +260,9 @@ class TaskRuntimeSyncMaintenanceE2ETests(unittest.TestCase):
                 await asyncio.gather(
                     handle_b.runner_task,
                     handle_b.heartbeat_task,
-                    handle_b.sync_maintenance_task,
                     return_exceptions=True,
                 )
+                handle_b.sync_maintenance_task.join()
             return created_a, created_b, processed, list(drain_calls), fake_queue
 
         created_a, created_b, processed, drain_calls, fake_queue = asyncio.run(_exercise())

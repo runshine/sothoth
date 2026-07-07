@@ -658,7 +658,7 @@ class TaskRuntimeHandle:
     claimed_at: datetime
     execution_token: str | None
     lease_owner_instance_id: str | None
-    sync_maintenance_task: asyncio.Task | None = None
+    sync_maintenance_task: TaskRuntimeThreadHandle | None = None
     cancel_requested: bool = False
     cancel_requested_reason: str | None = None
     last_progress_at: datetime | None = None
@@ -694,6 +694,31 @@ class TaskRuntimeHandle:
             self.sync_maintenance_task.cancel()
         if not self.runner_task.done():
             self.runner_task.cancel()
+
+
+@dataclass
+class TaskRuntimeThreadHandle:
+    name: str
+    thread: threading.Thread
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    done_event: threading.Event = field(default_factory=threading.Event)
+    cancel_requested: bool = False
+
+    def done(self) -> bool:
+        return self.done_event.is_set() or not self.thread.is_alive()
+
+    def cancel(self) -> None:
+        self.cancel_requested = True
+        self.stop_event.set()
+
+    def cancelled(self) -> bool:
+        return self.cancel_requested and self.done()
+
+    def get_name(self) -> str:
+        return self.name
+
+    def join(self, timeout: float | None = None) -> None:
+        self.thread.join(timeout=timeout)
 
 
 @dataclass(frozen=True)
@@ -2213,6 +2238,32 @@ class TaskManager(
         handle.pending_operation_id = None
         handle.pending_operation_type = None
 
+    def _start_runtime_sync_maintenance_thread(self, task_id: str) -> TaskRuntimeThreadHandle:
+        normalized_task_id = str(task_id or "").strip()
+        thread_name = f"binary-security-sync-maintenance-{normalized_task_id}"
+        stop_event = threading.Event()
+        done_event = threading.Event()
+
+        def _worker() -> None:
+            try:
+                self._run_task_sync_maintenance_thread_worker(normalized_task_id, stop_event)
+            finally:
+                done_event.set()
+
+        thread = threading.Thread(
+            target=_worker,
+            name=thread_name,
+            daemon=True,
+        )
+        handle = TaskRuntimeThreadHandle(
+            name=thread_name,
+            thread=thread,
+            stop_event=stop_event,
+            done_event=done_event,
+        )
+        thread.start()
+        return handle
+
     def _request_local_worker_control_wakeup_nowait(
         self,
         task_id: str,
@@ -2252,10 +2303,7 @@ class TaskManager(
                 self._run_task_heartbeat(normalized_task_id),
                 name=f"binary-security-heartbeat-{normalized_task_id}-restart",
             )
-            sync_maintenance_task = asyncio.create_task(
-                self._run_task_sync_maintenance(normalized_task_id),
-                name=f"binary-security-sync-maintenance-{normalized_task_id}-restart",
-            )
+            sync_maintenance_task = self._start_runtime_sync_maintenance_thread(normalized_task_id)
             generation = int(getattr(existing, "runner_generation", 0) or 0) + 1
             handle = TaskRuntimeHandle(
                 task_id=normalized_task_id,
@@ -2358,10 +2406,7 @@ class TaskManager(
                 self._run_task_heartbeat(normalized_task_id),
                 name=f"binary-security-heartbeat-{normalized_task_id}",
             )
-            sync_maintenance_task = asyncio.create_task(
-                self._run_task_sync_maintenance(normalized_task_id),
-                name=f"binary-security-sync-maintenance-{normalized_task_id}",
-            )
+            sync_maintenance_task = self._start_runtime_sync_maintenance_thread(normalized_task_id)
             handle = TaskRuntimeHandle(
                 task_id=normalized_task_id,
                 runner_task=runner_task,
@@ -2461,6 +2506,60 @@ class TaskManager(
             handle = self._runtime_handle(task_id)
             logger.info(
                 "binary-security sync maintenance worker exiting: task_id=%s cancel_requested=%s runner_done=%s heartbeat_done=%s source=sync_maintenance_loop",
+                task_id,
+                bool(getattr(handle, "cancel_requested", False)) if handle is not None else None,
+                bool(handle.runner_task.done()) if handle is not None else None,
+                bool(handle.heartbeat_task.done()) if handle is not None and handle.heartbeat_task is not None else None,
+            )
+
+    def _run_task_sync_maintenance_thread_worker(
+        self,
+        task_id: str,
+        stop_event: threading.Event,
+    ) -> None:
+        interval_seconds = max(
+            1,
+            int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
+        )
+        logger.info("binary-security sync maintenance worker started: task_id=%s", task_id)
+        try:
+            while self._running and not stop_event.is_set():
+                handle = self._runtime_handle(task_id)
+                if (
+                    handle is None
+                    or handle.cancel_requested
+                    or handle.runner_task.done()
+                    or handle.release_requested
+                    or handle.takeover_observed
+                ):
+                    return
+                if not handle.active_commit_succeeded or not handle.lease_established:
+                    stop_event.wait(interval_seconds)
+                    continue
+                ownership_decision = self._verify_local_runtime_lease_or_abort(
+                    task_id,
+                    "sync_maintenance_loop",
+                )
+                if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
+                    return
+                try:
+                    processed = self._service_local_runtime_sync_maintenance_blocking(task_id)
+                    if processed:
+                        self._mark_runtime_handle_sync_progress(task_id)
+                except StaleTaskExecution:
+                    return
+                except Exception:
+                    logger.exception(
+                        "binary-security local runtime sync maintenance worker failed: task_id=%s",
+                        task_id,
+                    )
+                    stop_event.wait(2)
+                    continue
+                stop_event.wait(interval_seconds)
+        finally:
+            handle = self._runtime_handle(task_id)
+            logger.info(
+                "binary-security sync maintenance worker exiting: task_id=%s cancel_requested=%s runner_done=%s heartbeat_done=%s source=sync_maintenance_thread",
                 task_id,
                 bool(getattr(handle, "cancel_requested", False)) if handle is not None else None,
                 bool(handle.runner_task.done()) if handle is not None else None,
@@ -2593,6 +2692,9 @@ class TaskManager(
             return processed
         finally:
             handle.sync_maintenance_in_progress = False
+
+    def _service_local_runtime_sync_maintenance_blocking(self, task_id: str) -> bool:
+        return asyncio.run(self._service_local_runtime_sync_maintenance(task_id))
 
     async def _drain_local_runtime_sync_queue_once(
         self,
@@ -13373,9 +13475,9 @@ class TaskManager(
             tasks = [handle.runner_task]
             if handle.heartbeat_task is not None:
                 tasks.append(handle.heartbeat_task)
-            if handle.sync_maintenance_task is not None:
-                tasks.append(handle.sync_maintenance_task)
             await asyncio.gather(*tasks, return_exceptions=True)
+            if handle.sync_maintenance_task is not None:
+                await asyncio.to_thread(handle.sync_maintenance_task.join, 5.0)
 
     async def _cancel_downstream_refs(self, db: Session, task: BinarySecurityTask, refs: list[dict[str, str]], token: str | None) -> int:
         return await self._downstream_cancel_refs(db, task, refs, token)
