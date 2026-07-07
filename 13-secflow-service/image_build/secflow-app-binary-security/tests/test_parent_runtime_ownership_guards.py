@@ -373,3 +373,39 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
             [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
             self.fake_task_queue.requeued_tasks,
         )
+
+    def test_release_task_without_supported_runtime_owner_ignores_stale_pending_claim_after_ten_minutes(self):
+        self.manager.instance_id = "worker-new"
+        task = self._task(
+            id="task-running-release-stale-pending-claim",
+            status="dispatching",
+            current_stage="dataflow_vuln_scan",
+            summary={
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": (_now() - timedelta(minutes=11)).isoformat(),
+                    "enqueue_context": "owned_execution_release_for_takeover",
+                }
+            },
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-dead",
+            lease_expires_at=_now() - timedelta(minutes=1),
+            heartbeat_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[expired_lease], events=[])
+
+        released = self.manager._release_task_without_supported_runtime_owner(
+            db,
+            task,
+            reason="unit_test_release_dispatching_to_pending_after_pending_claim_expired",
+        )
+
+        self.assertTrue(released)
+        self.assertEqual("pending", task.status)
+        self.assertTrue(any(event.event_type == "parent_takeover_recovery_committed" for event in db.events))
+        self.assertEqual(
+            [{"task_id": task.id, "context": "owned_execution_release_for_takeover"}],
+            self.fake_task_queue.requeued_tasks,
+        )

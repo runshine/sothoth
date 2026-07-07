@@ -121,10 +121,20 @@ class TaskRuntimeServiceMixin:
         raw = summary.get("parent_takeover_pending_claim")
         return dict(raw) if isinstance(raw, dict) else {}
 
+    def _parent_takeover_pending_claim_grace_seconds(self: TaskManager) -> int:
+        return 600
+
     def _parent_takeover_pending_claim_active(self: TaskManager, task) -> bool:
+        from app.service import task_manager as task_manager_module
+
         snapshot = self._parent_takeover_pending_claim_snapshot(task)
         if not bool(snapshot.get("active")):
             return False
+        released_at = task_manager_module._parse_iso_datetime(snapshot.get("released_at"))
+        if released_at is not None:
+            age_seconds = task_manager_module._elapsed_seconds_since(released_at)
+            if age_seconds is not None and age_seconds > float(self._parent_takeover_pending_claim_grace_seconds()):
+                return False
         status = str(getattr(task, "status", "") or "").strip().lower()
         return status in {"pending", "dispatching", "cancelling"}
 
