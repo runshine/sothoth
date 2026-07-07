@@ -613,6 +613,17 @@ def _mtime_iso_text(path: Path) -> Optional[str]:
         return None
 
 
+def _latest_mtime_iso_text(*paths: Path) -> Optional[str]:
+    latest_dt: Optional[datetime] = None
+    for path in paths:
+        current = _parse_iso_datetime(_mtime_iso_text(path))
+        if current is None:
+            continue
+        if latest_dt is None or ensure_local(current) > ensure_local(latest_dt):
+            latest_dt = current
+    return latest_dt.isoformat() if latest_dt is not None else None
+
+
 def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
     raw = str(value or "").strip()
     if not raw:
@@ -724,6 +735,9 @@ def _get_task_progress(task_id: str) -> dict:
     run_dir = _derive_run_path(task)
     round_zero = _round_dir(run_dir, 0)
     stage1_path = _round_log_path(run_dir, 0, "preprocess.json")
+    stage1_log_path = _round_log_path(run_dir, 0, "preprocess.log")
+    recursive_preprocess_json_path = _round_log_path(run_dir, 0, "preprocess_recursive.json")
+    recursive_preprocess_log_path = _round_log_path(run_dir, 0, "preprocess_recursive.log")
     stage2_path = _round_log_path(run_dir, 0, "skill_match.json")
     stage3_path = _round_log_path(run_dir, 0, "skill_exec.json")
     stage3_llm_unpack_log = _round_log_path(run_dir, 0, "stage3_llm_unpack.log")
@@ -919,7 +933,12 @@ def _get_task_progress(task_id: str) -> dict:
             "预处理",
             "success",
             phase1_detail or "预处理已完成",
-            _mtime_iso_text(stage1_path),
+            _latest_mtime_iso_text(
+                stage1_path,
+                stage1_log_path,
+                recursive_preprocess_json_path,
+                recursive_preprocess_log_path,
+            ),
         )
 
     if quick_preprocess_success:
