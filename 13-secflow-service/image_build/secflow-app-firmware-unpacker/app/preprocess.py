@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import signal
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Callable, Optional
@@ -260,7 +261,8 @@ def run_preprocess(
     stage_entries = []
     info = detect_format(firmware_path)
     fmt = info["fmt"]
-    firmware_name = Path(firmware_path).name
+    firmware_file = Path(firmware_path)
+    firmware_name = firmware_file.name
     os.makedirs(output_path, exist_ok=True)
 
     stage_entries.append(
@@ -353,6 +355,39 @@ def run_preprocess(
             returncode=proc.returncode,
         )
         return None
+
+    is_shared_object_name = firmware_file.name.endswith(".so") or any(
+        suffix.startswith(".so.") for suffix in firmware_file.suffixes
+    )
+    if fmt == "elf" or is_shared_object_name:
+        target = Path(output_path) / firmware_file.name
+        method = "already executable artifact"
+        log_event(
+            log,
+            logging.DEBUG,
+            "[Stage1] treating ELF/shared object as terminal artifact",
+            event="preprocess_try_tool",
+            tool=method,
+            firmware=firmware_name,
+        )
+        try:
+            shutil.copy2(firmware_file, target)
+            _record(
+                method,
+                success=True,
+                extra={"output_file": str(target), "size": target.stat().st_size},
+            )
+            return _success(method)
+        except Exception as exc:
+            _record(method, extra={"error": str(exc)})
+            log_event(
+                log,
+                logging.DEBUG,
+                "[Stage1] treating ELF/shared object as terminal artifact failed",
+                event="preprocess_tool_fail",
+                tool=method,
+                error=str(exc),
+            )
 
     if fmt == "tar":
         log_event(
