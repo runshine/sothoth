@@ -1312,6 +1312,51 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._dispatch_claim_decision(),
         )
 
+    def test_dispatch_task_by_id_requeues_when_task_row_is_locked_but_still_exists(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="locked-task",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        db = _ModelAwareDb(tasks=[task], events=[])
+        original_query_with_lock = manager._query_with_fast_task_row_lock
+        original_exists_without_lock = manager._task_row_exists_without_lock
+
+        class _LockedTaskQuery:
+            def first(self):
+                return None
+
+        manager._query_with_fast_task_row_lock = lambda _query: _LockedTaskQuery()
+        manager._task_row_exists_without_lock = lambda _db, _task_id: True
+        try:
+            with patch("app.service.task_manager.logger.info") as log_info:
+                claimed = manager._dispatch_task_by_id(db, task.id)
+        finally:
+            manager._query_with_fast_task_row_lock = original_query_with_lock
+            manager._task_row_exists_without_lock = original_exists_without_lock
+
+        self.assertIsNone(claimed)
+        self.assertTrue(
+            any("binary-security dispatch claim blocked:" in str(call.args[0]) for call in log_info.call_args_list)
+        )
+        self.assertEqual(
+            {
+                "task_id": "locked-task",
+                "claimed_task_id": None,
+                "blocked_reason": "task_row_locked_retry_later",
+                "should_requeue": True,
+                "cooldown_seconds": None,
+            },
+            manager._dispatch_claim_decision(),
+        )
+
     def test_dispatch_task_by_id_marks_running_owned_task_as_drop_after_pop(self):
         manager = TaskManager()
         task = BinarySecurityTask(
@@ -1629,7 +1674,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         requeued: list[str] = []
         prepared: list[str] = []
 
-        self.manager._force_requeue_delete_task = lambda task_id: requeued.append(task_id)
+        self.manager._force_requeue_delete_task = lambda task_id, context=None: requeued.append(task_id)
 
         async def _prepare(_db, _task):
             prepared.append(_task.id)
