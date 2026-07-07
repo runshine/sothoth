@@ -3915,6 +3915,7 @@ class TaskRuntimeServiceMixin:
             )
             async with self._worker_lock:
                 handle = self._workers.get(task_id)
+            preserve_local_runtime_holder = False
             cleanup_db = session_factory()
             try:
                 cleanup_completed = False
@@ -3929,6 +3930,7 @@ class TaskRuntimeServiceMixin:
                         task,
                         handle,
                     )
+                preserve_local_runtime_holder = bool(has_local_runtime_holder)
                 if (
                     task is not None
                     and not has_local_runtime_holder
@@ -4009,6 +4011,10 @@ class TaskRuntimeServiceMixin:
             async with self._worker_lock:
                 current_handle = self._workers.get(task_id)
                 if current_handle is not None and current_handle.runner_task is asyncio.current_task():
+                    if preserve_local_runtime_holder:
+                        current_handle.owner_active = True
+                        current_handle.last_runner_exit_at = task_manager_module._now()
+                        return
                     current_handle.owner_active = False
                     if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
                         current_handle.heartbeat_task.cancel()
@@ -4016,8 +4022,8 @@ class TaskRuntimeServiceMixin:
                             await current_handle.heartbeat_task
                     if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
                         current_handle.sync_maintenance_task.cancel()
-                        with suppress(asyncio.CancelledError, Exception):
-                            await current_handle.sync_maintenance_task
+                        with suppress(Exception):
+                            await asyncio.to_thread(current_handle.sync_maintenance_task.join, 5.0)
                     self._workers.pop(task_id, None)
                 elif current_handle is not None and not bool(current_handle.owner_active):
                     if current_handle.heartbeat_task is not None and not current_handle.heartbeat_task.done():
@@ -4026,8 +4032,8 @@ class TaskRuntimeServiceMixin:
                             await current_handle.heartbeat_task
                     if current_handle.sync_maintenance_task is not None and not current_handle.sync_maintenance_task.done():
                         current_handle.sync_maintenance_task.cancel()
-                        with suppress(asyncio.CancelledError, Exception):
-                            await current_handle.sync_maintenance_task
+                        with suppress(Exception):
+                            await asyncio.to_thread(current_handle.sync_maintenance_task.join, 5.0)
                     self._workers.pop(task_id, None)
             if owner_registered and not self._has_local_task_execution_owner(task_id):
                 self._release_task_execution_owner(task_id, "primary_task_worker")

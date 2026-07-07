@@ -683,7 +683,9 @@ class TaskRuntimeHandle:
     sync_maintenance_in_progress: bool = False
 
     def done(self) -> bool:
-        return self.runner_task.done()
+        heartbeat_done = self.heartbeat_task is None or self.heartbeat_task.done()
+        sync_maintenance_done = self.sync_maintenance_task is None or self.sync_maintenance_task.done()
+        return self.runner_task.done() and heartbeat_done and sync_maintenance_done
 
     def cancel(self, reason: str | None = None) -> None:
         self.cancel_requested = True
@@ -2433,7 +2435,7 @@ class TaskManager(
         failure_count = 0
         while self._running:
             handle = self._runtime_handle(task_id)
-            if handle is None or handle.cancel_requested or handle.runner_task.done():
+            if handle is None or handle.cancel_requested or handle.release_requested or handle.takeover_observed:
                 return
             try:
                 if await self._handoff_active_serial_control_operation_from_runtime(task_id):

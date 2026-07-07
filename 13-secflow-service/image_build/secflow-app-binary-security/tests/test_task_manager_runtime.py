@@ -504,6 +504,7 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         manager._execute_task = lambda *_args, **_kwargs: asyncio.sleep(0)
         manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
         manager._task_runtime_transition_guard_active = lambda *_args, **_kwargs: False
+        manager._task_should_remain_owned_without_active_runner = lambda *_args, **_kwargs: False
 
         with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
             with suppress(asyncio.CancelledError):
@@ -512,6 +513,68 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(heartbeat_cancelled.is_set())
         self.assertTrue(sync_maintenance_cancelled.is_set())
         self.assertNotIn("task-1", manager._workers)
+
+    async def test_run_task_finally_keeps_runtime_companions_when_owner_should_remain_active(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="dispatching",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root=self._workspace_root("run-task-finally-keeps-runtime-companions"),
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+        heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="heartbeat")
+        sync_handle = _FakeSyncMaintenanceThreadHandle()
+        current_task = asyncio.current_task()
+        assert current_task is not None
+
+        manager._workers["task-1"] = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=current_task,
+            heartbeat_task=heartbeat_task,
+            sync_maintenance_task=sync_handle,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+            owner_active=True,
+        )
+        manager._run_current_task_operation = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._run_task_runtime_signals = lambda *_args, **_kwargs: asyncio.sleep(0, result=False)
+        manager._execute_task = lambda *_args, **_kwargs: asyncio.sleep(0)
+        manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
+        manager._task_runtime_transition_guard_active = lambda *_args, **_kwargs: False
+        manager._task_should_remain_owned_without_active_runner = lambda *_args, **_kwargs: True
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            await manager._run_task("task-1")
+
+        handle = manager._workers.get("task-1")
+        self.assertIsNotNone(handle)
+        self.assertTrue(handle.owner_active)
+        self.assertFalse(heartbeat_task.done())
+        self.assertFalse(sync_handle.cancelled())
+
+        handle.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+        manager._workers.pop("task-1", None)
 
     async def test_task_heartbeat_handoffs_active_serial_control_operation(self):
         manager = TaskManager()
@@ -585,6 +648,51 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(task.id, False)], cancelled)
         self.assertEqual([task.id], enqueued)
         self.assertTrue(any(event.event_type == "runtime_yielded_for_serial_control_operation" for event in db.events))
+
+    async def test_task_heartbeat_keeps_running_after_runner_exit_when_owner_still_active(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        runner_task = asyncio.create_task(asyncio.sleep(0), name="runner-done")
+        await asyncio.gather(runner_task, return_exceptions=True)
+        current_task = asyncio.current_task()
+        assert current_task is not None
+        handle = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=runner_task,
+            heartbeat_task=current_task,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+            owner_active=True,
+        )
+        manager._workers["task-1"] = handle
+        verify_calls = {"count": 0}
+
+        async def _handoff(_task_id):
+            return False
+
+        def _verify(_task_id, source):
+            verify_calls["count"] += 1
+            manager._running = False
+            return task_manager_module._RuntimeLeaseOwnershipDecision(
+                should_continue=True,
+                runtime_lease_present=True,
+                runtime_lease_active=True,
+                runtime_lease_owner="worker-a",
+                local_handle_alive=True,
+            )
+
+        manager._handoff_active_serial_control_operation_from_runtime = _handoff
+        manager._verify_local_runtime_lease_or_abort = _verify
+
+        with patch("app.service.task_manager.asyncio.sleep", new=AsyncMock()) as sleep_mock:
+            await manager._run_task_heartbeat("task-1")
+
+        self.assertEqual(1, verify_calls["count"])
+        sleep_mock.assert_awaited()
 
     def test_recover_loop_db_error_disposes_engine_for_operational_and_timeout_errors(self):
         manager = TaskManager()
