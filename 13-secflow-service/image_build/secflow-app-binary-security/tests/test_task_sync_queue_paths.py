@@ -800,7 +800,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertEqual("child_sync", entries[0]["operation"])
         self.assertEqual(["i1", "i2"], entries[0]["item_ids"])
         self.assertTrue(entries[0]["payload"]["migrated_from_runtime_workset"])
-        self.assertEqual([task.id], queued)
+        self.assertEqual([], queued)
 
     def test_drain_task_sync_queue_acks_stale_existing_items_without_retry(self):
         manager = TaskManager()
