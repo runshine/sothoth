@@ -80,7 +80,10 @@ class TaskRuntimeServiceMixin:
 
     def _parent_takeover_pending_claim_active(self: TaskManager, task) -> bool:
         snapshot = self._parent_takeover_pending_claim_snapshot(task)
-        return bool(snapshot.get("active"))
+        if not bool(snapshot.get("active")):
+            return False
+        status = str(getattr(task, "status", "") or "").strip().lower()
+        return status in {"pending", "dispatching"}
 
     def _clear_parent_takeover_pending_claim(self: TaskManager, task) -> None:
         summary = dict(getattr(task, "summary", None) or {})

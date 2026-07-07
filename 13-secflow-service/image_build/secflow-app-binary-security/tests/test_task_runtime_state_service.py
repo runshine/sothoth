@@ -150,6 +150,15 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual([], db.events)
 
     def test_repair_running_lease_invariant_defers_when_runtime_lease_clear_hits_lock_conflict(self):
+        class _CountingDb(_ModelAwareDb):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.rollback_count = 0
+
+            def rollback(self):
+                self.rollback_count += 1
+                return None
+
         task = self._task(
             status="running",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
@@ -159,15 +168,14 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
             owner_instance_id="worker-a",
             lease_expires_at=_now() - timedelta(minutes=1),
         )
-        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+        db = _CountingDb(tasks=[task], runtime_leases=[lease], events=[])
         original_clear = self.manager._clear_runtime_lease
 
         def _defer_clear(*_args, **_kwargs):
-            return task_manager_module.RuntimeLeaseClearResult(
-                status="lease_locked_retry_later",
-                task_id=task.id,
-                owner_instance_id="worker-a",
-                error_message="deadlock",
+            raise task_manager_module.OperationalError(
+                "DELETE FROM secflow_binary_security_task_runtime_lease ...",
+                {},
+                Exception(1205, "Lock wait timeout exceeded; try restarting transaction"),
             )
 
         self.manager._clear_runtime_lease = _defer_clear
@@ -183,6 +191,7 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
 
         self.assertFalse(repaired)
         self.assertEqual("running", task.status)
+        self.assertEqual(0, db.rollback_count)
         event_types = [row.event_type for row in db.events]
         self.assertIn("parent_takeover_lock_acquired", event_types)
         self.assertIn("parent_takeover_recovery_deferred_by_db_lock", event_types)
@@ -232,7 +241,7 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(0, task_db_2.commit_count)
         self.assertEqual(1, task_db_2.rollback_count)
 
-    def test_repair_running_lease_invariant_single_task_locked_skips_pending_claim_task(self):
+    def test_repair_running_lease_invariant_single_task_locked_ignores_pending_claim_marker_for_running_task(self):
         task = self._task(
             status="running",
             runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
@@ -248,9 +257,10 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
 
         repaired = self.manager._repair_running_lease_invariant_single_task_locked(db, task.id)
 
-        self.assertFalse(repaired)
-        self.assertEqual("running", task.status)
-        self.assertEqual([], db.events)
+        self.assertTrue(repaired)
+        self.assertEqual("pending", task.status)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("parent_takeover_recovery_committed", event_types)
 
 
 if __name__ == "__main__":
