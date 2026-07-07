@@ -346,18 +346,8 @@ class TaskItemSyncServiceMixin:
         child_terminal = bool(child_status in self._TERMINAL_CHILD_STATUSES)
         child_active = bool(child_status in self._ACTIVE_CHILD_STATUSES)
         binding_state = self._downstream_binding_state(item)
-        counts_as_active_child = bool((child_bound and child_active) or binding_state == "creating")
+        counts_as_active_child = bool(child_bound and child_active)
         if not child_bound:
-            if binding_state == "creating":
-                return {
-                    "action": "noop",
-                    "child_bound": False,
-                    "child_status": None,
-                    "child_terminal": False,
-                    "child_active": False,
-                    "counts_as_active_child": True,
-                    "reason": "child_create_in_progress",
-                }
             if item_status in {"pending", "queued", "running", "dispatching"}:
                 return {
                     "action": "create_child",
@@ -366,7 +356,7 @@ class TaskItemSyncServiceMixin:
                     "child_terminal": False,
                     "child_active": False,
                     "counts_as_active_child": False,
-                    "reason": "missing_authoritative_child",
+                    "reason": "missing_authoritative_child" if binding_state != "creating" else "missing_authoritative_child_after_create_attempt",
                 }
             return {
                 "action": "noop",

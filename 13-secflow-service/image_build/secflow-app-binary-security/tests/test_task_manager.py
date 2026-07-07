@@ -46619,6 +46619,41 @@ def _test_create_downstream_children_reattaches_item_after_async_wait_before_bin
     self.assertEqual(task.id, resp.task_id)
 
 
+def _test_compute_item_downstream_action_recreates_missing_authoritative_child_after_stale_creating_state(self):
+    task = BinarySecurityTask(
+        id="task-create-decision",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="item-create-decision",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        downstream_service="system_analyse",
+        status="queued",
+        result={
+            "sync_observation": {"binding_state": "creating"},
+            "downstream_binding": {"state": "creating", "attempts": 1},
+        },
+    )
+
+    decision = self.manager._compute_item_downstream_action(task, item, for_task_status="running")
+
+    self.assertEqual("create_child", decision["action"])
+    self.assertFalse(decision["child_bound"])
+    self.assertFalse(decision["counts_as_active_child"])
+    self.assertEqual("missing_authoritative_child_after_create_attempt", decision["reason"])
+
+
 def _test_get_sync_events_returns_paginated_filtered_records(self):
     task = BinarySecurityTask(
         id="task-sync-query",
@@ -47101,6 +47136,7 @@ TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_
 TaskManagerTests.test_record_downstream_item_disposition_maps_create_and_retry_audit_events = _test_record_downstream_item_disposition_maps_create_and_retry_audit_events
 TaskManagerTests.test_downstream_create_task_records_requested_sync_event_before_authoritative_binding = _test_downstream_create_task_records_requested_sync_event_before_authoritative_binding
 TaskManagerTests.test_create_downstream_children_reattaches_item_after_async_wait_before_binding_commit = _test_create_downstream_children_reattaches_item_after_async_wait_before_binding_commit
+TaskManagerTests.test_compute_item_downstream_action_recreates_missing_authoritative_child_after_stale_creating_state = _test_compute_item_downstream_action_recreates_missing_authoritative_child_after_stale_creating_state
 TaskManagerTests.test_persist_child_sync_observation_records_success_and_recovery_events = _test_persist_child_sync_observation_records_success_and_recovery_events
 TaskManagerTests.test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success = _test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success
 TaskManagerTests.test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key = _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key
