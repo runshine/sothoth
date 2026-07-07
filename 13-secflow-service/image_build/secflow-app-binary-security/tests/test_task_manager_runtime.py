@@ -3580,6 +3580,60 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pending_task_layer_reconcile", workset)
         self.assertEqual("legacy_tail_finalize_migrated", workset["pending_task_layer_reconcile"].get("source_event_type"))
 
+    async def test_run_task_runtime_signals_keeps_reconcile_signal_when_processing_fails(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-reconcile-failure",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+        )
+        task.summary = {
+            "runtime_workset": {
+                "pending_task_layer_reconcile": {
+                    "requested_at": _now().isoformat(),
+                    "source": "owner_fact_apply",
+                    "source_event_type": "stage_worker_terminal_observed",
+                    "reconcile_reason": "stage_waiting_downstream_progress",
+                    "stage_name": "dataflow_vuln_scan",
+                    "fact_applied": True,
+                }
+            }
+        }
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=int(getattr(task, "execution_epoch", 0) or 0),
+            owner_instance_id="worker-a",
+            owner_started_at=_now(),
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
+        manager._has_local_runtime_owner_fast_path = lambda *_args, **_kwargs: True
+        manager._run_task_layer_reconcile_signal = AsyncMock(side_effect=RuntimeError("reconcile boom"))
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: db):
+            changed = await manager._run_task_runtime_signals(task.id)
+
+        self.assertFalse(changed)
+        workset = task.summary.get("runtime_workset") or {}
+        self.assertIn("pending_task_layer_reconcile", workset)
+        self.assertEqual(
+            "stage_waiting_downstream_progress",
+            workset["pending_task_layer_reconcile"].get("reconcile_reason"),
+        )
+        failure_events = [event for event in db.events if event.event_type == "task_runtime_signal_processing_failed"]
+        self.assertTrue(failure_events)
+        self.assertEqual("pending_task_layer_reconcile", failure_events[-1].payload.get("signal_name"))
+        self.assertEqual("RuntimeError", failure_events[-1].payload.get("error_type"))
+
     async def test_run_task_processes_operation_before_runtime_signals(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"

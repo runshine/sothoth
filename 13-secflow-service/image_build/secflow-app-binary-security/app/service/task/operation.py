@@ -3118,8 +3118,6 @@ class TaskOperationServiceMixin:
                 return True
             if workset.get("pending_task_layer_reconcile"):
                 signal = dict(workset.get("pending_task_layer_reconcile") or {})
-                self._clear_task_runtime_signal(task, "pending_task_layer_reconcile")
-                db.commit()
                 reconcile_db = session_factory()
                 try:
                     reconcile_task = (
@@ -3139,6 +3137,7 @@ class TaskOperationServiceMixin:
                             self._reconcile_stage_domain_in_session(reconcile_db, reconcile_task, stage_name)
                         if stage_name and self._is_streaming_tail_stage(reconcile_task, stage_name):
                             await self._sync_streaming_task_tail_state(reconcile_task.id)
+                        self._clear_task_runtime_signal(reconcile_task, "pending_task_layer_reconcile")
                         reconcile_db.commit()
                         return True
                     changed = await self._run_task_layer_reconcile_signal(
@@ -3146,8 +3145,34 @@ class TaskOperationServiceMixin:
                         reconcile_task,
                         signal=signal,
                     )
+                    self._clear_task_runtime_signal(reconcile_task, "pending_task_layer_reconcile")
                     reconcile_db.commit()
                     return changed
+                except task_manager_module.StaleTaskExecution:
+                    reconcile_db.rollback()
+                    return False
+                except Exception as exc:
+                    reconcile_db.rollback()
+                    task_manager_module.logger.exception(
+                        "binary-security task runtime signal processing failed: task_id=%s signal=pending_task_layer_reconcile",
+                        task_id,
+                    )
+                    await asyncio.to_thread(
+                        self._record_task_runtime_lifecycle_event,
+                        task_id,
+                        event_type="task_runtime_signal_processing_failed",
+                        message="任务层 reconcile 信号处理失败，已保留信号等待下轮继续处理",
+                        source="run_task_runtime_signals",
+                        level="warning",
+                        payload={
+                            "signal_name": "pending_task_layer_reconcile",
+                            "reconcile_reason": str(signal.get("reconcile_reason") or signal.get("reason") or "").strip() or None,
+                            "source_event_type": str(signal.get("source_event_type") or "").strip() or None,
+                            "error": str(exc),
+                            "error_type": exc.__class__.__name__,
+                        },
+                    )
+                    return False
                 finally:
                     reconcile_db.close()
             if workset.get("pending_binding_repair") or workset.get("pending_downstream_sync"):

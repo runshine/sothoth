@@ -3820,6 +3820,12 @@ class TaskRuntimeServiceMixin:
         except task_manager_module.StaleTaskExecution:
             return
         except Exception as exc:
+            task_manager_module.logger.exception(
+                "binary-security run_task failed unexpectedly: task_id=%s active_commit_succeeded=%s execution_token=%s",
+                task_id,
+                bool(active_commit_succeeded),
+                execution_token,
+            )
             with suppress(Exception):
                 db.rollback()
             async with self._worker_lock:

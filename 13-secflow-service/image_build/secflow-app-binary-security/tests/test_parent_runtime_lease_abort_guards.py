@@ -62,6 +62,8 @@ class ParentRuntimeLeaseAbortGuardTests(unittest.IsolatedAsyncioTestCase):
         handle = SimpleNamespace(
             done=lambda: False,
             cancel_requested=False,
+            release_requested=False,
+            takeover_observed=False,
             runner_task=runner_task,
             heartbeat_task=heartbeat_task,
             active_commit_succeeded=True,
