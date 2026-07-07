@@ -1615,24 +1615,6 @@ class TaskManager(
             payload=effective_payload,
             event_payload=event_payload,
         )
-        self._record_stage_item_sync_audit(
-            db,
-            task=task,
-            item=item,
-            stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
-            downstream_service=service,
-            operation="downstream_create",
-            event_type="applied",
-            sync_status="observed",
-            outcome="success",
-            state_applied=True,
-            payload={
-                "service": str(service or ""),
-                "created_task_id": created.get("task_id") or created.get("id"),
-                "created_status": created.get("status"),
-                **(event_payload or {}),
-            },
-        )
         return created
 
     async def _downstream_control_existing_task(
@@ -6632,6 +6614,7 @@ class TaskManager(
                     token=token,
                     payload=payload,
                 )
+                item = self._reattach_stage_item_after_async_wait(db, item)
                 self._apply_created_downstream_child(
                     db,
                     task,
@@ -12530,6 +12513,7 @@ class TaskManager(
             token=create_token,
             payload=create_payload,
         )
+        item = self._reattach_stage_item_after_async_wait(session, item)
         new_task_id = str(created.get("task_id") or created.get("id") or "").strip() or None
         self._apply_created_downstream_child(
             session,

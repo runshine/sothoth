@@ -53,6 +53,13 @@ class TaskDownstreamServiceMixin:
                 return item
         return item
 
+    def _reattach_stage_item_after_async_wait(
+        self: TaskManager,
+        session: Session,
+        item: BinarySecurityStageItem,
+    ) -> BinarySecurityStageItem:
+        return self._refresh_stage_item_authoritative_state(session, item)
+
     def _defer_item_with_previous_authoritative_result(
         self: TaskManager,
         session: Session,

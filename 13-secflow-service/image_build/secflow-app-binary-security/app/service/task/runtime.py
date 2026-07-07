@@ -4826,6 +4826,7 @@ class TaskRuntimeServiceMixin:
                             response_item=input_file,
                         )
             if created is not None:
+                item = self._reattach_stage_item_after_async_wait(session, item)
                 self._apply_created_downstream_child(
                     session,
                     task,
@@ -6249,6 +6250,7 @@ class TaskRuntimeServiceMixin:
                         },
                     )
                     if created is not None:
+                        item = self._reattach_stage_item_after_async_wait(session, item)
                         self._apply_created_downstream_child(
                             session,
                             task,

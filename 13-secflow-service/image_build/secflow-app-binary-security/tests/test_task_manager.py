@@ -46433,7 +46433,7 @@ def _test_record_downstream_item_disposition_maps_create_and_retry_audit_events(
     self.assertIsNone(sync_rows[-1].error_message)
 
 
-def _test_downstream_create_task_records_requested_and_applied_sync_events(self):
+def _test_downstream_create_task_records_requested_sync_event_before_authoritative_binding(self):
     task = BinarySecurityTask(
         id="task-sync-create",
         project_id="p1",
@@ -46490,9 +46490,133 @@ def _test_downstream_create_task_records_requested_and_applied_sync_events(self)
     self.assertEqual("child-1", created["task_id"])
     self.assertEqual(1, len(create_calls))
     sync_rows = [row for row in db.sync_events if isinstance(row, BinarySecuritySyncEvent)]
-    self.assertEqual(2, len(sync_rows))
-    self.assertEqual(["requested", "applied"], [row.event_type for row in sync_rows])
+    self.assertEqual(1, len(sync_rows))
+    self.assertEqual(["requested"], [row.event_type for row in sync_rows])
     self.assertTrue(all(row.operation == "downstream_create" for row in sync_rows))
+
+
+def _test_create_downstream_children_reattaches_item_after_async_wait_before_binding_commit(self):
+    task = BinarySecurityTask(
+        id="task-create-reattach",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="item-create-reattach",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr1",
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        downstream_service="system_analyse",
+        status="queued",
+        result={
+            "sync_observation": {"binding_state": "creating"},
+            "downstream_binding": {"state": "creating", "attempts": 1},
+        },
+    )
+
+    class _DetachedCreateDb(_AppendingModelAwareDb):
+        def __init__(self, stage_item, **kwargs):
+            super().__init__(stage_items=[stage_item], **kwargs)
+            self.stage_item = stage_item
+            self.detached_item = None
+
+        def close(self):
+            detached = BinarySecurityStageItem(
+                id=self.stage_item.id,
+                task_id=self.stage_item.task_id,
+                project_id=self.stage_item.project_id,
+                stage_run_id=self.stage_item.stage_run_id,
+                stage_name=self.stage_item.stage_name,
+                item_key=self.stage_item.item_key,
+                item_name=self.stage_item.item_name,
+                parent_key=self.stage_item.parent_key,
+                status=self.stage_item.status,
+                downstream_service=self.stage_item.downstream_service,
+                downstream_task_id=self.stage_item.downstream_task_id,
+                result=dict(self.stage_item.result or {}),
+                input_ref=dict(self.stage_item.input_ref or {}),
+                output_ref=dict(self.stage_item.output_ref or {}),
+            )
+            self.detached_item = detached
+            return None
+
+        def refresh(self, obj):
+            if self.detached_item is not None and obj is self.detached_item:
+                obj.downstream_task_id = self.stage_item.downstream_task_id
+                obj.status = self.stage_item.status
+                obj.result = dict(self.stage_item.result or {})
+                return obj
+            return obj
+
+    db = _DetachedCreateDb(item, tasks=[task], events=[])
+
+    original_task_or_404 = self.manager._task_or_404
+    original_ensure_write_ownership = self.manager._ensure_task_write_ownership
+    original_reconcile_requested_items = self.manager._task_reconcile_requested_items
+    original_build_workset = self.manager._build_task_downstream_workset
+    original_build_request = self.manager._build_child_create_request_for_item
+    original_downstream_create = self.manager._downstream_create_task
+    original_refresh_stage_run = self.manager._refresh_stage_run_from_items
+    try:
+        self.manager._task_or_404 = lambda _db, _project_id, _task_id: task
+        self.manager._ensure_task_write_ownership = lambda *_args, **_kwargs: None
+        self.manager._task_reconcile_requested_items = lambda _db, _task, stage_name=None, item_ids=None: ([db.detached_item or item], [])
+        self.manager._build_task_downstream_workset = lambda _db, _task, *, items, force=False, for_task_status=None: [
+            {
+                "item": items[0],
+                "item_id": items[0].id,
+                "stage_name": "system_analysis",
+                "operation": "child_create",
+                "force": False,
+                "decision": {"action": "create_child"},
+                "reason": "test",
+                "blocked_reason": None,
+                "missing_recorded_status": False,
+                "active_child_count": 0,
+                "stage_parallelism": 4,
+            }
+        ]
+        self.manager._build_child_create_request_for_item = lambda _db, _task, _item: ("system_analyse", "tok", {"input_path": "/src"})
+
+        async def fake_create(_db, _task, _item, *, service, token, payload):
+            del _db, _task, service, token, payload
+            db.close()
+            return {"task_id": "sat-bound", "status": "pending"}
+
+        self.manager._downstream_create_task = fake_create
+        self.manager._refresh_stage_run_from_items = lambda *_args, **_kwargs: None
+
+        resp = asyncio.run(
+            self.manager._create_downstream_children(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name="system_analysis",
+                item_ids=[item.id],
+                force=True,
+            )
+        )
+    finally:
+        self.manager._task_or_404 = original_task_or_404
+        self.manager._ensure_task_write_ownership = original_ensure_write_ownership
+        self.manager._task_reconcile_requested_items = original_reconcile_requested_items
+        self.manager._build_task_downstream_workset = original_build_workset
+        self.manager._build_child_create_request_for_item = original_build_request
+        self.manager._downstream_create_task = original_downstream_create
+        self.manager._refresh_stage_run_from_items = original_refresh_stage_run
+
+    self.assertEqual("sat-bound", item.downstream_task_id)
+    self.assertEqual("pending", item.status)
+    self.assertEqual(task.id, resp.task_id)
 
 
 def _test_get_sync_events_returns_paginated_filtered_records(self):
@@ -46975,7 +47099,8 @@ TaskManagerTests.test_record_downstream_sync_event_trims_per_item_bucket_to_20 =
 TaskManagerTests.test_record_downstream_sync_event_trims_each_item_bucket_independently = _test_record_downstream_sync_event_trims_each_item_bucket_independently
 TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_item_id = _test_record_downstream_sync_event_uses_fallback_bucket_without_item_id
 TaskManagerTests.test_record_downstream_item_disposition_maps_create_and_retry_audit_events = _test_record_downstream_item_disposition_maps_create_and_retry_audit_events
-TaskManagerTests.test_downstream_create_task_records_requested_and_applied_sync_events = _test_downstream_create_task_records_requested_and_applied_sync_events
+TaskManagerTests.test_downstream_create_task_records_requested_sync_event_before_authoritative_binding = _test_downstream_create_task_records_requested_sync_event_before_authoritative_binding
+TaskManagerTests.test_create_downstream_children_reattaches_item_after_async_wait_before_binding_commit = _test_create_downstream_children_reattaches_item_after_async_wait_before_binding_commit
 TaskManagerTests.test_persist_child_sync_observation_records_success_and_recovery_events = _test_persist_child_sync_observation_records_success_and_recovery_events
 TaskManagerTests.test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success = _test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success
 TaskManagerTests.test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key = _test_downstream_create_task_after_hard_restart_preserves_and_forwards_work_key

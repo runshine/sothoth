@@ -1985,6 +1985,7 @@ class TaskOperationServiceMixin:
                     token=create_token,
                     payload=create_payload,
                 )
+                item = self._reattach_stage_item_after_async_wait(db, item)
                 self._apply_created_downstream_child(
                     db,
                     task,
@@ -2113,6 +2114,7 @@ class TaskOperationServiceMixin:
                             token=create_token,
                             payload=create_payload,
                         )
+                        item = self._reattach_stage_item_after_async_wait(db, item)
                         self._apply_created_downstream_child(
                             db,
                             task,
