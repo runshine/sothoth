@@ -2494,7 +2494,8 @@ class TaskRuntimeServiceMixin:
                         task_id=task_id,
                         claimed_task_id=None,
                         blocked_reason="dispatch_claim_blocked_stale_owner_release_failed",
-                        should_requeue=False,
+                        should_requeue=True,
+                        cooldown_seconds=self._dispatch_claim_handoff_cooldown_seconds(),
                     )
                     return None
                 current_status = str(getattr(task, "status", "") or "").strip().lower()

@@ -1624,6 +1624,44 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._dispatch_claim_decision(),
         )
 
+    def test_dispatch_task_by_id_requeues_when_stale_owner_release_is_deferred(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        task = BinarySecurityTask(
+            id="task-running-release-deferred",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-release-deferred",
+            runtime_phase="owned_execution",
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-old",
+            heartbeat_at=_now() - timedelta(minutes=2),
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[expired_lease])
+        manager._release_task_without_supported_runtime_owner = lambda *_args, **_kwargs: False
+
+        claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": None,
+                "blocked_reason": "dispatch_claim_blocked_stale_owner_release_failed",
+                "should_requeue": True,
+                "cooldown_seconds": manager._dispatch_claim_handoff_cooldown_seconds(),
+            },
+            manager._dispatch_claim_decision(),
+        )
+
 
 class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
