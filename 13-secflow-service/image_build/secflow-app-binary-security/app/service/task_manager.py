@@ -1618,18 +1618,6 @@ class TaskManager(
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
-        normalized_status = str(item.status or "").strip().lower()
-        if str(item.downstream_task_id or "").strip():
-            try:
-                self._release_session_connection_before_wait(db)
-                payload = await self._fetch_downstream_task_payload(task, item, token or "")
-            except Exception:
-                payload = None
-            mapped = self._map_downstream_status(str((payload or {}).get("status") or ""))
-            if payload and mapped == "running":
-                return {"outcome": "already_running", "payload": payload}
-            if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
-                return {"outcome": "already_running", "payload": payload}
         self._release_session_connection_before_wait(db)
         return await self._downstream_tasks().control_existing_child(
             db,
@@ -6083,39 +6071,46 @@ class TaskManager(
     ) -> list[dict[str, Any]]:
         expected: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in self._task_reconcile_candidate_items(
+        candidate_items = self._task_reconcile_candidate_items(
             db,
             task,
             force=False,
             include_failed_terminal_items=True,
-        ):
-            normalized_stage = str(normalize_stage_name(item.stage_name) or "").strip() or None
+        )
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=candidate_items,
+            force=False,
+            for_task_status=str(task.status or "").strip().lower() or None,
+        )
+        for work_item in workset:
+            item = work_item["item"]
+            normalized_stage = work_item["stage_name"]
             observed_status = self._latest_observed_downstream_status(item)
-            decision = self._compute_item_downstream_action(
-                task,
-                item,
-                for_task_status=str(task.status or "").strip().lower() or None,
-            )
-            missing_recorded_status = self._item_missing_recorded_downstream_status(item)
-            if decision["action"] == "noop" and not missing_recorded_status:
+            operation = str(work_item.get("operation") or "").strip()
+            if operation not in {"child_create", "child_sync"}:
                 continue
             entry = {
-                "operation": "child_create" if decision["action"] == "create_child" else "child_sync",
+                "operation": operation,
                 "source": "db_repair",
                 "reason": "repair_missing_or_stale_sync_queue_entry",
                 "source_event_type": "task_sync_queue_repair",
                 "stage_name": normalized_stage,
                 "item_ids": [str(item.id or "").strip()] if str(item.id or "").strip() else [],
                 "archive_job_ids": [],
-                "force": bool(missing_recorded_status),
+                "force": bool(work_item.get("force")),
                 "payload": {
                     "item_key": str(item.item_key or "").strip() or None,
                     "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
                     "observed_downstream_status": observed_status,
-                    "decision_reason": decision["reason"],
+                    "decision_reason": work_item.get("reason"),
+                    "blocked_reason": work_item.get("blocked_reason"),
+                    "stage_parallelism": int(work_item.get("stage_parallelism") or 0),
+                    "active_child_count": int(work_item.get("active_child_count") or 0),
                     "cross_stage_sync": bool(normalized_stage and normalized_stage != str(normalize_stage_name(task.current_stage) or "").strip()),
                 },
-                "priority": 10 if decision["action"] == "create_child" else 20 if missing_recorded_status else 30,
+                "priority": 10 if operation == "child_create" else 20 if work_item.get("missing_recorded_status") else 30,
             }
             dedupe_key = self._task_sync_request_dedupe_key(
                 operation=entry["operation"],
@@ -6433,7 +6428,16 @@ class TaskManager(
         try:
             self._configure_runtime_session_fast_lock_wait_timeout(sync_db)
             if operation == "child_create":
-                self._enqueue_task(task_id)
+                self._run_async_blocking(
+                    self._create_downstream_children(
+                        sync_db,
+                        project_id=project_id,
+                        task_id=task_id,
+                        stage_name=stage_name,
+                        item_ids=item_ids or None,
+                        force=force,
+                    )
+                )
                 return
             self._run_async_blocking(
                 self.sync_downstream_status(
@@ -6450,6 +6454,114 @@ class TaskManager(
             )
         finally:
             sync_db.close()
+
+    async def _create_downstream_children(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        stage_name: str | None = None,
+        item_ids: list[str] | None = None,
+        force: bool = False,
+    ) -> BinarySecurityActionResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        self._ensure_task_write_ownership(task, db=db)
+        requested_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
+        if requested_ids:
+            items, missing_requested_item_ids = self._task_reconcile_requested_items(
+                db,
+                task,
+                stage_name=stage_name,
+                item_ids=requested_ids,
+            )
+            if not items:
+                raise NotFoundError("阶段子任务不存在")
+        else:
+            items = self._task_reconcile_candidate_items(
+                db,
+                task,
+                stage_name=stage_name,
+                force=force,
+                include_failed_terminal_items=True,
+            )
+            missing_requested_item_ids = []
+
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=items,
+            force=force,
+            for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
+        )
+        created_count = 0
+        skipped_count = 0
+        created_item_ids: list[str] = []
+        skipped_item_ids: list[str] = []
+        for entry in workset:
+            item = entry["item"]
+            operation_name = str(entry.get("operation") or "").strip()
+            if operation_name != "child_create":
+                if str(entry.get("blocked_reason") or "").strip() == "stage_parallelism_exhausted":
+                    skipped_count += 1
+                    skipped_item_ids.append(str(item.id or "").strip())
+                    self._record_downstream_sync_event(
+                        db,
+                        task=task,
+                        item=item,
+                        stage_name=str(item.stage_name or "").strip() or None,
+                        operation="downstream_create",
+                        event_type="skipped",
+                        sync_status="skipped",
+                        outcome="parallelism_limited",
+                        state_applied=False,
+                        error_type="stage_parallelism_exhausted",
+                        error_message="当前阶段活跃下游数量已达到并发上限，本轮暂不创建新的下游任务",
+                        payload={
+                            "item_id": str(item.id or "").strip() or None,
+                            "item_key": str(item.item_key or "").strip() or None,
+                            "stage_parallelism": int(entry.get("stage_parallelism") or 0),
+                            "active_child_count": int(entry.get("active_child_count") or 0),
+                        },
+                    )
+                continue
+
+            service, token, payload = self._build_child_create_request_for_item(db, task, item)
+            self._mark_downstream_binding_creating(item)
+            created = await self._downstream_create_task(
+                db,
+                task,
+                item,
+                service=service,
+                token=token,
+                payload=payload,
+            )
+            self._apply_created_downstream_child(
+                db,
+                task,
+                item,
+                created=created,
+                reason=f"{normalize_stage_name(item.stage_name)}_child_create",
+                event_type="downstream_child_created",
+            )
+            self._refresh_stage_run_from_items(db, task, str(item.stage_name or "").strip())
+            db.commit()
+            created_count += 1
+            created_item_ids.append(str(item.id or "").strip())
+
+        if skipped_count > 0:
+            db.commit()
+        return BinarySecurityActionResponse(
+            task_id=task.id,
+            message="下游任务创建处理完成",
+            detail={
+                "created_count": created_count,
+                "skipped_count": skipped_count,
+                "created_item_ids": created_item_ids,
+                "skipped_item_ids": skipped_item_ids,
+                "missing_requested_item_ids": missing_requested_item_ids,
+            },
+        )
 
     def _resolve_task_sync_entry_item_targets(
         self,
@@ -8146,6 +8258,15 @@ class TaskManager(
             "accumulated_selected_entry_count": accumulated_selected_entry_count,
             **analysis_metrics,
         }
+
+    def _knowledge_graph_upstream_terminal_state(self, meta: dict[str, Any]) -> tuple[bool, bool]:
+        graph_status = str(meta.get("graph_status") or "").strip().lower()
+        identification_state = str(meta.get("identification_state") or "").strip().lower()
+        if graph_status in {"failed", "superseded"} or identification_state == "failed":
+            return True, False
+        if identification_state == "done":
+            return True, True
+        return False, False
 
     def _filter_candidate_modules(self, modules: list[dict[str, Any]], risk_levels: list[str]) -> list[dict[str, Any]]:
         allowed = set(_normalize_module_risk_levels(risk_levels))
@@ -12192,40 +12313,34 @@ class TaskManager(
             )
             session.commit()
 
-        dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
-        source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
-        if not dataflow_input_dir:
-            raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
-        if not source_dir:
-            raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
+        create_entry = {
+            **dict(item.input_ref or {}),
+            **dict(dataflow_result or {}),
+        }
+        service, create_token, create_payload = self._retry_recreate_payload_for_item(
+            task,
+            item,
+            db=session,
+            preferred_token=token,
+            input_ref_override=create_entry,
+        )
         created = await self._downstream_create_task(
             session,
             task,
             item,
-            service="dataflow_vuln_scan",
-            token=token,
-            payload={
-                "title": f"{task.name}-{dataflow_result['function_name']}-scan",
-                "data_flow_path": dataflow_input_dir,
-                "source_dir": source_dir,
-                "origin": _downstream_origin_payload(task, item),
-            },
+            service=service,
+            token=create_token,
+            payload=create_payload,
         )
         new_task_id = str(created.get("task_id") or created.get("id") or "").strip() or None
-        item.downstream_task_id = new_task_id or item.downstream_task_id
-        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-        item.started_at = item.started_at or _now()
-        item.finished_at = None
-        item.error_message = None
-        self._clear_replacement_in_progress(item)
-        self._record_downstream_item_disposition(
+        self._apply_created_downstream_child(
             session,
             task,
             item,
+            created=created,
+            reason=f"{normalize_stage_name(item.stage_name)}_retry_fallback_recreated",
             event_type="downstream_retry_fallback_recreated",
-            message=f"已重建新的下游任务: {item.downstream_service}:{new_task_id or '-'}",
-            payload={
-                "stage_name": item.stage_name,
+            event_payload={
                 "old_downstream_task_id": old_task_id,
                 "new_downstream_task_id": new_task_id,
                 "control_outcome": outcome or None,
@@ -14502,6 +14617,7 @@ class TaskManager(
             return "failed", failure_summary
         graph_status = str(meta.get("graph_status") or "").strip()
         identification_state = str(meta.get("identification_state") or "").strip()
+        upstream_terminal, upstream_success_terminal = self._knowledge_graph_upstream_terminal_state(meta)
         accumulated_entries = self._merge_knowledge_graph_entry_results(task, entries)
         accumulated_selected_entry_count = len(accumulated_entries)
         executable_entries = self._filter_executable_knowledge_graph_entries(accumulated_entries)
@@ -14640,7 +14756,7 @@ class TaskManager(
             }
             self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
             return "running", waiting_summary
-        if identification_state != "done" and not accumulated_entries:
+        if not upstream_terminal and not accumulated_entries:
             self._record_event(
                 db,
                 task,
@@ -14683,6 +14799,63 @@ class TaskManager(
                 **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                **state_summary,
+                **meta,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
+            return "running", waiting_summary
+        if not upstream_terminal and accumulated_entries and not executable_entries:
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_waiting_for_upstream_terminal",
+                "知识图谱已发现入口，但上游仍在分析，继续增量轮询",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph_audit_sources",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                    "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                    "knowledge_graph_executable_entry_count": executable_entry_count,
+                    **meta,
+                },
+            )
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": [pending_module],
+                "knowledge_graph_state": state_summary,
+            }
+            task.metrics = {
+                **(task.metrics or {}),
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
+                **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
+            }
+            waiting_summary = {
+                "status": "waiting_for_upstream_terminal",
+                "items": [pending_module],
+                "success_count": executable_entry_count,
+                "failed_count": 0,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
+                "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "entry_results": [pending_module],
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 **state_summary,
@@ -14799,6 +14972,7 @@ class TaskManager(
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_executable_entry_count": executable_entry_count,
+                "upstream_success_terminal": upstream_success_terminal,
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 **meta,
@@ -14987,12 +15161,19 @@ class TaskManager(
         self,
         task: BinarySecurityTask,
         item: BinarySecurityStageItem,
+        *,
+        db: Session | None = None,
+        preferred_token: str | None = None,
+        input_ref_override: dict[str, Any] | None = None,
     ) -> tuple[str, str | None, dict[str, Any]]:
-        input_ref = dict(item.input_ref or {})
+        input_ref = dict(input_ref_override or item.input_ref or {})
         service = str(item.downstream_service or "").strip()
-        token: str | None = self._service_token()
+        token: str | None = self._resolve_downstream_token(preferred_token)
         if service == "firmware_unpacker":
-            input_path = str(input_ref.get("path") or "").strip()
+            input_path = str(input_ref.get("path") or input_ref.get("input_path") or "").strip()
+            if not input_path:
+                default_name = str(input_ref.get("filename") or item.item_name or item.item_key or "firmware.bin").strip()
+                input_path = str(Path(task.workspace_root) / "input" / default_name)
             if not input_path:
                 raise ValidationError("firmware_unpack retry 缺少输入路径")
             return service, token, {
@@ -15001,10 +15182,17 @@ class TaskManager(
             }
         if service == "system_analyse":
             input_path = str(input_ref.get("input_path") or "").strip()
+            if not input_path:
+                recovered_input = self._system_analysis_input_for_item(task, item)
+                input_path = str(
+                    recovered_input.get("unpacked_root")
+                    or recovered_input.get("input_path")
+                    or ""
+                ).strip()
             firmware_name = str(item.item_name or input_ref.get("firmware_key") or "firmware").strip()
             if not input_path:
                 raise ValidationError("system_analysis retry 缺少 input_path")
-            return service, None, {
+            return service, self._resolve_downstream_token(preferred_token), {
                 "task_name": f"{task.name}-{firmware_name}-system-analysis",
                 "input_path": input_path,
                 "origin": _downstream_origin_payload(task, item),
@@ -15022,12 +15210,51 @@ class TaskManager(
             }
         if service == "entry_analyse":
             entry_input = self._normalize_entry_analysis_module_input(task, input_ref)
+            if db is not None and (
+                not str(entry_input.get("module_dir") or "").strip()
+                or not str(entry_input.get("source_root") or entry_input.get("source_root_path") or "").strip()
+            ):
+                summary_modules = [
+                    dict(row)
+                    for row in list(self._entry_results(task) or [])
+                    if isinstance(row, dict)
+                ]
+                matched = next(
+                    (
+                        row
+                        for row in summary_modules
+                        if str(row.get("module_key") or "").strip() == str(item.item_key or input_ref.get("module_key") or "").strip()
+                        or str(row.get("module_name") or "").strip() == str(item.item_name or input_ref.get("module_name") or "").strip()
+                    ),
+                    None,
+                )
+                if matched is not None:
+                    entry_input = self._normalize_entry_analysis_module_input(task, {**matched, **entry_input})
+            if (
+                not str(entry_input.get("module_dir") or "").strip()
+                or not str(entry_input.get("source_root") or entry_input.get("source_root_path") or "").strip()
+            ):
+                default_input_dir = str(
+                    (task.summary or {}).get("input_dir")
+                    or getattr(task, "firmware_path", "")
+                    or ""
+                ).strip()
+                if default_input_dir:
+                    entry_input = {
+                        **entry_input,
+                        "module_dir": str(entry_input.get("module_dir") or default_input_dir),
+                        "source_dir": str(entry_input.get("source_dir") or default_input_dir),
+                        "source_root": str(entry_input.get("source_root") or entry_input.get("source_root_path") or default_input_dir),
+                        "source_root_path": str(entry_input.get("source_root_path") or entry_input.get("source_root") or default_input_dir),
+                        "files_list_path": str(entry_input.get("files_list_path") or entry_input.get("entry_files_list") or entry_input.get("files_list") or default_input_dir),
+                    }
             input_contract = self._build_entry_analysis_input_contract(entry_input)
             return service, token, {
                 "task_name": f"{task.name}-{entry_input['module_name']}-entry",
                 "input_path": input_contract["module_dir"],
                 "module_name": entry_input["module_name"],
                 "source_path": input_contract["source_root"],
+                "input_contract": input_contract,
                 "origin": {
                     **_downstream_origin_payload(task, item),
                     "input_contract": input_contract,
@@ -15038,19 +15265,100 @@ class TaskManager(
         if service == "dataflow_analyse":
             raise ValidationError("历史下游服务 dataflow_analyse 已移除，请使用 dataflow_vuln_scan")
         if service == "dataflow_vuln_scan":
-            entry_result = self._normalize_entry_analysis_module_input(task, input_ref)
-            entry_input_contract = self._build_entry_analysis_input_contract(entry_result)
-            source_dir = str(entry_input_contract.get("source_root") or entry_result.get("source_dir") or "").strip()
-            dataflow_input_dir = str(entry_input_contract.get("module_dir") or entry_input_contract.get("source_root") or "").strip()
-            if not dataflow_input_dir or not source_dir:
+            entry = dict(input_ref)
+            default_input_dir = str(
+                (task.summary or {}).get("input_dir")
+                or getattr(task, "firmware_path", "")
+                or ""
+            ).strip()
+            if default_input_dir:
+                entry = {
+                    **entry,
+                    "module_dir": str(entry.get("module_dir") or default_input_dir),
+                    "source_dir": str(entry.get("source_dir") or default_input_dir),
+                    "source_root": str(entry.get("source_root") or entry.get("source_root_path") or default_input_dir),
+                    "source_root_path": str(entry.get("source_root_path") or entry.get("source_root") or default_input_dir),
+                    "module_input_path": str(entry.get("module_input_path") or entry.get("module_dir") or default_input_dir),
+                    "descriptor_root": str(entry.get("descriptor_root") or default_input_dir),
+                }
+            module_input_path = str(entry.get("module_input_path") or "").strip()
+            source_root_path = str(entry.get("source_root_path") or "").strip()
+            if (not module_input_path or not source_root_path) and db is not None:
+                recovered_entry = self._recover_entry_output_contract(db, task, entry)
+                if recovered_entry:
+                    entry = {**recovered_entry, **entry}
+                    module_input_path = module_input_path or str(entry.get("module_input_path") or "").strip()
+                    source_root_path = source_root_path or str(entry.get("source_root_path") or "").strip()
+            if not module_input_path or not source_root_path:
+                entry_result = self._normalize_entry_analysis_module_input(task, entry)
+                entry_input_contract = self._build_entry_analysis_input_contract(entry_result)
+                module_input_path = str(
+                    entry.get("module_input_path")
+                    or entry_input_contract.get("module_dir")
+                    or entry_input_contract.get("source_root")
+                    or ""
+                ).strip()
+                source_root_path = str(
+                    entry.get("source_root_path")
+                    or entry_input_contract.get("source_root")
+                    or entry_result.get("source_dir")
+                    or ""
+                ).strip()
+            if not module_input_path or not source_root_path:
                 raise ValidationError("dataflow_vuln_scan retry 缺少 entry/source 输入")
-            return service, token, {
-                "title": f"{task.name}-{str(entry_result.get('function_name') or item.item_name or 'entry').strip()}-scan",
-                "data_flow_path": dataflow_input_dir,
-                "source_dir": source_dir,
+            taint_params = [str(value).strip() for value in (entry.get("taint_params") or []) if str(value).strip()]
+            if not taint_params:
+                taint_params = _entry_signature_params(entry)
+            definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
+            line_hint = definition_line if not definition_line or definition_line.upper().startswith("L") else f"L{definition_line}"
+            source_file = self._normalize_dfa_source_file(source_root_path, entry)
+            if not source_file:
+                raise ValidationError("dataflow_vuln_scan retry 缺少 source_file")
+            return service, self._resolve_downstream_token(preferred_token), {
+                "task_name": f"{task.name}-{str(entry.get('function_name') or item.item_name or 'entry').strip()}-scan",
+                "input_path": module_input_path,
+                "module_input_path": module_input_path,
+                "source_root_path": source_root_path,
+                "prompt_content": (
+                    f"分析文件 {str(entry.get('definition_file') or entry.get('file_name') or '').strip() or source_file} "
+                    f"中函数 {str(entry.get('function_name') or item.item_name or '').strip()} 的外部输入数据流"
+                ),
                 "origin": _downstream_origin_payload(task, item),
+                "source_file": source_file,
+                "function_name": str(entry.get("function_name") or item.item_name or "").strip() or None,
+                "line_hint": line_hint or None,
+                "definition_kind": self._resolve_entry_definition_kind(entry),
+                "taint_params": taint_params,
+                "function_description": str(entry.get("function_description") or ""),
+                "function_description_source": str(entry.get("function_description_source") or ""),
+                "entry_reason": str(entry.get("entry_reason") or ""),
+                "entry_reason_source": str(entry.get("entry_reason_source") or ""),
+                "taint_mode": "explicit" if taint_params else "no_explicit_taint",
+                "taint_params_missing": not bool(taint_params),
+                "taint_details": [
+                    dict(detail)
+                    for detail in (entry.get("taint_details") or [])
+                    if isinstance(detail, dict)
+                ],
             }
         raise ValidationError(f"不支持的 retry downstream service: {service or '-'}")
+
+    def _build_child_create_request_for_item(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        preferred_token: str | None = None,
+        input_ref_override: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        return self._retry_recreate_payload_for_item(
+            task,
+            item,
+            db=db,
+            preferred_token=preferred_token,
+            input_ref_override=input_ref_override,
+        )
 
     def _resolve_dataflow_directory(self, root: Path) -> Path | None:
         if not root.exists():
