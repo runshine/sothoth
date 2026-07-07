@@ -35,6 +35,24 @@ class TaskDownstreamServiceMixin:
     CHILD_TRANSITION_DESTRUCTIVE_REBUILD = "destructive_rebuild"
     _ARCHIVE_NONBLOCKING_STATUSES = frozenset({"superseded", "ignored"})
 
+    def _refresh_stage_item_authoritative_state(
+        self: TaskManager,
+        session: Session,
+        item: BinarySecurityStageItem,
+    ) -> BinarySecurityStageItem:
+        if hasattr(session, "refresh"):
+            try:
+                session.refresh(item)
+                return item
+            except Exception:
+                pass
+        if hasattr(session, "merge"):
+            try:
+                return session.merge(item)
+            except Exception:
+                return item
+        return item
+
     def _defer_item_with_previous_authoritative_result(
         self: TaskManager,
         session: Session,
@@ -1993,6 +2011,7 @@ class TaskDownstreamServiceMixin:
         exc: Exception,
         response_item: dict[str, Any],
     ) -> dict[str, Any]:
+        item = self._refresh_stage_item_authoritative_state(session, item)
         has_downstream_ref = bool(str(item.downstream_task_id or "").strip())
         if normalize_stage_name(item.stage_name) == "dataflow_vuln_scan" and not has_downstream_ref:
             self._mark_downstream_binding_retry(
@@ -2115,6 +2134,7 @@ class TaskDownstreamServiceMixin:
         operation: str,
         response_item: dict[str, Any],
     ) -> dict[str, Any]:
+        item = self._refresh_stage_item_authoritative_state(session, item)
         if str(item.downstream_task_id or "").strip():
             return self._defer_item_after_downstream_transport_error(
                 session,
@@ -2184,6 +2204,7 @@ class TaskDownstreamServiceMixin:
         response_item: dict[str, Any],
         has_downstream_ref: bool | None = None,
     ) -> dict[str, Any]:
+        item = self._refresh_stage_item_authoritative_state(session, item)
         if has_downstream_ref is None:
             has_downstream_ref = bool(str(item.downstream_task_id or "").strip())
         state = self._build_next_stage_item_orchestration_failure_state(item)

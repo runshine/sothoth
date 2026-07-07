@@ -35064,6 +35064,116 @@ def _test_defer_item_after_downstream_transport_error_records_child_transport_fa
     self.assertTrue(deferred_events[-1].payload.get("client_recreated"))
 
 
+def _test_defer_item_after_downstream_transport_error_refreshes_authoritative_binding_before_commit(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="module-a",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id=None,
+    )
+    authoritative_item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="module-a",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-1",
+    )
+
+    class _RefreshBindingDb(_AppendingModelAwareDb):
+        def __init__(self, authoritative, **kwargs):
+            super().__init__(**kwargs)
+            self.authoritative = authoritative
+
+        def refresh(self, obj):
+            obj.downstream_task_id = self.authoritative.downstream_task_id
+            obj.status = self.authoritative.status
+            obj.result = copy.deepcopy(self.authoritative.result)
+            return obj
+
+    db = _RefreshBindingDb(authoritative_item, tasks=[task], stage_items=[item], events=[])
+
+    exc = UpstreamError("downstream temporarily unavailable")
+    result = self.manager._defer_item_after_downstream_transport_error(
+        db,
+        task,
+        item,
+        operation="system_analysis",
+        exc=exc,
+        response_item={"module_key": "module-a"},
+    )
+
+    self.assertEqual("sat-1", item.downstream_task_id)
+    self.assertEqual("running", item.status)
+    self.assertEqual("running", result["status"])
+    deferred_events = [event for event in db.events if event.event_type == "downstream_transport_deferred"]
+    self.assertTrue(deferred_events)
+    self.assertEqual("reconcile", deferred_events[-1].payload.get("deferred_mode"))
+
+
+def _test_defer_item_to_sync_maintenance_child_create_refreshes_authoritative_binding_before_commit(self):
+    task = BinarySecurityTask(id="t1", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="module-a",
+        status="pending",
+        downstream_service="system_analyse",
+        downstream_task_id=None,
+    )
+    authoritative_item = BinarySecurityStageItem(
+        id="si1",
+        task_id="t1",
+        project_id="p1",
+        stage_name="system_analysis",
+        item_key="module-a",
+        status="running",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-1",
+    )
+
+    class _RefreshBindingDb(_AppendingModelAwareDb):
+        def __init__(self, authoritative, **kwargs):
+            super().__init__(**kwargs)
+            self.authoritative = authoritative
+
+        def refresh(self, obj):
+            obj.downstream_task_id = self.authoritative.downstream_task_id
+            obj.status = self.authoritative.status
+            obj.result = copy.deepcopy(self.authoritative.result)
+            return obj
+
+    db = _RefreshBindingDb(authoritative_item, tasks=[task], stage_items=[item], events=[])
+
+    result = asyncio.run(
+        self.manager._defer_item_to_sync_maintenance_child_create(
+            db,
+            task,
+            item,
+            operation="system_analysis",
+            response_item={"module_key": "module-a"},
+        )
+    )
+
+    self.assertEqual("sat-1", item.downstream_task_id)
+    self.assertEqual("running", item.status)
+    self.assertEqual("running", result["status"])
+    queued_entries = self.fake_task_queue.entries_by_task.get("t1") or []
+    self.assertEqual([], queued_entries)
+    deferred_events = [event for event in db.events if event.event_type == "downstream_transport_deferred"]
+    self.assertTrue(deferred_events)
+    self.assertEqual("reconcile", deferred_events[-1].payload.get("deferred_mode"))
+
+
 def _test_extract_http_status_from_exception_supports_leading_status_code(self):
     self.assertEqual(429, self.manager._extract_http_status_from_exception(UpstreamError("429 No deployments available for selected model")))
     self.assertEqual(429, self.manager._extract_http_status_from_exception(UpstreamError("HTTP 429 capacity exhausted")))
@@ -35399,6 +35509,8 @@ def _test_upsert_stage_item_preserves_sync_metadata_on_refresh(self):
 
 TaskManagerTests.test_apply_child_task_status_change_records_timeline_and_sync_metadata = _test_apply_child_task_status_change_records_timeline_and_sync_metadata
 TaskManagerTests.test_defer_item_after_downstream_transport_error_records_child_transport_failed = _test_defer_item_after_downstream_transport_error_records_child_transport_failed
+TaskManagerTests.test_defer_item_after_downstream_transport_error_refreshes_authoritative_binding_before_commit = _test_defer_item_after_downstream_transport_error_refreshes_authoritative_binding_before_commit
+TaskManagerTests.test_defer_item_to_sync_maintenance_child_create_refreshes_authoritative_binding_before_commit = _test_defer_item_to_sync_maintenance_child_create_refreshes_authoritative_binding_before_commit
 TaskManagerTests.test_extract_http_status_from_exception_supports_leading_status_code = _test_extract_http_status_from_exception_supports_leading_status_code
 TaskManagerTests.test_http_429_uses_fixed_rate_limit_backoff = _test_http_429_uses_fixed_rate_limit_backoff
 TaskManagerTests.test_http_429_timeline_events_are_compressed = _test_http_429_timeline_events_are_compressed
