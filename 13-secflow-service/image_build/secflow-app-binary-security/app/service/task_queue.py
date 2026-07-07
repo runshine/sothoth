@@ -7,6 +7,7 @@ import json
 import logging
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
@@ -62,7 +63,7 @@ class RedisSelfHealingClientHelper:
         self.socket_timeout = socket_timeout
         self.extra_log_fields_fn = extra_log_fields_fn
         self.on_recovered = on_recovered
-        self._clients_by_loop_id: dict[asyncio.AbstractEventLoop, Redis] = {}
+        self._clients_by_loop_id: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Redis] = weakref.WeakKeyDictionary()
 
     def current_loop(self) -> asyncio.AbstractEventLoop:
         return asyncio.get_running_loop()

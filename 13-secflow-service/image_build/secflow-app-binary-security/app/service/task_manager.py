@@ -809,6 +809,10 @@ class TaskManager(
         self._readonly_projection_cache_lock = threading.Lock()
         self._loop_heartbeats: dict[str, datetime] = {}
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
+        self._async_bridge_loop: asyncio.AbstractEventLoop | None = None
+        self._async_bridge_thread: threading.Thread | None = None
+        self._async_bridge_ready = threading.Event()
+        self._async_bridge_lock = threading.Lock()
         self._lease_watchdog_thread: threading.Thread | None = None
         self._lease_watchdog_stop_event = threading.Event()
         self._lease_watchdog_state_lock = threading.Lock()
@@ -3313,22 +3317,45 @@ class TaskManager(
             asyncio.get_running_loop()
         except RuntimeError:
             return self._run_sync(coro)
+        loop = self._ensure_async_bridge_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
 
-        result: dict[str, Any] = {}
-        error: dict[str, BaseException] = {}
+    def _ensure_async_bridge_loop(self) -> asyncio.AbstractEventLoop:
+        loop = self._async_bridge_loop
+        thread = self._async_bridge_thread
+        if loop is not None and thread is not None and thread.is_alive() and not loop.is_closed():
+            return loop
+        with self._async_bridge_lock:
+            loop = self._async_bridge_loop
+            thread = self._async_bridge_thread
+            if loop is not None and thread is not None and thread.is_alive() and not loop.is_closed():
+                return loop
+            self._async_bridge_ready.clear()
 
-        def _runner() -> None:
-            try:
-                result["value"] = asyncio.run(coro)
-            except BaseException as exc:  # pragma: no cover - re-raised to caller
-                error["value"] = exc
+            def _runner() -> None:
+                bridge_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(bridge_loop)
+                self._async_bridge_loop = bridge_loop
+                self._async_bridge_ready.set()
+                bridge_loop.run_forever()
+                pending = [task for task in asyncio.all_tasks(bridge_loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    with suppress(Exception):
+                        bridge_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                bridge_loop.close()
 
-        thread = threading.Thread(target=_runner, name="binary-security-async-bridge", daemon=True)
-        thread.start()
-        thread.join()
-        if "value" in error:
-            raise error["value"]
-        return result.get("value")
+            thread = threading.Thread(target=_runner, name="binary-security-async-bridge", daemon=True)
+            thread.start()
+            self._async_bridge_thread = thread
+            if not self._async_bridge_ready.wait(timeout=5):
+                raise RuntimeError("binary-security async bridge loop failed to start")
+            loop = self._async_bridge_loop
+            if loop is None or loop.is_closed():
+                raise RuntimeError("binary-security async bridge loop unavailable")
+            return loop
 
     def _parent_takeover_lock_ttl_seconds(self) -> int:
         return 60

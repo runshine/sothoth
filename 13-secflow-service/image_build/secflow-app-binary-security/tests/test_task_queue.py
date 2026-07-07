@@ -362,14 +362,17 @@ class TaskQueueTests(unittest.TestCase):
             await _bind_client_for_current_loop(queue, fake)
             await _bind_blocking_client_for_current_loop(queue, fake, channel="task_dispatch_pop")
             await queue.push_task("task-1")
-            return await queue.pop_task(timeout_seconds=1)
+            popped = await queue.pop_task(timeout_seconds=1)
+            general = queue._general_redis_helper.new_client(context="post_pop_task_check")
+            blocking = queue._task_dispatch_blocking_redis_helper.new_client(context="post_pop_task_check")
+            return popped, general, blocking
 
-        popped = asyncio.run(_exercise())
+        popped, general, blocking = asyncio.run(_exercise())
 
         self.assertEqual("task-1", popped)
         self.assertEqual(set(), fake.sets[f"{queue.config.task_queue_key}:dedupe"])
-        self.assertEqual(1, len(queue._general_redis_helper._clients_by_loop_id))
-        self.assertEqual(1, len(queue._task_dispatch_blocking_redis_helper._clients_by_loop_id))
+        self.assertIs(fake, general)
+        self.assertIs(fake, blocking)
 
     def test_pop_task_rebuilds_blocking_client_after_connection_error(self):
         queue = TaskQueue()
@@ -399,12 +402,14 @@ class TaskQueueTests(unittest.TestCase):
 
         async def _exercise():
             await _bind_blocking_client_for_current_loop(queue, fake, channel="task_delete_dispatch_pop")
-            return await queue.pop_delete_task(timeout_seconds=1)
+            popped = await queue.pop_delete_task(timeout_seconds=1)
+            current = queue._task_delete_blocking_redis_helper.new_client(context="post_pop_delete_task_check")
+            return popped, current
 
-        popped = asyncio.run(_exercise())
+        popped, current = asyncio.run(_exercise())
 
         self.assertIsNone(popped)
-        self.assertEqual(1, len(queue._task_delete_blocking_redis_helper._clients_by_loop_id))
+        self.assertIs(fake, current)
 
     def test_queue_stats_returns_empty_snapshot_after_connection_error(self):
         queue = TaskQueue()
@@ -435,14 +440,16 @@ class TaskQueueTests(unittest.TestCase):
 
         async def _exercise():
             await _bind_client_for_current_loop(queue, fake)
-            return await queue.snapshot()
+            snapshot = await queue.snapshot()
+            current = queue._general_redis_helper.new_client(context="post_snapshot_check")
+            return snapshot, current
 
-        snapshot = asyncio.run(_exercise())
+        snapshot, current = asyncio.run(_exercise())
 
         self.assertEqual(1, snapshot["task_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["length"])
         self.assertEqual(0, snapshot["operation_queue"]["enabled"])
-        self.assertEqual(1, len(queue._general_redis_helper._clients_by_loop_id))
+        self.assertIs(fake, current)
 
     def test_wait_until_ready_succeeds_after_ping(self):
         queue = TaskQueue()
@@ -530,7 +537,6 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertIs(fake_client, first)
         self.assertIs(fake_client, second)
-        self.assertEqual(1, len(queue._general_redis_helper._clients_by_loop_id))
         from_url.assert_called_once()
 
     def test_blocking_client_is_cached_within_same_loop_per_channel(self):
@@ -549,7 +555,6 @@ class TaskQueueTests(unittest.TestCase):
 
         self.assertIs(fake_client, first)
         self.assertIs(fake_client, second)
-        self.assertEqual(1, len(queue._task_dispatch_blocking_redis_helper._clients_by_loop_id))
         from_url.assert_called_once()
 
     def test_general_and_blocking_clients_do_not_share_cache(self):
@@ -596,10 +601,11 @@ class TaskQueueTests(unittest.TestCase):
         async def _exercise():
             await _bind_client_for_current_loop(queue, fake)
             await queue.push_task("task-1", context="startup_seed")
+            return queue._general_redis_helper.new_client(context="post_push_task_check")
 
-        asyncio.run(_exercise())
+        current = asyncio.run(_exercise())
 
-        self.assertEqual(1, len(queue._general_redis_helper._clients_by_loop_id))
+        self.assertIs(fake, current)
         self.assertEqual(["task-1"], fake.lists[queue.config.task_queue_key])
 
     def test_queue_positions_returns_current_queue_membership(self):
@@ -623,12 +629,14 @@ class TaskQueueTests(unittest.TestCase):
 
         async def _exercise():
             await _bind_client_for_current_loop(queue, fake)
-            return await queue.dedupe_orphans(queue.config.task_queue_key)
+            snapshot = await queue.dedupe_orphans(queue.config.task_queue_key)
+            current = queue._general_redis_helper.new_client(context="post_dedupe_orphans_check")
+            return snapshot, current
 
-        snapshot = asyncio.run(_exercise())
+        snapshot, current = asyncio.run(_exercise())
 
         self.assertEqual(0, snapshot["orphan_count"])
-        self.assertEqual(1, len(queue._general_redis_helper._clients_by_loop_id))
+        self.assertIs(fake, current)
 
     def test_push_task_rebuilds_cached_client_after_connection_error(self):
         queue = TaskQueue()

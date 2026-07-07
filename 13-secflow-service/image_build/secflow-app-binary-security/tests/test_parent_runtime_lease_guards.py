@@ -217,6 +217,9 @@ class ParentRuntimeLeaseGuardTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], events=[], runtime_leases=[])
 
+        # Release-for-takeover now acquires parent takeover locks through TaskQueue.
+        # Keep these tests on the fake queue so they do not fall into the real
+        # rebuild-forever Redis path and hang the suite.
         with (
             patch.object(manager, "_task_has_active_cancel_operation", return_value=False),
             patch.object(manager, "_task_runtime_transition_guard_active", return_value=False),

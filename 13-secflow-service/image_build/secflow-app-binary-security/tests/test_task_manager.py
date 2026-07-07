@@ -16,6 +16,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.sql import operators
 
@@ -39273,6 +39274,52 @@ def _test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails(se
             raise RuntimeError("original write failure")
 
 
+def _test_savepoint_preserves_retryable_lock_error_when_rollback_to_savepoint_is_gone(self):
+    manager = TaskManager()
+
+    class _MissingSavepointNestedTransaction:
+        def rollback(self):
+            raise pymysql.err.OperationalError(1305, "SAVEPOINT sa_savepoint_2 does not exist")
+
+    class _DeadlockSavepointDb:
+        def __init__(self):
+            self.rollback_called = False
+
+        def begin_nested(self):
+            return _MissingSavepointNestedTransaction()
+
+        def rollback(self):
+            self.rollback_called = True
+
+    db = _DeadlockSavepointDb()
+    deadlock_orig = pymysql.err.OperationalError(1213, "Deadlock found when trying to get lock; try restarting transaction")
+    deadlock = SAOperationalError("ROLLBACK TO SAVEPOINT sa_savepoint_2", None, deadlock_orig)
+
+    with self.assertRaises(SAOperationalError) as raised:
+        with manager._savepoint(db):
+            raise deadlock
+
+    self.assertIs(raised.exception, deadlock)
+    self.assertTrue(db.rollback_called)
+
+
+def _test_run_async_blocking_reuses_single_bridge_loop(self):
+    manager = TaskManager()
+
+    async def _current_loop_id():
+        return id(asyncio.get_running_loop())
+
+    async def _run_under_loop():
+        return manager._run_async_blocking(_current_loop_id())
+
+    first = asyncio.run(_run_under_loop())
+    second = asyncio.run(_run_under_loop())
+
+    self.assertEqual(first, second)
+    self.assertIsNotNone(manager._async_bridge_thread)
+    self.assertTrue(manager._async_bridge_thread.is_alive())
+
+
 def _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending(self):
     manager = TaskManager()
     task = BinarySecurityTask(id="task-7", project_id="p1", name="demo", status="running")
@@ -43768,6 +43815,8 @@ TaskManagerTests.test_active_operation_ignores_expired_claim_lease = _test_activ
 TaskManagerTests.test_persist_child_sync_observation_records_observation_persist_failed = _test_persist_child_sync_observation_records_observation_persist_failed
 TaskManagerTests.test_apply_child_state_with_savepoint_records_state_apply_failed = _test_apply_child_state_with_savepoint_records_state_apply_failed
 TaskManagerTests.test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails = _test_savepoint_preserves_original_error_when_rollback_cleanup_also_fails
+TaskManagerTests.test_savepoint_preserves_retryable_lock_error_when_rollback_to_savepoint_is_gone = _test_savepoint_preserves_retryable_lock_error_when_rollback_to_savepoint_is_gone
+TaskManagerTests.test_run_async_blocking_reuses_single_bridge_loop = _test_run_async_blocking_reuses_single_bridge_loop
 TaskManagerTests.test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending = _test_refresh_polled_child_sync_snapshot_rewinds_running_to_pending
 TaskManagerTests.test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied = _test_refresh_polled_child_sync_snapshot_keeps_dispatching_pending_unapplied
 TaskManagerTests.test_refresh_polled_child_sync_snapshot_applies_pending_dfvs_item_to_running = _test_refresh_polled_child_sync_snapshot_applies_pending_dfvs_item_to_running

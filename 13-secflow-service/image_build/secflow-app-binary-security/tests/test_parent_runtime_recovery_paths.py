@@ -195,6 +195,9 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             manager._run_task_runtime_signals = _run_task_runtime_signals
             manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
             manager.cfg.scheduler.stage_poll_interval_seconds = 0
+            # _run_task() can release/requeue parent ownership through takeover locks.
+            # Use the fake queue here so the test never depends on the real Redis
+            # lock client and cannot hang in rebuild-forever retry loops.
             with (
                 patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep),
                 patch.object(task_manager_module, "get_task_queue", return_value=_FakeTaskSyncQueue()),

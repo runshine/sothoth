@@ -874,11 +874,20 @@ class TaskOperationServiceMixin:
             nested = begin_nested()
             try:
                 yield nested
-            except Exception:
+            except Exception as exc:
                 # Preserve the original write failure when the DB connection has
                 # already been invalidated and savepoint cleanup cannot run.
-                with suppress(Exception):
+                rollback_failed = False
+                try:
                     nested.rollback()
+                except Exception as rollback_exc:
+                    rollback_failed = True
+                    if not self._is_retryable_lock_error(exc):
+                        with suppress(Exception):
+                            raise rollback_exc
+                if rollback_failed and self._is_retryable_lock_error(exc):
+                    with suppress(Exception):
+                        db.rollback()
                 raise
 
         return _cm()
