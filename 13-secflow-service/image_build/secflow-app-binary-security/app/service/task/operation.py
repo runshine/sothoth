@@ -2335,18 +2335,73 @@ class TaskOperationServiceMixin:
     async def _prepare_delete_task(self: TaskManager, db: Session, task: BinarySecurityTask) -> dict[str, Any] | None:
         from app.service import task_manager as task_manager_module
 
+        def _classify_delete_blocking(
+            *,
+            blocking_step: str,
+            failure_reason: str,
+            failure_message: str,
+            payload: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            normalized_payload = dict(payload or {})
+            return {
+                "blocking_step": str(blocking_step or "").strip() or "unknown",
+                "blocking_reason": str(failure_reason or "").strip() or "delete_blocked",
+                "blocking_error": str(failure_message or "").strip() or "删除阻塞",
+                "failure_message": str(failure_message or "").strip() or "删除阻塞",
+                "payload": normalized_payload,
+                "should_escalate": not force_delete,
+                "already_force_delete": force_delete,
+            }
+
+        def _record_delete_blocked_event(decision: dict[str, Any]) -> None:
+            self._record_event(
+                db,
+                task,
+                "task_delete_blocked_detected",
+                "检测到删除主链路阻塞，已准备升级为强制删除",
+                stage_name=task.current_stage,
+                level="warning",
+                payload={
+                    "operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                    "force_delete": force_delete,
+                    "blocking_step": decision.get("blocking_step"),
+                    "blocking_reason": decision.get("blocking_reason"),
+                    "failure_message": decision.get("failure_message"),
+                    "downstream_service": decision.get("payload", {}).get("downstream_service"),
+                    "downstream_task_id": decision.get("payload", {}).get("downstream_task_id"),
+                    **dict(decision.get("payload", {}) or {}),
+                },
+            )
+
         def _ensure_force_delete_fallback(
             *,
+            blocking_step: str,
             failure_reason: str,
             failure_message: str,
             payload: dict[str, Any] | None = None,
         ) -> bool:
             nonlocal force_delete, event_prefix, request_payload
+            decision = _classify_delete_blocking(
+                blocking_step=blocking_step,
+                failure_reason=failure_reason,
+                failure_message=failure_message,
+                payload=payload,
+            )
+            _record_delete_blocked_event(decision)
+            if force_delete:
+                return False
             if force_delete:
                 return False
             force_delete = True
             event_prefix = "task_force_delete"
-            request_payload = {**request_payload, "force": True, "force_delete": True, "auto_force_delete_fallback": True}
+            request_payload = {
+                **request_payload,
+                "force": True,
+                "force_delete": True,
+                "auto_force_delete_fallback": True,
+                "force_delete_fallback_reason": failure_reason,
+                "blocking_step": decision["blocking_step"],
+            }
             if operation is not None:
                 merged_request_payload = dict(getattr(operation, "request_payload", None) or {})
                 merged_request_payload.update(
@@ -2355,6 +2410,7 @@ class TaskOperationServiceMixin:
                         "force_delete": True,
                         "auto_force_delete_fallback": True,
                         "force_delete_fallback_reason": failure_reason,
+                        "blocking_step": decision["blocking_step"],
                     }
                 )
                 operation.request_payload = merged_request_payload
@@ -2379,10 +2435,17 @@ class TaskOperationServiceMixin:
                 payload={
                     "failure_reason": failure_reason,
                     "failure_message": failure_message,
+                    "blocking_step": decision["blocking_step"],
                     "source_force_delete": False,
                     "fallback_force_delete": True,
                     **dict(payload or {}),
                 },
+            )
+            self._mark_task_delete_progress(
+                task,
+                operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+                step=f"force_escalated:{decision['blocking_step']}",
+                force_delete=True,
             )
             task_manager_module.logger.warning(
                 "binary-security delete fell back to force delete: task_id=%s reason=%s message=%s",
@@ -2445,6 +2508,12 @@ class TaskOperationServiceMixin:
                 task.id,
                 len(list(getattr(self, "_last_downstream_cleanup_results", []) or [])),
             )
+            self._mark_task_delete_progress(
+                task,
+                operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+                step="downstream_cleanup_finished",
+                force_delete=force_delete,
+            )
         await self._request_local_worker_cancel(task.id, wait_for_runner=False)
 
         downstream_cleanup_results = [
@@ -2462,6 +2531,21 @@ class TaskOperationServiceMixin:
             for result in downstream_cleanup_results
             if bool(result.get("blocking"))
         ]
+        if downstream_cleanup_blocking_refs and not force_delete:
+            first_blocking_ref = downstream_cleanup_blocking_refs[0]
+            _ensure_force_delete_fallback(
+                blocking_step="downstream_delete",
+                failure_reason="downstream_cleanup_blocking",
+                failure_message=(
+                    str(first_blocking_ref.get("error") or first_blocking_ref.get("verification_error") or "").strip()
+                    or "下游删除阻塞"
+                ),
+                payload={
+                    "cleanup_scope": "task_delete",
+                    "downstream_service": str(first_blocking_ref.get("service") or "").strip() or None,
+                    "downstream_task_id": str(first_blocking_ref.get("task_id") or "").strip() or None,
+                },
+            )
 
         cleanup_counts = {
             "archive_jobs_deleted": self._delete_archive_children_for_stages(db, task, stage_names),
@@ -2488,12 +2572,19 @@ class TaskOperationServiceMixin:
             operation_id=str(getattr(operation, "id", "") or "").strip() or None,
             reason="删除任务时封禁工作目录写入",
         )
+        self._mark_task_delete_progress(
+            task,
+            operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+            step="delete_in_progress",
+            force_delete=force_delete,
+        )
         self._release_task_delete_runtime_state(db, task)
         db.commit()
 
         quiesced = await self._wait_for_task_workspace_quiesce(db, task)
         if not quiesced:
             if _ensure_force_delete_fallback(
+                blocking_step="workspace_quiesce",
                 failure_reason="workspace_quiesce_failed",
                 failure_message="删除前静默收敛失败",
                 payload={"workspace_root": str(task.workspace_root or "").strip() or None},
@@ -2551,11 +2642,18 @@ class TaskOperationServiceMixin:
                 "workspace_root": str(task.workspace_root or "").strip() or None,
             },
         )
+        self._mark_task_delete_progress(
+            task,
+            operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+            step="workspace_cleanup_started",
+            force_delete=force_delete,
+        )
         db.commit()
 
         cleanup_status = await self._cleanup_task_workspace(task, token=token)
         if cleanup_status != "deleted":
             if _ensure_force_delete_fallback(
+                blocking_step="workspace_cleanup",
                 failure_reason="workspace_cleanup_failed",
                 failure_message="任务目录清理失败",
                 payload={
@@ -2635,6 +2733,13 @@ class TaskOperationServiceMixin:
                     )
                 db.commit()
                 raise ValidationError("任务目录清理失败")
+        else:
+            self._mark_task_delete_progress(
+                task,
+                operation_id=str(getattr(operation, "id", "") or "").strip() or None,
+                step="workspace_cleanup_deleted",
+                force_delete=force_delete,
+            )
 
         deleted_downstream_count = sum(
             1

@@ -61,6 +61,9 @@ class TaskControlServiceMixin:
             "delete_mode": str(snapshot.get("delete_mode") or "").strip() or None,
             "delete_operation_id": str(snapshot.get("delete_operation_id") or "").strip() or None,
             "delete_requested_at": str(snapshot.get("delete_queue_requested_at") or "").strip() or None,
+            "delete_started_at": str(snapshot.get("delete_started_at") or "").strip() or None,
+            "delete_last_progress_at": str(snapshot.get("delete_last_progress_at") or "").strip() or None,
+            "delete_last_progress_step": str(snapshot.get("delete_last_progress_step") or "").strip() or None,
             "delete_last_error": str(snapshot.get("delete_last_error") or "").strip() or None,
         }
 
@@ -152,6 +155,8 @@ class TaskControlServiceMixin:
         snapshot["delete_mode"] = "force_delete" if force_delete else "delete"
         snapshot["delete_operation_id"] = str(operation_id or "").strip() or None
         snapshot["delete_queue_requested_at"] = task_manager_module._now().isoformat()
+        snapshot["delete_last_progress_at"] = snapshot["delete_queue_requested_at"]
+        snapshot["delete_last_progress_step"] = "queued"
         snapshot["delete_last_error"] = None
         task.cleanup_snapshot = snapshot
 
@@ -170,6 +175,8 @@ class TaskControlServiceMixin:
         snapshot["delete_mode"] = "force_delete" if force_delete else "delete"
         snapshot["delete_operation_id"] = str(operation_id or "").strip() or None
         snapshot["delete_started_at"] = task_manager_module._now().isoformat()
+        snapshot["delete_last_progress_at"] = snapshot["delete_started_at"]
+        snapshot["delete_last_progress_step"] = "consumer_started"
         task.cleanup_snapshot = snapshot
 
     def _mark_task_delete_terminal_failure(
@@ -185,7 +192,29 @@ class TaskControlServiceMixin:
         snapshot["delete_in_progress"] = False
         snapshot["delete_mode"] = "force_delete" if force_delete else "delete"
         snapshot["delete_operation_id"] = str(operation_id or "").strip() or None
+        snapshot["delete_last_progress_at"] = None
+        snapshot["delete_last_progress_step"] = None
         snapshot["delete_last_error"] = str(error_message or "").strip() or None
+        task.cleanup_snapshot = snapshot
+
+    def _mark_task_delete_progress(
+        self: TaskManager,
+        task,
+        *,
+        operation_id: str | None = None,
+        step: str | None = None,
+        force_delete: bool | None = None,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        snapshot = self._task_delete_snapshot_state(task)
+        snapshot["delete_last_progress_at"] = task_manager_module._now().isoformat()
+        if operation_id is not None:
+            snapshot["delete_operation_id"] = str(operation_id or "").strip() or None
+        if step is not None:
+            snapshot["delete_last_progress_step"] = str(step or "").strip() or None
+        if force_delete is not None:
+            snapshot["delete_mode"] = "force_delete" if force_delete else "delete"
         task.cleanup_snapshot = snapshot
 
     def _enqueue_delete_task(self: TaskManager, task_id: str) -> None:
@@ -200,11 +229,11 @@ class TaskControlServiceMixin:
             return
         asyncio.create_task(_push())
 
-    def _force_requeue_delete_task(self: TaskManager, task_id: str) -> None:
+    def _force_requeue_delete_task(self: TaskManager, task_id: str, *, context: str = "task_delete_enqueue") -> None:
         from app.service import task_manager as task_manager_module
 
         async def _push() -> None:
-            await task_manager_module.get_task_queue().force_requeue_delete_task(task_id, context="task_delete_enqueue")
+            await task_manager_module.get_task_queue().force_requeue_delete_task(task_id, context=context)
 
         loop = self._loop_task.get_loop() if self._loop_task is not None else None
         if loop and loop.is_running():
