@@ -2153,7 +2153,6 @@ class TaskDownstreamServiceMixin:
             )
         item_id = str(getattr(item, "id", "") or "").strip() or None
         stage_name = str(getattr(item, "stage_name", "") or "").strip() or None
-        self._mark_downstream_binding_creating(item)
         item.status = "queued"
         item.finished_at = None
         item.error_message = None

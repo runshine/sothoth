@@ -6586,13 +6586,6 @@ class TaskManager(
         for entry in workset:
             item = entry["item"]
             operation_name = str(entry.get("operation") or "").strip()
-            if (
-                operation_name != "child_create"
-                and requested_ids
-                and not str(getattr(item, "downstream_task_id", "") or "").strip()
-                and self._downstream_binding_state(item) == "creating"
-            ):
-                operation_name = "child_create"
             if operation_name != "child_create":
                 if str(entry.get("blocked_reason") or "").strip() == "stage_parallelism_exhausted":
                     skipped_count += 1

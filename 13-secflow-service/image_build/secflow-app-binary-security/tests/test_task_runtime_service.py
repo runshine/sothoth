@@ -326,7 +326,7 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
 
         async def _fake_poll(*args, **kwargs):
             del args, kwargs
-            return "success", {"task_id": "sa-child", "status": "passed"}
+            return "success", {"task_id": "sa-child", "status": "passed"}, None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_root = Path(tmpdir)
@@ -352,7 +352,7 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
                     new=AsyncMock(return_value={"outcome": "already_running", "payload": {"task_id": "sa-child", "status": "running"}}),
                 ) as control_mock,
                 patch.object(self.manager, "_downstream_create_task", new=AsyncMock(side_effect=AssertionError("should reuse active child"))),
-                patch.object(self.manager, "_poll_until_terminal", side_effect=_fake_poll),
+                patch.object(self.manager, "_poll_item_until_local_terminal_or_defer", side_effect=_fake_poll),
                 patch.object(self.manager, "_downstream_fetch_item_result", new=AsyncMock(return_value={"summary": "ok"})),
                 patch.object(self.manager, "_queue_archive_and_wait", new=AsyncMock(return_value=(archive_root, None))),
                 patch.object(self.manager, "_parse_system_analysis_modules", return_value=[{"module_key": "m1", "risk_level": "高"}]),
@@ -365,7 +365,7 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
         self.assertEqual("fw-1", result["item"]["firmware_key"])
         control_mock.assert_not_awaited()
 
-    def test_run_system_analysis_item_returns_archive_blocked_after_authoritative_success_payload(self):
+    def test_run_system_analysis_item_defers_child_create_to_sync_maintenance_without_legacy_direct_path(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="system-archive")
         task.current_stage = "system_analysis"
         stage_run = self._stage_run("system_analysis")
@@ -390,30 +390,28 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
             "task_type": TASK_TYPE_BINARY,
         }
 
-        async def _fake_poll(*args, **kwargs):
-            del args, kwargs
-            return "success", {"task_id": "sa-child", "status": "passed"}
-
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
-            patch.object(self.manager, "_downstream_create_task", new=AsyncMock(return_value={"task_id": "sa-child", "status": "pending"})),
-            patch.object(self.manager, "_replace_active_child_binding", new=AsyncMock(return_value=None)),
-            patch.object(self.manager, "_poll_until_terminal", side_effect=_fake_poll),
-            patch.object(self.manager, "_downstream_fetch_item_result", new=AsyncMock(return_value={"summary": "ok"})),
             patch.object(
                 self.manager,
-                "_queue_archive_and_wait",
-                new=AsyncMock(return_value=(None, SimpleNamespace(error_message="archive blocked"))),
+                "_defer_item_to_sync_maintenance_child_create",
+                new=AsyncMock(
+                    return_value={
+                        "status": "queued",
+                        "item": dict(firmware),
+                        "deferred_mode": "sync_maintenance_create",
+                    }
+                ),
             ),
         ):
             result = asyncio.run(self.manager._run_system_analysis_item(task, stage_run, firmware))
 
-        self.assertEqual("archive_blocked", result["status"])
-        self.assertTrue(result["archive_blocked"])
-        self.assertEqual("archive blocked", result["error"])
-        self.assertEqual("archive blocked", item.error_message)
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("sync_maintenance_create", result["deferred_mode"])
+        self.assertEqual(firmware["firmware_key"], result["item"]["firmware_key"])
+        self.assertEqual("queued", item.status)
 
     def test_run_firmware_item_retry_adopts_active_child_and_preserves_downstream_input_shape(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="firmware-task")
@@ -437,7 +435,7 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
 
         async def _fake_poll(*args, **kwargs):
             del args, kwargs
-            return "success", {"task_id": "fw-child", "status": "success"}
+            return "success", {"task_id": "fw-child", "status": "success"}, None
 
         with tempfile.TemporaryDirectory() as tmpdir:
             archive_root = Path(tmpdir)
@@ -463,7 +461,7 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
                     new=AsyncMock(return_value={"outcome": "already_running", "payload": {"task_id": "fw-child", "status": "running"}}),
                 ) as control_mock,
                 patch.object(self.manager, "_downstream_create_task", new=AsyncMock(side_effect=AssertionError("should reuse active child"))),
-                patch.object(self.manager, "_poll_until_terminal", side_effect=_fake_poll),
+                patch.object(self.manager, "_poll_item_until_local_terminal_or_defer", side_effect=_fake_poll),
                 patch.object(self.manager, "_queue_archive_and_wait", new=AsyncMock(return_value=(archive_root, None))),
             ):
                 result = asyncio.run(
@@ -477,7 +475,7 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(str(archive_root), result["item"]["unpacked_root"])
         control_mock.assert_awaited_once()
 
-    def test_run_firmware_item_returns_failed_when_downstream_terminal_fails(self):
+    def test_run_firmware_item_defers_child_create_to_sync_maintenance_without_legacy_direct_path(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="firmware-failed")
         task.current_stage = "firmware_unpack"
         stage_run = self._stage_run("firmware_unpack")
@@ -496,25 +494,28 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
         fake_session = _ModelAwareDb(stage_items=[item])
         input_file = {"firmware_key": "fw-1", "filename": "firmware.bin", "firmware_name": "firmware"}
 
-        async def _fake_poll(*args, **kwargs):
-            del args, kwargs
-            return "failed", {"task_id": "fw-child", "status": "failed", "error": "unpack crashed"}
-
         with (
             patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
             patch.object(self.manager, "_upsert_stage_item", return_value=item),
             patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
-            patch.object(self.manager, "_downstream_create_task", new=AsyncMock(return_value={"task_id": "fw-child", "status": "pending"})),
-            patch.object(self.manager, "_replace_active_child_binding", new=AsyncMock(return_value=None)),
-            patch.object(self.manager, "_poll_until_terminal", side_effect=_fake_poll),
-            patch.object(self.manager, "_queue_archive_and_wait", new=AsyncMock(return_value=(None, None))),
+            patch.object(
+                self.manager,
+                "_defer_item_to_sync_maintenance_child_create",
+                new=AsyncMock(
+                    return_value={
+                        "status": "queued",
+                        "item": dict(input_file),
+                        "deferred_mode": "sync_maintenance_create",
+                    }
+                ),
+            ),
         ):
             result = asyncio.run(self.manager._run_firmware_item(task, stage_run, input_file, token="tok"))
 
-        self.assertEqual("failed", result["status"])
-        self.assertEqual("unpack crashed", result["error"])
-        self.assertEqual("failed", item.status)
-        self.assertEqual("unpack crashed", item.error_message)
+        self.assertEqual("queued", result["status"])
+        self.assertEqual("sync_maintenance_create", result["deferred_mode"])
+        self.assertEqual(input_file["firmware_key"], result["item"]["firmware_key"])
+        self.assertEqual("queued", item.status)
 
 
 if __name__ == "__main__":

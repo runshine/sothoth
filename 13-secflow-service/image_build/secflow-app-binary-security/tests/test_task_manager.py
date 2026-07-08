@@ -35277,6 +35277,39 @@ def _test_defer_item_to_sync_maintenance_child_create_refreshes_authoritative_bi
     self.assertEqual("reconcile", deferred_events[-1].payload.get("deferred_mode"))
 
 
+def _test_defer_item_to_sync_maintenance_child_create_does_not_preclaim_parallelism_slot(self):
+    task = BinarySecurityTask(id="t-create-defer", project_id="p1", name="demo", status="running")
+    item = BinarySecurityStageItem(
+        id="si-create-defer",
+        task_id="t-create-defer",
+        project_id="p1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-a",
+        status="pending",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id=None,
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+
+    result = asyncio.run(
+        self.manager._defer_item_to_sync_maintenance_child_create(
+            db,
+            task,
+            item,
+            operation="dataflow_vuln_scan",
+            response_item={"entry_key": "entry-a"},
+        )
+    )
+
+    self.assertEqual("queued", item.status)
+    self.assertIsNone(item.downstream_task_id)
+    self.assertEqual("not_started", self.manager._downstream_binding_state(item))
+    self.assertEqual("queued", result["status"])
+    queued_entries = self.fake_task_queue.entries_by_task.get(task.id) or []
+    self.assertEqual(1, len(queued_entries))
+    self.assertEqual("child_create", queued_entries[0]["operation"])
+
+
 def _test_extract_http_status_from_exception_supports_leading_status_code(self):
     self.assertEqual(429, self.manager._extract_http_status_from_exception(UpstreamError("429 No deployments available for selected model")))
     self.assertEqual(429, self.manager._extract_http_status_from_exception(UpstreamError("HTTP 429 capacity exhausted")))
@@ -41257,7 +41290,9 @@ def _test_refresh_task_status_after_sync_does_not_finalize_when_next_stage_not_m
     self.assertNotEqual("failed", task.status)
     self.assertIsNone(task.finished_at)
     self.assertEqual("running", task.status)
-    self.assertEqual("entry_analysis", task.current_stage)
+    self.assertEqual("system_analysis", task.current_stage)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("task_finalize_deferred_for_incomplete_stage", event_types)
 
 
 def _test_refresh_task_status_after_sync_blocks_plain_pending_resume_for_unmaterialized_entry_analysis(self):
@@ -46730,6 +46765,101 @@ def _test_create_downstream_children_reattaches_item_after_async_wait_before_bin
     self.assertEqual(task.id, resp.task_id)
 
 
+def _test_create_downstream_children_requested_item_still_respects_stage_parallelism(self):
+    task = BinarySecurityTask(
+        id="task-create-parallelism",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        policy={"stage_parallelism": {"dataflow_vuln_scan": 1}},
+    )
+    active_item = BinarySecurityStageItem(
+        id="item-active",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-active",
+        item_name="entry-active",
+        downstream_service="dataflow_vuln_scan",
+        status="running",
+        downstream_task_id="dvs-active",
+        result={
+            "sync_observation": {"downstream_status": "running"},
+            "downstream_binding": {"state": "bound"},
+        },
+    )
+    active_item.downstream_status = "running"
+    blocked_item = BinarySecurityStageItem(
+        id="item-blocked",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr1",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-blocked",
+        item_name="entry-blocked",
+        downstream_service="dataflow_vuln_scan",
+        status="queued",
+        result={},
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[active_item, blocked_item], events=[])
+
+    original_task_or_404 = self.manager._task_or_404
+    original_ensure_write_ownership = self.manager._ensure_task_write_ownership
+    original_reconcile_requested_items = self.manager._task_reconcile_requested_items
+    original_build_request = self.manager._build_child_create_request_for_item
+    original_downstream_create = self.manager._downstream_create_task
+    original_refresh_stage_run = self.manager._refresh_stage_run_from_items
+    original_stage_parallelism = self.manager._stage_parallelism
+    create_mock = AsyncMock(side_effect=AssertionError("should not create when parallelism is exhausted"))
+    try:
+        self.manager._task_or_404 = lambda _db, _project_id, _task_id: task
+        self.manager._ensure_task_write_ownership = lambda *_args, **_kwargs: None
+        self.manager._task_reconcile_requested_items = (
+            lambda _db, _task, stage_name=None, item_ids=None: ([blocked_item], [])
+        )
+        self.manager._build_child_create_request_for_item = lambda *_args, **_kwargs: ("dataflow_vuln_scan", "tok", {})
+        self.manager._downstream_create_task = create_mock
+        self.manager._refresh_stage_run_from_items = lambda *_args, **_kwargs: None
+        self.manager._stage_parallelism = lambda _task, _stage_name: 1
+
+        resp = asyncio.run(
+            self.manager._create_downstream_children(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name="dataflow_vuln_scan",
+                item_ids=[blocked_item.id],
+                force=True,
+            )
+        )
+    finally:
+        self.manager._task_or_404 = original_task_or_404
+        self.manager._ensure_task_write_ownership = original_ensure_write_ownership
+        self.manager._task_reconcile_requested_items = original_reconcile_requested_items
+        self.manager._build_child_create_request_for_item = original_build_request
+        self.manager._downstream_create_task = original_downstream_create
+        self.manager._refresh_stage_run_from_items = original_refresh_stage_run
+        self.manager._stage_parallelism = original_stage_parallelism
+
+    self.assertEqual(0, create_mock.await_count)
+    self.assertIsNone(blocked_item.downstream_task_id)
+    self.assertEqual("queued", blocked_item.status)
+    sync_rows = [
+        row for row in db.sync_events
+        if isinstance(row, BinarySecuritySyncEvent) and getattr(row, "item_id", None) == blocked_item.id
+    ]
+    self.assertTrue(sync_rows)
+    self.assertEqual("skipped", sync_rows[-1].event_type)
+    self.assertEqual("parallelism_limited", sync_rows[-1].outcome)
+    self.assertEqual("stage_parallelism_exhausted", sync_rows[-1].error_type)
+
+
 def _test_compute_item_downstream_action_recreates_missing_authoritative_child_after_stale_creating_state(self):
     task = BinarySecurityTask(
         id="task-create-decision",
@@ -47335,6 +47465,7 @@ TaskManagerTests.test_record_downstream_sync_event_uses_fallback_bucket_without_
 TaskManagerTests.test_record_downstream_item_disposition_maps_create_and_retry_audit_events = _test_record_downstream_item_disposition_maps_create_and_retry_audit_events
 TaskManagerTests.test_downstream_create_task_records_requested_sync_event_before_authoritative_binding = _test_downstream_create_task_records_requested_sync_event_before_authoritative_binding
 TaskManagerTests.test_create_downstream_children_reattaches_item_after_async_wait_before_binding_commit = _test_create_downstream_children_reattaches_item_after_async_wait_before_binding_commit
+TaskManagerTests.test_create_downstream_children_requested_item_still_respects_stage_parallelism = _test_create_downstream_children_requested_item_still_respects_stage_parallelism
 TaskManagerTests.test_compute_item_downstream_action_recreates_missing_authoritative_child_after_stale_creating_state = _test_compute_item_downstream_action_recreates_missing_authoritative_child_after_stale_creating_state
 TaskManagerTests.test_persist_child_sync_observation_records_success_and_recovery_events = _test_persist_child_sync_observation_records_success_and_recovery_events
 TaskManagerTests.test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success = _test_stage_item_has_active_sync_error_ignores_historical_error_after_sync_success
@@ -47352,6 +47483,7 @@ TaskManagerTests.test_local_runtime_sync_maintenance_consumes_owner_signal = _te
 TaskManagerTests.test_task_sync_entry_score_respects_timezone_iso_retry_at = _test_task_sync_entry_score_respects_timezone_iso_retry_at
 TaskManagerTests.test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp = _test_task_sync_entry_score_falls_back_to_requested_at_timezone_timestamp
 TaskManagerTests.test_fake_task_sync_queue_has_due_request_respects_future_retry_at = _test_fake_task_sync_queue_has_due_request_respects_future_retry_at
+TaskManagerTests.test_defer_item_to_sync_maintenance_child_create_does_not_preclaim_parallelism_slot = _test_defer_item_to_sync_maintenance_child_create_does_not_preclaim_parallelism_slot
 TaskManagerTests.test_sync_downstream_status_defers_commit_until_fetch_cycle_finishes = _test_sync_downstream_status_defers_commit_until_fetch_cycle_finishes
 TaskManagerTests.test_sync_downstream_status_persists_transport_error_observation_in_same_cycle = _test_sync_downstream_status_persists_transport_error_observation_in_same_cycle
 TaskManagerTests.test_confirm_entry_selection_requires_pending_confirmation_status = _test_confirm_entry_selection_requires_pending_confirmation_status

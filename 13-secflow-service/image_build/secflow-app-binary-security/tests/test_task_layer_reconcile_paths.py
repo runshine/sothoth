@@ -831,7 +831,7 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual("running", task.status)
-        self.assertEqual(["task-archive-owner-advance"], queued)
+        self.assertEqual([], queued)
         if applied:
             self.assertEqual("entry_analysis", applied[0]["next_stage"])
         self.assertIn(applied[0]["source"], {"stage_terminal", "downstream_sync"})
@@ -845,6 +845,7 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         self.assertTrue(
             any(
                 event.event_type in {
+                    "task_stage_handoff_applied",
                     "task_requeued_after_stage_completion",
                     "task_finalize_deferred_for_incomplete_stage",
                     "task_layer_reconcile_completed",
