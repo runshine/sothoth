@@ -2425,7 +2425,75 @@ class TaskManager(
             return False
         if not bool(handle.owner_active) or bool(handle.release_requested) or bool(handle.takeover_observed):
             return False
+        if (
+            bool(getattr(handle, "cancel_requested", False))
+            and str(getattr(handle, "cancel_requested_reason", "") or "").strip()
+            == "invalid_owned_execution_state"
+        ):
+            return False
         return self._task_runtime_owner_matches_current_instance(db, task)
+
+    def _detect_invalid_owned_execution_keepalive_state(
+        self,
+        db: Session,
+        task: BinarySecurityTask | None,
+    ) -> dict[str, object]:
+        if task is None:
+            return {"invalid": False, "reason": "task_missing"}
+        task_status = str(getattr(task, "status", "") or "").strip().lower()
+        runtime_phase = str(self._task_runtime_phase(task) or "").strip()
+        if task_status != "pending":
+            return {
+                "invalid": False,
+                "reason": "task_status_not_pending",
+                "task_status": task_status or None,
+                "runtime_phase": runtime_phase or None,
+            }
+        if runtime_phase != TASK_RUNTIME_PHASE_OWNED_EXECUTION:
+            return {
+                "invalid": False,
+                "reason": "runtime_phase_not_owned_execution",
+                "task_status": task_status or None,
+                "runtime_phase": runtime_phase or None,
+            }
+        lease = self._runtime_lease_for_task(db, str(getattr(task, "id", "") or "").strip())
+        runtime_lease_active = bool(self._runtime_lease_is_active(lease))
+        runtime_lease_owner = (
+            str(getattr(lease, "owner_instance_id", "") or "").strip() or None
+            if lease is not None
+            else None
+        )
+        owner_matches_current_instance = (
+            runtime_lease_active
+            and runtime_lease_owner is not None
+            and runtime_lease_owner == (str(self.instance_id or "").strip() or None)
+        )
+        if not runtime_lease_active:
+            return {
+                "invalid": False,
+                "reason": "runtime_lease_not_active",
+                "task_status": task_status or None,
+                "runtime_phase": runtime_phase or None,
+                "runtime_lease_owner": runtime_lease_owner,
+                "runtime_lease_active": runtime_lease_active,
+            }
+        if not owner_matches_current_instance:
+            return {
+                "invalid": False,
+                "reason": "runtime_lease_owner_not_current_instance",
+                "task_status": task_status or None,
+                "runtime_phase": runtime_phase or None,
+                "runtime_lease_owner": runtime_lease_owner,
+                "runtime_lease_active": runtime_lease_active,
+            }
+        return {
+            "invalid": True,
+            "reason": "pending_owned_execution_with_live_local_lease",
+            "task_status": task_status or None,
+            "runtime_phase": runtime_phase or None,
+            "runtime_lease_owner": runtime_lease_owner,
+            "runtime_lease_active": runtime_lease_active,
+        }
 
     def _should_continue_parent_lease_heartbeat(
         self,
@@ -2635,6 +2703,72 @@ class TaskManager(
                 )
                 if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
                     return
+                heartbeat_db = get_session_factory()()
+                try:
+                    self._configure_runtime_session_fast_lock_wait_timeout(heartbeat_db)
+                    task = heartbeat_db.query(BinarySecurityTask).filter(BinarySecurityTask.id == str(task_id or "").strip()).first()
+                    invalid_state = self._detect_invalid_owned_execution_keepalive_state(heartbeat_db, task)
+                    if bool(invalid_state.get("invalid")) and task is not None:
+                        runtime_lease = self._runtime_lease_for_task(heartbeat_db, task.id)
+                        self._record_event(
+                            heartbeat_db,
+                            task,
+                            "runtime_invalid_owned_execution_state_detected",
+                            "检测到当前实例持有非法 owned execution 主状态，已停止本地 keepalive 等待租约自然过期",
+                            level="warning",
+                            stage_name=str(getattr(task, "current_stage", "") or "").strip() or None,
+                            payload={
+                                "task_id": str(task.id or "").strip() or None,
+                                "source": "heartbeat_verify",
+                                "reason": str(invalid_state.get("reason") or "").strip() or None,
+                                "task_status": str(invalid_state.get("task_status") or "").strip() or None,
+                                "runtime_phase": str(invalid_state.get("runtime_phase") or "").strip() or None,
+                                "runtime_lease_owner": str(invalid_state.get("runtime_lease_owner") or "").strip() or None,
+                                "runtime_lease_expires_at": _isoformat_or_none(
+                                    getattr(runtime_lease, "lease_expires_at", None)
+                                ) if runtime_lease is not None else None,
+                                "repair_action": "stop_local_keepalive_only",
+                            },
+                        )
+                        heartbeat_db.commit()
+                        self._request_runtime_handle_abort(
+                            task_id,
+                            reason="invalid_owned_execution_state",
+                        )
+                        lifecycle_db = get_session_factory()()
+                        try:
+                            self._configure_runtime_session_fast_lock_wait_timeout(lifecycle_db)
+                            lifecycle_task = lifecycle_db.query(BinarySecurityTask).filter(
+                                BinarySecurityTask.id == str(task_id or "").strip()
+                            ).first()
+                            if lifecycle_task is not None:
+                                self._record_event(
+                                    lifecycle_db,
+                                    lifecycle_task,
+                                    "runtime_invalid_owned_execution_state_local_keepalive_stopped",
+                                    "非法 owned execution 主状态已停止当前实例的本地 keepalive，等待租约自然过期后由后续流程接管",
+                                    level="warning",
+                                    stage_name=str(getattr(lifecycle_task, "current_stage", "") or "").strip() or None,
+                                    payload={
+                                        "task_id": str(lifecycle_task.id or "").strip() or None,
+                                        "source": "heartbeat_verify",
+                                        "reason": str(invalid_state.get("reason") or "").strip() or None,
+                                        "repair_action": "stop_local_keepalive_only",
+                                    },
+                                )
+                                lifecycle_db.commit()
+                        except Exception:
+                            with suppress(Exception):
+                                lifecycle_db.rollback()
+                            logger.exception(
+                                "binary-security failed to record local keepalive stop after invalid owned execution detection: task_id=%s",
+                                task_id,
+                            )
+                        finally:
+                            lifecycle_db.close()
+                        return
+                finally:
+                    heartbeat_db.close()
                 self._mark_runtime_handle_lease_verify(task_id)
                 handle.last_progress_at = _now()
                 failure_count = 0

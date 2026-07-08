@@ -528,7 +528,7 @@ class _FakeTaskSyncQueue:
     async def acquire_parent_takeover_lock(self, task_id: str, owner_token: str, *, ttl_seconds: int = 60, context: str = "test"):
         del ttl_seconds, context
         task_id = str(task_id)
-        if task_id in self.parent_takeover_locks:
+        if task_id in self.parent_takeover_locks or task_id in self.dispatch_claim_locks:
             return False
         self.parent_takeover_locks[task_id] = str(owner_token)
         return True
@@ -544,7 +544,7 @@ class _FakeTaskSyncQueue:
     async def acquire_dispatch_claim_lock(self, task_id: str, owner_token: str, *, ttl_seconds: int = 30, context: str = "test"):
         del ttl_seconds, context
         task_id = str(task_id)
-        if task_id in self.dispatch_claim_locks:
+        if task_id in self.dispatch_claim_locks or task_id in self.parent_takeover_locks:
             return False
         self.dispatch_claim_locks[task_id] = str(owner_token)
         return True

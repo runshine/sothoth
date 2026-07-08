@@ -306,6 +306,47 @@ class TaskQueueTests(unittest.TestCase):
         self.assertTrue(released)
         self.assertTrue(reacquired)
 
+    def test_parent_takeover_and_dispatch_claim_share_same_runtime_ownership_lock(self):
+        queue = TaskQueue()
+        fake = _FakeRedis()
+
+        async def _exercise():
+            await _bind_client_for_current_loop(queue, fake)
+            claim_acquired = await queue.acquire_dispatch_claim_lock("task-1", owner_token="owner-1", ttl_seconds=30)
+            takeover_blocked = await queue.acquire_parent_takeover_lock("task-1", owner_token="owner-2", ttl_seconds=60)
+            claim_released = await queue.release_dispatch_claim_lock("task-1", "owner-1")
+            takeover_acquired = await queue.acquire_parent_takeover_lock("task-1", owner_token="owner-2", ttl_seconds=60)
+            dispatch_blocked = await queue.acquire_dispatch_claim_lock("task-1", owner_token="owner-3", ttl_seconds=30)
+            takeover_released = await queue.release_parent_takeover_lock("task-1", "owner-2")
+            dispatch_acquired = await queue.acquire_dispatch_claim_lock("task-1", owner_token="owner-3", ttl_seconds=30)
+            return (
+                claim_acquired,
+                takeover_blocked,
+                claim_released,
+                takeover_acquired,
+                dispatch_blocked,
+                takeover_released,
+                dispatch_acquired,
+            )
+
+        (
+            claim_acquired,
+            takeover_blocked,
+            claim_released,
+            takeover_acquired,
+            dispatch_blocked,
+            takeover_released,
+            dispatch_acquired,
+        ) = asyncio.run(_exercise())
+
+        self.assertTrue(claim_acquired)
+        self.assertFalse(takeover_blocked)
+        self.assertTrue(claim_released)
+        self.assertTrue(takeover_acquired)
+        self.assertFalse(dispatch_blocked)
+        self.assertTrue(takeover_released)
+        self.assertTrue(dispatch_acquired)
+
     def test_dedupe_orphans_reports_set_without_list(self):
         queue = TaskQueue()
         fake = _FakeRedis()

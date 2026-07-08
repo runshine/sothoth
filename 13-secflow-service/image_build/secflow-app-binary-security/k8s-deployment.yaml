@@ -21,6 +21,11 @@ spec:
         - name: secflow-app-binary-security
           image: ghcr.io/runshine/secflow-app-binary-security:latest
           imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - exec ./scripts/start-with-probe.sh python -m app.main
           env:
             - name: TZ
               value: Asia/Shanghai
@@ -30,6 +35,8 @@ spec:
               value: api
             - name: SECFLOW_BINARY_SECURITY_ENABLE_SCHEDULER
               value: "false"
+            - name: SECFLOW_OPEN_FILE_LIMIT
+              value: "65535"
             - name: CONFIG_PATH
               value: /app/config.yaml
             - name: POD_NAME

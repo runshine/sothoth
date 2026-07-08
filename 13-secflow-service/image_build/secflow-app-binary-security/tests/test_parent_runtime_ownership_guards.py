@@ -248,6 +248,27 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertTrue(any(event.event_type == "parent_takeover_lock_deferred" for event in db.events))
         self.assertEqual([], self.fake_task_queue.requeued_tasks)
 
+    def test_release_task_without_supported_runtime_owner_defers_when_dispatch_claim_lock_is_held(self):
+        self.manager.instance_id = "local-worker"
+        task = self._task(
+            id="task-release-owner-claim-lock-deferred",
+            status="running",
+            current_stage="system_analysis",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[], runtime_leases=[], events=[])
+        self.fake_task_queue.dispatch_claim_locks[task.id] = "claim-worker:token"
+
+        released = self.manager._release_task_without_supported_runtime_owner(
+            db,
+            task,
+            reason="unit_test_claim_lock_deferred",
+        )
+
+        self.assertFalse(released)
+        self.assertEqual("running", task.status)
+        self.assertTrue(any(event.event_type == "parent_takeover_lock_deferred" for event in db.events))
+        self.assertEqual([], self.fake_task_queue.requeued_tasks)
+
     def test_release_task_without_supported_runtime_owner_suppresses_release_with_active_runtime_lease_mismatch(self):
         self.manager.instance_id = "local-worker"
         task = self._task(
@@ -272,6 +293,39 @@ class ParentRuntimeOwnershipGuardTests(_TaskManagerQueuePatchedMixin, unittest.T
         self.assertFalse(released)
         self.assertEqual("running", task.status)
         self.assertEqual("worker-live", db.runtime_leases[0].owner_instance_id)
+
+    def test_task_should_not_remain_owned_without_active_runner_after_invalid_owned_execution_abort(self):
+        self.manager.instance_id = "local-worker"
+        task = self._task(
+            id="task-invalid-owned-execution",
+            status="pending",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="local-worker",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+        handle = type(
+            "_Handle",
+            (),
+            {
+                "owner_active": True,
+                "release_requested": False,
+                "takeover_observed": False,
+                "cancel_requested": True,
+                "cancel_requested_reason": "invalid_owned_execution_state",
+            },
+        )()
+
+        should_preserve = self.manager._task_should_remain_owned_without_active_runner(
+            db,
+            task,
+            handle,
+        )
+
+        self.assertFalse(should_preserve)
 
     def test_dispatch_task_by_id_skips_non_pending_task_when_active_runtime_lease_matches_owner(self):
         self.manager.instance_id = "local-worker"

@@ -13,8 +13,10 @@ from app.model import (
     BinarySecurityStateEvent,
     BinarySecurityTask,
     BinarySecurityTaskRuntimeLease,
+    PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
     TASK_RUNTIME_PHASE_OWNED_EXECUTION,
     TASK_TYPE_BINARY,
+    TASK_TYPE_BINARY_MODULE,
     TASK_TYPE_SOURCE,
 )
 from app.service.task_manager import TaskManager, _now
@@ -942,3 +944,76 @@ class TaskLayerReconcilePathTests(unittest.TestCase):
         self.assertEqual([("refresh", "entry_analysis", "running")], calls)
         self.assertTrue(any(event.event_type == "task_layer_reconcile_noop" for event in db.events))
         self.assertFalse(any(event.event_type == "task_requeued_after_stage_completion" for event in db.events))
+
+    def test_downstream_status_observed_terminal_stage_uses_owner_stage_terminal_apply_for_all_workflows(self):
+        cases = [
+            ("source-system-analysis", TASK_TYPE_SOURCE, "system_analysis", "entry_analysis", {}),
+            ("binary-firmware-unpack", TASK_TYPE_BINARY, "firmware_unpack", "system_analysis", {}),
+            ("binary-module-binary-to-source", TASK_TYPE_BINARY_MODULE, "binary_to_source", "entry_analysis", {}),
+            (
+                "kg-entry-fetch",
+                TASK_TYPE_SOURCE,
+                "knowledge_graph_entry_fetch",
+                "dataflow_vuln_scan",
+                {"pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN},
+            ),
+        ]
+
+        for label, task_type, stage_name, next_stage, policy in cases:
+            with self.subTest(label=label):
+                task = BinarySecurityTask(
+                    id=f"task-{label}",
+                    project_id="p1",
+                    name="n",
+                    status="running",
+                    task_type=task_type,
+                    current_stage=stage_name,
+                    firmware_source="project_filesystem",
+                    firmware_path="/src",
+                    output_root="/o",
+                    workspace_root="/w",
+                    runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+                )
+                task.policy = policy
+                stage_run = BinarySecurityStageRun(
+                    id=f"sr-{label}",
+                    task_id=task.id,
+                    project_id=task.project_id,
+                    stage_name=stage_name,
+                    sequence_no=1,
+                    status="success",
+                    output_summary={"success_count": 1},
+                )
+                next_run = BinarySecurityStageRun(
+                    id=f"sr-next-{label}",
+                    task_id=task.id,
+                    project_id=task.project_id,
+                    stage_name=next_stage,
+                    sequence_no=2,
+                    status="pending",
+                )
+                db = _AppendingModelAwareDb(tasks=[task], stage_runs=[stage_run, next_run], events=[])
+
+                with patch.object(self.manager, "_next_stage_candidate", return_value=next_stage), patch.object(
+                    self.manager,
+                    "_evaluate_stage_start_gate",
+                    return_value={"allowed": True},
+                ), patch.object(
+                    self.manager,
+                    "_system_analysis_authoritative_complete",
+                    return_value=True,
+                ):
+                    decision = self.manager._decide_task_layer_reconcile(
+                        db,
+                        task,
+                        signal={
+                            "source_event_type": "downstream_status_observed",
+                            "reconcile_reason": "periodic_reconcile",
+                            "stage_name": stage_name,
+                            "fact_applied": True,
+                        },
+                    )
+
+                self.assertEqual("stage_terminal_apply", decision.action)
+                self.assertEqual(stage_name, decision.stage_name)
+                self.assertEqual("success", decision.stage_status)

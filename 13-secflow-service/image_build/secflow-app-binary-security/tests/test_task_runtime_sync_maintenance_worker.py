@@ -1,11 +1,14 @@
 import asyncio
 import threading
 import unittest
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 from app.service import task_manager as task_manager_module
 from app.service import http_client as http_client_module
+from app.model import BinarySecurityTask, BinarySecurityTaskRuntimeLease, TASK_RUNTIME_PHASE_OWNED_EXECUTION, TASK_TYPE_SOURCE
 from app.service.task_manager import TaskManager, _now
+from test_task_manager import _ModelAwareDb
 
 
 class _FakeSyncMaintenanceThreadHandle:
@@ -87,6 +90,78 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(["heartbeat_verify"], verify_calls)
         manager._service_local_runtime_sync_maintenance.assert_not_awaited()
         sleep_mock.assert_awaited()
+
+    async def test_task_heartbeat_stops_local_keepalive_for_pending_owned_execution_with_live_local_lease(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        runner_task = asyncio.create_task(asyncio.sleep(3600), name="runner-live")
+        heartbeat_task = asyncio.create_task(asyncio.sleep(3600), name="heartbeat-live")
+        handle = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=runner_task,
+            heartbeat_task=heartbeat_task,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+            owner_active=True,
+        )
+        manager._workers["task-1"] = handle
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-heartbeat-invalid",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id="task-1",
+            owner_instance_id="worker-a",
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        async def _handoff(_task_id):
+            return False
+
+        def _verify(_task_id, source):
+            return task_manager_module._RuntimeLeaseOwnershipDecision(
+                should_continue=True,
+                runtime_lease_present=True,
+                runtime_lease_active=True,
+                runtime_lease_owner="worker-a",
+                local_handle_alive=True,
+                verification_error=None,
+            )
+
+        manager._handoff_active_serial_control_operation_from_runtime = _handoff
+        manager._verify_local_runtime_lease_or_abort = _verify
+
+        try:
+            with (
+                patch("app.service.task_manager.get_session_factory", return_value=lambda: db),
+                patch("app.service.task_manager.asyncio.sleep", new=AsyncMock()),
+            ):
+                await manager._run_task_heartbeat("task-1")
+        finally:
+            runner_task.cancel()
+            heartbeat_task.cancel()
+            await asyncio.gather(runner_task, return_exceptions=True)
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+
+        self.assertTrue(handle.cancel_requested)
+        self.assertEqual("invalid_owned_execution_state", handle.cancel_requested_reason)
+        event_types = [row.event_type for row in db.events]
+        self.assertIn("runtime_invalid_owned_execution_state_detected", event_types)
+        self.assertIn("runtime_invalid_owned_execution_state_local_keepalive_stopped", event_types)
 
     async def test_sync_maintenance_worker_thread_invokes_task_sync_maintenance(self):
         manager = TaskManager()

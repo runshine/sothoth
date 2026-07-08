@@ -5,9 +5,16 @@ set -euo pipefail
 PID_FILE="${SECFLOW_MAIN_PID_FILE:-/tmp/secflow-main.pid}"
 STARTED_AT_FILE="${SECFLOW_MAIN_STARTED_AT_FILE:-/tmp/secflow-main.started_at}"
 SERVICE_NAME="${SECFLOW_PROBE_SERVICE_NAME:-secflow-app}"
+OPEN_FILE_LIMIT="${SECFLOW_OPEN_FILE_LIMIT:-65535}"
 
 PYTHON_BIN="$(command -v python3 || command -v python)"
 rm -f "${PID_FILE}" "${STARTED_AT_FILE}"
+
+if ulimit -n "${OPEN_FILE_LIMIT}" 2>/dev/null; then
+    echo "[${SERVICE_NAME}] open file limit set to $(ulimit -n)"
+else
+    echo "[${SERVICE_NAME}] failed to raise open file limit to ${OPEN_FILE_LIMIT}, current=$(ulimit -n)"
+fi
 
 echo "[${SERVICE_NAME}] starting independent probe process"
 "${PYTHON_BIN}" -m app.probe_process &

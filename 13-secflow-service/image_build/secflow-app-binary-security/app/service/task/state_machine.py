@@ -3219,7 +3219,7 @@ class TaskStateMachineMixin:
             source_event_type=source_event_type,
             reconcile_reason=reconcile_reason,
         )
-        if source_event_type in {"stage_worker_start_requested", "downstream_status_observed"}:
+        if source_event_type == "stage_worker_start_requested":
             decision.action = "refresh_only"
             return decision
         if source_event_type == "stale_execution_requeue_requested":
@@ -3241,7 +3241,12 @@ class TaskStateMachineMixin:
             else:
                 decision.action = "refresh_only"
             return decision
-        if source_event_type in {"stage_worker_terminal_observed", "archive_job_copied", "downstream_terminal_observed"}:
+        if source_event_type in {
+            "stage_worker_terminal_observed",
+            "archive_job_copied",
+            "downstream_terminal_observed",
+            "downstream_status_observed",
+        }:
             resolved_stage_name = stage_name or str(task.current_stage or "").strip() or None
             if str(task.status or "").strip() in TASK_TERMINAL_STATUSES:
                 decision.action = "finalize_task"

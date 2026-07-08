@@ -751,8 +751,10 @@ class TaskQueue:
         return f"{prefix}:owner_signal:{str(owner_instance_id or '').strip()}:{str(task_id or '').strip()}"
 
     def _parent_takeover_lock_key(self, task_id: str) -> str:
-        prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
-        return f"{prefix}:parent_takeover_lock:{str(task_id or '').strip()}"
+        # Stale parent recovery and dispatch claim must contend on the same
+        # task-level runtime ownership lock so they cannot both rewrite owner
+        # facts concurrently.
+        return self._dispatch_claim_lock_key(task_id)
 
     def _dispatch_claim_lock_key(self, task_id: str) -> str:
         prefix = str(getattr(self.config, "task_sync_queue_prefix", "") or "").strip() or "bs:task_sync_queue"
