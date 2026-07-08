@@ -30686,6 +30686,21 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             response.config.partial_success_stage_advancement,
         )
 
+    def test_get_task_policy_config_expands_legacy_entry_top_n_into_split_fields(self):
+        row = BinarySecurityServiceConfig(config_key="global")
+        row.config = {
+            "entry_selection_mode": "auto",
+            "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+            "entry_auto_selection_top_n": 11,
+        }
+        db = _ModelAwareDb(service_configs=[row])
+
+        response = self.manager.get_task_policy_config(db)
+
+        self.assertEqual(11, response.config.entry_auto_selection_top_n)
+        self.assertEqual(11, response.config.entry_analysis_auto_selection_top_n)
+        self.assertEqual(11, response.config.knowledge_graph_entry_auto_selection_top_n)
+
     def test_save_project_config_alias_normalizes_pipeline_mode(self):
         db = _AppendingModelAwareDb()
 
@@ -30722,6 +30737,28 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             },
             response.config.partial_success_stage_advancement,
         )
+
+    def test_save_project_config_alias_persists_split_entry_top_n_fields(self):
+        db = _AppendingModelAwareDb()
+
+        response = self.manager.save_project_config(
+            db,
+            "p1",
+            BinarySecurityProjectConfigPayload(
+                entry_selection_mode="auto",
+                entry_auto_selection_strategy="top_n_per_module_by_confidence",
+                entry_analysis_auto_selection_top_n=3,
+                knowledge_graph_entry_auto_selection_top_n=9,
+            ),
+        )
+
+        self.assertEqual(3, response.config.entry_auto_selection_top_n)
+        self.assertEqual(3, response.config.entry_analysis_auto_selection_top_n)
+        self.assertEqual(9, response.config.knowledge_graph_entry_auto_selection_top_n)
+        self.assertEqual(1, len(db.service_configs))
+        self.assertEqual(3, db.service_configs[0].config["entry_auto_selection_top_n"])
+        self.assertEqual(3, db.service_configs[0].config["entry_analysis_auto_selection_top_n"])
+        self.assertEqual(9, db.service_configs[0].config["knowledge_graph_entry_auto_selection_top_n"])
 
     def test_merge_policy_merges_partial_success_stage_advancement(self):
         row = BinarySecurityServiceConfig(config_key="global")
@@ -30814,6 +30851,8 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
             "entry_selection_mode": "auto",
             "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
             "entry_auto_selection_top_n": 15,
+            "entry_analysis_auto_selection_top_n": 5,
+            "knowledge_graph_entry_auto_selection_top_n": 12,
             "stage_parallelism": {
                 "system_analysis": 7,
                 "entry_analysis": 6,
@@ -30834,7 +30873,9 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual(6, policy["stage_parallelism"]["entry_analysis"])
         self.assertFalse(policy["continue_on_item_failure"])
         self.assertEqual("top_n_per_module_by_confidence", policy["entry_auto_selection_strategy"])
-        self.assertEqual(15, policy["entry_auto_selection_top_n"])
+        self.assertEqual(5, policy["entry_auto_selection_top_n"])
+        self.assertEqual(5, policy["entry_analysis_auto_selection_top_n"])
+        self.assertEqual(12, policy["knowledge_graph_entry_auto_selection_top_n"])
 
     def test_merge_policy_defaults_source_entry_auto_selection(self):
         policy = self.manager._project_config_defaults(task_type=TASK_TYPE_SOURCE)
@@ -30842,6 +30883,31 @@ def _test_ensure_downstream_archive_job_keeps_success_job_when_downstream_payloa
         self.assertEqual("auto", policy["entry_selection_mode"])
         self.assertEqual("all", policy["entry_auto_selection_strategy"])
         self.assertEqual(0, policy["entry_auto_selection_top_n"])
+
+    def test_merge_policy_keeps_kg_top_n_and_forces_only_auto_selection_mode(self):
+        row = BinarySecurityServiceConfig(config_key="global")
+        row.config = {
+            "entry_selection_mode": "manual_confirm",
+            "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+            "entry_analysis_auto_selection_top_n": 2,
+            "knowledge_graph_entry_auto_selection_top_n": 8,
+        }
+
+        policy = self.manager._merge_policy(
+            _ModelAwareDb(service_configs=[row]),
+            "p1",
+            {
+                "task_type": TASK_TYPE_SOURCE,
+                "pipeline_profile": PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN,
+            },
+            {},
+        )
+
+        self.assertEqual("auto", policy["entry_selection_mode"])
+        self.assertEqual("top_n_per_module_by_confidence", policy["entry_auto_selection_strategy"])
+        self.assertEqual(2, policy["entry_analysis_auto_selection_top_n"])
+        self.assertEqual(8, policy["knowledge_graph_entry_auto_selection_top_n"])
+        self.assertEqual(2, policy["entry_auto_selection_top_n"])
 
     def test_claim_pending_tasks_reclaims_expired_lease(self):
         task = BinarySecurityTask(
