@@ -2504,7 +2504,7 @@ class TaskStateMachineMixin:
                     stage_run=existing_run,
                 )
                 self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
-                if rebuild_state.get("required") or str(rebuild_state.get("reason") or "").strip() == "active_operation_in_progress":
+                if str(rebuild_state.get("reason") or "").strip() == "active_operation_in_progress":
                     return False
             if existing_run_status in {"queued", "running", "dispatching"}:
                 return True
@@ -2524,7 +2524,7 @@ class TaskStateMachineMixin:
         if not self._should_auto_advance_to_stage(db, task, normalized_stage):
             return False
         if normalize_stage_name(normalized_stage) == "entry_analysis":
-            return bool(self._stage_has_materialized_inputs(db, task, normalized_stage, allow_rebuild=False))
+            return bool(self._stage_execution_ready(db, task, normalized_stage, allow_rebuild=False))
         return bool(self._stage_has_authoritative_materialization(db, task, normalized_stage))
 
     def _evaluate_stage_start_gate(
@@ -2591,16 +2591,33 @@ class TaskStateMachineMixin:
                 else "pending"
             )
         ).strip() or None
-        allowed = self._should_auto_advance_to_stage(db, task, normalized_stage)
-        blocked_reason = None if allowed else self._continue_stage_input_error(db, task, normalized_stage)
+        prearm_allowed = self._should_auto_advance_to_stage(db, task, normalized_stage)
+        execute_ready = self._stage_execution_ready(
+            db,
+            task,
+            normalized_stage,
+            allow_rebuild=allow_entry_rebuild,
+        )
+        blocked_reason = None
+        reason_code = None
+        if not prearm_allowed:
+            blocked_reason = self._continue_stage_input_error(db, task, normalized_stage)
+            reason_code = "stage_start_blocked"
+        elif not execute_ready:
+            blocked_reason = "pending_stage_materialization"
+            reason_code = "pending_stage_materialization"
         return {
             "stage_name": normalized_stage,
-            "allowed": allowed,
+            "allowed": prearm_allowed,
+            "prearm_allowed": prearm_allowed,
+            "execute_ready": execute_ready,
             "blocked_reason": blocked_reason,
+            "reason_code": reason_code,
             "stage_run": stage_run,
             "stage_items": stage_items,
             "snapshot": snapshot,
             "stage_status": stage_status,
+            "stage_execution_mode": self._stage_execution_mode(task, normalized_stage),
             "has_active_ownerless_progress": bool((snapshot or {}).get("has_active_items")),
         }
 
@@ -2874,7 +2891,7 @@ class TaskStateMachineMixin:
             and next_stage
             and self._streaming_mode_enabled(task)
             and self._is_streaming_tail_stage(task, next_stage)
-            and self._streaming_stage_start_ready(db, task, next_stage)
+            and bool((next_stage_gate or {}).get("allowed"))
             and (
                 not self._stage_requires_archive_success_gate(task, stage_name)
                 or self._stage_has_archived_success_progress(db, task, stage_name)
@@ -2882,9 +2899,23 @@ class TaskStateMachineMixin:
         ):
             decision.action = "activate_streaming_tail"
             decision.next_stage = next_stage
-            decision.event_type = "streaming_tail_activated"
-            decision.message = f"阶段完成后切换为流式尾段推进: {next_stage}"
-            decision.payload = {"state_event_id": state_event_id, "completed_stage": stage_name}
+            decision.event_type = (
+                "streaming_tail_execution_ready"
+                if bool((next_stage_gate or {}).get("execute_ready"))
+                else "streaming_tail_prearmed"
+            )
+            decision.message = (
+                f"阶段完成后流式尾段已可直接执行: {next_stage}"
+                if bool((next_stage_gate or {}).get("execute_ready"))
+                else f"阶段完成后流式尾段进入等待态，待 gate 消失后自动执行: {next_stage}"
+            )
+            decision.payload = {
+                "state_event_id": state_event_id,
+                "completed_stage": stage_name,
+                "execute_ready": bool((next_stage_gate or {}).get("execute_ready")),
+                "blocked_reason": (next_stage_gate or {}).get("blocked_reason"),
+                "stage_execution_mode": (next_stage_gate or {}).get("stage_execution_mode"),
+            }
             return decision
         if task.status in {"running", "dispatching"} and next_stage:
             decision.action = "requeue_next_stage"
@@ -3024,10 +3055,10 @@ class TaskStateMachineMixin:
             if not self._apply_active_owned_execution_state(
                 db,
                 task,
-                reason="进入 streaming tail 收口",
+                reason="进入 streaming tail 等待/收口",
                 source="state_machine",
                 status="running",
-                stage_name=decision.next_stage,
+                stage_name=str(getattr(task, "current_stage", "") or "").strip() or decision.next_stage,
                 finished_at=None,
                 last_error=None,
             ):
@@ -3044,7 +3075,7 @@ class TaskStateMachineMixin:
             self._record_event(
                 db,
                 task,
-                decision.event_type or "streaming_tail_activated",
+                decision.event_type or "streaming_tail_prearmed",
                 decision.message or "",
                 stage_name=decision.next_stage,
                 payload=dict(decision.payload or {}),
@@ -4260,7 +4291,7 @@ class TaskStateMachineMixin:
             next_stage,
             stage_runs=stage_runs,
             snapshots=workflow_snapshots,
-            allow_entry_rebuild=True,
+            allow_entry_rebuild=False,
         ) if next_stage else {"allowed": False}
         summary_after_retry_clear = dict(task.summary or {})
         current_stage_name = str(task.current_stage or "").strip()
@@ -4282,11 +4313,6 @@ class TaskStateMachineMixin:
             and not bool((next_stage_gate or {}).get("allowed"))
         ):
             if next_stage == "entry_analysis":
-                rebuilt = self._rebuild_missing_entry_analysis_stage_items_from_inputs(
-                    db,
-                    task,
-                    stage_run=next_stage_run,
-                )
                 if self._entry_analysis_pending_requires_materialization(
                     db,
                     task,
@@ -4302,7 +4328,7 @@ class TaskStateMachineMixin:
                         stage_name=next_stage,
                         payload={
                             "stage_status": next_stage_status,
-                            "rebuild_state": dict(rebuilt or {}),
+                            "blocked_reason": (next_stage_gate or {}).get("blocked_reason"),
                         },
                     )
             _apply_retry_reopen_patch(
@@ -5067,7 +5093,7 @@ class TaskStateMachineMixin:
                 next_stage,
                 stage_runs=stage_runs,
                 snapshots=snapshots,
-                allow_entry_rebuild=True,
+                allow_entry_rebuild=False,
             )
             next_stage_run = next_stage_gate.get("stage_run")
             next_stage_status = str(next_stage_gate.get("stage_status") or "").strip()

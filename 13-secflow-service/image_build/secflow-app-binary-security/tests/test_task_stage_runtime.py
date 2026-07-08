@@ -85,6 +85,38 @@ class TaskStageRuntimeTests(unittest.TestCase):
         self.assertIs(result, stage_run)
         refresh_tail.assert_called_once_with(db, task, "entry_analysis")
 
+    def test_refresh_stage_from_authoritative_items_once_refreshes_kg_inputs_before_dataflow_tail_refresh(self):
+        task = BinarySecurityTask(
+            id="task-kg-tail",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            task_type="source",
+            current_stage="dataflow_vuln_scan",
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming", "pipeline_profile": "kg_source_vuln_scan"}
+        stage_run = BinarySecurityStageRun(
+            id="sr-dvs",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run])
+
+        with (
+            patch.object(self.manager, "_refresh_kg_streaming_inputs_if_needed") as refresh_kg_inputs,
+            patch.object(self.manager, "_stage_handler", return_value=None),
+            patch.object(self.manager, "_refresh_streaming_tail_stage_state") as refresh_tail,
+        ):
+            result = self.manager._refresh_stage_from_authoritative_items_once(db, task, "dataflow_vuln_scan")
+
+        self.assertIs(result, stage_run)
+        refresh_kg_inputs.assert_called_once_with(db, task)
+        refresh_tail.assert_called_once_with(db, task, "dataflow_vuln_scan")
+
     def test_reconcile_retry_affected_stages_in_session_deduplicates_and_avoids_compatibility_facade(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
         db = _ModelAwareDb(tasks=[task])

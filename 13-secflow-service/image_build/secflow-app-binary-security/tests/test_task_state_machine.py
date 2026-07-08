@@ -247,7 +247,7 @@ class TaskStateMachineTests(unittest.TestCase):
 
         with (
             patch.object(self.manager, "_system_analysis_authoritative_complete", return_value=True),
-            patch.object(self.manager, "_entry_analysis_inputs", return_value=[{"module_key": "mod-a"}]),
+            patch.object(self.manager, "_entry_analysis_inputs", return_value=[{"module_key": "mod-a", "module_name": "mod-a"}]),
             patch.object(self.manager, "_source_entry_analysis_barrier_enabled", return_value=True),
         ):
             self.assertTrue(self.manager._streaming_upstream_gate_ready(db, task, "entry_analysis"))
@@ -301,6 +301,40 @@ class TaskStateMachineTests(unittest.TestCase):
         self.assertFalse(gate["allowed"])
         self.assertEqual("entry_analysis", gate["stage_name"])
         self.assertEqual("missing archive success", gate["blocked_reason"])
+
+    def test_evaluate_stage_start_gate_distinguishes_streaming_prearm_from_execute_ready(self):
+        task = BinarySecurityTask(
+            id="task-streaming-gate-prearm",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry-prearm",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[entry_run], stage_items=[])
+
+        with (
+            patch.object(self.manager, "_should_auto_advance_to_stage", return_value=True),
+            patch.object(self.manager, "_stage_execution_ready", return_value=False),
+            patch.object(self.manager, "_stage_items", return_value=[]),
+            patch.object(self.manager, "_build_workflow_stage_snapshots", return_value=[]),
+        ):
+            gate = self.manager._evaluate_stage_start_gate(db, task, "entry_analysis")
+
+        self.assertTrue(gate["allowed"])
+        self.assertFalse(gate["execute_ready"])
+        self.assertEqual("pending_stage_materialization", gate["blocked_reason"])
+        self.assertEqual("streaming_tail", gate["stage_execution_mode"])
 
     def test_decide_task_resume_after_stage_reset_reports_blocked_reason(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")
@@ -613,7 +647,7 @@ class TaskStateMachineTests(unittest.TestCase):
 
         self.assertTrue(applied)
         self.assertEqual("running", task.status)
-        self.assertEqual("entry_analysis", task.current_stage)
+        self.assertEqual("system_analysis", task.current_stage)
         self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
         self.assertGreaterEqual(record_event.call_count, 1)
         repair_running_lease_invariant.assert_not_called()

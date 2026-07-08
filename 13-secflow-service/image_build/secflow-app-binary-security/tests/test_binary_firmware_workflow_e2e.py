@@ -4618,7 +4618,7 @@ class BinaryFirmwareWorkflowE2ETests(unittest.TestCase):
         self.assertTrue(signals)
         self.assertEqual("entry_analysis", task.current_stage)
         self.assertEqual("running", task.status)
-        self.assertEqual(1, len(self.manager._stage_items(db, task.id, "entry_analysis")))
+        self.assertEqual(0, len(self.manager._stage_items(db, task.id, "entry_analysis")))
         self.assertEqual("pending", entry_run.status)
         self.assertEqual("pending", dataflow_run.status)
         event_types = [event.event_type for event in db.events]

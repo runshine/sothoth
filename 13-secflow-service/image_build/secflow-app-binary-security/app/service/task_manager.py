@@ -11505,11 +11505,48 @@ class TaskManager(
         *,
         allow_rebuild: bool = False,
     ) -> bool:
+        return self._stage_execution_ready(
+            db,
+            task,
+            stage_name,
+            allow_rebuild=allow_rebuild,
+        )
+
+    def _stage_execution_mode(
+        self,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+    ) -> str:
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage and self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, normalized_stage):
+            return "streaming_tail"
+        return "serial"
+
+    def _stage_requires_authoritative_execution_readiness(
+        self,
+        task: BinarySecurityTask,
+        stage_name: str | None,
+    ) -> bool:
+        normalized_stage = normalize_stage_name(stage_name)
+        if self._stage_execution_mode(task, normalized_stage) != "streaming_tail":
+            return False
+        return normalized_stage in {"entry_analysis", "dataflow_vuln_scan"}
+
+    def _stage_execution_ready(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        allow_rebuild: bool = False,
+    ) -> bool:
         normalized_stage = normalize_stage_name(stage_name)
         if not normalized_stage:
             return False
         if self._stage_has_real_runnable_work(db, task, normalized_stage):
             return True
+        if self._stage_requires_authoritative_execution_readiness(task, normalized_stage):
+            return self._stage_has_authoritative_materialization(db, task, normalized_stage)
         return self._stage_has_materialized_inputs(
             db,
             task,
@@ -12794,8 +12831,8 @@ class TaskManager(
             normalized = [self._normalize_entry_analysis_module_input(task, module) for module in (summary.get("b2s_results") or []) if isinstance(module, dict)]
             if normalized != list(summary.get("b2s_results") or []):
                 task.summary = {**summary, "b2s_results": normalized}
-        if normalize_stage_name(stage_name) == "entry_analysis":
-            self._rebuild_missing_entry_analysis_stage_items_from_inputs(db, task)
+        # entry_analysis authoritative items are only materialized on actual execution start.
+        # Passive read/gate paths should not create stage items ahead of time.
         if normalize_stage_name(stage_name) == "dataflow_vuln_scan" and not summary.get("entry_results"):
             if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
                 self._refresh_knowledge_graph_entry_fetch_summary(task)
@@ -12853,18 +12890,20 @@ class TaskManager(
         historical_child_count = self._entry_analysis_historical_child_count(db, task)
         reason = None
         required = False
-        if resolved_stage_run is None:
-            reason = "stage_run_missing"
-        elif stage_run_status not in {"pending", "queued"}:
-            reason = "stage_run_not_pending"
-        elif current_stage_item_count > 0:
+        if current_stage_item_count > 0:
             reason = "authoritative_items_present"
         elif input_count <= 0:
             reason = "missing_entry_analysis_inputs"
         elif active_operation is not None:
             reason = "active_operation_in_progress"
+        elif resolved_stage_run is None:
+            reason = "stage_run_missing"
+            required = True
+        elif stage_run_status not in {"pending", "queued"}:
+            reason = "stage_run_not_pending"
         elif historical_child_count <= 0:
-            reason = "no_historical_entry_analysis_children"
+            reason = "authoritative_items_missing_from_inputs"
+            required = True
         else:
             reason = "historical_children_exist_but_authoritative_items_missing"
             required = True
@@ -12911,7 +12950,11 @@ class TaskManager(
             )
             return bool(
                 rebuild_state.get("required")
-                and rebuild_state.get("reason") == "historical_children_exist_but_authoritative_items_missing"
+                and rebuild_state.get("reason") in {
+                    "stage_run_missing",
+                    "authoritative_items_missing_from_inputs",
+                    "historical_children_exist_but_authoritative_items_missing",
+                }
                 and int(rebuild_state.get("input_count") or 0) > 0
             )
         if normalized_stage == "dataflow_vuln_scan":

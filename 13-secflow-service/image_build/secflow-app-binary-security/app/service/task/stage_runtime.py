@@ -260,12 +260,62 @@ class TaskStageRuntimeMixin:
         elif normalize_stage_name(stage_name) == "dataflow_vuln_scan":
             self._rebuild_summary_results_from_stage_items(db, task, "dataflow_vuln_scan", "dataflow_results")
 
+    def _refresh_kg_streaming_inputs_if_needed(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        if not self._streaming_mode_enabled(task):
+            return False
+        if normalize_stage_name(self._pipeline_profile(task)) != normalize_stage_name("kg_source_vuln_scan"):
+            return False
+        kg_stage_run = self._latest_stage_run(db, task.id, "knowledge_graph_entry_fetch")
+        if kg_stage_run is None:
+            return False
+        kg_stage_status = str(getattr(kg_stage_run, "status", "") or "").strip().lower()
+        if kg_stage_status in {"success", "failed", "cancelled", "downstream_missing", "partial_success"}:
+            return False
+        if str(getattr(task, "status", "") or "").strip().lower() in {"success", "failed", "cancelled", "downstream_missing", "partial_success"}:
+            return False
+        previous_entry_keys = {
+            str(entry.get("entry_key") or "").strip()
+            for entry in list(self._effective_entry_inputs(task, db) or [])
+            if isinstance(entry, dict) and str(entry.get("entry_key") or "").strip()
+        }
+        refresh_result = self._run_async_blocking(self._stage_knowledge_graph_entry_fetch(db, task, kg_stage_run, None, False))
+        refreshed = bool(refresh_result)
+        current_entry_keys = {
+            str(entry.get("entry_key") or "").strip()
+            for entry in list(self._effective_entry_inputs(task, db) or [])
+            if isinstance(entry, dict) and str(entry.get("entry_key") or "").strip()
+        }
+        new_entry_keys = sorted(current_entry_keys - previous_entry_keys)
+        if new_entry_keys:
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_incremental_inputs_materialized",
+                "知识图谱增量入口已写回任务输入，等待数据流漏洞挖掘阶段继续创建新子任务",
+                level="info",
+                stage_name="knowledge_graph_entry_fetch",
+                payload={
+                    "new_entry_count": len(new_entry_keys),
+                    "new_entry_keys_sample": new_entry_keys[:10],
+                    "previous_entry_count": len(previous_entry_keys),
+                    "current_entry_count": len(current_entry_keys),
+                },
+            )
+        return refreshed or bool(new_entry_keys)
+
     def _refresh_stage_from_authoritative_items_once(
         self: TaskManager,
         db: Session,
         task: BinarySecurityTask,
         stage_name: str,
     ) -> BinarySecurityStageRun | None:
+        normalized_stage_name = normalize_stage_name(stage_name)
+        if normalized_stage_name == "dataflow_vuln_scan":
+            self._refresh_kg_streaming_inputs_if_needed(db, task)
         handler = self._stage_handler(stage_name)
         if handler is not None and handler.manages_stage_refresh():
             handler.refresh_summary_from_items(self, db, task)

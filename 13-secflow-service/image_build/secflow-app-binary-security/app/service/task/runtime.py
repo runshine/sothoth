@@ -4193,75 +4193,59 @@ class TaskRuntimeServiceMixin:
             if stage_retry_mode:
                 start_index = min(start_index, target_stage_index)
             for stage_name in stage_sequence[start_index:]:
-                if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_stage_loop"):
-                    return
-                self._mark_runtime_handle_runner_progress(task_id)
                 if stage_retry_mode and stage_sequence.index(stage_name) < target_stage_index:
                     continue
-                if hasattr(db, "refresh"):
-                    db.refresh(task)
-                if task.status == "cancelled":
-                    return
-                missing_entry_results_failure = self._missing_entry_results_failure_context(
-                    db,
-                    task,
-                    stage_name=stage_name,
-                    reason="execute_task_missing_entry_results",
-                )
-                if missing_entry_results_failure is not None:
-                    self._finalize_task_after_authoritative_failure(
+                gate_wait_attempt = 0
+                gate_block_logged = False
+                archive_barrier_logged = False
+                while True:
+                    if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_stage_loop"):
+                        return
+                    self._mark_runtime_handle_runner_progress(task_id)
+                    if hasattr(db, "refresh"):
+                        db.refresh(task)
+                    if task.status == "cancelled":
+                        return
+                    missing_entry_results_failure = self._missing_entry_results_failure_context(
                         db,
                         task,
-                        failure_ctx=missing_entry_results_failure,
-                        previous_status=str(task.status or "").strip() or None,
-                        event_type="missing_entry_results_terminalized",
+                        stage_name=stage_name,
+                        reason="execute_task_missing_entry_results",
                     )
-                    db.commit()
-                    return
-                # 流式推进到 dataflow_vuln_scan 要求 entry_analysis 至少有 1 个成功归档子任务。
-                # 若 entry_analysis 仍未终态且 0 归档成功，不在本顺序 pass 启动 DFS（避免空跑+永久等待），
-                # 交给 streaming reconcile 在满足条件后通过 activate_streaming_tail 启动。
-                # entry_analysis 已终态且 0 归档成功的情况已由上方 _missing_entry_results_failure_context 失败收口。
-                if (
-                    task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan"
-                    and self._source_entry_analysis_barrier_enabled(task)
-                    and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
-                ):
-                    task_manager_module.logger.info(
-                        "binary-security execute_task paused before downstream polling because entry-analysis archive barrier is not satisfied: "
-                        "task_id=%s stage=%s current_stage=%s",
-                        task.id,
-                        stage_name,
-                        str(getattr(task, "current_stage", "") or "").strip() or None,
-                    )
-                    if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_entry_analysis_barrier_blocked"):
+                    if missing_entry_results_failure is not None:
+                        self._finalize_task_after_authoritative_failure(
+                            db,
+                            task,
+                            failure_ctx=missing_entry_results_failure,
+                            previous_status=str(task.status or "").strip() or None,
+                            event_type="missing_entry_results_terminalized",
+                        )
+                        db.commit()
                         return
-                    break
-                if not self._stage_enabled(task, stage_name):
-                    stage_run = self._ensure_stage_run(db, task, stage_name)
-                    stage_run.status = "success"
-                    stage_run.started_at = stage_run.started_at or task_manager_module._now()
-                    stage_run.finished_at = task_manager_module._now()
-                    await self._persist_stage_run_output_summary_async(task, stage_run, {"reason": "disabled_by_stage_options"})
-                    stage_run.counts = self._stage_counts(db, stage_run)
-                    task.stage_summary = {
-                        **task.stage_summary,
-                        stage_name: {
-                            "status": "success",
-                            "counts": stage_run.counts,
-                            "finished_at": stage_run.finished_at.isoformat(),
-                            "reason": "disabled_by_stage_options",
-                        },
-                    }
-                    self._record_event(db, task, "stage_completed", f"阶段未启用，按配置完成: {stage_name}", stage_name=stage_name)
-                    task_manager_module.observe_stage_duration(
-                        stage=stage_name,
-                        result="success",
-                        duration_seconds=task_manager_module._elapsed_seconds_since(stage_run.started_at),
-                    )
-                    db.commit()
-                    continue
-                if not self._stage_start_ready(db, task, stage_name, allow_rebuild=False):
+                    if (
+                        task_manager_module.normalize_stage_name(stage_name) == "dataflow_vuln_scan"
+                        and self._source_entry_analysis_barrier_enabled(task)
+                        and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
+                    ):
+                        if not archive_barrier_logged:
+                            task_manager_module.logger.info(
+                                "binary-security execute_task paused before downstream polling because entry-analysis archive barrier is not satisfied: "
+                                "task_id=%s stage=%s current_stage=%s",
+                                task.id,
+                                stage_name,
+                                str(getattr(task, "current_stage", "") or "").strip() or None,
+                            )
+                            archive_barrier_logged = True
+                        if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_entry_analysis_barrier_blocked"):
+                            return
+                        await asyncio.sleep(min(5, 1 + gate_wait_attempt))
+                        gate_wait_attempt += 1
+                        continue
+                    archive_barrier_logged = False
+                    if self._stage_start_ready(db, task, stage_name, allow_rebuild=False):
+                        gate_block_logged = False
+                        gate_wait_attempt = 0
+                        break
                     stage_gate = self._evaluate_stage_start_gate(
                         db,
                         task,
@@ -4291,17 +4275,44 @@ class TaskRuntimeServiceMixin:
                         )
                         db.commit()
                         return
-                    task_manager_module.logger.info(
-                        "binary-security execute_task paused before stage worker start because stage start gate is blocked: "
-                        "task_id=%s stage=%s blocked_reason=%s stage_status=%s",
-                        task.id,
-                        stage_name,
-                        blocked_reason,
-                        str(stage_gate.get("stage_status") or "").strip() or None,
-                    )
+                    if not gate_block_logged:
+                        task_manager_module.logger.info(
+                            "binary-security execute_task paused before stage worker start because stage start gate is blocked: "
+                            "task_id=%s stage=%s blocked_reason=%s stage_status=%s",
+                            task.id,
+                            stage_name,
+                            blocked_reason,
+                            str(stage_gate.get("stage_status") or "").strip() or None,
+                        )
+                        gate_block_logged = True
                     if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_stage_start_gate_blocked"):
                         return
-                    break
+                    await asyncio.sleep(min(5, 1 + gate_wait_attempt))
+                    gate_wait_attempt += 1
+                if not self._stage_enabled(task, stage_name):
+                    stage_run = self._ensure_stage_run(db, task, stage_name)
+                    stage_run.status = "success"
+                    stage_run.started_at = stage_run.started_at or task_manager_module._now()
+                    stage_run.finished_at = task_manager_module._now()
+                    await self._persist_stage_run_output_summary_async(task, stage_run, {"reason": "disabled_by_stage_options"})
+                    stage_run.counts = self._stage_counts(db, stage_run)
+                    task.stage_summary = {
+                        **task.stage_summary,
+                        stage_name: {
+                            "status": "success",
+                            "counts": stage_run.counts,
+                            "finished_at": stage_run.finished_at.isoformat(),
+                            "reason": "disabled_by_stage_options",
+                        },
+                    }
+                    self._record_event(db, task, "stage_completed", f"阶段未启用，按配置完成: {stage_name}", stage_name=stage_name)
+                    task_manager_module.observe_stage_duration(
+                        stage=stage_name,
+                        result="success",
+                        duration_seconds=task_manager_module._elapsed_seconds_since(stage_run.started_at),
+                    )
+                    db.commit()
+                    continue
                 stage_run = self._ensure_stage_run(db, task, stage_name)
                 if stage_name == "entry_analysis":
                     self._rebuild_missing_entry_analysis_stage_items_from_inputs(

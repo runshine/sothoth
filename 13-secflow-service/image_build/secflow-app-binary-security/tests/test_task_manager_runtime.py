@@ -5488,8 +5488,10 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(manager, "_missing_entry_results_failure_context", return_value=None),
             patch.object(manager, "_source_entry_analysis_barrier_enabled", return_value=True),
             patch.object(manager, "_stage_has_archived_success_progress", return_value=False),
+            patch.object(manager, "_abort_local_runtime_if_lease_lost", side_effect=[False, True]),
             patch.object(manager, "_record_event"),
             patch.object(manager, "_write_task_metadata_async", new=_noop_write),
+            patch("app.service.task.runtime.asyncio.sleep", new=AsyncMock()),
             patch("app.service.task_manager.logger.info") as info_log,
         ):
             asyncio.run(manager._execute_task(task.id))
@@ -5544,8 +5546,10 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
                 "_evaluate_stage_start_gate",
                 return_value={"blocked_reason": "entry_analysis_pending_archive", "stage_status": "running"},
             ),
+            patch.object(manager, "_abort_local_runtime_if_lease_lost", side_effect=[False, True]),
             patch.object(manager, "_record_event"),
             patch.object(manager, "_write_task_metadata_async", new=_noop_write),
+            patch("app.service.task.runtime.asyncio.sleep", new=AsyncMock()),
             patch("app.service.task_manager.logger.info") as info_log,
         ):
             asyncio.run(manager._execute_task(task.id))
