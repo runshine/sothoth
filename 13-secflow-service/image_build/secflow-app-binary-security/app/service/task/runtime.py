@@ -4260,12 +4260,14 @@ class TaskRuntimeServiceMixin:
                         and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
                     ):
                         if not archive_barrier_logged:
+                            gate_snapshot = self._stage_archive_gate_debug_snapshot(db, task, "entry_analysis")
                             task_manager_module.logger.info(
                                 "binary-security execute_task paused before downstream polling because entry-analysis archive barrier is not satisfied: "
-                                "task_id=%s stage=%s current_stage=%s",
+                                "task_id=%s stage=%s current_stage=%s gate_snapshot=%s",
                                 task.id,
                                 stage_name,
                                 str(getattr(task, "current_stage", "") or "").strip() or None,
+                                gate_snapshot,
                             )
                             archive_barrier_logged = True
                         if await self._abort_local_runtime_if_lease_lost(task_id, "execute_task_entry_analysis_barrier_blocked"):

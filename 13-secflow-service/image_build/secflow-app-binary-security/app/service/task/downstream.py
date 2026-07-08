@@ -1168,9 +1168,10 @@ class TaskDownstreamServiceMixin:
             return []
         if self._entry_selection_mode(task) == task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM:
             return []
-        entries = task_manager_module._deduplicate_entry_keys(
+        raw_entries = task_manager_module._deduplicate_entry_keys(
             [dict(entry) for entry in (entry_result.get("entries") or []) if isinstance(entry, dict)]
         )
+        entries, selection_snapshot = self._select_auto_entries_for_entry_result_module(task, entry_result)
         if not entries:
             return []
         created_items: list[BinarySecurityStageItem] = []
@@ -1367,6 +1368,10 @@ class TaskDownstreamServiceMixin:
                     "metadata_only_count": metadata_only_count,
                     "recreate_count": recreate_count,
                     "entry_count": len(created_items),
+                    "candidate_entry_count": len(raw_entries),
+                    "selected_entry_count": len(entries),
+                    "entry_auto_selection_strategy": str(selection_snapshot.get("auto_selection_strategy") or "").strip() or None,
+                    "entry_auto_selection_top_n": int(selection_snapshot.get("auto_selection_top_n") or 0),
                     "pipeline_mode": self._pipeline_mode(task),
                 },
             )

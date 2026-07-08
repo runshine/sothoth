@@ -7924,6 +7924,19 @@ class TaskManager(
                 )
         return _deduplicate_entry_keys(entries)
 
+    def _select_auto_entries_for_entry_result_module(
+        self,
+        task: BinarySecurityTask,
+        module_or_result: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        normalized_module = self._normalize_entry_result_module(task, dict(module_or_result or {}))
+        if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
+            return self._select_auto_entries_for_kg_task(
+                task,
+                self._normalize_module_selection_entries(task, [normalized_module]),
+            )
+        return self._select_auto_entries_per_module(task, [normalized_module], None)
+
     def _select_auto_entries_per_module(
         self,
         task: BinarySecurityTask,
@@ -10334,6 +10347,44 @@ class TaskManager(
         if normalized_stage == "knowledge_graph_entry_fetch":
             return str(self._virtual_archive_stage_status(db, task, normalized_stage) or "").strip().lower() == "success"
         return bool(self._stage_archived_success_items(db, task, normalized_stage))
+
+    def _stage_archive_gate_debug_snapshot(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> dict[str, Any]:
+        normalized_stage = normalize_stage_name(stage_name)
+        stage_items = list(self._stage_items(db, task.id, normalized_stage) or [])
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, normalized_stage)
+        archived_success_items = [
+            item for item in stage_items
+            if self._stage_item_has_successful_archive_job(
+                item,
+                archive_jobs=archive_jobs_by_item.get(str(item.id or ""), []),
+            )
+        ]
+        status_counts: dict[str, int] = {}
+        archive_status_counts: dict[str, int] = {}
+        active_bound_items = 0
+        for item in stage_items:
+            item_status = str(getattr(item, "status", "") or "").strip().lower() or "unknown"
+            status_counts[item_status] = int(status_counts.get(item_status, 0)) + 1
+            if str(getattr(item, "downstream_task_id", "") or "").strip() and item_status in {"queued", "pending", "dispatching", "running"}:
+                active_bound_items += 1
+            for archive_job in archive_jobs_by_item.get(str(item.id or ""), []):
+                archive_status = self._archive_job_status_value(archive_job) or "unknown"
+                archive_status_counts[archive_status] = int(archive_status_counts.get(archive_status, 0)) + 1
+        return {
+            "stage_name": normalized_stage,
+            "stage_item_count": len(stage_items),
+            "stage_item_status_counts": status_counts,
+            "archive_job_status_counts": archive_status_counts,
+            "archived_success_item_count": len(archived_success_items),
+            "active_bound_item_count": active_bound_items,
+            "entry_result_count": len(self._entry_results(task) or []),
+            "effective_entry_input_count": len(self._effective_entry_inputs(task, db) or []),
+        }
 
     def _archived_success_stage_payload_rows(
         self,
@@ -15430,6 +15481,7 @@ class TaskManager(
         if not self._entry_analysis_authoritative_items_ready(db, task):
             rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task)
             self._mark_entry_analysis_authoritative_rebuild_summary(task, rebuild_state)
+            gate_snapshot = self._stage_archive_gate_debug_snapshot(db, task, "entry_analysis")
             self._record_event(
                 db,
                 task,
@@ -15437,7 +15489,10 @@ class TaskManager(
                 "入口分析 authoritative item 尚未 materialize，阻止提前进入数据流漏洞挖掘阶段",
                 stage_name=stage_run.stage_name,
                 level="warning",
-                payload=dict(rebuild_state),
+                payload={
+                    **dict(rebuild_state),
+                    "entry_analysis_gate_snapshot": gate_snapshot,
+                },
             )
             blocked_summary = {
                 "status": "blocked_until_entry_analysis_materialized",
@@ -15447,6 +15502,7 @@ class TaskManager(
                 "candidate_entry_count": 0,
                 "selected_entry_count": 0,
                 "entry_count": 0,
+                "entry_analysis_gate_snapshot": gate_snapshot,
                 **dict(rebuild_state),
             }
             self._persist_stage_run_output_summary(task, stage_run, blocked_summary)

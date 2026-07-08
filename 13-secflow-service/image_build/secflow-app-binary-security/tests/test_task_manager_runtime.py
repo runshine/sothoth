@@ -5527,6 +5527,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             patch.object(manager, "_missing_entry_results_failure_context", return_value=None),
             patch.object(manager, "_source_entry_analysis_barrier_enabled", return_value=True),
             patch.object(manager, "_stage_has_archived_success_progress", return_value=False),
+            patch.object(manager, "_stage_archive_gate_debug_snapshot", return_value={"archived_success_item_count": 0}),
             patch.object(manager, "_abort_local_runtime_if_lease_lost", side_effect=[False, True]),
             patch.object(manager, "_record_event"),
             patch.object(manager, "_write_task_metadata_async", new=_noop_write),
@@ -5540,10 +5541,11 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
             for call in info_log.call_args_list
             if call.args
             and call.args[0]
-            == "binary-security execute_task paused before downstream polling because entry-analysis archive barrier is not satisfied: task_id=%s stage=%s current_stage=%s"
+            == "binary-security execute_task paused before downstream polling because entry-analysis archive barrier is not satisfied: task_id=%s stage=%s current_stage=%s gate_snapshot=%s"
         ]
         self.assertEqual(1, len(barrier_calls))
         self.assertEqual((task.id, "dataflow_vuln_scan", "entry_analysis"), barrier_calls[0].args[1:4])
+        self.assertEqual({"archived_success_item_count": 0}, barrier_calls[0].args[4])
 
     def test_execute_task_logs_when_stage_start_gate_blocks_stage_worker_start(self):
         manager = TaskManager()

@@ -2929,6 +2929,82 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         self.assertTrue(any(event.event_type == "streaming_dataflow_vuln_scan_items_seeded" for event in db.events))
         self.assertEqual(original_task_state, (task.status, task.current_stage, task.runtime_phase))
 
+    def test_trigger_dataflow_items_from_entry_result_respects_per_module_top_n_policy(self):
+        self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="demo",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/tmp/ws",
+            policy_json=json.dumps(
+                {
+                    "pipeline_mode": "mixed_streaming",
+                    "entry_selection_mode": "auto",
+                    "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+                    "entry_analysis_auto_selection_top_n": 1,
+                }
+            ),
+        )
+        upstream_item = BinarySecurityStageItem(
+            id="si-entry",
+            task_id="t1",
+            project_id="p1",
+            stage_run_id="sr-entry",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="mod-a",
+            parent_key="source-project",
+            item_identity_key="module-1::source-project",
+            status="success",
+            downstream_service="entry_analyse",
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[], runtime_leases=[lease])
+
+        seeded = self.manager._trigger_dataflow_items_from_entry_result(
+            db,
+            task,
+            {
+                "module_key": "module-1",
+                "module_name": "mod-a",
+                "entries": [
+                    {
+                        "entry_key": "entry-low",
+                        "module_key": "module-1",
+                        "function_name": "handle_low",
+                        "file_name": "main.c",
+                        "confidence": "low",
+                    },
+                    {
+                        "entry_key": "entry-high",
+                        "module_key": "module-1",
+                        "function_name": "handle_high",
+                        "file_name": "main.c",
+                        "confidence": "high",
+                    },
+                ],
+            },
+            upstream_item=upstream_item,
+        )
+
+        self.assertEqual(["entry-high"], [item.item_key for item in seeded])
+        seeded_event = next(event for event in db.events if event.event_type == "streaming_dataflow_vuln_scan_items_seeded")
+        payload = dict(seeded_event.payload or {})
+        self.assertEqual(2, payload.get("candidate_entry_count"))
+        self.assertEqual(1, payload.get("selected_entry_count"))
+        self.assertEqual("top_n_per_module_by_confidence", payload.get("entry_auto_selection_strategy"))
+        self.assertEqual(1, payload.get("entry_auto_selection_top_n"))
+
     def test_trigger_dataflow_items_from_entry_result_requires_current_owner_for_stage_run_materialization(self):
         self.manager.cfg.runtime_policy.pipeline_mode = "mixed_streaming"
         task = BinarySecurityTask(
