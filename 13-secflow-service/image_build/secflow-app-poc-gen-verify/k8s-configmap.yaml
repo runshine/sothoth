@@ -1,0 +1,47 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: secflow-app-poc-gen-verify-config
+  namespace: secflow-ns
+  labels: { name: secflow-app-poc-gen-verify }
+data:
+  service.yaml: |
+    service_id: secflow-app-poc-gen-verify
+    service_name: PoC 生成与验证服务
+    api_prefix: /api/app/poc-gen-verify
+    host: secflow-app-poc-gen-verify
+    port: 80
+    maturity: alpha
+    description: "PoC 生成与 GDB 验证服务"
+    database:
+      host: "mysql.sothothv2-ns.svc.cluster.local"
+      port: 3306
+      username: "secflow"
+      password: "Huawei12#$"
+      name: "secflow"
+      pool_size: 5
+      max_overflow: 10
+    registry:
+      enabled: true
+      menu_service_url: "http://secflow-platform-menu:80"
+      service_id: secflow-app-poc-gen-verify
+      service_name: "PoC 生成与验证"
+      host: secflow-app-poc-gen-verify
+      port: 80
+      maturity: alpha
+      description: "PoC 生成与 GDB 验证服务"
+      api_prefix: /api/app/poc-gen-verify
+      unregister_on_shutdown: false
+      heartbeat_interval_seconds: 30
+      menu:
+        id: app-poc-gen-verify
+        path: /app/poc-gen-verify
+        icon: bug
+        order: 115
+        level1: { name: "应用工具", name_en: "App Tools" }
+        level2: { name: "PoC 生成与验证", name_en: "PoC Gen & Verify" }
+        level3: { name: "", name_en: "" }
+    app:
+      host: "0.0.0.0"
+      port: 8080
+      debug: false

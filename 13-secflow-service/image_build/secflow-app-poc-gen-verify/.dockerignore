@@ -1,0 +1,11 @@
+# keep the image lean — runtime state & VCS never go in
+workspace/
+tasks/
+logs/
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+.git/
+.gitignore
+*.log

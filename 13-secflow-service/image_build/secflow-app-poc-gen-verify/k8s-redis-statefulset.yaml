@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: secflow-app-poc-gen-verify-redis
+  namespace: secflow-ns
+  labels: { name: secflow-app-poc-gen-verify, component: redis }
+spec:
+  serviceName: secflow-app-poc-gen-verify-redis
+  replicas: 1
+  selector: { matchLabels: { name: secflow-app-poc-gen-verify, component: redis } }
+  template:
+    metadata: { labels: { name: secflow-app-poc-gen-verify, component: redis } }
+    spec:
+      containers:
+        - name: redis
+          image: ghcr.io/glueops/mirror/docker/library/redis:8.0.3-bookworm
+          imagePullPolicy: IfNotPresent
+          ports: [{ name: redis, containerPort: 6379, protocol: TCP }]
+          args: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+          volumeMounts: [{ name: data, mountPath: /data }]
+          resources: { requests: { cpu: "100m", memory: "256Mi" }, limits: { cpu: "500m", memory: "2Gi" } }
+          readinessProbe:
+            exec: { command: ["sh", "-c", "redis-cli ping | grep PONG"] }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            exec: { command: ["sh", "-c", "redis-cli ping | grep PONG"] }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels: { name: secflow-app-poc-gen-verify, component: redis }
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: local-path
+        resources: { requests: { storage: 10Gi } }

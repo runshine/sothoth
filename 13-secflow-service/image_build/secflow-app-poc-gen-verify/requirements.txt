@@ -1,0 +1,12 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.6
+pyyaml>=6.0
+sse-starlette
+sqlalchemy
+pymysql
+cryptography
+httpx
+python-dotenv
+celery[redis]==5.4.0
+redis>=5.0

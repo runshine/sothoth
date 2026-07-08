@@ -1,0 +1,40 @@
+# Dev override for docker-compose: DB = the compose `mysql` service, no menu registry.
+service_id: secflow-app-poc-gen-verify
+service_name: PoC 生成与验证服务 (dev)
+api_prefix: /api/app/poc-gen-verify
+host: 127.0.0.1
+port: 8080
+maturity: alpha
+description: "PoC 生成与 GDB 验证服务 (dev)"
+
+database:
+  host: "mysql"
+  port: 3306
+  username: "secflow"
+  password: "Huawei12#$"
+  name: "secflow"
+  pool_size: 5
+  max_overflow: 10
+
+registry:
+  enabled: false
+  menu_service_url: "http://secflow-platform-menu:80"
+  service_id: secflow-app-poc-gen-verify
+  service_name: "PoC 生成与验证 (dev)"
+  host: 127.0.0.1
+  port: 8080
+  api_prefix: /api/app/poc-gen-verify
+  heartbeat_interval_seconds: 30
+  menu:
+    id: app-poc-gen-verify
+    path: /app/poc-gen-verify
+    icon: bug
+    order: 115
+    level1: { name: "应用工具", name_en: "App Tools" }
+    level2: { name: "PoC 生成与验证", name_en: "PoC Gen & Verify" }
+    level3: { name: "", name_en: "" }
+
+app:
+  host: "0.0.0.0"
+  port: 8080
+  debug: false

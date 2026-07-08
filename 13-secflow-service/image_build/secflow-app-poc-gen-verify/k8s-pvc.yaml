@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: secflow-app-poc-gen-verify-data-nfs-pvc
+  namespace: secflow-ns
+  labels: { name: secflow-app-poc-gen-verify }
+spec:
+  accessModes: [ReadWriteMany]
+  storageClassName: nfs           # match the platform's shared storage class
+  resources: { requests: { storage: 200Gi } }
