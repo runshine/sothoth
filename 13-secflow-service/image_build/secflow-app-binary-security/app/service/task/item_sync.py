@@ -111,15 +111,14 @@ class TaskItemSyncServiceMixin:
         candidates = self._task_reconcile_candidate_items(db, task, force=False)
         if not candidates:
             return False
-        return any(
-            self._compute_item_downstream_action(
-                task,
-                item,
-                for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
-            )["action"]
-            in {"create_child", "sync_child"}
-            for item in candidates
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=candidates,
+            force=False,
+            for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
         )
+        return any(entry["operation"] in {"child_create", "child_sync"} for entry in workset)
 
     def _reconcile_authoritative_archive_item(
         self: TaskManager,
@@ -282,7 +281,6 @@ class TaskItemSyncServiceMixin:
             getattr(item, "downstream_status", None),
             result.get("downstream_status"),
             dict(result.get("downstream") or {}).get("status"),
-            getattr(item, "status", None),
         ]
         for candidate in candidates:
             normalized = self._map_downstream_status(str(candidate or "")) or str(candidate or "").strip().lower()
@@ -297,7 +295,9 @@ class TaskItemSyncServiceMixin:
         return (self._item_authoritative_child_status(item) or "") in self._ACTIVE_CHILD_STATUSES
 
     def _child_counts_as_active_for_parallelism(self: TaskManager, item: BinarySecurityStageItem) -> bool:
-        return self._item_authoritative_child_bound(item) and self._item_authoritative_child_active(item)
+        if self._item_authoritative_child_bound(item) and self._item_authoritative_child_active(item):
+            return True
+        return self._downstream_binding_state(item) == "creating"
 
     def _item_needs_authoritative_terminal_apply(self: TaskManager, item: BinarySecurityStageItem) -> bool:
         if not self._item_authoritative_child_bound(item):
@@ -345,7 +345,8 @@ class TaskItemSyncServiceMixin:
         child_status = self._item_authoritative_child_status(item)
         child_terminal = bool(child_status in self._TERMINAL_CHILD_STATUSES)
         child_active = bool(child_status in self._ACTIVE_CHILD_STATUSES)
-        counts_as_active_child = child_bound and child_active
+        binding_state = self._downstream_binding_state(item)
+        counts_as_active_child = bool(child_bound and child_active)
         if not child_bound:
             if item_status in {"pending", "queued", "running", "dispatching"}:
                 return {
@@ -355,7 +356,7 @@ class TaskItemSyncServiceMixin:
                     "child_terminal": False,
                     "child_active": False,
                     "counts_as_active_child": False,
-                    "reason": "missing_authoritative_child",
+                    "reason": "missing_authoritative_child" if binding_state != "creating" else "missing_authoritative_child_after_create_attempt",
                 }
             return {
                 "action": "noop",
@@ -385,6 +386,16 @@ class TaskItemSyncServiceMixin:
                 "child_active": False,
                 "counts_as_active_child": False,
                 "reason": "terminal_child_already_applied",
+            }
+        if child_status is None:
+            return {
+                "action": "sync_child",
+                "child_bound": True,
+                "child_status": None,
+                "child_terminal": False,
+                "child_active": True,
+                "counts_as_active_child": True,
+                "reason": "bound_child_missing_observation",
             }
         if self._item_needs_initial_downstream_sync(item):
             reason = "active_child_initial_sync"
@@ -468,6 +479,86 @@ class TaskItemSyncServiceMixin:
             }:
                 candidates.append(item)
         return candidates
+
+    def _build_task_downstream_workset(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        items: list[BinarySecurityStageItem],
+        force: bool = False,
+        for_task_status: str | None = None,
+        now_value: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        stage_active_counts: dict[str, int] = {}
+        all_stage_items = db.query(BinarySecurityStageItem).filter(
+            BinarySecurityStageItem.task_id == task.id,
+            BinarySecurityStageItem.downstream_service.isnot(None),
+        ).all()
+        for stage_item in all_stage_items:
+            normalized_stage = str(normalize_stage_name(stage_item.stage_name) or "").strip()
+            if not normalized_stage:
+                continue
+            if not self._child_counts_as_active_for_parallelism(stage_item):
+                continue
+            stage_active_counts[normalized_stage] = stage_active_counts.get(normalized_stage, 0) + 1
+
+        normalized_task_status = (
+            str(for_task_status or getattr(task, "status", "") or "").strip().lower() or None
+        )
+        workset: list[dict[str, Any]] = []
+        for item in items:
+            normalized_stage = str(normalize_stage_name(item.stage_name) or "").strip() or None
+            decision = self._compute_item_downstream_action(
+                task,
+                item,
+                for_task_status=normalized_task_status,
+                now_value=now_value,
+            )
+            missing_recorded_status = self._item_missing_recorded_downstream_status(item)
+            active_child_count = (
+                stage_active_counts.get(normalized_stage or "", 0)
+                if normalized_stage
+                else 0
+            )
+            stage_parallelism = (
+                self._stage_parallelism(task, normalized_stage)
+                if normalized_stage
+                else 0
+            )
+            operation = "noop"
+            blocked_reason: str | None = None
+            if decision["action"] == "create_child":
+                if normalized_stage and active_child_count < stage_parallelism:
+                    operation = "child_create"
+                    stage_active_counts[normalized_stage] = active_child_count + 1
+                else:
+                    blocked_reason = "stage_parallelism_exhausted"
+            elif decision["action"] == "sync_child":
+                operation = "child_sync"
+            elif bool(force) and bool(decision.get("child_bound")):
+                operation = "child_sync"
+                blocked_reason = "forced_child_sync"
+            elif missing_recorded_status and decision.get("child_bound"):
+                operation = "child_sync"
+                blocked_reason = "missing_recorded_downstream_status"
+
+            workset.append(
+                {
+                    "item": item,
+                    "item_id": str(getattr(item, "id", "") or "").strip() or None,
+                    "stage_name": normalized_stage,
+                    "operation": operation,
+                    "force": bool(force or missing_recorded_status),
+                    "decision": decision,
+                    "reason": decision.get("reason"),
+                    "blocked_reason": blocked_reason,
+                    "missing_recorded_status": missing_recorded_status,
+                    "active_child_count": active_child_count,
+                    "stage_parallelism": stage_parallelism,
+                }
+            )
+        return workset
 
     def _stage_item_sync_observation(self: TaskManager, item: BinarySecurityStageItem) -> dict[str, Any]:
         result = self._load_stage_item_result_payload(item)
@@ -946,7 +1037,25 @@ class TaskItemSyncServiceMixin:
         if status == "pending":
             return True
         if status == "failed":
-            return bool(self._task_reconcile_candidate_items(db, task, force=False, include_failed_terminal_items=False))
+            candidates = self._task_reconcile_candidate_items(
+                db,
+                task,
+                force=False,
+                include_failed_terminal_items=True,
+            )
+            if not candidates:
+                return False
+            workset = self._build_task_downstream_workset(
+                db,
+                task,
+                items=candidates,
+                force=False,
+                for_task_status=status,
+            )
+            return any(
+                str(entry.get("operation") or "").strip() in {"child_create", "child_sync"}
+                for entry in workset
+            )
         if status not in {"dispatching", "running"}:
             return False
         if self._streaming_mode_enabled(task) and self._is_streaming_tail_stage(task, task.current_stage):
@@ -1721,14 +1830,17 @@ class TaskItemSyncServiceMixin:
         touched_stages: set[str] = set()
         stage_takeover_candidates: set[str] = set()
         auth_token = token or self._service_token()
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=items,
+            force=force,
+            for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
+        )
         ready_items: list[BinarySecurityStageItem] = []
-        for item in items:
-            decision = self._compute_item_downstream_action(
-                task,
-                item,
-                for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
-            )
-            if decision["action"] != "sync_child":
+        for entry in workset:
+            item = entry["item"]
+            if entry["operation"] != "child_sync":
                 self._repair_false_not_started_binding_mismatch(item)
                 skipped_count += 1
                 continue
@@ -2334,20 +2446,22 @@ class TaskItemSyncServiceMixin:
                             )
                             skipped_count += 1
                             continue
-                        job = self._ensure_downstream_archive_job(
+                        archive_root, job = await self._queue_archive_and_wait(
                             db,
                             task,
                             item,
                             payload=payload,
                             mapped_status=mapped_status,
                             before_status=before_status,
-                            force=force,
                         )
-                        if job.archive_status == "success":
+                        if job is None:
+                            skipped_count += 1
+                            continue
+                        if str(getattr(job, "archive_status", "") or "").strip().lower() in {"success", "archived"}:
                             await self._apply_archive_job_status_locked(
                                 db,
                                 job.id,
-                                job.archive_root,
+                                archive_root or job.archive_root,
                                 state_event_id=None,
                             )
                             if hasattr(db, "expire_all"):
@@ -2571,17 +2685,31 @@ class TaskItemSyncServiceMixin:
                             and mapped_status in {"pending", "queued", "running", "dispatching"}
                             and mapped_status != before_status
                         )
+                        observed_sync_status = (
+                            "synced"
+                            if mapped_status in {"pending", "queued", "running", "dispatching"}
+                            else "skipped"
+                        )
+                        observed_last_result = (
+                            "success"
+                            if observed_sync_status == "synced"
+                            else None
+                        )
                         self._refresh_stage_item_downstream_observation(
                             item,
-                            sync_status="skipped",
+                            sync_status=observed_sync_status,
                             synced_at=sync_observed_at,
                             status_raw=downstream_status,
                             mapped_status=mapped_status,
                             downstream_status=downstream_status,
                             state_applied=False,
                             downstream_payload=payload,
+                            last_sync_result=observed_last_result,
                         )
-                        skipped_count += 1
+                        if observed_sync_status == "skipped":
+                            skipped_count += 1
+                        else:
+                            synced_count += 1
                     skip_reason_code, skip_reason_category = self._classify_downstream_sync_skip_reason(
                         mapped_status=mapped_status,
                         before_status=before_status,

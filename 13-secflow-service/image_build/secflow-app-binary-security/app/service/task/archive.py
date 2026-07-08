@@ -1053,7 +1053,7 @@ class TaskArchiveServiceMixin:
             db.refresh(item)
         except Exception:
             db.rollback()
-        if completed is None or completed.archive_status != "success":
+        if completed is None or str(getattr(completed, "archive_status", "") or "").strip().lower() not in {"success", "archived"}:
             error = completed.error_message if completed is not None else "归档任务不存在"
             self._record_event(
                 db,

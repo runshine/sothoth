@@ -1,6 +1,7 @@
 import asyncio
 import re
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -545,6 +546,71 @@ class DownstreamControlPathTests(unittest.TestCase):
         event_types = [getattr(event, "event_type", "") for event in db.added]
         self.assertNotIn("child_task_retry_requested", event_types)
         self.assertIn("child_observation_observed", event_types)
+
+    def test_downstream_controller_control_existing_child_treats_dispatching_post_retry_check_as_already_running(self):
+        task = BinarySecurityTask(id="t1", project_id="p1", name="source")
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-1",
+            status="failed",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], events=[])
+        controller = self.manager._downstream_tasks()
+
+        with patch.object(
+            controller,
+            "invoke_retry_or_restart",
+            new=AsyncMock(side_effect=ValidationError("retry not supported")),
+        ), patch.object(
+            controller,
+            "fetch_child_payload",
+            new=AsyncMock(
+                side_effect=[
+                    {"task_id": "eat-1", "status": "failed"},
+                    {"task_id": "eat-1", "status": "dispatching"},
+                ]
+            ),
+        ):
+            control = asyncio.run(
+                controller.control_existing_child(
+                    db,
+                    stage_name="entry_analysis",
+                    task=task,
+                    item=item,
+                    token="token",
+                )
+            )
+
+        self.assertEqual("already_running", control["outcome"])
+        self.assertEqual("invalid_transition", control["retry_outcome"])
+
+    def test_wait_child_refs_inactive_treats_cancelling_child_as_still_active(self):
+        controller = self.manager._downstream_tasks()
+        self.manager.cfg.scheduler.downstream_request_timeout_seconds = 1
+        self.manager.cfg.scheduler.stage_poll_interval_seconds = 0
+        refs = [{"service": "entry_analyse", "project_id": "p1", "task_id": "eat-1"}]
+        clock = {"value": task_manager_module._now()}
+
+        def _fake_now_local():
+            current = clock["value"]
+            clock["value"] = current + timedelta(seconds=2)
+            return current
+
+        with patch.object(
+            controller,
+            "fetch_child_ref_payload",
+            new=AsyncMock(return_value={"task_id": "eat-1", "status": "cancelling"}),
+        ), patch("app.service.downstream_tasks.asyncio.sleep", new=AsyncMock(return_value=None)), patch(
+            "app.service.downstream_tasks.now_local",
+            side_effect=_fake_now_local,
+        ):
+            with self.assertRaisesRegex(ValidationError, "仍在运行"):
+                asyncio.run(controller.wait_child_refs_inactive(refs, "token"))
 
     def test_downstream_controller_cancel_records_child_task_events(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="source")

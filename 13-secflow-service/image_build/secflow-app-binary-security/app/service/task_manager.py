@@ -231,6 +231,7 @@ from app.service.task.shared import (
 )
 from app.service.task_queue import get_task_queue
 from app.service.http_client import get_shared_async_client
+from app.service.http_client import close_async_clients_for_current_loop
 from app.service.stages.registry import get_binary_security_stage_registry
 from app.service.knowledge_graph_audit import get_knowledge_graph_audit_client
 from app.service.llm_gateway import LLMGatewayWorkKeyIssueError, get_llm_gateway_client
@@ -706,6 +707,8 @@ class TaskRuntimeThreadHandle:
     stop_event: threading.Event = field(default_factory=threading.Event)
     done_event: threading.Event = field(default_factory=threading.Event)
     cancel_requested: bool = False
+    loop_ready: threading.Event = field(default_factory=threading.Event)
+    event_loop: asyncio.AbstractEventLoop | None = None
 
     def done(self) -> bool:
         return self.done_event.is_set() or not self.thread.is_alive()
@@ -809,6 +812,10 @@ class TaskManager(
         self._readonly_projection_cache_lock = threading.Lock()
         self._loop_heartbeats: dict[str, datetime] = {}
         self._runtime_loop: asyncio.AbstractEventLoop | None = None
+        self._async_bridge_loop: asyncio.AbstractEventLoop | None = None
+        self._async_bridge_thread: threading.Thread | None = None
+        self._async_bridge_ready = threading.Event()
+        self._async_bridge_lock = threading.Lock()
         self._lease_watchdog_thread: threading.Thread | None = None
         self._lease_watchdog_stop_event = threading.Event()
         self._lease_watchdog_state_lock = threading.Lock()
@@ -1046,6 +1053,14 @@ class TaskManager(
                 observation["replacement_in_progress"] = False
                 result["sync_observation"] = observation
                 stage_item.result = result
+                self._set_downstream_binding_snapshot(
+                    stage_item,
+                    state="created",
+                    last_error=None,
+                    last_error_type=None,
+                    recoverable=None,
+                    message=message,
+                )
             return _mark_downstream_binding_created
         if item == "_lease_filter_available":
             def _lease_filter_available():
@@ -1065,6 +1080,21 @@ class TaskManager(
                 observation["replacement_in_progress"] = False
                 result["sync_observation"] = observation
                 stage_item.result = result
+                binding = dict(self._downstream_binding_snapshot(stage_item) or {})
+                attempts = max(1, int(binding.get("attempts") or 0) + 1)
+                first_attempt_at = self._downstream_binding_time(stage_item, "first_attempt_at") or _now()
+                self._set_downstream_binding_snapshot(
+                    stage_item,
+                    state="creating",
+                    attempts=attempts,
+                    first_attempt_at=first_attempt_at,
+                    last_attempt_at=_now(),
+                    next_retry_at=None,
+                    last_error=None,
+                    last_error_type=None,
+                    recoverable=True,
+                    message="下游创建中",
+                )
             return _mark_downstream_binding_creating
         if item == "_should_recreate_entry_child_from_terminal_status":
             def _should_recreate_entry_child_from_terminal_status(*, retrying, terminal_status):
@@ -1585,24 +1615,6 @@ class TaskManager(
             payload=effective_payload,
             event_payload=event_payload,
         )
-        self._record_stage_item_sync_audit(
-            db,
-            task=task,
-            item=item,
-            stage_name=str(getattr(item, "stage_name", "") or "").strip() or None,
-            downstream_service=service,
-            operation="downstream_create",
-            event_type="applied",
-            sync_status="observed",
-            outcome="success",
-            state_applied=True,
-            payload={
-                "service": str(service or ""),
-                "created_task_id": created.get("task_id") or created.get("id"),
-                "created_status": created.get("status"),
-                **(event_payload or {}),
-            },
-        )
         return created
 
     async def _downstream_control_existing_task(
@@ -1614,18 +1626,6 @@ class TaskManager(
         item: BinarySecurityStageItem,
         token: str | None,
     ) -> dict[str, Any]:
-        normalized_status = str(item.status or "").strip().lower()
-        if str(item.downstream_task_id or "").strip():
-            try:
-                self._release_session_connection_before_wait(db)
-                payload = await self._fetch_downstream_task_payload(task, item, token or "")
-            except Exception:
-                payload = None
-            mapped = self._map_downstream_status(str((payload or {}).get("status") or ""))
-            if payload and mapped == "running":
-                return {"outcome": "already_running", "payload": payload}
-            if normalized_status in {"running", "dispatching"} and payload and mapped == "pending":
-                return {"outcome": "already_running", "payload": payload}
         self._release_session_connection_before_wait(db)
         return await self._downstream_tasks().control_existing_child(
             db,
@@ -2093,6 +2093,20 @@ class TaskManager(
     def _has_local_task_execution_owner(self, task_id: str) -> bool:
         return self._task_execution_owner_count(task_id) > 0
 
+    def _local_runtime_owner_alive(self, task_id: str) -> bool:
+        handle = self._runtime_handle(task_id)
+        if handle is None:
+            return False
+        if bool(handle.cancel_requested) or bool(handle.release_requested) or bool(handle.takeover_observed):
+            return False
+        if not bool(handle.owner_active):
+            return False
+        if self._has_local_task_execution_owner(task_id):
+            return True
+        if bool(handle.active_commit_succeeded) and bool(handle.lease_established):
+            return True
+        return not handle.done()
+
     def _runtime_handle(self, task_id: str) -> TaskRuntimeHandle | None:
         return self._workers.get(str(task_id or "").strip())
 
@@ -2267,11 +2281,33 @@ class TaskManager(
         thread_name = f"binary-security-sync-maintenance-{normalized_task_id}"
         stop_event = threading.Event()
         done_event = threading.Event()
+        loop_ready = threading.Event()
+        handle = TaskRuntimeThreadHandle(
+            name=thread_name,
+            thread=None,  # type: ignore[arg-type]
+            stop_event=stop_event,
+            done_event=done_event,
+            loop_ready=loop_ready,
+        )
 
         def _worker() -> None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            handle.event_loop = loop
+            handle.loop_ready.set()
             try:
-                self._run_task_sync_maintenance_thread_worker(normalized_task_id, stop_event)
+                self._run_task_sync_maintenance_thread_worker(normalized_task_id, stop_event, loop)
             finally:
+                try:
+                    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.run_until_complete(close_async_clients_for_current_loop())
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
                 done_event.set()
 
         thread = threading.Thread(
@@ -2279,12 +2315,7 @@ class TaskManager(
             name=thread_name,
             daemon=True,
         )
-        handle = TaskRuntimeThreadHandle(
-            name=thread_name,
-            thread=thread,
-            stop_event=stop_event,
-            done_event=done_event,
-        )
+        handle.thread = thread
         return handle
 
     def _request_local_worker_control_wakeup_nowait(
@@ -2310,14 +2341,38 @@ class TaskManager(
         handle.release_requested = False
         return True
 
-    async def _restart_local_runtime_for_active_owner(self, task_id: str) -> bool:
+    async def _restart_local_runtime_for_active_owner(
+        self,
+        task_id: str,
+        *,
+        replace_current_runner: bool = False,
+    ) -> bool:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return False
         async with self._worker_lock:
             existing = self._workers.get(normalized_task_id)
-            if existing is not None and not existing.done() and not existing.cancel_requested:
+            current_runner = asyncio.current_task()
+            replacing_live_runner = bool(
+                replace_current_runner
+                and existing is not None
+                and getattr(existing, "runner_task", None) is current_runner
+            )
+            if existing is not None and not existing.done() and not existing.cancel_requested and not replacing_live_runner:
                 return False
+            if existing is not None:
+                heartbeat_task = getattr(existing, "heartbeat_task", None)
+                if heartbeat_task is not None and not heartbeat_task.done():
+                    heartbeat_task.cancel()
+                sync_maintenance_task = getattr(existing, "sync_maintenance_task", None)
+                if sync_maintenance_task is not None and not sync_maintenance_task.done():
+                    sync_maintenance_task.cancel()
+                if (
+                    not replacing_live_runner
+                    and getattr(existing, "runner_task", None) is not None
+                    and not existing.runner_task.done()
+                ):
+                    existing.runner_task.cancel()
             runner_task = asyncio.create_task(
                 self._run_task(normalized_task_id),
                 name=f"binary-security-{normalized_task_id}-restart",
@@ -2670,7 +2725,13 @@ class TaskManager(
         self,
         task_id: str,
         stop_event: threading.Event,
+        loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
+        owns_loop = False
+        if loop is None:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            owns_loop = True
         interval_seconds = max(
             1,
             int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
@@ -2703,7 +2764,13 @@ class TaskManager(
                 if self._should_abort_local_runtime_after_lease_loss(ownership_decision):
                     return
                 try:
-                    processed = self._service_local_runtime_sync_maintenance_blocking(task_id)
+                    service_blocking = self._service_local_runtime_sync_maintenance_blocking
+                    try:
+                        processed = service_blocking(task_id, loop=loop)
+                    except TypeError as exc:
+                        if "unexpected keyword argument 'loop'" not in str(exc):
+                            raise
+                        processed = service_blocking(task_id)
                     if processed:
                         self._mark_runtime_handle_sync_progress(task_id)
                 except StaleTaskExecution:
@@ -2715,6 +2782,8 @@ class TaskManager(
                     )
                     stop_event.wait(2)
                     continue
+                if not self._running or stop_event.is_set():
+                    return
                 stop_event.wait(interval_seconds)
         finally:
             handle = self._runtime_handle(task_id)
@@ -2738,6 +2807,17 @@ class TaskManager(
                 exit_payload["runner_done"],
                 exit_payload["heartbeat_done"],
             )
+            if owns_loop:
+                try:
+                    pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                    for current in pending:
+                        current.cancel()
+                    if pending:
+                        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                    loop.run_until_complete(close_async_clients_for_current_loop())
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
 
     def _verify_local_runtime_lease_or_abort(
         self,
@@ -2869,7 +2949,26 @@ class TaskManager(
         finally:
             handle.sync_maintenance_in_progress = False
 
-    def _service_local_runtime_sync_maintenance_blocking(self, task_id: str) -> bool:
+    def _service_local_runtime_sync_maintenance_blocking(
+        self,
+        task_id: str,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> bool:
+        target_loop = loop
+        if target_loop is not None and not target_loop.is_closed():
+            try:
+                current_loop = asyncio.get_event_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is target_loop and not target_loop.is_running():
+                return bool(target_loop.run_until_complete(self._service_local_runtime_sync_maintenance(task_id)))
+            if target_loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    self._service_local_runtime_sync_maintenance(task_id),
+                    target_loop,
+                )
+                return bool(future.result())
         return asyncio.run(self._service_local_runtime_sync_maintenance(task_id))
 
     async def _reconcile_periodic_task_sync_requests(self, task_id: str) -> int:
@@ -3313,22 +3412,45 @@ class TaskManager(
             asyncio.get_running_loop()
         except RuntimeError:
             return self._run_sync(coro)
+        loop = self._ensure_async_bridge_loop()
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        return future.result()
 
-        result: dict[str, Any] = {}
-        error: dict[str, BaseException] = {}
+    def _ensure_async_bridge_loop(self) -> asyncio.AbstractEventLoop:
+        loop = self._async_bridge_loop
+        thread = self._async_bridge_thread
+        if loop is not None and thread is not None and thread.is_alive() and not loop.is_closed():
+            return loop
+        with self._async_bridge_lock:
+            loop = self._async_bridge_loop
+            thread = self._async_bridge_thread
+            if loop is not None and thread is not None and thread.is_alive() and not loop.is_closed():
+                return loop
+            self._async_bridge_ready.clear()
 
-        def _runner() -> None:
-            try:
-                result["value"] = asyncio.run(coro)
-            except BaseException as exc:  # pragma: no cover - re-raised to caller
-                error["value"] = exc
+            def _runner() -> None:
+                bridge_loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(bridge_loop)
+                self._async_bridge_loop = bridge_loop
+                self._async_bridge_ready.set()
+                bridge_loop.run_forever()
+                pending = [task for task in asyncio.all_tasks(bridge_loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    with suppress(Exception):
+                        bridge_loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                bridge_loop.close()
 
-        thread = threading.Thread(target=_runner, name="binary-security-async-bridge", daemon=True)
-        thread.start()
-        thread.join()
-        if "value" in error:
-            raise error["value"]
-        return result.get("value")
+            thread = threading.Thread(target=_runner, name="binary-security-async-bridge", daemon=True)
+            thread.start()
+            self._async_bridge_thread = thread
+            if not self._async_bridge_ready.wait(timeout=5):
+                raise RuntimeError("binary-security async bridge loop failed to start")
+            loop = self._async_bridge_loop
+            if loop is None or loop.is_closed():
+                raise RuntimeError("binary-security async bridge loop unavailable")
+            return loop
 
     def _parent_takeover_lock_ttl_seconds(self) -> int:
         return 60
@@ -4223,7 +4345,7 @@ class TaskManager(
     ) -> _RuntimeLeaseOwnershipDecision:
         normalized_task_id = str(task_id or "").strip()
         normalized_expected_owner = str(expected_owner or self.instance_id or "").strip() or None
-        local_handle_alive = bool(self._has_local_task_execution_owner(normalized_task_id))
+        local_handle_alive = bool(self._local_runtime_owner_alive(normalized_task_id))
         if not normalized_task_id:
             return _RuntimeLeaseOwnershipDecision(
                 should_continue=False,
@@ -4305,7 +4427,7 @@ class TaskManager(
                 return _RuntimeLeaseOwnershipDecision(
                     should_continue=False,
                     abort_reason="runtime_lease_verification_failed",
-                    local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+                    local_handle_alive=bool(self._local_runtime_owner_alive(task_id)),
                     verification_error=str(exc),
                 )
             except Exception as exc:
@@ -4315,7 +4437,7 @@ class TaskManager(
                 return _RuntimeLeaseOwnershipDecision(
                     should_continue=False,
                     abort_reason="runtime_lease_verification_failed",
-                    local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+                    local_handle_alive=bool(self._local_runtime_owner_alive(task_id)),
                     verification_error=str(exc),
                 )
             last_decision = decision
@@ -4326,7 +4448,7 @@ class TaskManager(
         return last_decision or _RuntimeLeaseOwnershipDecision(
             should_continue=False,
             abort_reason="runtime_lease_verification_failed",
-            local_handle_alive=bool(self._has_local_task_execution_owner(task_id)),
+            local_handle_alive=bool(self._local_runtime_owner_alive(task_id)),
         )
 
     def _local_runtime_handle_state(self, task_id: str) -> str:
@@ -4629,26 +4751,6 @@ class TaskManager(
             decision_reason="runtime_lease_missing_or_expired",
         )
 
-    def _should_enqueue_parent_dispatch_for_task_sync(
-        self,
-        db: Session | None,
-        task: BinarySecurityTask,
-        *,
-        sync_kind: str,
-        force: bool,
-    ) -> bool:
-        normalized_sync_kind = str(sync_kind or "child_sync").strip() or "child_sync"
-        normalized_status = str(getattr(task, "status", "") or "").strip().lower()
-        if self._task_is_hidden_by_delete_queue(task):
-            return False
-        if normalized_status in TASK_TERMINAL_STATUSES and not str(getattr(task, "current_operation_id", "") or "").strip():
-            return False
-        if self._task_has_healthy_active_owner_runtime(db, task):
-            return False
-        if normalized_sync_kind == "child_sync":
-            return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING} or bool(force)
-        return normalized_status in {"pending", "dispatching", "running", TASK_STATUS_CANCELLING, "failed"} or bool(force)
-
     async def _release_task_without_supported_runtime_owner_async(
         self,
         db: Session,
@@ -4725,6 +4827,7 @@ class TaskManager(
         previous_status = str(getattr(task, "status", "") or "").strip().lower()
         current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
         observed_owner = str(decision.runtime_lease_owner or "").strip() or None
+        should_force_requeue = False
         try:
             with self._savepoint(db):
                 refreshed_snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
@@ -4810,21 +4913,13 @@ class TaskManager(
                     level="warning",
                 )
                 self._repair_active_operations_for_task(db, task)
-                requeue_succeeded = bool(
-                    await self._enqueue_task_and_wait(
-                        task.id,
-                        context="owned_execution_release_for_takeover",
-                        timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
-                        force_requeue=True,
-                    )
-                )
                 summary = dict(getattr(task, "summary", None) or {})
                 summary["parent_takeover_pending_claim"] = {
                     "active": True,
                     "released_at": _isoformat_or_none(_now()),
                     "released_by_instance_id": str(self.instance_id or "").strip() or None,
                     "enqueue_context": "owned_execution_release_for_takeover",
-                    "requeue_succeeded": bool(requeue_succeeded),
+                    "requeue_succeeded": False,
                 }
                 task.summary = summary
                 self._record_event(
@@ -4843,10 +4938,33 @@ class TaskManager(
                         "local_task_runtime_handle_alive": self._has_local_task_execution_owner(task.id),
                         "local_streaming_stage_worker_alive": self._task_has_active_streaming_stage_workers(task.id),
                         "active_runtime_lease_owner": active_runtime_lease_owner,
-                        "force_requeue": requeue_succeeded,
+                        "force_requeue": False,
                         "enqueue_context": "owned_execution_release_for_takeover",
                     },
                 )
+                should_force_requeue = True
+            if should_force_requeue:
+                db.commit()
+            requeue_succeeded = bool(
+                await self._enqueue_task_and_wait(
+                    task.id,
+                    context="owned_execution_release_for_takeover",
+                    timeout_seconds=self._initial_enqueue_wait_timeout_seconds(),
+                    force_requeue=True,
+                )
+            ) if should_force_requeue else False
+            if should_force_requeue:
+                refresh_task = None
+                if hasattr(db, "query"):
+                    refresh_task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
+                if refresh_task is not None:
+                    task = refresh_task
+                summary = dict(getattr(task, "summary", None) or {})
+                takeover_pending_claim = dict(summary.get("parent_takeover_pending_claim") or {})
+                if takeover_pending_claim:
+                    takeover_pending_claim["requeue_succeeded"] = bool(requeue_succeeded)
+                    summary["parent_takeover_pending_claim"] = takeover_pending_claim
+                    task.summary = summary
                 if requeue_succeeded:
                     self._record_event(
                         db,
@@ -4877,6 +4995,7 @@ class TaskManager(
                             "enqueue_context": "owned_execution_release_for_takeover",
                         },
                     )
+                db.commit()
                 return True
         except OperationalError as exc:
             if not self._is_retryable_lock_error(exc):
@@ -5929,13 +6048,32 @@ class TaskManager(
                     },
                 )
             raise
-        if self._should_enqueue_parent_dispatch_for_task_sync(
-            db,
-            task,
-            sync_kind=entry["operation"],
-            force=bool(entry["force"]),
-        ):
-            self._enqueue_task(task.id)
+        if db is not None:
+            normalized_status = str(getattr(task, "status", "") or "").strip().lower()
+            if (
+                not self._task_is_hidden_by_delete_queue(task)
+                and normalized_status in {"dispatching", "running", TASK_STATUS_CANCELLING}
+                and not self._task_has_healthy_active_owner_runtime(db, task)
+            ):
+                self._record_event(
+                    db,
+                    task,
+                    "task_sync_request_owner_missing_detected",
+                    "子任务同步请求已保留在任务内队列，但当前缺少健康 owner，等待 runtime/lease 修复后继续处理",
+                    level="warning",
+                    stage_name=entry.get("stage_name"),
+                    payload={
+                        "operation": entry["operation"],
+                        "reason": entry["reason"],
+                        "source": entry["source"],
+                        "source_event_type": entry.get("source_event_type"),
+                        "item_ids": list(entry.get("item_ids") or []),
+                        "archive_job_ids": list(entry.get("archive_job_ids") or []),
+                        "dedupe_key": dedupe_key,
+                        "task_sync_queue_only": True,
+                        "shared_dispatch_enqueued": False,
+                    },
+                )
         return normalized_entry
 
     async def _reconcile_missing_task_sync_requests(self, db: Session, task: BinarySecurityTask) -> int:
@@ -5988,6 +6126,8 @@ class TaskManager(
                     "item_ids": list(entry.get("item_ids") or []),
                     "archive_job_ids": list(entry.get("archive_job_ids") or []),
                     "dedupe_key": dedupe_key,
+                    "task_sync_queue_only": True,
+                    "shared_dispatch_enqueued": False,
                 },
             )
             repaired += 1
@@ -6001,39 +6141,46 @@ class TaskManager(
     ) -> list[dict[str, Any]]:
         expected: list[dict[str, Any]] = []
         seen: set[str] = set()
-        for item in self._task_reconcile_candidate_items(
+        candidate_items = self._task_reconcile_candidate_items(
             db,
             task,
             force=False,
             include_failed_terminal_items=True,
-        ):
-            normalized_stage = str(normalize_stage_name(item.stage_name) or "").strip() or None
+        )
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=candidate_items,
+            force=False,
+            for_task_status=str(task.status or "").strip().lower() or None,
+        )
+        for work_item in workset:
+            item = work_item["item"]
+            normalized_stage = work_item["stage_name"]
             observed_status = self._latest_observed_downstream_status(item)
-            decision = self._compute_item_downstream_action(
-                task,
-                item,
-                for_task_status=str(task.status or "").strip().lower() or None,
-            )
-            missing_recorded_status = self._item_missing_recorded_downstream_status(item)
-            if decision["action"] == "noop" and not missing_recorded_status:
+            operation = str(work_item.get("operation") or "").strip()
+            if operation not in {"child_create", "child_sync"}:
                 continue
             entry = {
-                "operation": "child_create" if decision["action"] == "create_child" else "child_sync",
+                "operation": operation,
                 "source": "db_repair",
                 "reason": "repair_missing_or_stale_sync_queue_entry",
                 "source_event_type": "task_sync_queue_repair",
                 "stage_name": normalized_stage,
                 "item_ids": [str(item.id or "").strip()] if str(item.id or "").strip() else [],
                 "archive_job_ids": [],
-                "force": bool(missing_recorded_status),
+                "force": bool(work_item.get("force")),
                 "payload": {
                     "item_key": str(item.item_key or "").strip() or None,
                     "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
                     "observed_downstream_status": observed_status,
-                    "decision_reason": decision["reason"],
+                    "decision_reason": work_item.get("reason"),
+                    "blocked_reason": work_item.get("blocked_reason"),
+                    "stage_parallelism": int(work_item.get("stage_parallelism") or 0),
+                    "active_child_count": int(work_item.get("active_child_count") or 0),
                     "cross_stage_sync": bool(normalized_stage and normalized_stage != str(normalize_stage_name(task.current_stage) or "").strip()),
                 },
-                "priority": 10 if decision["action"] == "create_child" else 20 if missing_recorded_status else 30,
+                "priority": 10 if operation == "child_create" else 20 if work_item.get("missing_recorded_status") else 30,
             }
             dedupe_key = self._task_sync_request_dedupe_key(
                 operation=entry["operation"],
@@ -6351,7 +6498,16 @@ class TaskManager(
         try:
             self._configure_runtime_session_fast_lock_wait_timeout(sync_db)
             if operation == "child_create":
-                self._enqueue_task(task_id)
+                self._run_async_blocking(
+                    self._create_downstream_children(
+                        sync_db,
+                        project_id=project_id,
+                        task_id=task_id,
+                        stage_name=stage_name,
+                        item_ids=item_ids or None,
+                        force=force,
+                    )
+                )
                 return
             self._run_async_blocking(
                 self.sync_downstream_status(
@@ -6368,6 +6524,150 @@ class TaskManager(
             )
         finally:
             sync_db.close()
+
+    async def _create_downstream_children(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        stage_name: str | None = None,
+        item_ids: list[str] | None = None,
+        force: bool = False,
+    ) -> BinarySecurityActionResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        self._ensure_task_write_ownership(task, db=db)
+        requested_ids = [str(current_id).strip() for current_id in list(item_ids or []) if str(current_id).strip()]
+        if requested_ids:
+            items, missing_requested_item_ids = self._task_reconcile_requested_items(
+                db,
+                task,
+                stage_name=stage_name,
+                item_ids=requested_ids,
+            )
+            if not items:
+                raise NotFoundError("阶段子任务不存在")
+        else:
+            items = self._task_reconcile_candidate_items(
+                db,
+                task,
+                stage_name=stage_name,
+                force=force,
+                include_failed_terminal_items=True,
+            )
+            missing_requested_item_ids = []
+
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=items,
+            force=force,
+            for_task_status=str(getattr(task, "status", "") or "").strip().lower() or None,
+        )
+        created_count = 0
+        skipped_count = 0
+        created_item_ids: list[str] = []
+        skipped_item_ids: list[str] = []
+        for entry in workset:
+            item = entry["item"]
+            operation_name = str(entry.get("operation") or "").strip()
+            if (
+                operation_name != "child_create"
+                and requested_ids
+                and not str(getattr(item, "downstream_task_id", "") or "").strip()
+                and self._downstream_binding_state(item) == "creating"
+            ):
+                operation_name = "child_create"
+            if operation_name != "child_create":
+                if str(entry.get("blocked_reason") or "").strip() == "stage_parallelism_exhausted":
+                    skipped_count += 1
+                    skipped_item_ids.append(str(item.id or "").strip())
+                    self._record_downstream_sync_event(
+                        db,
+                        task=task,
+                        item=item,
+                        stage_name=str(item.stage_name or "").strip() or None,
+                        operation="downstream_create",
+                        event_type="skipped",
+                        sync_status="skipped",
+                        outcome="parallelism_limited",
+                        state_applied=False,
+                        error_type="stage_parallelism_exhausted",
+                        error_message="当前阶段活跃下游数量已达到并发上限，本轮暂不创建新的下游任务",
+                        payload={
+                            "item_id": str(item.id or "").strip() or None,
+                            "item_key": str(item.item_key or "").strip() or None,
+                            "stage_parallelism": int(entry.get("stage_parallelism") or 0),
+                            "active_child_count": int(entry.get("active_child_count") or 0),
+                        },
+                    )
+                continue
+
+            try:
+                service, token, payload = self._build_child_create_request_for_item(db, task, item)
+                self._mark_downstream_binding_creating(item)
+                created = await self._downstream_create_task(
+                    db,
+                    task,
+                    item,
+                    service=service,
+                    token=token,
+                    payload=payload,
+                )
+                item = self._reattach_stage_item_after_async_wait(db, item)
+                self._apply_created_downstream_child(
+                    db,
+                    task,
+                    item,
+                    created=created,
+                    reason=f"{normalize_stage_name(item.stage_name)}_child_create",
+                    event_type="downstream_child_created",
+                )
+                self._refresh_stage_run_from_items(db, task, str(item.stage_name or "").strip())
+                db.commit()
+                created_count += 1
+                created_item_ids.append(str(item.id or "").strip())
+            except Exception as exc:
+                self._set_downstream_binding_snapshot(
+                    item,
+                    state="create_failed",
+                    last_attempt_at=_now(),
+                    last_error=str(exc),
+                    last_error_type=exc.__class__.__name__,
+                    recoverable=True,
+                    message="下游创建失败，等待后续重新尝试",
+                )
+                self._persist_child_sync_observation(
+                    db,
+                    task=task,
+                    item=item,
+                    change_source="child_create",
+                    sync_status="transport_error",
+                    synced_at=_now(),
+                    error_message=str(exc),
+                    error_type=exc.__class__.__name__,
+                    state_applied=False,
+                    extra_payload={
+                        "operation": "child_create",
+                        "downstream_service": str(getattr(item, "downstream_service", "") or "").strip() or None,
+                    },
+                )
+                db.commit()
+                raise
+
+        if skipped_count > 0:
+            db.commit()
+        return BinarySecurityActionResponse(
+            task_id=task.id,
+            message="下游任务创建处理完成",
+            detail={
+                "created_count": created_count,
+                "skipped_count": skipped_count,
+                "created_item_ids": created_item_ids,
+                "skipped_item_ids": skipped_item_ids,
+                "missing_requested_item_ids": missing_requested_item_ids,
+            },
+        )
 
     def _resolve_task_sync_entry_item_targets(
         self,
@@ -8065,6 +8365,15 @@ class TaskManager(
             **analysis_metrics,
         }
 
+    def _knowledge_graph_upstream_terminal_state(self, meta: dict[str, Any]) -> tuple[bool, bool]:
+        graph_status = str(meta.get("graph_status") or "").strip().lower()
+        identification_state = str(meta.get("identification_state") or "").strip().lower()
+        if graph_status in {"failed", "superseded"} or identification_state == "failed":
+            return True, False
+        if identification_state == "done":
+            return True, True
+        return False, False
+
     def _filter_candidate_modules(self, modules: list[dict[str, Any]], risk_levels: list[str]) -> list[dict[str, Any]]:
         allowed = set(_normalize_module_risk_levels(risk_levels))
         candidates = [
@@ -8649,6 +8958,7 @@ class TaskManager(
         for key, value in updates.items():
             if value is None:
                 continue
+            value = self._normalize_result_payload_value(value)
             if merged_output_ref.get(key) == value:
                 continue
             merged_output_ref[key] = value
@@ -10845,41 +11155,98 @@ class TaskManager(
         mapped_status: str,
         archived_dir: Path | None,
     ) -> None:
-        if item.stage_name != "system_analysis" or item.downstream_service != "system_analyse":
-            return
         if mapped_status != "success":
             return
-        result_payload: dict[str, Any] = {}
-        try:
-            result_payload = await self._downstream_fetch_item_result(item)
-        except Exception:
-            result_payload = {}
-        firmware = self._system_analysis_input_for_item(task, item)
         artifact_root = archived_dir or self._service_output_dir(
             task,
             item.downstream_service or item.stage_name,
             item.item_key,
             item.downstream_task_id,
         )
-        modules = self._parse_system_analysis_modules(artifact_root, firmware, result_payload)
-        self._persist_stage_item_result(
-            task,
-            item,
-            stage_name=item.stage_name,
-            result={
-                **self._lightweight_system_analysis_input(firmware),
-                "modules": self._lightweight_modules_for_storage(modules),
-                "module_count": len(modules),
-                "downstream": self._lightweight_downstream_payload(payload),
-                "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
-                "downstream_status_synced_at": _now().isoformat(),
-            },
-        )
-        item.output_ref = {
-            **(item.output_ref or {}),
-            "artifact_root": str(artifact_root),
-            "archive_root": str(artifact_root),
-        }
+        if item.stage_name == "system_analysis" and item.downstream_service == "system_analyse":
+            result_payload: dict[str, Any] = {}
+            try:
+                result_payload = await self._downstream_fetch_item_result(item)
+            except Exception:
+                result_payload = {}
+            firmware = self._system_analysis_input_for_item(task, item)
+            modules = self._parse_system_analysis_modules(artifact_root, firmware, result_payload)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=item.stage_name,
+                result={
+                    **self._lightweight_system_analysis_input(firmware),
+                    "modules": self._lightweight_modules_for_storage(modules),
+                    "module_count": len(modules),
+                    "downstream": self._lightweight_downstream_payload(payload),
+                    "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
+                    "downstream_status_synced_at": _now().isoformat(),
+                },
+            )
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+            }
+            return
+
+        if item.stage_name == "entry_analysis" and item.downstream_service == "entry_analyse":
+            module_payload = dict(item.input_ref or {})
+            entries = self._parse_entries(artifact_root, module_payload)
+            selected_entry = dict(entries[0]) if entries else {}
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=item.stage_name,
+                result={
+                    **selected_entry,
+                    "entry_count": len(entries),
+                    "entries_preview": self._compact_entry_rows(entries, summary_only=True),
+                    "downstream": self._lightweight_downstream_payload(payload),
+                    "downstream_status_synced_at": _now().isoformat(),
+                },
+            )
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+            }
+            return
+
+        if item.stage_name == "dataflow_vuln_scan" and item.downstream_service == "dataflow_vuln_scan":
+            entry = self._validate_entry_output_contract(dict(item.input_ref or {}), allow_fallback=True)
+            dataflow_dir = self._resolve_dataflow_directory(artifact_root)
+            data_flow_file = self._find_first(
+                dataflow_dir or artifact_root,
+                [r"final_report\.md", r"dataflow-.*\.md", r".*result.*\.md", r"report\.md"],
+            )
+            source_file = self._compress_source_file_hint(
+                str(entry.get("source_file") or entry.get("definition_file") or entry.get("file_name") or "")
+            )
+            result = self._build_dataflow_output_contract(
+                entry,
+                artifact_root=str(artifact_root),
+                archive_root=str(artifact_root),
+                module_input_path=str(entry.get("module_input_path") or ""),
+                source_root_path=str(entry.get("source_root_path") or ""),
+                source_dir=str(entry.get("source_dir") or ""),
+                source_file=source_file,
+                data_flow_file=str(data_flow_file or ""),
+                dataflow_dir=str(dataflow_dir or artifact_root),
+            )
+            result["downstream"] = self._lightweight_downstream_payload(payload)
+            self._persist_stage_item_result(
+                task,
+                item,
+                stage_name=item.stage_name,
+                result=result,
+            )
+            item.output_ref = {
+                **(item.output_ref or {}),
+                "artifact_root": str(artifact_root),
+                "archive_root": str(artifact_root),
+            }
 
     def _refresh_firmware_unpack_item_result(
         self,
@@ -11391,6 +11758,15 @@ class TaskManager(
         running_status: str = "running",
         preserve_active_status: bool = False,
     ) -> BinarySecurityStageItem:
+        def _should_preserve_existing_bound_child_state(stage_item: BinarySecurityStageItem) -> bool:
+            if retrying or auto_retrying:
+                return False
+            normalized_status = str(stage_item.status or "").strip().lower()
+            if str(stage_item.downstream_task_id or "").strip():
+                return normalized_status in {"pending", "queued", "dispatching", "running"}
+            binding_state = self._downstream_binding_state(stage_item)
+            return binding_state in {"creating", "created_pending_sync"}
+
         identity_key = build_stage_item_identity_key(item_key, parent_key)
         item = self._find_stage_item(
             db,
@@ -11426,16 +11802,20 @@ class TaskManager(
             item.item_name = item_name
             item.parent_key = parent_key
             item.item_identity_key = identity_key
-            keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(item)
+            preserve_bound_child_state = _should_preserve_existing_bound_child_state(item)
+            keep_existing_active = preserve_bound_child_state or (
+                preserve_active_status and self._should_preserve_streaming_item_status(item)
+            )
             item.status = item.status if keep_existing_active else running_status
             item.downstream_service = downstream_service
-            self._reset_child_runtime_payload(
-                item,
-                payload={},
-                keep_error=False,
-                reset_started_at=False,
-                reset_finished_at=True,
-            )
+            if not preserve_bound_child_state:
+                self._reset_child_runtime_payload(
+                    item,
+                    payload={},
+                    keep_error=False,
+                    reset_started_at=False,
+                    reset_finished_at=True,
+                )
             if not keep_existing_active:
                 item.started_at = self._stage_item_started_at(running_status)
                 self._ensure_stage_item_first_started_at(item)
@@ -11467,16 +11847,20 @@ class TaskManager(
                 existing.item_name = item_name
                 existing.parent_key = parent_key
                 existing.item_identity_key = identity_key
-                keep_existing_active = preserve_active_status and self._should_preserve_streaming_item_status(existing)
+                preserve_bound_child_state = _should_preserve_existing_bound_child_state(existing)
+                keep_existing_active = preserve_bound_child_state or (
+                    preserve_active_status and self._should_preserve_streaming_item_status(existing)
+                )
                 existing.status = existing.status if keep_existing_active else running_status
                 existing.downstream_service = downstream_service
-                self._reset_child_runtime_payload(
-                    existing,
-                    payload={},
-                    keep_error=False,
-                    reset_started_at=False,
-                    reset_finished_at=True,
-                )
+                if not preserve_bound_child_state:
+                    self._reset_child_runtime_payload(
+                        existing,
+                        payload={},
+                        keep_error=False,
+                        reset_started_at=False,
+                        reset_finished_at=True,
+                    )
                 if not keep_existing_active:
                     existing.started_at = self._stage_item_started_at(running_status)
                     self._ensure_stage_item_first_started_at(existing)
@@ -12110,40 +12494,35 @@ class TaskManager(
             )
             session.commit()
 
-        dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
-        source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
-        if not dataflow_input_dir:
-            raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
-        if not source_dir:
-            raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
+        create_entry = {
+            **dict(item.input_ref or {}),
+            **dict(dataflow_result or {}),
+        }
+        service, create_token, create_payload = self._retry_recreate_payload_for_item(
+            task,
+            item,
+            db=session,
+            preferred_token=token,
+            input_ref_override=create_entry,
+        )
         created = await self._downstream_create_task(
             session,
             task,
             item,
-            service="dataflow_vuln_scan",
-            token=token,
-            payload={
-                "title": f"{task.name}-{dataflow_result['function_name']}-scan",
-                "data_flow_path": dataflow_input_dir,
-                "source_dir": source_dir,
-                "origin": _downstream_origin_payload(task, item),
-            },
+            service=service,
+            token=create_token,
+            payload=create_payload,
         )
+        item = self._reattach_stage_item_after_async_wait(session, item)
         new_task_id = str(created.get("task_id") or created.get("id") or "").strip() or None
-        item.downstream_task_id = new_task_id or item.downstream_task_id
-        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-        item.started_at = item.started_at or _now()
-        item.finished_at = None
-        item.error_message = None
-        self._clear_replacement_in_progress(item)
-        self._record_downstream_item_disposition(
+        self._apply_created_downstream_child(
             session,
             task,
             item,
+            created=created,
+            reason=f"{normalize_stage_name(item.stage_name)}_retry_fallback_recreated",
             event_type="downstream_retry_fallback_recreated",
-            message=f"已重建新的下游任务: {item.downstream_service}:{new_task_id or '-'}",
-            payload={
-                "stage_name": item.stage_name,
+            event_payload={
                 "old_downstream_task_id": old_task_id,
                 "new_downstream_task_id": new_task_id,
                 "control_outcome": outcome or None,
@@ -14420,6 +14799,7 @@ class TaskManager(
             return "failed", failure_summary
         graph_status = str(meta.get("graph_status") or "").strip()
         identification_state = str(meta.get("identification_state") or "").strip()
+        upstream_terminal, upstream_success_terminal = self._knowledge_graph_upstream_terminal_state(meta)
         accumulated_entries = self._merge_knowledge_graph_entry_results(task, entries)
         accumulated_selected_entry_count = len(accumulated_entries)
         executable_entries = self._filter_executable_knowledge_graph_entries(accumulated_entries)
@@ -14558,7 +14938,7 @@ class TaskManager(
             }
             self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
             return "running", waiting_summary
-        if identification_state != "done" and not accumulated_entries:
+        if not upstream_terminal and not accumulated_entries:
             self._record_event(
                 db,
                 task,
@@ -14601,6 +14981,65 @@ class TaskManager(
                 **execution_metrics,
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                **state_summary,
+                **meta,
+            }
+            self._persist_stage_run_output_summary(task, stage_run, waiting_summary)
+            return "running", waiting_summary
+        if not upstream_terminal and accumulated_entries and (
+            not executable_entries or previous_entries or attempt == 1
+        ):
+            self._record_event(
+                db,
+                task,
+                "knowledge_graph_entry_fetch_waiting_for_upstream_terminal",
+                "知识图谱已发现入口，但上游仍在分析，继续增量轮询",
+                stage_name=stage_run.stage_name,
+                payload={
+                    "provider": "knowledge_graph_audit_sources",
+                    "attempt": attempt,
+                    "max_attempts": max_attempts,
+                    "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                    "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                    "knowledge_graph_executable_entry_count": executable_entry_count,
+                    **meta,
+                },
+            )
+            task.summary = {
+                **(task.summary or {}),
+                "knowledge_graph_entry_results": accumulated_entries,
+                "entry_results": [pending_module],
+                "knowledge_graph_state": state_summary,
+            }
+            task.metrics = {
+                **(task.metrics or {}),
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                **execution_metrics,
+                **self._knowledge_graph_analysis_metrics(meta),
+                **self._entry_selection_metrics(task),
+            }
+            waiting_summary = {
+                "status": "waiting_for_upstream_terminal",
+                "items": [pending_module],
+                "success_count": executable_entry_count,
+                "failed_count": 0,
+                "candidate_entry_count": executable_entry_count,
+                "selected_entry_count": executable_entry_count,
+                "entry_count": executable_entry_count,
+                "knowledge_graph_raw_entry_count": int(meta.get("raw_entry_count") or 0),
+                "knowledge_graph_selected_entry_count": accumulated_selected_entry_count,
+                "knowledge_graph_filtered_out_count": int(meta.get("filtered_out_count") or 0),
+                **execution_metrics,
+                "current_poll_selected_entry_count": current_poll_selected_entry_count,
+                "accumulated_selected_entry_count": accumulated_selected_entry_count,
+                "entry_results": [pending_module],
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 **state_summary,
@@ -14717,6 +15156,7 @@ class TaskManager(
                 "current_poll_selected_entry_count": current_poll_selected_entry_count,
                 "accumulated_selected_entry_count": accumulated_selected_entry_count,
                 "knowledge_graph_executable_entry_count": executable_entry_count,
+                "upstream_success_terminal": upstream_success_terminal,
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 **meta,
@@ -14905,12 +15345,19 @@ class TaskManager(
         self,
         task: BinarySecurityTask,
         item: BinarySecurityStageItem,
+        *,
+        db: Session | None = None,
+        preferred_token: str | None = None,
+        input_ref_override: dict[str, Any] | None = None,
     ) -> tuple[str, str | None, dict[str, Any]]:
-        input_ref = dict(item.input_ref or {})
+        input_ref = dict(input_ref_override or item.input_ref or {})
         service = str(item.downstream_service or "").strip()
-        token: str | None = self._service_token()
+        token: str | None = self._resolve_downstream_token(preferred_token)
         if service == "firmware_unpacker":
-            input_path = str(input_ref.get("path") or "").strip()
+            input_path = str(input_ref.get("path") or input_ref.get("input_path") or "").strip()
+            if not input_path:
+                default_name = str(input_ref.get("filename") or item.item_name or item.item_key or "firmware.bin").strip()
+                input_path = str(Path(task.workspace_root) / "input" / default_name)
             if not input_path:
                 raise ValidationError("firmware_unpack retry 缺少输入路径")
             return service, token, {
@@ -14919,10 +15366,17 @@ class TaskManager(
             }
         if service == "system_analyse":
             input_path = str(input_ref.get("input_path") or "").strip()
+            if not input_path:
+                recovered_input = self._system_analysis_input_for_item(task, item)
+                input_path = str(
+                    recovered_input.get("unpacked_root")
+                    or recovered_input.get("input_path")
+                    or ""
+                ).strip()
             firmware_name = str(item.item_name or input_ref.get("firmware_key") or "firmware").strip()
             if not input_path:
                 raise ValidationError("system_analysis retry 缺少 input_path")
-            return service, None, {
+            return service, self._resolve_downstream_token(preferred_token), {
                 "task_name": f"{task.name}-{firmware_name}-system-analysis",
                 "input_path": input_path,
                 "origin": _downstream_origin_payload(task, item),
@@ -14940,12 +15394,51 @@ class TaskManager(
             }
         if service == "entry_analyse":
             entry_input = self._normalize_entry_analysis_module_input(task, input_ref)
+            if db is not None and (
+                not str(entry_input.get("module_dir") or "").strip()
+                or not str(entry_input.get("source_root") or entry_input.get("source_root_path") or "").strip()
+            ):
+                summary_modules = [
+                    dict(row)
+                    for row in list(self._entry_results(task) or [])
+                    if isinstance(row, dict)
+                ]
+                matched = next(
+                    (
+                        row
+                        for row in summary_modules
+                        if str(row.get("module_key") or "").strip() == str(item.item_key or input_ref.get("module_key") or "").strip()
+                        or str(row.get("module_name") or "").strip() == str(item.item_name or input_ref.get("module_name") or "").strip()
+                    ),
+                    None,
+                )
+                if matched is not None:
+                    entry_input = self._normalize_entry_analysis_module_input(task, {**matched, **entry_input})
+            if (
+                not str(entry_input.get("module_dir") or "").strip()
+                or not str(entry_input.get("source_root") or entry_input.get("source_root_path") or "").strip()
+            ):
+                default_input_dir = str(
+                    (task.summary or {}).get("input_dir")
+                    or getattr(task, "firmware_path", "")
+                    or ""
+                ).strip()
+                if default_input_dir:
+                    entry_input = {
+                        **entry_input,
+                        "module_dir": str(entry_input.get("module_dir") or default_input_dir),
+                        "source_dir": str(entry_input.get("source_dir") or default_input_dir),
+                        "source_root": str(entry_input.get("source_root") or entry_input.get("source_root_path") or default_input_dir),
+                        "source_root_path": str(entry_input.get("source_root_path") or entry_input.get("source_root") or default_input_dir),
+                        "files_list_path": str(entry_input.get("files_list_path") or entry_input.get("entry_files_list") or entry_input.get("files_list") or default_input_dir),
+                    }
             input_contract = self._build_entry_analysis_input_contract(entry_input)
             return service, token, {
                 "task_name": f"{task.name}-{entry_input['module_name']}-entry",
                 "input_path": input_contract["module_dir"],
                 "module_name": entry_input["module_name"],
                 "source_path": input_contract["source_root"],
+                "input_contract": input_contract,
                 "origin": {
                     **_downstream_origin_payload(task, item),
                     "input_contract": input_contract,
@@ -14956,19 +15449,100 @@ class TaskManager(
         if service == "dataflow_analyse":
             raise ValidationError("历史下游服务 dataflow_analyse 已移除，请使用 dataflow_vuln_scan")
         if service == "dataflow_vuln_scan":
-            entry_result = self._normalize_entry_analysis_module_input(task, input_ref)
-            entry_input_contract = self._build_entry_analysis_input_contract(entry_result)
-            source_dir = str(entry_input_contract.get("source_root") or entry_result.get("source_dir") or "").strip()
-            dataflow_input_dir = str(entry_input_contract.get("module_dir") or entry_input_contract.get("source_root") or "").strip()
-            if not dataflow_input_dir or not source_dir:
+            entry = dict(input_ref)
+            default_input_dir = str(
+                (task.summary or {}).get("input_dir")
+                or getattr(task, "firmware_path", "")
+                or ""
+            ).strip()
+            if default_input_dir:
+                entry = {
+                    **entry,
+                    "module_dir": str(entry.get("module_dir") or default_input_dir),
+                    "source_dir": str(entry.get("source_dir") or default_input_dir),
+                    "source_root": str(entry.get("source_root") or entry.get("source_root_path") or default_input_dir),
+                    "source_root_path": str(entry.get("source_root_path") or entry.get("source_root") or default_input_dir),
+                    "module_input_path": str(entry.get("module_input_path") or entry.get("module_dir") or default_input_dir),
+                    "descriptor_root": str(entry.get("descriptor_root") or default_input_dir),
+                }
+            module_input_path = str(entry.get("module_input_path") or "").strip()
+            source_root_path = str(entry.get("source_root_path") or "").strip()
+            if (not module_input_path or not source_root_path) and db is not None:
+                recovered_entry = self._recover_entry_output_contract(db, task, entry)
+                if recovered_entry:
+                    entry = {**recovered_entry, **entry}
+                    module_input_path = module_input_path or str(entry.get("module_input_path") or "").strip()
+                    source_root_path = source_root_path or str(entry.get("source_root_path") or "").strip()
+            if not module_input_path or not source_root_path:
+                entry_result = self._normalize_entry_analysis_module_input(task, entry)
+                entry_input_contract = self._build_entry_analysis_input_contract(entry_result)
+                module_input_path = str(
+                    entry.get("module_input_path")
+                    or entry_input_contract.get("module_dir")
+                    or entry_input_contract.get("source_root")
+                    or ""
+                ).strip()
+                source_root_path = str(
+                    entry.get("source_root_path")
+                    or entry_input_contract.get("source_root")
+                    or entry_result.get("source_dir")
+                    or ""
+                ).strip()
+            if not module_input_path or not source_root_path:
                 raise ValidationError("dataflow_vuln_scan retry 缺少 entry/source 输入")
-            return service, token, {
-                "title": f"{task.name}-{str(entry_result.get('function_name') or item.item_name or 'entry').strip()}-scan",
-                "data_flow_path": dataflow_input_dir,
-                "source_dir": source_dir,
+            taint_params = [str(value).strip() for value in (entry.get("taint_params") or []) if str(value).strip()]
+            if not taint_params:
+                taint_params = _entry_signature_params(entry)
+            definition_line = str(entry.get("definition_line") or entry.get("line_no") or "").strip()
+            line_hint = definition_line if not definition_line or definition_line.upper().startswith("L") else f"L{definition_line}"
+            source_file = self._normalize_dfa_source_file(source_root_path, entry)
+            if not source_file:
+                raise ValidationError("dataflow_vuln_scan retry 缺少 source_file")
+            return service, self._resolve_downstream_token(preferred_token), {
+                "task_name": f"{task.name}-{str(entry.get('function_name') or item.item_name or 'entry').strip()}-scan",
+                "input_path": module_input_path,
+                "module_input_path": module_input_path,
+                "source_root_path": source_root_path,
+                "prompt_content": (
+                    f"分析文件 {str(entry.get('definition_file') or entry.get('file_name') or '').strip() or source_file} "
+                    f"中函数 {str(entry.get('function_name') or item.item_name or '').strip()} 的外部输入数据流"
+                ),
                 "origin": _downstream_origin_payload(task, item),
+                "source_file": source_file,
+                "function_name": str(entry.get("function_name") or item.item_name or "").strip() or None,
+                "line_hint": line_hint or None,
+                "definition_kind": self._resolve_entry_definition_kind(entry),
+                "taint_params": taint_params,
+                "function_description": str(entry.get("function_description") or ""),
+                "function_description_source": str(entry.get("function_description_source") or ""),
+                "entry_reason": str(entry.get("entry_reason") or ""),
+                "entry_reason_source": str(entry.get("entry_reason_source") or ""),
+                "taint_mode": "explicit" if taint_params else "no_explicit_taint",
+                "taint_params_missing": not bool(taint_params),
+                "taint_details": [
+                    dict(detail)
+                    for detail in (entry.get("taint_details") or [])
+                    if isinstance(detail, dict)
+                ],
             }
         raise ValidationError(f"不支持的 retry downstream service: {service or '-'}")
+
+    def _build_child_create_request_for_item(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        preferred_token: str | None = None,
+        input_ref_override: dict[str, Any] | None = None,
+    ) -> tuple[str, str | None, dict[str, Any]]:
+        return self._retry_recreate_payload_for_item(
+            task,
+            item,
+            db=db,
+            preferred_token=preferred_token,
+            input_ref_override=input_ref_override,
+        )
 
     def _resolve_dataflow_directory(self, root: Path) -> Path | None:
         if not root.exists():

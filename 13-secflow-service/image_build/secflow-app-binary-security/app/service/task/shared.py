@@ -7,7 +7,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -517,12 +517,23 @@ def _count_files(path: Path) -> int:
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    def _json_safe(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {str(key): _json_safe(inner) for key, inner in value.items()}
+        if isinstance(value, (list, tuple, set)):
+            return [_json_safe(inner) for inner in value]
+        return value
+
     ensure_dir(path.parent)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     started = time.perf_counter()
     target = path.name or "json"
     try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
         observe_state_file_write(target=target, result="success", duration_seconds=time.perf_counter() - started)
     except Exception:

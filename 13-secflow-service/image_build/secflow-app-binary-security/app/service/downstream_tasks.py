@@ -216,17 +216,22 @@ class DownstreamTaskGateway:
                 str(kwargs["module_name"]),
                 token or "",
                 kwargs.get("source_path"),
+                kwargs.get("input_contract"),
                 kwargs.get("origin"),
                 agent_task_key=agent_task_key or None,
             )
         if normalized in LEGACY_UNSUPPORTED_DOWNSTREAM_SERVICES:
             self._reject_legacy_service(normalized)
-        if normalized == "dataflow_vuln_scan" and "module_input_path" in kwargs:
+        if normalized == "dataflow_vuln_scan":
+            module_input_path = str(kwargs.get("module_input_path") or kwargs.get("input_path") or "").strip()
+            source_root_path = str(kwargs.get("source_root_path") or "").strip()
+            if not module_input_path or not source_root_path:
+                raise ValidationError("dataflow_vuln_scan create 缺少 module_input_path/source_root_path 权威输入")
             return await self._dataflow_vuln_scan_client().create_task(
                 project_id,
                 str(kwargs["task_name"]),
-                str(kwargs["module_input_path"]),
-                str(kwargs["source_root_path"]),
+                module_input_path,
+                source_root_path,
                 str(kwargs["prompt_content"]),
                 kwargs.get("origin"),
                 token=token or "",
@@ -241,17 +246,6 @@ class DownstreamTaskGateway:
                 taint_details=kwargs.get("taint_details"),
                 function_description_source=kwargs.get("function_description_source"),
                 entry_reason_source=kwargs.get("entry_reason_source"),
-            )
-        if normalized == "dataflow_vuln_scan":
-            return await self._dataflow_vuln_scan_client().create_task(
-                project_id,
-                str(kwargs["title"]),
-                str(kwargs["data_flow_path"]),
-                str(kwargs["source_dir"]),
-                str(kwargs.get("prompt_content") or ""),
-                kwargs.get("origin"),
-                token=token or "",
-                agent_task_key=agent_task_key or None,
             )
         raise ValidationError(f"未知下游服务: {normalized}")
 
@@ -333,6 +327,10 @@ class DownstreamTaskController:
     def __init__(self, manager: Any) -> None:
         self.manager = manager
         self.gateway = DownstreamTaskGateway()
+
+    @staticmethod
+    def _mapped_status_is_active(mapped_status: str | None) -> bool:
+        return str(mapped_status or "").strip().lower() in DOWNSTREAM_REF_ACTIVE_STATUSES
 
     def _record_event(
         self,
@@ -714,7 +712,7 @@ class DownstreamTaskController:
                 payload = None
             if isinstance(payload, dict):
                 mapped_status = self.manager._map_downstream_status(str(payload.get("status") or ""))
-                if mapped_status in {"pending", "queued", "dispatching", "running", "cancelling"}:
+                if self._mapped_status_is_active(mapped_status):
                     control = {
                         "outcome": "already_running",
                         "payload": payload,
@@ -810,7 +808,7 @@ class DownstreamTaskController:
             return result
 
         mapped_status = self.manager._map_downstream_status(str(payload.get("status") or ""))
-        if mapped_status in {"queued", "running"}:
+        if self._mapped_status_is_active(mapped_status):
             control = {**result, "outcome": "already_running", "payload": payload, "retry_outcome": result.get("outcome")}
             if db is not None:
                 self._record_control_outcome(db, task, item, stage_name=stage_name, control=control)
@@ -903,7 +901,7 @@ class DownstreamTaskController:
                 except NotFoundError:
                     continue
                 mapped_status = self.manager._map_downstream_status(str(payload.get("status") or "")) or str(payload.get("status") or "").lower()
-                if mapped_status in {"queued", "running", "dispatching", "pending"}:
+                if self._mapped_status_is_active(mapped_status):
                     active_refs.append(ref)
             if not active_refs:
                 return

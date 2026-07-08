@@ -1946,9 +1946,18 @@ class TaskStateMachineMixin:
         task: BinarySecurityTask,
     ) -> str | None:
         summary = dict(task.summary or {})
+        def _streaming_gate_ready(candidate_stage: str | None) -> bool:
+            upstream_stage = self._streaming_upstream_stage(task, candidate_stage)
+            if not upstream_stage:
+                return True
+            if not self._stage_requires_archive_success_gate(task, upstream_stage):
+                return True
+            return self._stage_has_archived_success_progress(db, task, upstream_stage)
+
         if (
             self._source_entry_analysis_barrier_enabled(task)
             and self._system_analysis_authoritative_complete(db, task)
+            and _streaming_gate_ready("entry_analysis")
             and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
             and bool(self._entry_analysis_inputs(db, task))
             and (
@@ -1960,6 +1969,7 @@ class TaskStateMachineMixin:
         if (
             self._binary_system_analysis_binary_to_source_barrier_enabled(task)
             and self._system_analysis_authoritative_complete(db, task)
+            and _streaming_gate_ready("binary_to_source")
             and not self._stage_has_archived_success_progress(db, task, "binary_to_source")
             and (
                 self._stage_status_for_task(db, task, "system_analysis") != "partial_success"
@@ -1969,6 +1979,7 @@ class TaskStateMachineMixin:
             return "binary_to_source"
         if (
             self._binary_entry_analysis_barrier_enabled(task)
+            and _streaming_gate_ready("entry_analysis")
             and self._stage_has_archived_success_progress(db, task, "binary_to_source")
             and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
             and bool(self._entry_analysis_inputs(db, task))
@@ -2442,6 +2453,19 @@ class TaskStateMachineMixin:
             self._enqueue_task(task.id)
         return True
 
+    def _streaming_upstream_gate_ready(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        downstream_stage: str | None,
+    ) -> bool:
+        upstream_stage = self._streaming_upstream_stage(task, downstream_stage)
+        if not upstream_stage:
+            return True
+        if not self._stage_requires_archive_success_gate(task, upstream_stage):
+            return True
+        return self._stage_has_archived_success_progress(db, task, upstream_stage)
+
     def _should_auto_advance_to_stage(
         self: TaskManager,
         db: Session,
@@ -2450,6 +2474,8 @@ class TaskStateMachineMixin:
     ) -> bool:
         normalized_stage = str(next_stage or "").strip()
         if not normalized_stage:
+            return False
+        if not self._streaming_upstream_gate_ready(db, task, normalized_stage):
             return False
         if normalized_stage == "dataflow_vuln_scan" and self._task_is_waiting_for_manual_confirmation(task):
             return False
@@ -2849,24 +2875,6 @@ class TaskStateMachineMixin:
             and self._streaming_mode_enabled(task)
             and self._is_streaming_tail_stage(task, next_stage)
             and self._streaming_stage_start_ready(db, task, next_stage)
-            and not (
-                next_stage == "entry_analysis"
-                and stage_name == "system_analysis"
-                and self._source_entry_analysis_barrier_enabled(task)
-            )
-            and not (
-                next_stage == "binary_to_source"
-                and stage_name == "system_analysis"
-                and self._binary_system_analysis_binary_to_source_barrier_enabled(task)
-            )
-            and not (
-                next_stage == "dataflow_vuln_scan"
-                and (
-                    self._source_entry_analysis_barrier_enabled(task)
-                    or self._binary_entry_analysis_barrier_enabled(task)
-                )
-                and not self._stage_has_archived_success_progress(db, task, "entry_analysis")
-            )
             and (
                 not self._stage_requires_archive_success_gate(task, stage_name)
                 or self._stage_has_archived_success_progress(db, task, stage_name)

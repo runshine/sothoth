@@ -13,6 +13,7 @@ from app.model import (
     BinarySecurityTask,
     BinarySecurityTaskRuntimeLease,
 )
+from app.service.downstream_tasks import DownstreamTaskGateway
 from app.service.task.downstream import TaskDownstreamServiceMixin
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb, _now
@@ -300,3 +301,132 @@ class TaskDownstreamServiceBehaviorTests(unittest.TestCase):
         __import__("asyncio").run(_run())
         event_types = [event.event_type for event in db.events]
         self.assertIn("downstream_create_skipped_due_to_delete_operation", event_types)
+
+    def test_build_child_create_request_for_item_entry_includes_input_contract(self):
+        task = self._task()
+        item = BinarySecurityStageItem(
+            id="item-entry-create",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            item_key="module-1",
+            item_name="module-1",
+            status="pending",
+            downstream_service="entry_analyse",
+            input_ref={
+                "module_key": "module-1",
+                "module_name": "module-1",
+                "source_dir": "/src/project/module-1",
+                "module_dir": "/src/project/module-1/modules/module-1",
+                "source_root": "/src/project/module-1",
+                "entry_descriptor_root": "/src/project/module-1/.entry",
+                "entry_files_list": "files.list",
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        service, token, payload = self.manager._build_child_create_request_for_item(db, task, item)
+
+        self.assertEqual("entry_analyse", service)
+        self.assertIsNotNone(token)
+        self.assertEqual("/src/project/module-1/modules/module-1", payload["input_path"])
+        self.assertIn("input_contract", payload)
+        self.assertEqual(payload["input_contract"]["source_root"], payload["source_path"])
+        self.assertEqual("/src/project/module-1/modules/module-1", payload["input_contract"]["module_dir"])
+        self.assertEqual("/src/project/module-1/.entry", payload["input_contract"]["source_root"])
+
+    def test_build_child_create_request_for_item_dataflow_uses_new_contract_fields(self):
+        task = self._task()
+        item = BinarySecurityStageItem(
+            id="item-dfa-create",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="doWork",
+            status="pending",
+            downstream_service="dataflow_vuln_scan",
+            input_ref={
+                "module_name": "module-1",
+                "module_input_path": "/archive/module-1/inputs",
+                "source_root_path": "/archive/module-1/src",
+                "source_file": "main.c",
+                "definition_file": "main.c",
+                "function_name": "doWork",
+                "line_no": "12",
+                "taint_params": ["req"],
+            },
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        service, token, payload = self.manager._build_child_create_request_for_item(db, task, item)
+
+        self.assertEqual("dataflow_vuln_scan", service)
+        self.assertIsNotNone(token)
+        self.assertEqual("/archive/module-1/inputs", payload["input_path"])
+        self.assertEqual("/archive/module-1/inputs", payload["module_input_path"])
+        self.assertEqual("/archive/module-1/src", payload["source_root_path"])
+        self.assertEqual("doWork", payload["function_name"])
+        self.assertNotIn("title", payload)
+        self.assertNotIn("data_flow_path", payload)
+        self.assertNotIn("source_dir", payload)
+
+    def test_retry_recreate_payload_for_item_dataflow_uses_override_contract(self):
+        task = self._task()
+        item = BinarySecurityStageItem(
+            id="item-dfa-recreate",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            item_name="doWork",
+            status="failed",
+            downstream_service="dataflow_vuln_scan",
+            input_ref={
+                "module_input_path": "/stale/module",
+                "source_root_path": "/stale/src",
+                "source_file": "stale.c",
+                "function_name": "staleFn",
+            },
+        )
+        override = {
+            "module_input_path": "/fresh/module",
+            "source_root_path": "/fresh/src",
+            "source_file": "fresh.c",
+            "definition_file": "fresh.c",
+            "function_name": "freshFn",
+            "line_no": "21",
+            "taint_params": ["req"],
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item])
+
+        service, token, payload = self.manager._retry_recreate_payload_for_item(
+            task,
+            item,
+            db=db,
+            input_ref_override=override,
+        )
+
+        self.assertEqual("dataflow_vuln_scan", service)
+        self.assertIsNotNone(token)
+        self.assertEqual("/fresh/module", payload["module_input_path"])
+        self.assertEqual("/fresh/src", payload["source_root_path"])
+        self.assertEqual("fresh.c", payload["source_file"])
+        self.assertEqual("freshFn", payload["function_name"])
+
+    def test_downstream_gateway_rejects_legacy_dataflow_create_contract(self):
+        gateway = DownstreamTaskGateway()
+
+        async def _run():
+            with self.assertRaisesRegex(ValidationError, "module_input_path/source_root_path"):
+                await gateway.create_task(
+                    "dataflow_vuln_scan",
+                    project_id="p1",
+                    token="tok",
+                    title="legacy",
+                    data_flow_path="/tmp/flow",
+                    source_dir="/tmp/src",
+                    prompt_content="legacy",
+                )
+
+        __import__("asyncio").run(_run())

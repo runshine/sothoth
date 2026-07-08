@@ -16,7 +16,7 @@ from app.model import (
 )
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, _now
-from test_task_manager import _AppendingModelAwareDb, _FakeDb, _FakeQuery
+from test_task_manager import _AppendingModelAwareDb, _FakeDb, _FakeQuery, _FakeTaskSyncQueue
 
 
 class ParentRuntimeRecoveryPathTests(unittest.TestCase):
@@ -195,7 +195,13 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             manager._run_task_runtime_signals = _run_task_runtime_signals
             manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
             manager.cfg.scheduler.stage_poll_interval_seconds = 0
-            with patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep):
+            # _run_task() can release/requeue parent ownership through takeover locks.
+            # Use the fake queue here so the test never depends on the real Redis
+            # lock client and cannot hang in rebuild-forever retry loops.
+            with (
+                patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep),
+                patch.object(task_manager_module, "get_task_queue", return_value=_FakeTaskSyncQueue()),
+            ):
                 asyncio.run(manager._run_task(task.id))
         finally:
             task_manager_module.get_session_factory = original_factory
@@ -283,7 +289,10 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
             manager._run_task_runtime_signals = _run_task_runtime_signals
             manager._task_has_authoritative_active_stage_context = lambda *_args, **_kwargs: False
             manager.cfg.scheduler.stage_poll_interval_seconds = 0
-            with patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep):
+            with (
+                patch("app.service.task.runtime.asyncio.sleep", new=_fast_sleep),
+                patch.object(task_manager_module, "get_task_queue", return_value=_FakeTaskSyncQueue()),
+            ):
                 asyncio.run(manager._run_task(task.id))
         finally:
             task_manager_module.get_session_factory = original_factory
@@ -347,7 +356,8 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         original_loader = manager._load_service_config
         manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
         try:
-            reclaimed = manager._reclaim_stale_running_locked(db)
+            with patch.object(task_manager_module, "get_task_queue", return_value=_FakeTaskSyncQueue()):
+                reclaimed = manager._reclaim_stale_running_locked(db)
         finally:
             manager._load_service_config = original_loader
 
@@ -403,14 +413,16 @@ class ParentRuntimeRecoveryPathTests(unittest.TestCase):
         manager._load_service_config = lambda db: SimpleNamespace(dispatch_timeout_seconds=60)
         manager._enqueue_task = lambda task_id: enqueued.append(task_id)
         try:
-            reclaimed = manager._reclaim_stale_running_locked(db)
+            with patch.object(task_manager_module, "get_task_queue", return_value=_FakeTaskSyncQueue()):
+                reclaimed = manager._reclaim_stale_running_locked(db)
         finally:
             manager._load_service_config = original_loader
             manager._enqueue_task = original_enqueue
 
         self.assertTrue(reclaimed)
-        self.assertEqual("running", task.status)
-        self.assertEqual([task.id], enqueued)
+        self.assertEqual("pending", task.status)
+        self.assertEqual([], enqueued)
+        self.assertTrue(dict(task.summary or {}).get("parent_takeover_pending_claim", {}).get("active"))
 
 
 if __name__ == "__main__":

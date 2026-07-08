@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import errno
+import json
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +32,21 @@ if TYPE_CHECKING:
 
 
 class TaskResultServiceMixin:
+    def _normalize_result_payload_value(self: TaskManager, value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, datetime):
+            return task_shared._isoformat_or_none(value)
+        if isinstance(value, dict):
+            return {str(key): self._normalize_result_payload_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._normalize_result_payload_value(item) for item in value]
+        if isinstance(value, tuple):
+            return [self._normalize_result_payload_value(item) for item in value]
+        if isinstance(value, set):
+            return [self._normalize_result_payload_value(item) for item in sorted(value, key=lambda item: str(item))]
+        return value
+
     def _build_binary_module_summary(
         self: TaskManager,
         task: BinarySecurityTask,
@@ -402,7 +418,13 @@ class TaskResultServiceMixin:
             "started_at",
             "finished_at",
         ]
-        return {key: payload.get(key) for key in keys if payload.get(key) is not None}
+        compact: dict[str, Any] = {}
+        for key in keys:
+            value = payload.get(key)
+            if value is None:
+                continue
+            compact[key] = self._normalize_result_payload_value(value)
+        return compact
 
     def _archive_job_downstream_payload(self: TaskManager, payload: dict[str, Any] | None) -> dict[str, Any]:
         def _compact_payload_dict(source: dict[str, Any] | None) -> dict[str, Any]:
@@ -629,7 +651,7 @@ class TaskResultServiceMixin:
     ) -> dict[str, Any]:
         from app.service import task_manager as task_manager_module
 
-        full_result = dict(result or {})
+        full_result = self._normalize_result_payload_value(dict(result or {}))
         compact = self._compact_result_for_storage(stage_name, full_result)
         if not self._result_payload_needs_externalization(stage_name, full_result):
             item.result = compact

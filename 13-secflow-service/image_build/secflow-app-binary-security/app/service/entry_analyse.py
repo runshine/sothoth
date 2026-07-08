@@ -24,6 +24,7 @@ class EntryAnalyseClient(JsonHttpClient):
         module_name: str,
         token: str | None = None,
         source_path: str | None = None,
+        input_contract: dict[str, Any] | None = None,
         origin: dict[str, Any] | None = None,
         agent_task_key: dict[str, Any] | None = None,
     ) -> dict:
@@ -36,6 +37,7 @@ class EntryAnalyseClient(JsonHttpClient):
                 "input_path": input_path,
                 "module_name": module_name,
                 "source_path": source_path,
+                "input_contract": input_contract,
                 "task_description": "由 binary security 编排器触发的入口分析任务",
                 **(origin or {}),
                 **(agent_task_key or {}),

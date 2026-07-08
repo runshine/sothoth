@@ -17,7 +17,7 @@ from app.exception import ValidationError
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-from app.model import BinarySecurityTask, BinarySecurityTaskOperation
+from app.model import BinarySecurityTask, BinarySecurityTaskOperation, normalize_stage_name
 from app.service import task_manager as task_manager_module
 from . import shared as task_shared
 
@@ -874,11 +874,20 @@ class TaskOperationServiceMixin:
             nested = begin_nested()
             try:
                 yield nested
-            except Exception:
+            except Exception as exc:
                 # Preserve the original write failure when the DB connection has
                 # already been invalidated and savepoint cleanup cannot run.
-                with suppress(Exception):
+                rollback_failed = False
+                try:
                     nested.rollback()
+                except Exception as rollback_exc:
+                    rollback_failed = True
+                    if not self._is_retryable_lock_error(exc):
+                        with suppress(Exception):
+                            raise rollback_exc
+                if rollback_failed and self._is_retryable_lock_error(exc):
+                    with suppress(Exception):
+                        db.rollback()
                 raise
 
         return _cm()
@@ -1962,16 +1971,28 @@ class TaskOperationServiceMixin:
                 created_item_ids.append(item_id)
                 continue
             try:
+                service, create_token, create_payload = self._build_child_create_request_for_item(
+                    db,
+                    task,
+                    item,
+                    preferred_token=self._service_token(),
+                )
                 created = await self._downstream_create_task(
                     db,
                     task,
                     item,
-                    service=str(item.downstream_service or "").strip(),
-                    token=self._service_token(),
-                    payload=dict(item.input_ref or {}),
+                    service=service,
+                    token=create_token,
+                    payload=create_payload,
                 )
-                item.downstream_task_id = str(created.get("task_id") or item.downstream_task_id or "").strip() or None
-                item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
+                item = self._reattach_stage_item_after_async_wait(db, item)
+                self._apply_created_downstream_child(
+                    db,
+                    task,
+                    item,
+                    created=created,
+                    reason=f"{normalize_stage_name(item.stage_name)}_retry_prepare_child_create",
+                )
                 self._update_retry_item_action(
                     task,
                     item_id=item_id,
@@ -2079,17 +2100,28 @@ class TaskOperationServiceMixin:
                             verification_status="pending",
                             transition_type=self.CHILD_TRANSITION_DESTRUCTIVE_REBUILD,
                         )
+                        service, create_token, create_payload = self._build_child_create_request_for_item(
+                            db,
+                            task,
+                            item,
+                            preferred_token=self._service_token(),
+                        )
                         created = await self._downstream_create_task(
                             db,
                             task,
                             item,
-                            service=str(item.downstream_service or "").strip(),
-                            token=self._service_token(),
-                            payload=dict(item.input_ref or {}),
+                            service=service,
+                            token=create_token,
+                            payload=create_payload,
                         )
-                        item.downstream_task_id = str(created.get("task_id") or item.downstream_task_id or "").strip() or None
-                        item.status = self._map_downstream_status(str(created.get("status") or "")) or "pending"
-                        self._clear_replacement_in_progress(item)
+                        item = self._reattach_stage_item_after_async_wait(db, item)
+                        self._apply_created_downstream_child(
+                            db,
+                            task,
+                            item,
+                            created=created,
+                            reason=f"{normalize_stage_name(item.stage_name)}_retry_verify_child_create",
+                        )
                         self._update_retry_item_action(
                             task,
                             item_id=item_id,
@@ -3109,8 +3141,6 @@ class TaskOperationServiceMixin:
                 return True
             if workset.get("pending_task_layer_reconcile"):
                 signal = dict(workset.get("pending_task_layer_reconcile") or {})
-                self._clear_task_runtime_signal(task, "pending_task_layer_reconcile")
-                db.commit()
                 reconcile_db = session_factory()
                 try:
                     reconcile_task = (
@@ -3130,6 +3160,7 @@ class TaskOperationServiceMixin:
                             self._reconcile_stage_domain_in_session(reconcile_db, reconcile_task, stage_name)
                         if stage_name and self._is_streaming_tail_stage(reconcile_task, stage_name):
                             await self._sync_streaming_task_tail_state(reconcile_task.id)
+                        self._clear_task_runtime_signal(reconcile_task, "pending_task_layer_reconcile")
                         reconcile_db.commit()
                         return True
                     changed = await self._run_task_layer_reconcile_signal(
@@ -3137,8 +3168,34 @@ class TaskOperationServiceMixin:
                         reconcile_task,
                         signal=signal,
                     )
+                    self._clear_task_runtime_signal(reconcile_task, "pending_task_layer_reconcile")
                     reconcile_db.commit()
                     return changed
+                except task_manager_module.StaleTaskExecution:
+                    reconcile_db.rollback()
+                    return False
+                except Exception as exc:
+                    reconcile_db.rollback()
+                    task_manager_module.logger.exception(
+                        "binary-security task runtime signal processing failed: task_id=%s signal=pending_task_layer_reconcile",
+                        task_id,
+                    )
+                    await asyncio.to_thread(
+                        self._record_task_runtime_lifecycle_event,
+                        task_id,
+                        event_type="task_runtime_signal_processing_failed",
+                        message="任务层 reconcile 信号处理失败，已保留信号等待下轮继续处理",
+                        source="run_task_runtime_signals",
+                        level="warning",
+                        payload={
+                            "signal_name": "pending_task_layer_reconcile",
+                            "reconcile_reason": str(signal.get("reconcile_reason") or signal.get("reason") or "").strip() or None,
+                            "source_event_type": str(signal.get("source_event_type") or "").strip() or None,
+                            "error": str(exc),
+                            "error_type": exc.__class__.__name__,
+                        },
+                    )
+                    return False
                 finally:
                     reconcile_db.close()
             if workset.get("pending_binding_repair") or workset.get("pending_downstream_sync"):
