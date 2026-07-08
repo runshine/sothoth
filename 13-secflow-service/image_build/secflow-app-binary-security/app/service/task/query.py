@@ -288,6 +288,8 @@ class TaskQueryServiceMixin:
             entry_selection_mode=self._entry_selection_mode(task),
             entry_auto_selection_strategy=self._entry_auto_selection_strategy(task),
             entry_auto_selection_top_n=self._entry_auto_selection_top_n(task),
+            entry_analysis_auto_selection_top_n=self._entry_analysis_auto_selection_top_n(task),
+            knowledge_graph_entry_auto_selection_top_n=self._knowledge_graph_entry_auto_selection_top_n(task),
             candidate_entry_count=len(self._entry_candidates(task)),
             selected_entry_count=len(self._effective_entry_inputs(task))
             if self._entry_selection_mode(task) == task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM

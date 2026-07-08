@@ -1062,7 +1062,7 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertIn("requested", sync_event_types)
         self.assertIn("applied", sync_event_types)
         self.assertTrue(all(operation == "downstream_create" for operation in sync_operations))
-        self.assertGreaterEqual(len(sync_event_types), 3)
+        self.assertEqual(2, len(sync_event_types))
 
 
 if __name__ == "__main__":

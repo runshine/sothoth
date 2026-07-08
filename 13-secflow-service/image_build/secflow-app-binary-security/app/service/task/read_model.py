@@ -1694,7 +1694,11 @@ class TaskReadModelServiceMixin:
             status=task.status,
             selection_mode=self._entry_selection_mode(task),
             auto_selection_strategy=self._entry_auto_selection_strategy(task),
-            auto_selection_top_n=self._entry_auto_selection_top_n(task),
+            auto_selection_top_n=(
+                self._knowledge_graph_entry_auto_selection_top_n(task)
+                if self._pipeline_profile(task) == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN
+                else self._entry_analysis_auto_selection_top_n(task)
+            ),
             requires_confirmation=task.status == task_manager_module.TASK_STATUS_PENDING_ENTRY_CONFIRMATION,
             candidate_entries=candidate_entries,
             selected_entry_keys=selected_keys,
@@ -2087,6 +2091,8 @@ class TaskReadModelServiceMixin:
             entry_selection_mode=self._entry_selection_mode(task),
             entry_auto_selection_strategy=self._entry_auto_selection_strategy(task),
             entry_auto_selection_top_n=self._entry_auto_selection_top_n(task),
+            entry_analysis_auto_selection_top_n=self._entry_analysis_auto_selection_top_n(task),
+            knowledge_graph_entry_auto_selection_top_n=self._knowledge_graph_entry_auto_selection_top_n(task),
             candidate_entry_count=len(self._entry_candidates(task)),
             selected_entry_count=len(self._effective_entry_inputs(task))
             if self._entry_selection_mode(task) == task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM
@@ -2180,18 +2186,25 @@ class TaskReadModelServiceMixin:
         entry_selection_mode = self._entry_selection_mode(task)
         entry_auto_selection_strategy = self._entry_auto_selection_strategy(task)
         entry_auto_selection_top_n = self._entry_auto_selection_top_n(task)
+        entry_analysis_auto_selection_top_n = self._entry_analysis_auto_selection_top_n(task)
+        knowledge_graph_entry_auto_selection_top_n = self._knowledge_graph_entry_auto_selection_top_n(task)
         is_binary_module = task_type == task_manager_module.TASK_TYPE_BINARY_MODULE
         is_kg_source = pipeline_profile == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN
         if is_kg_source:
             entry_selection_mode = task_manager_module.ENTRY_SELECTION_MODE_AUTO
-            entry_auto_selection_strategy = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
-            entry_auto_selection_top_n = 0
+            entry_auto_selection_top_n = knowledge_graph_entry_auto_selection_top_n
+        else:
+            entry_auto_selection_top_n = entry_analysis_auto_selection_top_n
         if entry_selection_mode == task_manager_module.ENTRY_SELECTION_MODE_MANUAL_CONFIRM:
             entry_display_mode = "manual_confirm"
             entry_display_label = "人工确认"
         elif entry_auto_selection_strategy == "top_n_per_module_by_confidence":
             entry_display_mode = "top_n"
-            entry_display_label = f"自动 / 每模块 Top {entry_auto_selection_top_n}"
+            entry_display_label = (
+                f"自动 / 知识图谱 Top {entry_auto_selection_top_n}"
+                if is_kg_source
+                else f"自动 / 每模块 Top {entry_auto_selection_top_n}"
+            )
         else:
             entry_display_mode = "all"
             entry_display_label = "自动 / 全部入口"
@@ -2235,6 +2248,8 @@ class TaskReadModelServiceMixin:
                 "entry_selection_mode": entry_selection_mode,
                 "entry_auto_selection_strategy": entry_auto_selection_strategy,
                 "entry_auto_selection_top_n": entry_auto_selection_top_n,
+                "entry_analysis_auto_selection_top_n": entry_analysis_auto_selection_top_n,
+                "knowledge_graph_entry_auto_selection_top_n": knowledge_graph_entry_auto_selection_top_n,
                 "display_mode": entry_display_mode,
                 "display_label": entry_display_label,
             },
@@ -2246,7 +2261,9 @@ class TaskReadModelServiceMixin:
                 "knowledge_graph_status_filter": str(effective_policy.get("knowledge_graph_status_filter") or "").strip() or None,
                 "knowledge_graph_kind": str(effective_policy.get("knowledge_graph_kind") or "").strip() or None,
                 "knowledge_graph_module": str(effective_policy.get("knowledge_graph_module") or "").strip() or None,
-                "entry_strategy_label": "自动 / 全部入口" if knowledge_graph_strategy_applicable else None,
+                "entry_auto_selection_strategy": entry_auto_selection_strategy if knowledge_graph_strategy_applicable else None,
+                "entry_auto_selection_top_n": knowledge_graph_entry_auto_selection_top_n if knowledge_graph_strategy_applicable else 0,
+                "entry_strategy_label": entry_display_label if knowledge_graph_strategy_applicable else None,
             },
             "display_sections": display_sections,
         }

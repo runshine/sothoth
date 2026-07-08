@@ -76,6 +76,8 @@ class TaskPolicyOverrides(BinarySecurityBaseModel):
     entry_selection_mode: Optional[str] = None
     entry_auto_selection_strategy: Optional[str] = None
     entry_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
+    entry_analysis_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
+    knowledge_graph_entry_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
     knowledge_graph_upload_id: Optional[str] = None
     knowledge_graph_db_name: Optional[str] = None
     knowledge_graph_include_excluded: Optional[bool] = None
@@ -135,6 +137,8 @@ class BinarySecurityTaskPolicyUpdatePayload(BinarySecurityBaseModel):
     entry_selection_mode: Optional[str] = None
     entry_auto_selection_strategy: Optional[str] = None
     entry_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
+    entry_analysis_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
+    knowledge_graph_entry_auto_selection_top_n: Optional[int] = Field(default=None, ge=1)
 
 
 class BinarySecurityTaskPrepareResponse(BinarySecurityBaseModel):
@@ -286,6 +290,8 @@ class BinarySecurityTaskResponse(BinarySecurityBaseModel):
     entry_selection_mode: str = "auto"
     entry_auto_selection_strategy: str = "all"
     entry_auto_selection_top_n: int = 0
+    entry_analysis_auto_selection_top_n: int = 0
+    knowledge_graph_entry_auto_selection_top_n: int = 0
     candidate_entry_count: int = 0
     selected_entry_count: int = 0
     entry_count: int = 0
@@ -1039,6 +1045,8 @@ class BinarySecurityTaskPolicyConfigPayload(BinarySecurityBaseModel):
     entry_selection_mode: str = Field(default="auto")
     entry_auto_selection_strategy: str = Field(default="all")
     entry_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
+    entry_analysis_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
+    knowledge_graph_entry_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
     partial_success_stage_advancement: dict[str, bool] = Field(
         default_factory=lambda: {
             "binary_to_source": True,
@@ -1090,6 +1098,8 @@ class BinarySecurityGlobalConfigPayload(BinarySecurityBaseModel):
     entry_selection_mode: str = Field(default="auto")
     entry_auto_selection_strategy: str = Field(default="all")
     entry_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
+    entry_analysis_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
+    knowledge_graph_entry_auto_selection_top_n: int = Field(default=0, ge=0, le=999)
     partial_success_stage_advancement: dict[str, bool] = Field(
         default_factory=lambda: {
             "binary_to_source": True,

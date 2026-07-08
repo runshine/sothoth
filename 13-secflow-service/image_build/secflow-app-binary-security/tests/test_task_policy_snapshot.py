@@ -53,7 +53,7 @@ class TaskPolicySnapshotTests(unittest.TestCase):
         self.assertEqual(["高", "中"], snapshot["module_strategy"]["module_risk_levels"])
         self.assertTrue(snapshot["stage_execution"]["continue_on_item_failure"])
 
-    def test_task_detail_policy_snapshot_for_kg_workflow_forces_all_entries(self):
+    def test_task_detail_policy_snapshot_for_kg_workflow_uses_kg_entry_top_n(self):
         task = BinarySecurityTask(
             id="t-policy-snapshot-kg",
             project_id="p1",
@@ -71,6 +71,8 @@ class TaskPolicySnapshotTests(unittest.TestCase):
             "entry_selection_mode": "manual_confirm",
             "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
             "entry_auto_selection_top_n": 9,
+            "entry_analysis_auto_selection_top_n": 3,
+            "knowledge_graph_entry_auto_selection_top_n": 9,
             "knowledge_graph_db_name": "kg-prod",
             "knowledge_graph_kind": "source",
             "knowledge_graph_module": "libxml2",
@@ -84,9 +86,12 @@ class TaskPolicySnapshotTests(unittest.TestCase):
         snapshot = detail.policy_snapshot
         self.assertEqual(PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN, snapshot["workflow"]["pipeline_profile"])
         self.assertTrue(snapshot["knowledge_graph_strategy"]["applicable"])
-        self.assertEqual("all", snapshot["entry_strategy"]["display_mode"])
-        self.assertEqual("自动 / 全部入口", snapshot["entry_strategy"]["display_label"])
-        self.assertEqual(0, snapshot["entry_strategy"]["entry_auto_selection_top_n"])
+        self.assertEqual("top_n", snapshot["entry_strategy"]["display_mode"])
+        self.assertEqual("自动 / 知识图谱 Top 9", snapshot["entry_strategy"]["display_label"])
+        self.assertEqual(9, snapshot["entry_strategy"]["entry_auto_selection_top_n"])
+        self.assertEqual(3, snapshot["entry_strategy"]["entry_analysis_auto_selection_top_n"])
+        self.assertEqual(9, snapshot["entry_strategy"]["knowledge_graph_entry_auto_selection_top_n"])
+        self.assertEqual(9, snapshot["knowledge_graph_strategy"]["entry_auto_selection_top_n"])
         self.assertEqual("kg-prod", snapshot["knowledge_graph_strategy"]["knowledge_graph_db_name"])
         self.assertEqual("libxml2", snapshot["knowledge_graph_strategy"]["knowledge_graph_module"])
 

@@ -81,6 +81,32 @@ class _RouteManagerStub:
             message="任务删除已受理，后台正在清理任务及下游资源",
         )
 
+    async def finish_task_as_success(
+        self,
+        db,
+        *,
+        project_id,
+        task_id,
+        requested_by=None,
+    ):
+        self.calls.append(
+            (
+                "finish_task_as_success",
+                db,
+                project_id,
+                task_id,
+                requested_by,
+            )
+        )
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id="op-force-success-1",
+            accepted=True,
+            action="finish_success",
+            status="accepted",
+            message="任务开发者成功结束已受理，后台正在停止执行并收口为成功终态",
+        )
+
     def get_task_detail(self, db, project_id, task_id):
         self.calls.append(("get_task_detail", db, project_id, task_id))
         return BinarySecurityTaskDetailResponse(
@@ -564,6 +590,26 @@ class TaskApiRouteTests(unittest.TestCase):
         self.assertEqual("running", payload["stage_summaries"][0]["status"])
         self.assertEqual("task_running", payload["manual_operation_state"]["blocking_code"])
         self.assertEqual(("get_task_detail", fake_db, "p1", "t1"), manager.calls[0])
+
+    def test_finish_success_route_passes_requested_by(self):
+        app, fake_db = self._build_client()
+        manager = _RouteManagerStub()
+
+        with patch.object(tasks_api_module, "get_task_manager", return_value=manager):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/app/binary-security/projects/p1/tasks/t1/finish-success",
+                    headers={"Authorization": "Bearer token"},
+                )
+
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertTrue(payload["accepted"])
+        self.assertEqual("finish_success", payload["action"])
+        self.assertEqual(
+            ("finish_task_as_success", fake_db, "p1", "t1", "tester"),
+            manager.calls[0],
+        )
 
     def test_get_task_detail_route_preserves_degraded_manual_operation_state(self):
         app, fake_db = self._build_client()

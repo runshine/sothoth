@@ -5622,6 +5622,59 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         self.assertEqual("top_n_per_module_by_confidence", detail.entry_auto_selection_strategy)
         self.assertEqual(3, detail.entry_auto_selection_top_n)
 
+    def test_entry_candidates_use_entry_analysis_specific_top_n(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy={
+                "entry_selection_mode": "auto",
+                "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+                "entry_auto_selection_top_n": 5,
+                "entry_analysis_auto_selection_top_n": 1,
+                "knowledge_graph_entry_auto_selection_top_n": 3,
+            },
+            summary={
+                "entry_results": [
+                    {
+                        "module_key": "mod-a",
+                        "module_name": "module-a",
+                        "completion_state": "success",
+                        "completion_ready": True,
+                        "execution_epoch": 0,
+                        "entries": [
+                            {"entry_key": "a-1", "function_name": "func1", "entry_confidence": 0.9},
+                            {"entry_key": "a-2", "function_name": "func2", "entry_confidence": 0.7},
+                        ],
+                    },
+                    {
+                        "module_key": "mod-b",
+                        "module_name": "module-b",
+                        "completion_state": "success",
+                        "completion_ready": True,
+                        "execution_epoch": 0,
+                        "entries": [
+                            {"entry_key": "b-1", "function_name": "func1", "entry_confidence": 0.8},
+                            {"entry_key": "b-2", "function_name": "func2", "entry_confidence": 0.2},
+                        ],
+                    },
+                ],
+            },
+        )
+
+        candidates = self.manager._entry_candidates(task)
+
+        self.assertEqual(1, self.manager._entry_analysis_auto_selection_top_n(task))
+        self.assertEqual(3, self.manager._knowledge_graph_entry_auto_selection_top_n(task))
+        self.assertEqual(["a-1", "b-1"], [entry["entry_key"] for entry in candidates])
+
     def test_manual_confirm_effective_entry_inputs_do_not_use_auto_top_n(self):
         task = BinarySecurityTask(
             id="t1",
@@ -5680,6 +5733,8 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
                 "entry_selection_mode": "auto",
                 "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
                 "entry_auto_selection_top_n": 1,
+                "entry_analysis_auto_selection_top_n": 4,
+                "knowledge_graph_entry_auto_selection_top_n": 1,
             },
             summary={
                 "entry_results": [
@@ -5702,6 +5757,30 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         self.assertEqual(["kg-1"], [entry["entry_key"] for entry in candidates])
         self.assertEqual("top_n_per_module_by_confidence", self.manager._entry_auto_selection_strategy(task))
         self.assertEqual(1, self.manager._entry_auto_selection_top_n(task))
+        self.assertEqual(4, self.manager._entry_analysis_auto_selection_top_n(task))
+        self.assertEqual(1, self.manager._knowledge_graph_entry_auto_selection_top_n(task))
+
+    def test_entry_top_n_helpers_fallback_to_legacy_value(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+            policy={
+                "entry_selection_mode": "auto",
+                "entry_auto_selection_strategy": "top_n_per_module_by_confidence",
+                "entry_auto_selection_top_n": 6,
+            },
+        )
+
+        self.assertEqual(6, self.manager._entry_analysis_auto_selection_top_n(task))
+        self.assertEqual(6, self.manager._knowledge_graph_entry_auto_selection_top_n(task))
 
     def test_kg_source_entry_candidates_top_n_by_confidence_uses_stable_ordering(self):
         task = BinarySecurityTask(
@@ -8180,8 +8259,8 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         ):
             rebuild_state = self.manager._entry_analysis_authoritative_rebuild_required(db, task, stage_run=stage_run)
 
-        self.assertFalse(rebuild_state["required"])
-        self.assertEqual("no_historical_entry_analysis_children", rebuild_state["reason"])
+        self.assertTrue(rebuild_state["required"])
+        self.assertEqual("authoritative_items_missing_from_inputs", rebuild_state["reason"])
 
     def test_stage_has_authoritative_materialization_for_entry_analysis_requires_rebuildable_current_inputs(self):
         task = BinarySecurityTask(
@@ -26013,7 +26092,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.assertEqual(3, len(items))
             self.assertEqual(3, len(queued_items))
             self.assertEqual(["m1", "m2", "m3"], [item.item_key for item in queued_items])
-            self.assertTrue(all(item.status == "queued" for item in queued_items))
+            self.assertTrue(all(item.status == "pending" for item in queued_items))
             self.assertTrue(all(item.started_at is None for item in queued_items))
             return [
                 {"status": "cancelled", "item": module, "error": "cancelled"}

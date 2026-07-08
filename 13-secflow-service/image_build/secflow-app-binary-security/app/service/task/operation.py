@@ -4010,6 +4010,14 @@ class TaskOperationServiceMixin:
                         operation.current_step = task_manager_module.TASK_OPERATION_STEP_SUCCEEDED
                         db.commit()
                         return
+                    elif operation.operation_type == task_manager_module.TASK_ACTION_FINISH_SUCCESS:
+                        await self._apply_finish_task_as_success_now(
+                            db,
+                            task,
+                            requested_by=str(getattr(operation, "requested_by", None) or "").strip() or None,
+                            operation=operation,
+                        )
+                        return
                     elif operation.operation_type == task_manager_module.TASK_ACTION_DELETE:
                         delete_result = await self._prepare_delete_task(db, task)
                         if isinstance(delete_result, dict) and bool(delete_result.get("operation_finalized")):

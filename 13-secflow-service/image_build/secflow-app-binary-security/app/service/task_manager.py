@@ -399,6 +399,7 @@ TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS = "retry_archive_failed_items"
 TASK_ACTION_RETRY_ARCHIVE_FULL = "retry_archive_full"
 TASK_ACTION_CANCEL = "cancel"
 TASK_ACTION_DELETE = "delete"
+TASK_ACTION_FINISH_SUCCESS = "finish_success"
 TASK_PENDING_ACTIONS = {
     TASK_ACTION_CONTINUE,
     TASK_ACTION_RETRY,
@@ -418,6 +419,7 @@ TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
     TASK_ACTION_RETRY_ARCHIVE_FULL,
     TASK_ACTION_CANCEL,
     TASK_ACTION_DELETE,
+    TASK_ACTION_FINISH_SUCCESS,
     "force_reset_to_pending",
 }
 TASK_OPERATION_REQUEUE_APPLIED_TYPES = {
@@ -7400,6 +7402,32 @@ class TaskManager(
             return DEFAULT_ENTRY_AUTO_SELECTION_TOP_N
         return max(1, value)
 
+    def _entry_analysis_auto_selection_top_n(self, task: BinarySecurityTask) -> int:
+        if self._entry_auto_selection_strategy(task) != ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
+            return 0
+        policy = dict(task.policy or {})
+        raw_value = policy.get("entry_analysis_auto_selection_top_n")
+        if raw_value in (None, ""):
+            raw_value = policy.get("entry_auto_selection_top_n")
+        try:
+            value = int(raw_value or DEFAULT_ENTRY_AUTO_SELECTION_TOP_N)
+        except (TypeError, ValueError):
+            return DEFAULT_ENTRY_AUTO_SELECTION_TOP_N
+        return max(1, value)
+
+    def _knowledge_graph_entry_auto_selection_top_n(self, task: BinarySecurityTask) -> int:
+        if self._entry_auto_selection_strategy(task) != ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
+            return 0
+        policy = dict(task.policy or {})
+        raw_value = policy.get("knowledge_graph_entry_auto_selection_top_n")
+        if raw_value in (None, ""):
+            raw_value = policy.get("entry_auto_selection_top_n")
+        try:
+            value = int(raw_value or DEFAULT_ENTRY_AUTO_SELECTION_TOP_N)
+        except (TypeError, ValueError):
+            return DEFAULT_ENTRY_AUTO_SELECTION_TOP_N
+        return max(1, value)
+
     def _module_risk_levels(self, task: BinarySecurityTask) -> list[str]:
         return _normalize_module_risk_levels((task.policy or {}).get("module_risk_levels"))
 
@@ -7688,7 +7716,7 @@ class TaskManager(
         entries: list[dict[str, Any]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         strategy = self._entry_auto_selection_strategy(task)
-        top_n = self._entry_auto_selection_top_n(task)
+        top_n = self._knowledge_graph_entry_auto_selection_top_n(task)
         normalized_entries = _deduplicate_entry_keys(
             [dict(entry) for entry in entries if isinstance(entry, dict)]
         )
@@ -7770,7 +7798,7 @@ class TaskManager(
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         del db
         strategy = self._entry_auto_selection_strategy(task)
-        top_n = self._entry_auto_selection_top_n(task)
+        top_n = self._entry_analysis_auto_selection_top_n(task)
         modules = [
             self._normalize_entry_result_module(task, dict(item))
             for item in modules_or_entries

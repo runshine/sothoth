@@ -2723,7 +2723,11 @@ class TaskRuntimeServiceMixin:
                     if active_operation_type == task_manager_module.TASK_ACTION_DELETE
                     else "retry_takeover_suppressed_active_lease"
                     if str(active_operation_type or "").startswith("retry")
-                    or active_operation_type in {task_manager_module.TASK_ACTION_CONTINUE, "force_reset_to_pending"}
+                    or active_operation_type in {
+                        task_manager_module.TASK_ACTION_CONTINUE,
+                        "force_reset_to_pending",
+                        task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                    }
                     else "claim_suppressed_active_runtime_lease"
                 ),
                 message="父任务租约仍有效，当前 worker 不允许接管并重新 claim",
@@ -2761,7 +2765,11 @@ class TaskRuntimeServiceMixin:
                     if active_operation_type == task_manager_module.TASK_ACTION_DELETE
                     else "retry_takeover_suppressed_active_lease"
                     if str(active_operation_type or "").startswith("retry")
-                    or active_operation_type in {task_manager_module.TASK_ACTION_CONTINUE, "force_reset_to_pending"}
+                    or active_operation_type in {
+                        task_manager_module.TASK_ACTION_CONTINUE,
+                        "force_reset_to_pending",
+                        task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                    }
                     else "claim_suppressed_active_runtime_lease"
                 ),
                 message="父任务 authoritative runtime lease 仍有效，当前 worker 不允许重新 claim",
@@ -2802,7 +2810,11 @@ class TaskRuntimeServiceMixin:
                     if active_operation_type == task_manager_module.TASK_ACTION_DELETE
                     else "retry_takeover_suppressed_active_lease"
                     if str(active_operation_type or "").startswith("retry")
-                    or active_operation_type in {task_manager_module.TASK_ACTION_CONTINUE, "force_reset_to_pending"}
+                    or active_operation_type in {
+                        task_manager_module.TASK_ACTION_CONTINUE,
+                        "force_reset_to_pending",
+                        task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                    }
                     else "claim_suppressed_transition_guard"
                 ),
                 "任务仍在 transition guard 保护窗口内，暂不重新 claim",

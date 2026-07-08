@@ -1763,7 +1763,7 @@ class TaskRuntimeStateServiceMixin:
                         if decision.active_operation_type == "delete"
                         else "retry_takeover_suppressed_active_lease"
                         if str(decision.active_operation_type or "").startswith("retry")
-                        or decision.active_operation_type in {"continue", "force_reset_to_pending"}
+                        or decision.active_operation_type in {"continue", "force_reset_to_pending", task_manager_module.TASK_ACTION_FINISH_SUCCESS}
                         else "parent_runtime_reopen_suppressed_active_lease"
                     ),
                     message="父任务 row mirror 仍在保护窗口内，当前不允许重新排队接管",
@@ -1782,7 +1782,7 @@ class TaskRuntimeStateServiceMixin:
                     if decision.active_operation_type == "delete"
                     else "retry_takeover_suppressed_active_lease"
                     if str(decision.active_operation_type or "").startswith("retry")
-                    or decision.active_operation_type in {"continue", "force_reset_to_pending"}
+                    or decision.active_operation_type in {"continue", "force_reset_to_pending", task_manager_module.TASK_ACTION_FINISH_SUCCESS}
                     else "parent_runtime_reopen_suppressed_active_lease"
                 ),
                 message="父任务租约仍有效，当前不允许重新排队接管",

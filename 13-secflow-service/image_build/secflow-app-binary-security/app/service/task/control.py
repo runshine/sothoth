@@ -653,6 +653,8 @@ class TaskControlServiceMixin:
             "entry_selection_mode": "auto",
             "entry_auto_selection_strategy": "all",
             "entry_auto_selection_top_n": 0,
+            "entry_analysis_auto_selection_top_n": 0,
+            "knowledge_graph_entry_auto_selection_top_n": 0,
             "module_risk_levels": ["高"],
         }
         defaults["partial_success_stage_advancement"] = {
@@ -660,11 +662,28 @@ class TaskControlServiceMixin:
         }
         return defaults
 
+    def _normalize_entry_top_n_fields(self: TaskManager, values: dict[str, Any] | None) -> dict[str, Any]:
+        normalized = dict(values or {})
+        legacy_top_n = normalized.get("entry_auto_selection_top_n")
+        entry_analysis_top_n = normalized.get("entry_analysis_auto_selection_top_n")
+        kg_top_n = normalized.get("knowledge_graph_entry_auto_selection_top_n")
+        if entry_analysis_top_n in (None, "") and legacy_top_n not in (None, ""):
+            normalized["entry_analysis_auto_selection_top_n"] = legacy_top_n
+        if kg_top_n in (None, "") and legacy_top_n not in (None, ""):
+            normalized["knowledge_graph_entry_auto_selection_top_n"] = legacy_top_n
+        if legacy_top_n in (None, ""):
+            if entry_analysis_top_n not in (None, ""):
+                normalized["entry_auto_selection_top_n"] = entry_analysis_top_n
+            elif kg_top_n not in (None, ""):
+                normalized["entry_auto_selection_top_n"] = kg_top_n
+        return normalized
+
     def _global_task_policy_config(self: TaskManager, db: Session, *, task_type: str) -> dict[str, Any]:
         policy = self._project_config_defaults(task_type=task_type)
         row = self._ensure_global_service_config_row(db)
         config = dict(getattr(row, "config", {}) or {}) if row is not None else {}
         if config:
+            config = self._normalize_entry_top_n_fields(config)
             policy.update({k: v for k, v in config.items() if k != "partial_success_stage_advancement"})
             if "partial_success_stage_advancement" in config:
                 policy["partial_success_stage_advancement"] = self._normalize_partial_success_stage_advancement_for_task_type(
@@ -720,6 +739,8 @@ class TaskControlServiceMixin:
             "entry_selection_mode",
             "entry_auto_selection_strategy",
             "entry_auto_selection_top_n",
+            "entry_analysis_auto_selection_top_n",
+            "knowledge_graph_entry_auto_selection_top_n",
         ):
             if override_payload.get(key) is not None:
                 policy[key] = override_payload.get(key)
@@ -742,9 +763,7 @@ class TaskControlServiceMixin:
             policy["knowledge_graph_include_excluded"] = None if include_excluded is None else bool(include_excluded)
         if policy.get("pipeline_profile") == task_manager_module.PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
             policy["entry_selection_mode"] = "auto"
-            policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
-            policy["entry_auto_selection_top_n"] = 0
-        return policy
+        return self._normalize_entry_top_n_fields(policy)
 
     def save_task_policy_config(
         self: TaskManager,
@@ -793,6 +812,7 @@ class TaskControlServiceMixin:
         config = {**self._global_config_defaults()}
         if row is not None and row.config:
             config.update(dict(row.config or {}))
+        config = self._normalize_entry_top_n_fields(config)
         config["pipeline_mode"] = self._normalize_policy_update_payload(
             type("TaskLike", (), {"policy": {}, "task_type": "binary"})(),
             BinarySecurityTaskPolicyUpdatePayload(pipeline_mode=config.get("pipeline_mode")),
@@ -817,6 +837,7 @@ class TaskControlServiceMixin:
             row = BinarySecurityServiceConfig(config_key="global")
             db.add(row)
         config = payload.model_dump()
+        config = self._normalize_entry_top_n_fields(config)
         config["pipeline_mode"] = self._normalize_policy_update_payload(
             type("TaskLike", (), {"policy": {}, "task_type": "binary"})(),
             BinarySecurityTaskPolicyUpdatePayload(pipeline_mode=config.get("pipeline_mode")),
@@ -875,6 +896,10 @@ class TaskControlServiceMixin:
             updated["entry_auto_selection_strategy"] = str(payload.entry_auto_selection_strategy or "").strip() or task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
         if payload.entry_auto_selection_top_n is not None:
             updated["entry_auto_selection_top_n"] = int(payload.entry_auto_selection_top_n)
+        if payload.entry_analysis_auto_selection_top_n is not None:
+            updated["entry_analysis_auto_selection_top_n"] = int(payload.entry_analysis_auto_selection_top_n)
+        if payload.knowledge_graph_entry_auto_selection_top_n is not None:
+            updated["knowledge_graph_entry_auto_selection_top_n"] = int(payload.knowledge_graph_entry_auto_selection_top_n)
         stage_options = dict(updated.get("stage_options") or {})
         for stage_name, option in dict(payload.stage_options or {}).items():
             normalized_stage = str(stage_name or "").strip()
@@ -909,15 +934,34 @@ class TaskControlServiceMixin:
         if str(updated.get("entry_selection_mode") or "auto").strip() != task_manager_module.ENTRY_SELECTION_MODE_AUTO:
             updated["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
             updated["entry_auto_selection_top_n"] = 0
+            updated["entry_analysis_auto_selection_top_n"] = 0
+            updated["knowledge_graph_entry_auto_selection_top_n"] = 0
         else:
             strategy = str(updated.get("entry_auto_selection_strategy") or task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
-            top_n = int(updated.get("entry_auto_selection_top_n") or 0)
-            if strategy == task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE and top_n <= 0:
-                raise ValidationError("按模块置信度 Top N 模式要求 entry_auto_selection_top_n >= 1")
+            entry_top_n = int(
+                updated.get("entry_analysis_auto_selection_top_n")
+                or updated.get("entry_auto_selection_top_n")
+                or 0
+            )
+            kg_top_n = int(
+                updated.get("knowledge_graph_entry_auto_selection_top_n")
+                or updated.get("entry_auto_selection_top_n")
+                or 0
+            )
+            if strategy == task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE and (
+                entry_top_n <= 0 or kg_top_n <= 0
+            ):
+                raise ValidationError("按置信度 Top N 模式要求入口分析和知识图谱入口上限都 >= 1")
             if strategy != task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
                 updated["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
                 updated["entry_auto_selection_top_n"] = 0
-        return updated
+                updated["entry_analysis_auto_selection_top_n"] = 0
+                updated["knowledge_graph_entry_auto_selection_top_n"] = 0
+            else:
+                updated["entry_analysis_auto_selection_top_n"] = entry_top_n
+                updated["knowledge_graph_entry_auto_selection_top_n"] = kg_top_n
+                updated["entry_auto_selection_top_n"] = entry_top_n
+        return self._normalize_entry_top_n_fields(updated)
 
     def update_task_policy(
         self: TaskManager,
@@ -1181,14 +1225,34 @@ class TaskControlServiceMixin:
         if str(policy.get("entry_selection_mode") or "auto").strip() != task_manager_module.ENTRY_SELECTION_MODE_AUTO:
             policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
             policy["entry_auto_selection_top_n"] = 0
+            policy["entry_analysis_auto_selection_top_n"] = 0
+            policy["knowledge_graph_entry_auto_selection_top_n"] = 0
         else:
             strategy = str(policy.get("entry_auto_selection_strategy") or task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL).strip()
-            top_n = int(policy.get("entry_auto_selection_top_n") or 0)
-            if strategy == task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE and top_n <= 0:
-                raise ValidationError("按模块置信度 Top N 模式要求 entry_auto_selection_top_n >= 1")
+            entry_top_n = int(
+                policy.get("entry_analysis_auto_selection_top_n")
+                or policy.get("entry_auto_selection_top_n")
+                or 0
+            )
+            kg_top_n = int(
+                policy.get("knowledge_graph_entry_auto_selection_top_n")
+                or policy.get("entry_auto_selection_top_n")
+                or 0
+            )
+            if strategy == task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE and (
+                entry_top_n <= 0 or kg_top_n <= 0
+            ):
+                raise ValidationError("按置信度 Top N 模式要求入口分析和知识图谱入口上限都 >= 1")
             if strategy != task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_TOP_N_PER_MODULE_BY_CONFIDENCE:
                 policy["entry_auto_selection_strategy"] = task_manager_module.ENTRY_AUTO_SELECTION_STRATEGY_ALL
                 policy["entry_auto_selection_top_n"] = 0
+                policy["entry_analysis_auto_selection_top_n"] = 0
+                policy["knowledge_graph_entry_auto_selection_top_n"] = 0
+            else:
+                policy["entry_analysis_auto_selection_top_n"] = entry_top_n
+                policy["knowledge_graph_entry_auto_selection_top_n"] = kg_top_n
+                policy["entry_auto_selection_top_n"] = entry_top_n
+        policy = self._normalize_entry_top_n_fields(policy)
 
         input_kind = (
             path_input["input_kind"]
@@ -1490,6 +1554,99 @@ class TaskControlServiceMixin:
             task_status_after_accept=task.status,
         )
 
+    async def finish_task_as_success(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        requested_by: str | None = None,
+    ) -> BinarySecurityActionResponse:
+        from app.service import task_manager as task_manager_module
+
+        task = self._task_or_404(db, project_id, task_id)
+        self._reject_if_delete_queued(task, action=task_manager_module.TASK_ACTION_FINISH_SUCCESS)
+        previous_status = str(getattr(task, "status", "") or "").strip()
+        normalized_requested_by = str(requested_by or getattr(task, "created_by", None) or "").strip() or None
+        if previous_status.lower() in task_manager_module.TASK_TERMINAL_STATUSES:
+            task_manager_module.observe_task_operation("finish_success", "rejected")
+            raise ValidationError(f"当前任务状态不支持成功结束: {task.status}")
+        active_operations = (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.task_id == task.id)
+            .all()
+        )
+        request_at = task_manager_module._now()
+        for candidate in active_operations:
+            operation_status = str(getattr(candidate, "status", "") or "").strip().lower()
+            if operation_status in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+                continue
+            if str(getattr(candidate, "operation_type", "") or "").strip() == task_manager_module.TASK_ACTION_FINISH_SUCCESS:
+                task_manager_module.observe_task_operation("finish_success", "already_queued")
+                return BinarySecurityActionResponse(
+                    task_id=task_id,
+                    operation_id=candidate.id,
+                    accepted=True,
+                    action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+                    status="accepted",
+                    message="任务开发者成功结束已受理，后台正在停止执行并收口为成功终态",
+                    task_status_after_accept=task.status,
+                )
+            candidate.status = "superseded"
+            candidate.finished_at = request_at
+            candidate.superseded_by_operation_id = None
+            operation_payload = dict(self._operation_result_data(candidate) or {})
+            operation_payload["finish_success"] = {
+                "requested": True,
+                "requested_by": normalized_requested_by,
+                "requested_at": request_at.isoformat(),
+                "task_status_after": str(getattr(task, "status", "") or "").strip(),
+            }
+            self._persist_operation_result_payload(
+                candidate,
+                operation_payload,
+                workspace_root=task.workspace_root,
+            )
+            self._record_operation_event(
+                db,
+                task,
+                candidate,
+                "operation_force_success_superseded",
+                "开发者成功结束请求已受理，原后台操作已转为 superseded",
+                level="warning",
+                stage_name=candidate.target_stage,
+                payload={
+                    "source": "developer_finish_success_request",
+                    "requested_by": normalized_requested_by,
+                    "task_status_after": str(getattr(task, "status", "") or "").strip(),
+                },
+            )
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            target_stage=task.current_stage,
+            requested_by=normalized_requested_by,
+            request_payload={
+                "current_stage": task.current_stage,
+                "requested_by": normalized_requested_by,
+                "previous_status": previous_status,
+            },
+            accepted_event_type="task_force_success_accepted",
+            accepted_message="任务开发者成功结束已受理，后台正在停止执行并收口为成功终态",
+        )
+        await self._request_local_worker_cancel(task.id, wait_for_runner=False)
+        task_manager_module.observe_task_operation("finish_success", "accepted")
+        return BinarySecurityActionResponse(
+            task_id=task_id,
+            operation_id=operation.id,
+            accepted=True,
+            action=task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            status="accepted",
+            message="任务开发者成功结束已受理，后台正在停止执行并收口为成功终态",
+            task_status_after_accept=task.status,
+        )
+
     async def force_reset_task_to_pending(
         self: TaskManager,
         db: Session,
@@ -1581,6 +1738,180 @@ class TaskControlServiceMixin:
             status="accepted",
             message="任务强制重置已受理，后台将等待当前 owner 或租约过期后处理",
             task_status_after_accept=task.status,
+        )
+
+    async def _apply_finish_task_as_success_now(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        *,
+        requested_by: str | None = None,
+        operation: BinarySecurityTaskOperation | None = None,
+    ) -> dict[str, Any]:
+        from app.service import task_manager as task_manager_module
+
+        previous_status = str(getattr(task, "status", "") or "").strip()
+        finish_at = task_manager_module._now()
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip() or None
+        current_operation_type: str | None = None
+        superseded_operation_count = 0
+        executing_operation_id = str(getattr(operation, "id", "") or "").strip() or None
+        active_operations = (
+            db.query(task_manager_module.BinarySecurityTaskOperation)
+            .filter(task_manager_module.BinarySecurityTaskOperation.task_id == task.id)
+            .all()
+        )
+        for candidate in active_operations:
+            operation_status = str(getattr(candidate, "status", "") or "").strip().lower()
+            if operation_status in task_manager_module.TASK_OPERATION_TERMINAL_STATUSES:
+                continue
+            candidate_id = str(getattr(candidate, "id", "") or "").strip() or None
+            if executing_operation_id and candidate_id == executing_operation_id:
+                current_operation_type = str(getattr(candidate, "operation_type", "") or "").strip() or None
+                continue
+            if current_operation_id and candidate_id == current_operation_id:
+                current_operation_type = str(getattr(candidate, "operation_type", "") or "").strip() or None
+            candidate.status = "superseded"
+            candidate.finished_at = finish_at
+            candidate.superseded_by_operation_id = executing_operation_id
+            operation_payload = dict(self._operation_result_data(candidate) or {})
+            operation_payload["finish_success"] = {
+                "requested": True,
+                "requested_by": str(requested_by or "").strip() or None,
+                "finish_at": finish_at.isoformat(),
+                "task_status_after": "success",
+            }
+            self._persist_operation_result_payload(
+                candidate,
+                operation_payload,
+                workspace_root=task.workspace_root,
+            )
+            self._record_operation_event(
+                db,
+                task,
+                candidate,
+                "operation_force_success_superseded",
+                "开发者成功结束任务，已终止当前后台操作",
+                level="warning",
+                stage_name=candidate.target_stage,
+                payload={
+                    "source": "developer_finish_success",
+                    "requested_by": str(requested_by or "").strip() or None,
+                    "task_status_after": "success",
+                    "superseded_by_operation_id": executing_operation_id,
+                },
+            )
+            superseded_operation_count += 1
+
+        active_statuses = ["pending", "queued", "dispatching", "running"]
+        running_items = db.query(task_manager_module.BinarySecurityStageItem).filter(
+            task_manager_module.BinarySecurityStageItem.task_id == task.id,
+            task_manager_module.BinarySecurityStageItem.status.in_(active_statuses),
+        ).all()
+        for item in running_items:
+            item.status = "cancelled"
+            item.finished_at = item.finished_at or finish_at
+            self._clear_replacement_in_progress(item)
+            self._clear_stage_item_sync_observation_errors(item)
+            self._repair_stage_item_terminal_downstream_observation(
+                db,
+                task,
+                item,
+                reason="task_force_success",
+            )
+        active_stage_runs = db.query(task_manager_module.BinarySecurityStageRun).filter(
+            task_manager_module.BinarySecurityStageRun.task_id == task.id,
+            task_manager_module.BinarySecurityStageRun.status.in_(active_statuses),
+        ).all()
+        for stage_run in active_stage_runs:
+            stage_run.status = "cancelled"
+            stage_run.finished_at = stage_run.finished_at or finish_at
+
+        downstream_refs = self._dedupe_downstream_refs(
+            self._collect_downstream_refs(task, running_items) + self._discover_parent_linked_downstream_refs(db, task)
+        )
+        self._record_event(
+            db,
+            task,
+            "task_force_success_finishing",
+            "开发者成功结束开始停止当前执行并收口主任务",
+            level="warning",
+            stage_name=task.current_stage,
+            payload={
+                "requested_by": str(requested_by or "").strip() or None,
+                "previous_status": previous_status,
+                "cancelled_item_count": len(running_items),
+                "cancelled_stage_run_count": len(active_stage_runs),
+                "downstream_ref_count": len(downstream_refs),
+                "superseded_operation_count": superseded_operation_count,
+            },
+        )
+        db.commit()
+
+        downstream_cancel_error: str | None = None
+        if downstream_refs:
+            try:
+                await self._cancel_downstream_refs(
+                    db,
+                    task,
+                    downstream_refs,
+                    self._service_token(),
+                )
+            except Exception as exc:
+                downstream_cancel_error = str(exc)
+                self._record_event(
+                    db,
+                    task,
+                    "task_force_success_downstream_cancel_failed",
+                    f"开发者成功结束时，下游停止请求失败但已忽略: {exc}",
+                    level="warning",
+                    stage_name=task.current_stage,
+                    payload={
+                        "requested_by": str(requested_by or "").strip() or None,
+                        "downstream_ref_count": len(downstream_refs),
+                        "error": str(exc),
+                    },
+                )
+                db.commit()
+
+        summary_payload = self._clear_failure_fields_from_summary(dict(getattr(task, "summary", None) or {}))
+        summary_payload["manual_success_override"] = {
+            "requested": True,
+            "requested_by": str(requested_by or "").strip() or None,
+            "finished_at": finish_at.isoformat(),
+            "previous_status": previous_status,
+        }
+        task.summary = summary_payload
+        task.last_error = None
+        task.execution_mode = None
+        task.tail_reconcile_state = "idle"
+        self._clear_task_abnormal_reason_snapshot(db, task)
+
+        return self._finalize_control_operation_terminal(
+            db,
+            task,
+            operation if operation is not None else self._active_operation(db, task.id),
+            step_name=task_manager_module.TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+            step_message=f"后台操作准备步骤已完成: {task_manager_module.TASK_ACTION_FINISH_SUCCESS}",
+            task_status="success",
+            task_reason="开发者人工强制成功结束任务",
+            lease_reason="force_success_terminal_cleanup",
+            task_event_type="task_force_success_completed",
+            task_event_message="任务已被开发者人工强制收口为成功",
+            task_event_payload={
+                "source": "developer_finish_success",
+                "requested_by": str(requested_by or "").strip() or None,
+                "previous_status": previous_status,
+                "previous_current_operation_id": current_operation_id,
+                "previous_operation_type": current_operation_type,
+                "superseded_operation_count": superseded_operation_count,
+                "cancelled_item_count": len(running_items),
+                "cancelled_stage_run_count": len(active_stage_runs),
+                "downstream_ref_count": len(downstream_refs),
+                "downstream_cancel_error": downstream_cancel_error,
+                "task_status_after": "success",
+                "executed_via_operation_id": executing_operation_id,
+            },
         )
 
     async def _apply_force_reset_to_pending_now(
