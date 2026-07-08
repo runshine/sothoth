@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-poc-gen-verify-worker
+  namespace: secflow-ns
+  labels: { name: secflow-app-poc-gen-verify, role: worker }
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }   # only 1 worker down at a time
+  selector: { matchLabels: { name: secflow-app-poc-gen-verify, role: worker } }
+  template:
+    metadata: { labels: { name: secflow-app-poc-gen-verify, role: worker } }
+    spec:
+      securityContext: { fsGroup: 1000 }
+      containers:
+        - name: poc-gen-verify-worker
+          image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            capabilities: { add: [SYS_PTRACE] }   # gdb ptrace for the poc CLI
+          # entrypoint.sh (claude config setup) MUST run before celery — the poc
+          # CLI spawns `claude`, which needs ~/.claude.json + ~/.claude/settings.json.
+          command: ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+          args: ["celery", "-A", "app.celery_app", "worker", "-P", "prefork", "-c", "1",
+                 "--queues=poc", "--loglevel=info", "--hostname=poc-worker@%h"]
+          env:
+            - { name: TZ, value: Asia/Shanghai }
+            - { name: SERVICE_YAML, value: /app/service.yaml }
+            - { name: POC_ROLE, value: worker }
+            - { name: POC_GEN_VERIFY_STATE_ROOT, value: /var/lib/secflow-poc-gen-verify }
+            - { name: POC_GEN_VERIFY_WORKSPACE, value: /workspace }
+            - { name: POC_GEN_VERIFY_POC_BIN, value: poc }
+            - { name: POC_GEN_VERIFY_CLAUDE_MODEL, value: glm-5.2 }
+            - { name: POC_SCHEDULER_HOST, value: secflow-app-poc-gen-verify-redis }
+            - { name: POC_LEASE_TTL_SECONDS, value: "300" }
+            - { name: POC_HEARTBEAT_INTERVAL_SECONDS, value: "60" }
+            - { name: POC_CELERY_MAX_TASKS_PER_CHILD, value: "10" }
+            - { name: ANTHROPIC_BASE_URL, value: "https://dashscope.aliyuncs.com/apps/anthropic" }
+            - { name: ANTHROPIC_MODEL, value: glm-5.2 }
+            - { name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, value: "1" }
+            - name: POC_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          envFrom:
+            - secretRef: { name: secflow-app-poc-gen-verify-secret, optional: true }
+          volumeMounts:
+            - { name: cfg, mountPath: /app/service.yaml, subPath: service.yaml }
+            - { name: poc-data, mountPath: /var/lib/secflow-poc-gen-verify }
+            - { name: poc-data, mountPath: /workspace, subPath: workspace }
+          resources: { requests: { cpu: "2", memory: "4Gi" }, limits: { cpu: "8", memory: "16Gi" } }
+          # worker runs celery (not uvicorn) — liveness via process check
+          livenessProbe:
+            exec: { command: ["sh", "-c", "pgrep -f 'celery.*app.celery_app' >/dev/null"] }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            exec: { command: ["sh", "-c", "pgrep -f 'celery.*app.celery_app' >/dev/null"] }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: cfg
+          configMap: { name: secflow-app-poc-gen-verify-config, items: [{ key: service.yaml, path: service.yaml }] }
+        - name: poc-data
+          persistentVolumeClaim: { claimName: secflow-app-poc-gen-verify-data-nfs-pvc }

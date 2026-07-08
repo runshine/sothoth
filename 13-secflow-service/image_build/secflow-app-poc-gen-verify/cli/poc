@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# poc - wrapper for poc_cli.py (PoC generation & verification orchestrator).
+# Usage: ./poc -e <entry-func> -r <vuln-report> -b <firmware-bin-dir> [options]
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec python3 "$SCRIPT_DIR/poc_cli.py" "$@"

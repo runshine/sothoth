@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-poc-gen-verify-scheduler
+  namespace: secflow-ns
+  labels: { name: secflow-app-poc-gen-verify, role: scheduler }
+spec:
+  replicas: 1
+  selector: { matchLabels: { name: secflow-app-poc-gen-verify, role: scheduler } }
+  template:
+    metadata: { labels: { name: secflow-app-poc-gen-verify, role: scheduler } }
+    spec:
+      securityContext: { fsGroup: 1000 }
+      containers:
+        - name: poc-gen-verify-dispatcher
+          image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
+          imagePullPolicy: IfNotPresent
+          # entrypoint.sh runs first (harmless for the dispatcher; it doesn't
+          # spawn claude but needs the python env), then the dispatcher loop.
+          command: ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+          args: ["python3", "-m", "app.dispatcher"]
+          env:
+            - { name: TZ, value: Asia/Shanghai }
+            - { name: SERVICE_YAML, value: /app/service.yaml }
+            - { name: POC_ROLE, value: scheduler }
+            - { name: POC_SCHEDULER_HOST, value: secflow-app-poc-gen-verify-redis }
+            - { name: POC_DISPATCHER_PUMP_INTERVAL, value: "3" }
+            - { name: POC_DISPATCHER_STALE_INTERVAL, value: "30" }
+            - name: POC_POD_NAME
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+          volumeMounts:
+            - { name: cfg, mountPath: /app/service.yaml, subPath: service.yaml }
+          resources: { requests: { cpu: "200m", memory: "512Mi" }, limits: { cpu: "1", memory: "1Gi" } }
+          livenessProbe:
+            exec: { command: ["sh", "-c", "pgrep -f 'app.dispatcher' >/dev/null"] }
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          readinessProbe:
+            exec: { command: ["sh", "-c", "pgrep -f 'app.dispatcher' >/dev/null"] }
+            initialDelaySeconds: 15
+            periodSeconds: 15
+      volumes:
+        - name: cfg
+          configMap: { name: secflow-app-poc-gen-verify-config, items: [{ key: service.yaml, path: service.yaml }] }
