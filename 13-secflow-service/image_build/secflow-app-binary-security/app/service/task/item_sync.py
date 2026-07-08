@@ -2685,17 +2685,31 @@ class TaskItemSyncServiceMixin:
                             and mapped_status in {"pending", "queued", "running", "dispatching"}
                             and mapped_status != before_status
                         )
+                        observed_sync_status = (
+                            "synced"
+                            if mapped_status in {"pending", "queued", "running", "dispatching"}
+                            else "skipped"
+                        )
+                        observed_last_result = (
+                            "success"
+                            if observed_sync_status == "synced"
+                            else None
+                        )
                         self._refresh_stage_item_downstream_observation(
                             item,
-                            sync_status="skipped",
+                            sync_status=observed_sync_status,
                             synced_at=sync_observed_at,
                             status_raw=downstream_status,
                             mapped_status=mapped_status,
                             downstream_status=downstream_status,
                             state_applied=False,
                             downstream_payload=payload,
+                            last_sync_result=observed_last_result,
                         )
-                        skipped_count += 1
+                        if observed_sync_status == "skipped":
+                            skipped_count += 1
+                        else:
+                            synced_count += 1
                     skip_reason_code, skip_reason_category = self._classify_downstream_sync_skip_reason(
                         mapped_status=mapped_status,
                         before_status=before_status,

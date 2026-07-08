@@ -4355,14 +4355,16 @@ class TaskRuntimeServiceMixin:
                     state_event_id=None,
                     source_event_type="stage_worker_terminal_observed",
                 )
-                self._record_event(
-                    db,
-                    task,
-                    "stage_worker_terminal_applied_by_owner",
-                    f"阶段 worker 已完成，owner 已直接应用终态事实并继续收口: {stage_name}",
-                    stage_name=stage_name,
-                    payload={"status": status},
-                )
+                normalized_stage_status = self._normalize_downstream_status(status) or str(status or "").strip().lower()
+                if normalized_stage_status in {"success", "partial_success", "failed", "cancelled", "downstream_missing"}:
+                    self._record_event(
+                        db,
+                        task,
+                        "stage_worker_terminal_applied_by_owner",
+                        f"阶段 worker 已完成，owner 已直接应用终态事实并继续收口: {stage_name}",
+                        stage_name=stage_name,
+                        payload={"status": status},
+                    )
                 try:
                     db.commit()
                 except Exception:

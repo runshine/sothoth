@@ -1,9 +1,11 @@
 import unittest
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 import asyncio
 
 from app.model import (
+    BinarySecurityArchiveJob,
     BinarySecurityStageItem,
     BinarySecurityStageRun,
     BinarySecurityTask,
@@ -128,6 +130,129 @@ class TaskStateMachineTests(unittest.TestCase):
             should_advance = self.manager._should_auto_advance_to_stage(db, task, "entry_analysis")
 
         self.assertFalse(should_advance)
+
+    def test_should_auto_advance_to_stage_blocks_entry_analysis_without_upstream_archived_success(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        task.summary = {
+            "selected_modules": [{"module_key": "mod-a", "module_name": "mod-a"}],
+            "candidate_modules": [{"module_key": "mod-a", "module_name": "mod-a"}],
+        }
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        system_item = BinarySecurityStageItem(
+            id="si-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=system_run.id,
+            stage_name="system_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            status="success",
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[system_run, entry_run],
+            stage_items=[system_item],
+            archive_jobs=[],
+        )
+
+        with (
+            patch.object(self.manager, "_system_analysis_authoritative_complete", return_value=True),
+            patch.object(self.manager, "_entry_analysis_inputs", return_value=[{"module_key": "mod-a"}]),
+            patch.object(self.manager, "_source_entry_analysis_barrier_enabled", return_value=True),
+            patch.object(self.manager, "_stage_items", side_effect=lambda _db, _task_id, stage_name: [system_item] if stage_name == "system_analysis" else []),
+        ):
+            self.assertFalse(self.manager._streaming_upstream_gate_ready(db, task, "entry_analysis"))
+            self.assertFalse(self.manager._should_auto_advance_to_stage(db, task, "entry_analysis"))
+            self.assertEqual("system_analysis", self.manager._next_stage_candidate(db, task))
+
+    def test_should_auto_advance_to_stage_allows_entry_analysis_after_upstream_archived_success(self):
+        task = BinarySecurityTask(
+            id="task-1",
+            project_id="project-1",
+            name="task",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            policy_json=json.dumps({"pipeline_mode": "mixed_streaming"}),
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        task.summary = {
+            "selected_modules": [{"module_key": "mod-a", "module_name": "mod-a"}],
+            "candidate_modules": [{"module_key": "mod-a", "module_name": "mod-a"}],
+        }
+        system_run = BinarySecurityStageRun(
+            id="sr-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            sequence_no=1,
+            status="success",
+        )
+        entry_run = BinarySecurityStageRun(
+            id="sr-entry",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="entry_analysis",
+            sequence_no=2,
+            status="pending",
+        )
+        system_item = BinarySecurityStageItem(
+            id="si-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=system_run.id,
+            stage_name="system_analysis",
+            item_key="mod-a",
+            item_name="mod-a",
+            status="success",
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-system",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="system_analysis",
+            item_id=system_item.id,
+            archive_status="success",
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[system_run, entry_run],
+            stage_items=[system_item],
+            archive_jobs=[archive_job],
+        )
+
+        with (
+            patch.object(self.manager, "_system_analysis_authoritative_complete", return_value=True),
+            patch.object(self.manager, "_entry_analysis_inputs", return_value=[{"module_key": "mod-a"}]),
+            patch.object(self.manager, "_source_entry_analysis_barrier_enabled", return_value=True),
+        ):
+            self.assertTrue(self.manager._streaming_upstream_gate_ready(db, task, "entry_analysis"))
+            self.assertTrue(self.manager._should_auto_advance_to_stage(db, task, "entry_analysis"))
+            self.assertEqual("entry_analysis", self.manager._next_stage_candidate(db, task))
 
     def test_streaming_stage_start_ready_reuses_auto_advance_gate_for_entry_analysis(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")

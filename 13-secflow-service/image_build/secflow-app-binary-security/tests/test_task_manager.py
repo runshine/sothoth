@@ -22196,7 +22196,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("failed", item.status)
         self.assertEqual("failed", run.status)
         self.assertEqual("running", task.status)
-        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual(0, resp.skipped_downstream_count)
         self.assertEqual("running", item.result.get("sync_observation", {}).get("status_raw"))
         self.assertEqual("running", item.result.get("sync_observation", {}).get("mapped_status"))
         self.assertFalse(bool(item.result.get("sync_observation", {}).get("state_applied")))
@@ -22264,7 +22264,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual(0, resp.skipped_downstream_count)
         self.assertEqual("pending", item.status)
         self.assertEqual("pending", item.result.get("sync_observation", {}).get("status_raw"))
         self.assertEqual("pending", item.result.get("sync_observation", {}).get("mapped_status"))
@@ -22347,7 +22347,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual(0, resp.skipped_downstream_count)
         self.assertEqual("pending", item.result.get("downstream", {}).get("status"))
         self.assertIsNone(item.result.get("downstream", {}).get("error"))
         skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
@@ -22523,7 +22523,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             self.manager._write_task_metadata_async = original_write
             self.manager._enqueue_task = original_enqueue
 
-        self.assertEqual(1, resp.skipped_downstream_count)
+        self.assertEqual(0, resp.skipped_downstream_count)
         self.assertEqual("failed", item.status)
         self.assertEqual("pending", item.result.get("downstream", {}).get("status"))
         skipped_events = [event for event in db.events if event.event_type == "downstream_status_sync_skipped"]
@@ -41430,7 +41430,7 @@ def _test_stage_terminal_after_system_analysis_archive_keeps_entry_analysis_as_c
         state_event_id="se-1",
     )
 
-    self.assertEqual("requeue_next_stage", decision.action)
+    self.assertEqual("activate_streaming_tail", decision.action)
     self.assertEqual("entry_analysis", decision.next_stage)
 
 
@@ -46652,6 +46652,94 @@ def _test_compute_item_downstream_action_recreates_missing_authoritative_child_a
     self.assertFalse(decision["child_bound"])
     self.assertFalse(decision["counts_as_active_child"])
     self.assertEqual("missing_authoritative_child_after_create_attempt", decision["reason"])
+
+
+def _test_sync_downstream_status_marks_active_child_observation_as_synced_when_status_unchanged(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-active-child-fresh",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-active-child-fresh",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=1,
+        status="running",
+    )
+    item = BinarySecurityStageItem(
+        id="si-active-child-fresh",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="system_analysis",
+        item_key="source_project",
+        item_name="source-project",
+        status="pending",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-active-child-fresh",
+    )
+    item.result = {
+        "sync_status": "skipped",
+        "downstream_status": "pending",
+        "sync_observation": {
+            "sync_status": "skipped",
+            "last_result": "success",
+            "downstream_status": "pending",
+            "mapped_status": "pending",
+            "state_applied": False,
+        },
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "task_id": "sat-active-child-fresh",
+            "status": "pending",
+            "parent_stage_item_id": str(item.id),
+            "result": {},
+        }
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._write_task_metadata_async = AsyncMock(return_value=None)
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name="system_analysis",
+                apply_state=True,
+                force=True,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    observation = dict((item.result or {}).get("sync_observation") or {})
+    self.assertEqual("synced", item.result.get("sync_status"))
+    self.assertEqual("synced", observation.get("sync_status"))
+    self.assertEqual("success", observation.get("last_result"))
+    self.assertIsNotNone(observation.get("last_success_at"))
+    self.assertFalse(manager._item_needs_initial_downstream_sync(item))
+    decision = manager._compute_item_downstream_action(task, item, for_task_status="running")
+    self.assertEqual("noop", decision["action"])
+    self.assertEqual("active_child_fresh", decision["reason"])
 
 
 def _test_get_sync_events_returns_paginated_filtered_records(self):
