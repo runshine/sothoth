@@ -2360,6 +2360,45 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([], pushed)
         self.assertIn("dispatch_claim_cooldown", task.summary)
 
+    async def test_owned_execution_requeue_candidates_skip_task_when_pending_claim_marker_exists_in_db_summary(self):
+        task = BinarySecurityTask(
+            id="task-db-summary-pending-claim",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="entry_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+        )
+        task.summary = {
+            "parent_takeover_pending_claim": {
+                "active": True,
+                "released_at": _now().isoformat(),
+                "enqueue_context": "owned_execution_release_for_takeover",
+            }
+        }
+        reloaded = BinarySecurityTask(
+            id=task.id,
+            project_id=task.project_id,
+            name=task.name,
+            status=task.status,
+            task_type=task.task_type,
+            current_stage=task.current_stage,
+            firmware_path=task.firmware_path,
+            output_root=task.output_root,
+            workspace_root="",
+            runtime_phase=task.runtime_phase,
+            summary_json=task.summary_json,
+        )
+        db = _ModelAwareDb(tasks=[reloaded], events=[], state_events=[])
+
+        candidate_ids = self.manager._owned_execution_requeue_candidate_task_ids(db)
+
+        self.assertEqual([], candidate_ids)
+
     async def test_reconcile_work_queues_reenqueues_active_nonpending_task_after_runtime_lease_expiry(self):
         task = BinarySecurityTask(
             id="task-running-stale-owner",

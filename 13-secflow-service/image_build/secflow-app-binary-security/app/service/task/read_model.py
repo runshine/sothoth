@@ -2118,6 +2118,20 @@ class TaskReadModelServiceMixin:
             abnormal_reason_category=abnormal_reason.category if abnormal_reason else None,
             abnormal_reason=abnormal_reason,
             stage_summaries=stage_summaries,
+            stage_runs=[
+                task_manager_module.BinarySecurityStageRunResponse(
+                    stage_name=str(run.stage_name or ""),
+                    sequence_no=int(run.sequence_no or 0),
+                    status=str(run.status or ""),
+                    retry_count=int(run.retry_count or 0),
+                    started_at=run.started_at,
+                    finished_at=run.finished_at,
+                    last_error=run.last_error,
+                    counts=dict(run.counts or {}),
+                    output_summary=dict(run.output_summary or {}),
+                )
+                for run in stage_runs
+            ],
             manual_operation_state=manual_operation_state,
             cancel_state=self._cancel_state_from_operation(task, cancel_operation),
             cleanup_state=self._build_cleanup_state(task),

@@ -112,11 +112,19 @@ class TaskRuntimeServiceMixin:
             return 15
 
     def _dispatch_claim_cooldown_snapshot(self: TaskManager, task) -> dict[str, object]:
+        loader = getattr(task, "runtime_guard_summary_snapshot", None)
+        if callable(loader):
+            raw = loader("dispatch_claim_cooldown")
+            return dict(raw) if isinstance(raw, dict) else {}
         summary = dict(getattr(task, "summary", None) or {})
         raw = summary.get("dispatch_claim_cooldown")
         return dict(raw) if isinstance(raw, dict) else {}
 
     def _parent_takeover_pending_claim_snapshot(self: TaskManager, task) -> dict[str, object]:
+        loader = getattr(task, "runtime_guard_summary_snapshot", None)
+        if callable(loader):
+            raw = loader("parent_takeover_pending_claim")
+            return dict(raw) if isinstance(raw, dict) else {}
         summary = dict(getattr(task, "summary", None) or {})
         raw = summary.get("parent_takeover_pending_claim")
         return dict(raw) if isinstance(raw, dict) else {}
@@ -139,6 +147,10 @@ class TaskRuntimeServiceMixin:
         return status in {"pending", "dispatching", "cancelling"}
 
     def _clear_parent_takeover_pending_claim(self: TaskManager, task) -> None:
+        clearer = getattr(task, "clear_runtime_guard_summary_field", None)
+        if callable(clearer):
+            clearer("parent_takeover_pending_claim")
+            return
         summary = dict(getattr(task, "summary", None) or {})
         if "parent_takeover_pending_claim" not in summary:
             return
@@ -180,11 +192,19 @@ class TaskRuntimeServiceMixin:
             "cooldown_until": task_manager_module._isoformat_or_none(until),
             "count": previous_count + 1,
         }
+        setter = getattr(task, "set_runtime_guard_summary_field", None)
+        if callable(setter):
+            setter("dispatch_claim_cooldown", snapshot)
+            return snapshot
         summary["dispatch_claim_cooldown"] = snapshot
         task.summary = summary
         return snapshot
 
     def _clear_dispatch_claim_cooldown(self: TaskManager, task) -> None:
+        clearer = getattr(task, "clear_runtime_guard_summary_field", None)
+        if callable(clearer):
+            clearer("dispatch_claim_cooldown")
+            return
         summary = dict(getattr(task, "summary", None) or {})
         if "dispatch_claim_cooldown" not in summary:
             return

@@ -773,6 +773,18 @@ class BinarySecurityTaskKeySnapshot(BinarySecurityBaseModel):
     work_keys: list[BinarySecurityWorkKeySnapshot] = Field(default_factory=list)
 
 
+class BinarySecurityStageRunResponse(BinarySecurityBaseModel):
+    stage_name: str
+    sequence_no: int
+    status: str
+    retry_count: int = 0
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+    counts: dict[str, int] = Field(default_factory=dict)
+    output_summary: dict[str, Any] = Field(default_factory=dict)
+
+
 class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     description: Optional[str] = None
     output_root: str
@@ -785,6 +797,7 @@ class BinarySecurityTaskDetailResponse(BinarySecurityTaskResponse):
     item_stats: dict[str, dict[str, int]] = Field(default_factory=dict)
     stage_items_total: int = 0
     stage_items_truncated: bool = False
+    stage_runs: list[BinarySecurityStageRunResponse] = Field(default_factory=list)
     stage_items: list[BinarySecurityStageItemSummaryResponse] = Field(default_factory=list)
     archive_jobs: list[BinarySecurityArchiveJobResponse] = Field(default_factory=list)
     overview_nodes: list[BinarySecurityOverviewNode] = Field(default_factory=list)

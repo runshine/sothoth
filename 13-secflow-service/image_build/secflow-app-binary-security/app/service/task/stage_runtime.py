@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
-from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask, normalize_stage_name
+from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask, build_stage_item_identity_key, normalize_stage_name
 from app.observability import observe_task_snapshot_lock_retry
+from app.service.task.shared import _deduplicate_entry_keys
 
 if TYPE_CHECKING:
     from app.service.task_manager import TaskManager
@@ -290,7 +291,64 @@ class TaskStageRuntimeMixin:
             if isinstance(entry, dict) and str(entry.get("entry_key") or "").strip()
         }
         new_entry_keys = sorted(current_entry_keys - previous_entry_keys)
+        created_item_ids: list[str] = []
         if new_entry_keys:
+            dataflow_stage_run = self._latest_stage_run(db, task.id, "dataflow_vuln_scan")
+            if dataflow_stage_run is not None:
+                stage_inputs = [
+                    entry
+                    for entry in list(self._effective_entry_inputs(task, db) or [])
+                    if isinstance(entry, dict)
+                ]
+                self._prepare_stage_items_for_execution(
+                    db,
+                    task=task,
+                    stage_run=dataflow_stage_run,
+                    inputs=_deduplicate_entry_keys(stage_inputs),
+                    downstream_service="dataflow_vuln_scan",
+                    identity=lambda entry: (
+                        entry["entry_key"],
+                        entry["function_name"],
+                        entry.get("module_key"),
+                        entry,
+                    ),
+                    output_ref=lambda _entry: {},
+                )
+                target_identity_keys = {
+                    build_stage_item_identity_key(
+                        str(entry.get("entry_key") or "").strip(),
+                        entry.get("module_key"),
+                    )
+                    for entry in stage_inputs
+                    if isinstance(entry, dict) and str(entry.get("entry_key") or "").strip() in new_entry_keys
+                }
+                created_item_ids = [
+                    str(item.id or "").strip()
+                    for item in self._stage_items(db, task.id, "dataflow_vuln_scan")
+                    if (
+                        str(item.item_identity_key or "").strip() in target_identity_keys
+                        and str(item.status or "").strip().lower() in {"queued", "pending", "dispatching", "running"}
+                        and not str(item.downstream_task_id or "").strip()
+                    )
+                ]
+                if created_item_ids:
+                    self._run_async_blocking(
+                        self._enqueue_task_sync_request(
+                            task,
+                            db=db,
+                            operation="child_create",
+                            source="knowledge_graph_incremental_reseed",
+                            reason="knowledge_graph_incremental_reseed_child_create",
+                            stage_name="dataflow_vuln_scan",
+                            item_ids=created_item_ids,
+                            source_event_type="knowledge_graph_entry_incremental_inputs_materialized",
+                            payload={
+                                "new_entry_keys": new_entry_keys[:50],
+                                "new_entry_count": len(new_entry_keys),
+                            },
+                            priority=10,
+                        )
+                    )
             self._record_event(
                 db,
                 task,
@@ -303,6 +361,9 @@ class TaskStageRuntimeMixin:
                     "new_entry_keys_sample": new_entry_keys[:10],
                     "previous_entry_count": len(previous_entry_keys),
                     "current_entry_count": len(current_entry_keys),
+                    "dataflow_reseeded": dataflow_stage_run is not None,
+                    "dataflow_child_create_enqueued": bool(created_item_ids),
+                    "created_item_count": len(created_item_ids),
                 },
             )
         return refreshed or bool(new_entry_keys)

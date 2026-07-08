@@ -1900,6 +1900,104 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
             self.assertEqual({"runtime_task_keys": {}}, json.loads(task.summary_json))
             self.assertEqual({"selected_modules": [{"module_key": "m1"}]}, task.summary)
 
+    def test_task_summary_persists_runtime_guard_fields_to_db_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t-runtime-guards",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+
+            task.summary = {
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": "2026-07-08T13:47:20",
+                    "released_by_instance_id": "worker-a",
+                },
+                "dispatch_claim_cooldown": {
+                    "reason": "handoff",
+                    "cooldown_until": "2026-07-08T13:48:20",
+                    "count": 1,
+                },
+            }
+
+            self.assertEqual(
+                {
+                    "runtime_task_keys": {},
+                    "parent_takeover_pending_claim": {
+                        "active": True,
+                        "released_at": "2026-07-08T13:47:20",
+                        "released_by_instance_id": "worker-a",
+                    },
+                    "dispatch_claim_cooldown": {
+                        "reason": "handoff",
+                        "cooldown_until": "2026-07-08T13:48:20",
+                        "count": 1,
+                    },
+                },
+                json.loads(task.summary_json),
+            )
+
+    def test_runtime_guard_summary_snapshot_clears_stale_file_copy_from_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t-runtime-guards-clear",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            task.summary = {
+                "selected_modules": [{"module_key": "m1"}],
+                "parent_takeover_pending_claim": {
+                    "active": True,
+                    "released_at": "2026-07-08T13:47:20",
+                },
+            }
+            task._summary_cache = None
+            task.summary_json = json.dumps({"runtime_task_keys": {}}, ensure_ascii=False)
+
+            snapshot = task.runtime_guard_summary_snapshot("parent_takeover_pending_claim")
+
+            self.assertEqual({}, snapshot)
+            file_payload = json.loads((Path(tmp) / BinarySecurityTask.SUMMARY_FILENAME).read_text(encoding="utf-8"))
+            self.assertNotIn("parent_takeover_pending_claim", file_payload)
+            self.assertEqual([{"module_key": "m1"}], file_payload.get("selected_modules"))
+
+    def test_runtime_guard_summary_field_write_updates_file_and_db(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            task = BinarySecurityTask(
+                id="t-runtime-guards-write",
+                project_id="p1",
+                name="n",
+                status="pending",
+                task_type=TASK_TYPE_BINARY,
+                firmware_source="project_filesystem",
+                firmware_path="/fw",
+                output_root="/o",
+                workspace_root=tmp,
+            )
+            task.summary = {"selected_modules": [{"module_key": "m1"}]}
+
+            task.set_runtime_guard_summary_field(
+                "parent_takeover_pending_claim",
+                {"active": True, "released_at": "2026-07-08T13:47:20"},
+            )
+
+            file_payload = json.loads((Path(tmp) / BinarySecurityTask.SUMMARY_FILENAME).read_text(encoding="utf-8"))
+            self.assertTrue(file_payload.get("parent_takeover_pending_claim", {}).get("active"))
+            self.assertTrue(json.loads(task.summary_json).get("parent_takeover_pending_claim", {}).get("active"))
+
     def test_task_summary_is_not_written_when_delete_in_progress(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = BinarySecurityTask(
@@ -6760,6 +6858,11 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
         detail = self.manager.get_task_detail(db, project_id="p1", task_id="t1")
 
         by_stage = {summary.stage_name: summary for summary in detail.stage_summaries}
+        self.assertEqual(3, len(detail.stage_runs))
+        self.assertEqual("entry_analysis", detail.stage_runs[0].stage_name)
+        self.assertEqual("success", detail.stage_runs[0].status)
+        self.assertEqual("dataflow_vuln_scan", detail.stage_runs[-1].stage_name)
+        self.assertEqual("pending", detail.stage_runs[-1].status)
         self.assertEqual("blocked", detail.manual_operation_state["overall"])
         self.assertEqual("task_running", detail.manual_operation_state["blocking_code"])
         self.assertFalse(detail.manual_operation_state["can_continue"])
@@ -41285,13 +41388,20 @@ def _test_apply_task_resume_decision_keeps_running_for_owned_execution_handoff(s
         },
     )()
 
-    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True):
+    queued = []
+    with patch.object(manager, "_task_runtime_owner_matches_current_instance", return_value=True), patch.object(
+        manager,
+        "_enqueue_task",
+        lambda task_id: queued.append(task_id),
+    ):
         changed = manager._apply_task_resume_decision(db, task, decision)
 
     self.assertTrue(changed)
     self.assertEqual("running", task.status)
     self.assertEqual("entry_analysis", task.current_stage)
-    self.assertTrue(any(event.event_type == "task_resume_kept_running_due_to_owned_execution" for event in db.events))
+    self.assertEqual([], queued)
+    self.assertTrue(any(event.event_type == "task_stage_handoff_applied" for event in db.events))
+    self.assertFalse(any(event.event_type == "task_resume_kept_running_due_to_owned_execution" for event in db.events))
     self.assertFalse(
         any(
             event.event_type == "task_status_changed"
@@ -41299,6 +41409,7 @@ def _test_apply_task_resume_decision_keeps_running_for_owned_execution_handoff(s
             for event in db.events
         )
     )
+    self.assertFalse(any(event.event_type == "task_requeued_after_downstream_sync" for event in db.events))
 
 
 def _test_apply_task_main_state_update_allows_pending_for_lease_loss_requeue(self):
@@ -41955,7 +42066,7 @@ def _test_stage_terminal_after_system_analysis_archive_keeps_binary_to_source_as
         state_event_id="se-bin-1",
     )
 
-    self.assertEqual("requeue_next_stage", decision.action)
+    self.assertEqual("activate_streaming_tail", decision.action)
     self.assertEqual("binary_to_source", decision.next_stage)
 
 

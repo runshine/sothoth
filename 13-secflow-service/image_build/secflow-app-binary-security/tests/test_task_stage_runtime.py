@@ -2,7 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.model import BinarySecurityStageRun, BinarySecurityTask
+from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask
+from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager
 from test_task_manager import _ModelAwareDb
 
@@ -116,6 +117,76 @@ class TaskStageRuntimeTests(unittest.TestCase):
         self.assertIs(result, stage_run)
         refresh_kg_inputs.assert_called_once_with(db, task)
         refresh_tail.assert_called_once_with(db, task, "dataflow_vuln_scan")
+
+    def test_refresh_kg_streaming_inputs_if_needed_reseeds_dataflow_items_for_new_entries(self):
+        task = BinarySecurityTask(
+            id="task-kg-reseed",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            task_type="source",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming", "pipeline_profile": "kg_source_vuln_scan"}
+        kg_run = BinarySecurityStageRun(
+            id="sr-kg",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="knowledge_graph_entry_fetch",
+            sequence_no=1,
+            status="running",
+        )
+        dataflow_run = BinarySecurityStageRun(
+            id="sr-dvs",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="running",
+        )
+        seeded_item = BinarySecurityStageItem(
+            id="si-entry-b",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-b",
+            item_name="fn_b",
+            parent_key="mod-a",
+            item_identity_key="entry-b::mod-a",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[kg_run, dataflow_run], stage_items=[seeded_item], events=[])
+
+        before_entry = {"entry_key": "entry-a", "function_name": "fn_a", "module_key": "mod-a"}
+        after_entry = {"entry_key": "entry-b", "function_name": "fn_b", "module_key": "mod-a"}
+        effective_inputs = [[before_entry], [before_entry, after_entry], [before_entry, after_entry]]
+
+        with (
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=True),
+            patch.object(self.manager, "_pipeline_profile", return_value="kg_source_vuln_scan"),
+            patch.object(self.manager, "_latest_stage_run", side_effect=lambda _db, _task_id, stage: kg_run if stage == "knowledge_graph_entry_fetch" else dataflow_run if stage == "dataflow_vuln_scan" else None),
+            patch.object(self.manager, "_effective_entry_inputs", side_effect=lambda *_args, **_kwargs: effective_inputs.pop(0)),
+            patch.object(self.manager, "_stage_items", return_value=[seeded_item]),
+            patch.object(self.manager, "_run_async_blocking", side_effect=lambda value: value),
+            patch.object(self.manager, "_stage_knowledge_graph_entry_fetch") as refresh_kg,
+            patch.object(self.manager, "_prepare_stage_items_for_execution", return_value=[]) as prepare_items,
+            patch.object(self.manager, "_enqueue_task_sync_request", return_value={"queued": True}) as enqueue_sync,
+        ):
+            changed = self.manager._refresh_kg_streaming_inputs_if_needed(db, task)
+
+        self.assertTrue(changed)
+        refresh_kg.assert_called_once()
+        prepare_items.assert_called_once()
+        enqueue_sync.assert_called_once()
+        self.assertEqual(["si-entry-b"], enqueue_sync.call_args.kwargs["item_ids"])
+        payload = dict(db.events[-1].payload or {})
+        self.assertTrue(payload.get("dataflow_reseeded"))
+        self.assertTrue(payload.get("dataflow_child_create_enqueued"))
+        self.assertEqual(["entry-b"], payload.get("new_entry_keys_sample"))
 
     def test_reconcile_retry_affected_stages_in_session_deduplicates_and_avoids_compatibility_facade(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")

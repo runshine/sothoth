@@ -509,8 +509,16 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
-        db = _AppendingModelAwareDb(tasks=[task], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[runtime_lease], events=[])
 
         original_decide = self.manager._decide_task_action_after_stage_terminal
         original_apply = self.manager._apply_task_resume_decision
@@ -565,10 +573,11 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             self.manager._enqueue_task = original_enqueue
 
         self.assertTrue(applied_result)
-        self.assertEqual(["task-terminal"], queued)
+        self.assertEqual([], queued)
         self.assertEqual("entry_analysis", applied[0]["next_stage"])
         self.assertEqual("stage_terminal", applied[0]["source"])
         self.assertEqual("task_requeued_after_stage_completion", applied[0]["event_type"])
+        self.assertTrue(any(event.event_type == "task_stage_handoff_applied" for event in db.events))
 
     def test_refresh_task_status_after_sync_pending_next_stage_uses_resume_decision(self):
         task = BinarySecurityTask(
@@ -582,6 +591,7 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             firmware_path="/src",
             output_root="/o",
             workspace_root="/w",
+            runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
         )
         current_run = BinarySecurityStageRun(
             id="sr-system",
@@ -599,7 +609,20 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             sequence_no=2,
             status="pending",
         )
-        db = _AppendingModelAwareDb(tasks=[task], stage_runs=[current_run, next_run], stage_items=[], events=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            execution_epoch=0,
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_runs=[current_run, next_run],
+            stage_items=[],
+            runtime_leases=[runtime_lease],
+            events=[],
+        )
 
         original_next = self.manager._next_stage_candidate
         original_items = self.manager._stage_items
@@ -640,11 +663,11 @@ class ParentRuntimeResumePathTests(_TaskManagerQueuePatchedMixin, unittest.TestC
             self.manager._apply_task_resume_decision = original_apply
             self.manager._enqueue_task = original_enqueue
 
-        self.assertGreaterEqual(len(queued), 1)
-        self.assertTrue(all(task_id == "task-sync-resume" for task_id in queued))
+        self.assertEqual([], queued)
         self.assertEqual("entry_analysis", applied[0]["next_stage"])
         self.assertEqual("downstream_sync", applied[0]["source"])
         self.assertEqual("task_requeued_after_downstream_sync", applied[0]["event_type"])
+        self.assertTrue(any(event.event_type == "task_stage_handoff_applied" for event in db.events))
 
     def test_handoff_active_serial_control_operation_from_runtime_uses_owner_inbox(self):
         manager = TaskManager()

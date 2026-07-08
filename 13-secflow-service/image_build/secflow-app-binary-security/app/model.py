@@ -118,6 +118,10 @@ class JsonMixin:
 class BinarySecurityTask(Base, JsonMixin):
     __tablename__ = "secflow_binary_security_task"
     SUMMARY_FILENAME = "task-summary.json"
+    DB_RUNTIME_GUARD_SUMMARY_KEYS = (
+        "dispatch_claim_cooldown",
+        "parent_takeover_pending_claim",
+    )
 
     id = Column(String(32), primary_key=True)
     project_id = Column(String(64), nullable=False, index=True)
@@ -190,16 +194,18 @@ class BinarySecurityTask(Base, JsonMixin):
         cached = getattr(self, "_summary_cache", None)
         if isinstance(cached, dict):
             return dict(cached)
+        db_fallback = self._load_json(self.summary_json, {})
         path = self._summary_file_path()
         if path and path.is_file():
             try:
-                data = json.loads(path.read_text("utf-8") or "{}")
+                data = self._load_summary_file_payload(path)
                 if isinstance(data, dict):
+                    data = self._sync_runtime_guard_summary_fields(data, db_fallback, path=path)
                     self._summary_cache = data
                     return dict(data)
             except Exception:
                 pass
-        return self._load_json(self.summary_json, {})
+        return db_fallback
 
     @summary.setter
     def summary(self, value: dict[str, Any] | None) -> None:
@@ -209,21 +215,7 @@ class BinarySecurityTask(Base, JsonMixin):
         cleanup_snapshot = self.cleanup_snapshot
         delete_in_progress = bool(cleanup_snapshot.get("delete_in_progress"))
         if path and path.parent.exists() and not delete_in_progress:
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
-            started = time.perf_counter()
-            try:
-                tmp.write_text(self._dump_json(payload), encoding="utf-8")
-                tmp.replace(path)
-                observe_state_file_write(target=path.name, result="success", duration_seconds=time.perf_counter() - started)
-            except Exception:
-                observe_state_file_write(target=path.name, result="failed", duration_seconds=time.perf_counter() - started)
-                raise
-            finally:
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                except Exception:
-                    pass
+            self._write_summary_file(path, payload)
             self.summary_json = self._dump_json(self._db_summary_payload(payload))
             return
         self.summary_json = self._dump_json(payload)
@@ -245,7 +237,106 @@ class BinarySecurityTask(Base, JsonMixin):
             value = payload.get(key)
             if value is not None:
                 db_payload[key] = value
+        # 运行时跨 pod / 跨 session 的小型守护字段也必须落 DB，避免只写入文件副本后
+        # 在重新查询任务行时丢失保护语义，导致重复 recovery / claim。
+        for key in self.DB_RUNTIME_GUARD_SUMMARY_KEYS:
+            value = payload.get(key)
+            if isinstance(value, dict) and value:
+                db_payload[key] = dict(value)
         return db_payload
+
+    def _write_summary_file(self, path: Path, payload: dict[str, Any]) -> None:
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        started = time.perf_counter()
+        try:
+            tmp.write_text(self._dump_json(payload), encoding="utf-8")
+            tmp.replace(path)
+            observe_state_file_write(target=path.name, result="success", duration_seconds=time.perf_counter() - started)
+        except Exception:
+            observe_state_file_write(target=path.name, result="failed", duration_seconds=time.perf_counter() - started)
+            raise
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    def _load_summary_file_payload(self, path: Path) -> dict[str, Any]:
+        loaded = json.loads(path.read_text("utf-8") or "{}")
+        return loaded if isinstance(loaded, dict) else {}
+
+    def _sync_runtime_guard_summary_fields(
+        self,
+        file_payload: dict[str, Any],
+        db_payload: Any,
+        *,
+        path: Path | None = None,
+    ) -> dict[str, Any]:
+        next_payload = dict(file_payload)
+        db_payload = db_payload if isinstance(db_payload, dict) else {}
+        changed = False
+        for key in self.DB_RUNTIME_GUARD_SUMMARY_KEYS:
+            db_value = db_payload.get(key)
+            if isinstance(db_value, dict) and db_value:
+                normalized = dict(db_value)
+                if next_payload.get(key) != normalized:
+                    next_payload[key] = normalized
+                    changed = True
+                continue
+            if key in next_payload:
+                next_payload.pop(key, None)
+                changed = True
+        if changed:
+            self._summary_cache = dict(next_payload)
+            cleanup_snapshot = self.cleanup_snapshot
+            delete_in_progress = bool(cleanup_snapshot.get("delete_in_progress"))
+            if path and path.parent.exists() and not delete_in_progress:
+                try:
+                    self._write_summary_file(path, next_payload)
+                except Exception:
+                    pass
+        return next_payload
+
+    def runtime_guard_summary_snapshot(self, key: str) -> dict[str, Any]:
+        if key not in self.DB_RUNTIME_GUARD_SUMMARY_KEYS:
+            return {}
+        db_payload = self._load_json(self.summary_json, {})
+        path = self._summary_file_path()
+        file_payload: dict[str, Any] = {}
+        if path and path.is_file():
+            try:
+                file_payload = self._load_summary_file_payload(path)
+            except Exception:
+                file_payload = {}
+        merged = self._sync_runtime_guard_summary_fields(file_payload, db_payload, path=path)
+        if not file_payload and isinstance(db_payload, dict) and db_payload:
+            self._summary_cache = dict(merged)
+        raw = merged.get(key)
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def set_runtime_guard_summary_field(self, key: str, value: dict[str, Any] | None) -> dict[str, Any]:
+        if key not in self.DB_RUNTIME_GUARD_SUMMARY_KEYS:
+            return {}
+        path = self._summary_file_path()
+        payload: dict[str, Any]
+        if path and path.is_file():
+            try:
+                payload = self._load_summary_file_payload(path)
+            except Exception:
+                payload = {}
+        else:
+            payload = dict(getattr(self, "summary", None) or {})
+        if isinstance(value, dict) and value:
+            payload[key] = dict(value)
+        else:
+            payload.pop(key, None)
+        self.summary = payload
+        raw = payload.get(key)
+        return dict(raw) if isinstance(raw, dict) else {}
+
+    def clear_runtime_guard_summary_field(self, key: str) -> None:
+        self.set_runtime_guard_summary_field(key, None)
 
     def _summary_file_path(self) -> Path | None:
         if not self.workspace_root:

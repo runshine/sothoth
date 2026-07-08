@@ -2400,6 +2400,67 @@ class TaskStateMachineMixin:
             to_stage=decision.next_stage,
             reason=decision.resume_reason or "task_resume",
         )
+        same_owner_direct_handoff = bool(
+            str(getattr(task, "status", "") or "").strip() in {"running", "dispatching"}
+            and str(self._task_runtime_phase(task) or "").strip() == TASK_RUNTIME_PHASE_OWNED_EXECUTION
+            and self._task_runtime_owner_matches_current_instance(db, task)
+        )
+        if same_owner_direct_handoff:
+            self._apply_active_owned_execution_main_state(
+                db,
+                task,
+                source="state_machine",
+                reason="阶段完成后由当前 owner 直接切换到下一阶段继续执行",
+                status="running",
+                stage_name=decision.next_stage,
+                finished_at=None,
+                last_error=None,
+            )
+            task.summary = self._clear_failure_fields_from_summary(dict(task.summary or {}))
+            self._clear_task_abnormal_reason_snapshot(db, task)
+            handoff_payload = {
+                **dict(decision.payload or {}),
+                "next_stage": decision.next_stage,
+                "previous_stage": previous_stage,
+                "resume_reason": decision.resume_reason,
+                "source": decision.source,
+                "handoff_mode": "same_owner_direct",
+                "enqueue_task": False,
+            }
+            if operation is not None:
+                self._update_operation_result_payload(
+                    operation,
+                    {
+                        "requeue": {
+                            "requested": False,
+                            "task_status_before": "retry_operation_succeeded",
+                            "task_status_after": task.status,
+                            "resume_reason": decision.resume_reason,
+                            "source": decision.source,
+                            "handoff_mode": "same_owner_direct",
+                        },
+                    },
+                    workspace_root=task.workspace_root,
+                )
+                self._record_operation_event(
+                    db,
+                    task,
+                    operation,
+                    "task_stage_handoff_applied",
+                    decision.message or f"任务继续进入下一阶段并由当前 owner 直接执行: {decision.next_stage}",
+                    stage_name=decision.next_stage,
+                    payload=handoff_payload,
+                )
+            else:
+                self._record_event(
+                    db,
+                    task,
+                    "task_stage_handoff_applied",
+                    decision.message or f"任务继续进入下一阶段并由当前 owner 直接执行: {decision.next_stage}",
+                    stage_name=decision.next_stage,
+                    payload=handoff_payload,
+                )
+            return True
         self._apply_task_main_state_update(
             db,
             task,

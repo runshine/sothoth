@@ -135,6 +135,7 @@ from app.schemas import (
     BinarySecurityServiceConfigResponse,
     BinarySecurityStageItemResponse,
     BinarySecurityStageItemPageResponse,
+    BinarySecurityStageRunResponse,
     BinarySecurityStageSummary,
     BinarySecurityTaskCreate,
     BinarySecurityTaskConcurrencyUpdatePayload,
@@ -4913,15 +4914,20 @@ class TaskManager(
                     level="warning",
                 )
                 self._repair_active_operations_for_task(db, task)
-                summary = dict(getattr(task, "summary", None) or {})
-                summary["parent_takeover_pending_claim"] = {
+                pending_claim_snapshot = {
                     "active": True,
                     "released_at": _isoformat_or_none(_now()),
                     "released_by_instance_id": str(self.instance_id or "").strip() or None,
                     "enqueue_context": "owned_execution_release_for_takeover",
                     "requeue_succeeded": False,
                 }
-                task.summary = summary
+                setter = getattr(task, "set_runtime_guard_summary_field", None)
+                if callable(setter):
+                    setter("parent_takeover_pending_claim", pending_claim_snapshot)
+                else:
+                    summary = dict(getattr(task, "summary", None) or {})
+                    summary["parent_takeover_pending_claim"] = pending_claim_snapshot
+                    task.summary = summary
                 self._record_event(
                     db,
                     task,
@@ -4959,12 +4965,21 @@ class TaskManager(
                     refresh_task = db.query(BinarySecurityTask).filter(BinarySecurityTask.id == task.id).first()
                 if refresh_task is not None:
                     task = refresh_task
-                summary = dict(getattr(task, "summary", None) or {})
-                takeover_pending_claim = dict(summary.get("parent_takeover_pending_claim") or {})
+                loader = getattr(task, "runtime_guard_summary_snapshot", None)
+                takeover_pending_claim = (
+                    dict(loader("parent_takeover_pending_claim"))
+                    if callable(loader)
+                    else dict((dict(getattr(task, "summary", None) or {})).get("parent_takeover_pending_claim") or {})
+                )
                 if takeover_pending_claim:
                     takeover_pending_claim["requeue_succeeded"] = bool(requeue_succeeded)
-                    summary["parent_takeover_pending_claim"] = takeover_pending_claim
-                    task.summary = summary
+                    setter = getattr(task, "set_runtime_guard_summary_field", None)
+                    if callable(setter):
+                        setter("parent_takeover_pending_claim", takeover_pending_claim)
+                    else:
+                        summary = dict(getattr(task, "summary", None) or {})
+                        summary["parent_takeover_pending_claim"] = takeover_pending_claim
+                        task.summary = summary
                 if requeue_succeeded:
                     self._record_event(
                         db,

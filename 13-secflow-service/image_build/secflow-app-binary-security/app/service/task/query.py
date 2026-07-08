@@ -35,6 +35,7 @@ from app.schemas import (
     BinarySecurityRuntimeHealthResponse,
     BinarySecurityStageItemSummaryResponse,
     BinarySecurityStageItemDetailResponse,
+    BinarySecurityStageRunResponse,
     BinarySecurityStageSummary,
     BinarySecurityStageItemPageResponse,
     BinarySecurityTaskDetailResponse,
@@ -1145,6 +1146,20 @@ class TaskQueryServiceMixin:
                 item_stats=ctx.item_stats,
                 stage_items_total=ctx.stage_items_total,
                 stage_items_truncated=ctx.stage_items_total > 0,
+                stage_runs=[
+                    BinarySecurityStageRunResponse(
+                        stage_name=str(run.stage_name or ""),
+                        sequence_no=int(run.sequence_no or 0),
+                        status=str(run.status or ""),
+                        retry_count=int(run.retry_count or 0),
+                        started_at=run.started_at,
+                        finished_at=run.finished_at,
+                        last_error=run.last_error,
+                        counts=dict(run.counts or {}),
+                        output_summary=dict(run.output_summary or {}),
+                    )
+                    for run in ctx.stage_runs
+                ],
                 stage_items=[],
                 archive_jobs=[],
                 abnormal_reason_history=[],
