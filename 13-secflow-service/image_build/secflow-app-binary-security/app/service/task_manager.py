@@ -11404,6 +11404,7 @@ class TaskManager(
                     "system_analysis_result": self._lightweight_system_analysis_result(result_payload),
                     "downstream_status_synced_at": _now().isoformat(),
                 },
+                preserve_sync_fields=True,
             )
             item.output_ref = {
                 **(item.output_ref or {}),
@@ -11427,6 +11428,7 @@ class TaskManager(
                     "downstream": self._lightweight_downstream_payload(payload),
                     "downstream_status_synced_at": _now().isoformat(),
                 },
+                preserve_sync_fields=True,
             )
             item.output_ref = {
                 **(item.output_ref or {}),
@@ -11462,6 +11464,7 @@ class TaskManager(
                 item,
                 stage_name=item.stage_name,
                 result=result,
+                preserve_sync_fields=True,
             )
             item.output_ref = {
                 **(item.output_ref or {}),
@@ -11511,6 +11514,7 @@ class TaskManager(
                 "downstream_status_synced_at": _now().isoformat(),
                 "bound_downstream_task_id": effective_downstream_task_id or None,
             },
+            preserve_sync_fields=True,
         )
         item.output_ref = {
             **(item.output_ref or {}),

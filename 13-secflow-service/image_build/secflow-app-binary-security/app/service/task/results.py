@@ -32,6 +32,22 @@ if TYPE_CHECKING:
 
 
 class TaskResultServiceMixin:
+    _SYNC_RESULT_ROOT_KEYS = (
+        "sync_status",
+        "downstream_status",
+        "downstream_status_synced_at",
+        "last_sync_attempt_at",
+        "last_sync_success_at",
+        "last_sync_error_at",
+        "last_sync_error_message",
+        "last_sync_error_type",
+        "last_sync_result",
+        "consecutive_sync_error_count",
+        "sync_error_budget_exhausted",
+        "next_sync_retry_at",
+        "sync_observation",
+    )
+
     def _normalize_result_payload_value(self: TaskManager, value: Any) -> Any:
         if isinstance(value, Path):
             return str(value)
@@ -46,6 +62,22 @@ class TaskResultServiceMixin:
         if isinstance(value, set):
             return [self._normalize_result_payload_value(item) for item in sorted(value, key=lambda item: str(item))]
         return value
+
+    def _merge_result_with_preserved_sync_fields(
+        self: TaskManager,
+        item: BinarySecurityStageItem,
+        result: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged = self._normalize_result_payload_value(dict(result or {}))
+        existing = self._normalize_result_payload_value(dict(getattr(item, "result", None) or {}))
+        if not existing:
+            return merged
+        for key in self._SYNC_RESULT_ROOT_KEYS:
+            if key not in merged and key in existing:
+                merged[key] = existing[key]
+        if "downstream" not in merged and "downstream" in existing:
+            merged["downstream"] = existing["downstream"]
+        return merged
 
     def _build_binary_module_summary(
         self: TaskManager,
@@ -648,10 +680,14 @@ class TaskResultServiceMixin:
         *,
         stage_name: str,
         result: dict[str, Any] | None,
+        preserve_sync_fields: bool = False,
     ) -> dict[str, Any]:
         from app.service import task_manager as task_manager_module
 
-        full_result = self._normalize_result_payload_value(dict(result or {}))
+        if preserve_sync_fields:
+            full_result = self._merge_result_with_preserved_sync_fields(item, result)
+        else:
+            full_result = self._normalize_result_payload_value(dict(result or {}))
         compact = self._compact_result_for_storage(stage_name, full_result)
         if not self._result_payload_needs_externalization(stage_name, full_result):
             item.result = compact
