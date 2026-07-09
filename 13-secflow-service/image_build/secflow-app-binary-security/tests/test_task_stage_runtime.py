@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.model import BinarySecurityStageItem, BinarySecurityStageRun, BinarySecurityTask
 from app.service import task_manager as task_manager_module
@@ -172,9 +172,9 @@ class TaskStageRuntimeTests(unittest.TestCase):
             patch.object(self.manager, "_effective_entry_inputs", side_effect=lambda *_args, **_kwargs: effective_inputs.pop(0)),
             patch.object(self.manager, "_stage_items", return_value=[seeded_item]),
             patch.object(self.manager, "_run_async_blocking", side_effect=lambda value: value),
-            patch.object(self.manager, "_stage_knowledge_graph_entry_fetch") as refresh_kg,
+            patch.object(self.manager, "_stage_knowledge_graph_entry_fetch", new=Mock(return_value=True)) as refresh_kg,
             patch.object(self.manager, "_prepare_stage_items_for_execution", return_value=[]) as prepare_items,
-            patch.object(self.manager, "_enqueue_task_sync_request", return_value={"queued": True}) as enqueue_sync,
+            patch.object(self.manager, "_enqueue_task_sync_request", new=Mock(return_value={"queued": True})) as enqueue_sync,
         ):
             changed = self.manager._refresh_kg_streaming_inputs_if_needed(db, task)
 

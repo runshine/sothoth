@@ -16740,8 +16740,8 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("retry_archive_failed_items", operation.operation_type)
         self.assertEqual(["t1"], enqueued)
 
-    def test_finish_task_as_success_is_not_exposed_on_task_manager(self):
-        self.assertFalse(hasattr(self.manager, "finish_task_as_success"))
+    def test_finish_task_as_success_is_exposed_on_task_manager(self):
+        self.assertTrue(hasattr(self.manager, "finish_task_as_success"))
 
     def test_retry_stage_archive_full_falls_back_to_shared_dispatch_when_local_control_wakeup_missing(self):
         task = BinarySecurityTask(
@@ -36890,7 +36890,7 @@ def _test_streaming_stage_terminal_observed_keeps_task_running_with_active_items
     self.assertTrue(any(row.event_type == "stage_worker_terminal_deferred" for row in db.events))
 
 
-def _test_finalize_task_prefers_furthest_active_streaming_stage(self):
+def _test_finalize_task_defers_to_streaming_upstream_gate_before_tail_stage(self):
     now = _now()
     task = BinarySecurityTask(
         id="task1",
@@ -36991,9 +36991,9 @@ def _test_finalize_task_prefers_furthest_active_streaming_stage(self):
         manager._handle_finalize_gate_blocked_active_path(db, task, stage_runs=db.stage_runs, finalize_gate=gate)
 
         self.assertEqual("running", task.status)
-    self.assertEqual("dataflow_vuln_scan", task.current_stage)
+    self.assertEqual("system_analysis", task.current_stage)
     self.assertIsNone(task.finished_at)
-    self.assertTrue(any(row.event_type == "task_finalize_deferred_for_active_stage" for row in db.events))
+    self.assertTrue(any(row.event_type == "task_finalize_deferred_for_streaming_upstream" for row in db.events))
 
 
 def _test_entry_analyse_client_uses_management_api_prefix(self):
@@ -44561,7 +44561,7 @@ TaskManagerTests.test_stage_item_response_falls_back_to_downstream_payload_statu
 TaskManagerTests.test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs = _test_task_reconcile_candidate_items_scans_all_stages_with_downstream_refs
 TaskManagerTests.test_task_sync_cooldown_elapsed_uses_all_candidate_items = _test_task_sync_cooldown_elapsed_uses_all_candidate_items
 TaskManagerTests.test_streaming_stage_terminal_observed_keeps_task_running_with_active_items = _test_streaming_stage_terminal_observed_keeps_task_running_with_active_items
-TaskManagerTests.test_finalize_task_prefers_furthest_active_streaming_stage = _test_finalize_task_prefers_furthest_active_streaming_stage
+TaskManagerTests.test_finalize_task_defers_to_streaming_upstream_gate_before_tail_stage = _test_finalize_task_defers_to_streaming_upstream_gate_before_tail_stage
 TaskManagerTests.test_entry_analyse_client_uses_management_api_prefix = _test_entry_analyse_client_uses_management_api_prefix
 TaskManagerTests.test_system_analyse_client_uses_management_api_prefix = _test_system_analyse_client_uses_management_api_prefix
 TaskManagerTests.test_binary_to_source_client_uses_management_api_prefix = _test_binary_to_source_client_uses_management_api_prefix

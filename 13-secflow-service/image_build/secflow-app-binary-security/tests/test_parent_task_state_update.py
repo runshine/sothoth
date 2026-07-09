@@ -25,6 +25,7 @@ class ParentTaskStateUpdateTests(unittest.TestCase):
             task_manager_module.TASK_ACTION_RETRY_ARCHIVE_FULL,
             task_manager_module.TASK_ACTION_CANCEL,
             task_manager_module.TASK_ACTION_DELETE,
+            task_manager_module.TASK_ACTION_FINISH_SUCCESS,
             "force_reset_to_pending",
         }
 
