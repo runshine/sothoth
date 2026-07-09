@@ -9,6 +9,7 @@ from pathlib import Path
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import func
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -21,10 +22,25 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
+    def _defer_inline_event_trim_for_task(
+        self: TaskManager,
+        task: BinarySecurityTask | None,
+    ) -> bool:
+        if task is None:
+            return False
+        normalized_status = str(getattr(task, "status", "") or "").strip().lower()
+        return normalized_status in {"pending", "dispatching", "running", "cancelling"}
+
     def _task_timeline_trim_batch_size(self: TaskManager) -> int:
         from app.service import task_manager as task_manager_module
 
         return max(1, min(1_000, int(task_manager_module.DB_TIMELINE_EVENT_LIMIT or 10_000)))
+
+    def _task_timeline_trim_target_limit(self: TaskManager) -> int:
+        from app.service import task_manager as task_manager_module
+
+        effective_limit = max(1, int(task_manager_module.DB_TIMELINE_EVENT_LIMIT or 10_000))
+        return max(0, effective_limit - self._task_timeline_trim_batch_size())
 
     def _suppress_event_trim_lock_error(
         self: TaskManager,
@@ -252,7 +268,6 @@ class TaskEventServiceMixin:
             return
         from app.service import task_manager as task_manager_module
 
-        self._ensure_task_timeline_capacity_for_write(db, task_id=task.id, incoming_events=1)
         event = task_manager_module.BinarySecurityEvent(
             id=f"evt_{uuid.uuid4().hex[:24]}",
             task_id=task.id,
@@ -275,7 +290,6 @@ class TaskEventServiceMixin:
             state_event=False,
         )
         db.add(event)
-        self._ensure_task_timeline_capacity_for_write(db, task_id=task.id)
 
     def _sync_event_origin_value(self: TaskManager, payload: dict[str, Any] | None, key: str) -> str | None:
         origin = dict((payload or {}).get("event_origin") or {})
@@ -577,41 +591,70 @@ class TaskEventServiceMixin:
                 return
             raise
 
-    def _ensure_task_timeline_capacity_for_write(
+    def _find_timeline_over_limit_tasks(
+        self: TaskManager,
+        db: Session,
+        *,
+        batch_limit: int,
+    ) -> list[tuple[str, int]]:
+        from app.service import task_manager as task_manager_module
+
+        effective_limit = int(task_manager_module.DB_TIMELINE_EVENT_LIMIT or 10_000)
+        normalized_batch_limit = max(1, int(batch_limit or 1))
+        if effective_limit <= 0 or not hasattr(db, "query"):
+            return []
+        rows = (
+            db.query(
+                task_manager_module.BinarySecurityEvent.task_id,
+                func.count(task_manager_module.BinarySecurityEvent.id),
+            )
+            .group_by(task_manager_module.BinarySecurityEvent.task_id)
+            .having(func.count(task_manager_module.BinarySecurityEvent.id) > effective_limit)
+            .order_by(func.count(task_manager_module.BinarySecurityEvent.id).desc())
+            .limit(normalized_batch_limit)
+            .all()
+        )
+        normalized: list[tuple[str, int]] = []
+        for task_id, current_count in rows:
+            normalized_task_id = str(task_id or "").strip()
+            if not normalized_task_id:
+                continue
+            normalized.append((normalized_task_id, max(0, int(current_count or 0))))
+        return normalized
+
+    def _trim_task_timeline_to_headroom(
         self: TaskManager,
         db: Session,
         *,
         task_id: str,
-        incoming_events: int = 0,
-    ) -> None:
+        current_count: int | None = None,
+    ) -> int:
         from app.service import task_manager as task_manager_module
 
         effective_limit = int(task_manager_module.DB_TIMELINE_EVENT_LIMIT or 10_000)
-        if effective_limit <= 0 or not hasattr(db, "query"):
-            return
-        normalized_incoming = max(0, int(incoming_events or 0))
-        try:
-            current_count = 0
-            if hasattr(db, "events"):
-                current_count = len([
-                    event for event in (getattr(db, "events") or [])
-                    if str(getattr(event, "task_id", "") or "").strip() == str(task_id or "").strip()
-                ])
-            else:
-                current_count = (
-                    db.query(task_manager_module.BinarySecurityEvent)
-                    .filter(task_manager_module.BinarySecurityEvent.task_id == task_id)
-                    .count()
-                )
-            if current_count + normalized_incoming <= effective_limit:
-                return
-            trim_batch_size = self._task_timeline_trim_batch_size()
-            keep_limit = max(0, effective_limit - trim_batch_size)
-            self._trim_task_timeline_events(db, task_id=task_id, keep_limit=keep_limit)
-        except OperationalError as exc:
-            if self._suppress_event_trim_lock_error(exc, task_id=task_id, trim_kind="timeline capacity guard"):
-                return
-            raise
+        target_limit = self._task_timeline_trim_target_limit()
+        normalized_task_id = str(task_id or "").strip()
+        if effective_limit <= 0 or not normalized_task_id:
+            return 0
+        normalized_count = current_count
+        if normalized_count is None:
+            normalized_count = int(
+                db.query(task_manager_module.BinarySecurityEvent)
+                .filter(task_manager_module.BinarySecurityEvent.task_id == normalized_task_id)
+                .count()
+                or 0
+            )
+        if int(normalized_count or 0) <= effective_limit:
+            return 0
+        before_count = max(0, int(normalized_count or 0))
+        self._trim_task_timeline_events(db, task_id=normalized_task_id, keep_limit=target_limit)
+        after_count = int(
+            db.query(task_manager_module.BinarySecurityEvent)
+            .filter(task_manager_module.BinarySecurityEvent.task_id == normalized_task_id)
+            .count()
+            or 0
+        )
+        return max(0, before_count - after_count)
 
     @staticmethod
     def _json_payload_size_bytes(value: Any) -> int:

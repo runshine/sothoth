@@ -143,6 +143,10 @@ class SchedulerConfig(BaseModel):
     archive_runtime_stale_seconds: int = 300
     state_repair_reconcile_interval_seconds: int = 30
     state_repair_reconcile_batch_size: int = 100
+    timeline_trim_enabled: bool = True
+    timeline_trim_interval_seconds: int = 60
+    timeline_trim_task_batch_size: int = 20
+    timeline_trim_target_limit: int = 9000
 
 
 class QueueConfig(BaseModel):

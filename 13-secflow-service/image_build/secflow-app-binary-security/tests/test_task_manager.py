@@ -39291,8 +39291,8 @@ def _test_record_event_trims_task_timeline_to_10000_events(self):
         stage_name="system_analysis",
     )
 
-    self.assertEqual(10_000, len(db.events))
-    self.assertFalse(any(event.id == "evt-00000" for event in db.events))
+    self.assertEqual(10_001, len(db.events))
+    self.assertTrue(any(event.id == "evt-00000" for event in db.events))
     self.assertTrue(any(event.event_type == "overflow" for event in db.events))
 
 

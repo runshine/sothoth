@@ -632,6 +632,7 @@ PIPELINE_MODE_MIXED_STREAMING = "mixed_streaming"
 STREAMING_TAIL_STAGES = ("entry_analysis", "dataflow_vuln_scan")
 STREAMING_ACTIVE_ITEM_STATUSES = frozenset({"pending", "queued", "dispatching", "running"})
 PARENT_RECLAIM_COORDINATOR_LEASE = "parent_reclaim"
+TIMELINE_TRIM_COORDINATOR_LEASE = "timeline_trim"
 
 
 class StaleTaskExecution(RuntimeError):
@@ -826,6 +827,12 @@ class TaskManager(
         self._lease_watchdog_last_success_at: datetime | None = None
         self._lease_watchdog_last_error: str | None = None
         self._lease_watchdog_observed_task_ids: set[str] = set()
+        self._timeline_janitor_thread: threading.Thread | None = None
+        self._timeline_janitor_stop_event = threading.Event()
+        self._timeline_janitor_state_lock = threading.Lock()
+        self._timeline_janitor_last_tick_at: datetime | None = None
+        self._timeline_janitor_last_success_at: datetime | None = None
+        self._timeline_janitor_last_error: str | None = None
         self._max_stage_item_worker_count = max(
             1,
             int(
@@ -1753,6 +1760,7 @@ class TaskManager(
                     name="binary-security-event-loop-lag-monitor",
                 )
                 self._start_runtime_lease_watchdog()
+                self._start_global_timeline_janitor()
                 self._loop_task = asyncio.create_task(self._dispatch_loop(), name="binary-security-dispatcher")
                 self._archive_loop_task = asyncio.create_task(self._archive_dispatch_loop(), name="binary-security-archive-dispatcher")
                 self._delete_loop_task = asyncio.create_task(self._delete_dispatch_loop(), name="binary-security-delete-dispatcher")
@@ -1778,6 +1786,7 @@ class TaskManager(
     async def stop(self) -> None:
         self._running = False
         self._lease_watchdog_stop_event.set()
+        self._timeline_janitor_stop_event.set()
         await self._cancel_loop_task(self._loop_task)
         await self._cancel_loop_task(self._archive_loop_task)
         await self._cancel_loop_task(self._delete_loop_task)
@@ -1787,6 +1796,7 @@ class TaskManager(
         await self._cancel_loop_task(self._event_loop_lag_monitor_task)
         self._event_loop_lag_monitor_task = None
         await asyncio.to_thread(self._stop_runtime_lease_watchdog)
+        await asyncio.to_thread(self._stop_global_timeline_janitor)
         archive_active = list(self._archive_workers)
         for task in archive_active:
             task.cancel()
@@ -1860,6 +1870,140 @@ class TaskManager(
         if thread is not None and thread.is_alive():
             thread.join(timeout=max(1.0, float(self._runtime_watchdog_interval_seconds() * 2)))
         self._lease_watchdog_thread = None
+
+    def _timeline_trim_enabled(self) -> bool:
+        return bool(getattr(self.cfg.scheduler, "timeline_trim_enabled", True))
+
+    def _timeline_trim_interval_seconds(self) -> int:
+        configured = getattr(self.cfg.scheduler, "timeline_trim_interval_seconds", None)
+        try:
+            return max(10, int(configured or 60))
+        except (TypeError, ValueError):
+            return 60
+
+    def _timeline_trim_task_batch_size(self) -> int:
+        configured = getattr(self.cfg.scheduler, "timeline_trim_task_batch_size", None)
+        try:
+            return max(1, int(configured or 20))
+        except (TypeError, ValueError):
+            return 20
+
+    def _task_timeline_trim_target_limit(self) -> int:
+        configured = getattr(self.cfg.scheduler, "timeline_trim_target_limit", None)
+        effective_limit = max(1, int(DB_TIMELINE_EVENT_LIMIT or 10_000))
+        try:
+            target_limit = int(configured or max(0, effective_limit - 1_000))
+        except (TypeError, ValueError):
+            target_limit = max(0, effective_limit - 1_000)
+        return max(0, min(target_limit, effective_limit))
+
+    def _start_global_timeline_janitor(self) -> None:
+        if not self._timeline_trim_enabled():
+            return
+        thread = self._timeline_janitor_thread
+        if thread is not None and thread.is_alive():
+            return
+        self._timeline_janitor_stop_event.clear()
+        self._timeline_janitor_thread = threading.Thread(
+            target=self._run_global_timeline_janitor,
+            name="binary-security-global-timeline-janitor",
+            daemon=True,
+        )
+        self._timeline_janitor_thread.start()
+
+    def _stop_global_timeline_janitor(self) -> None:
+        self._timeline_janitor_stop_event.set()
+        thread = self._timeline_janitor_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(1.0, float(self._timeline_trim_interval_seconds() * 2)))
+        self._timeline_janitor_thread = None
+
+    def _run_global_timeline_janitor(self) -> None:
+        logger.info("binary-security global timeline janitor started")
+        interval_seconds = self._timeline_trim_interval_seconds()
+        try:
+            while self._running and not self._timeline_janitor_stop_event.is_set():
+                tick_at = _now()
+                with self._timeline_janitor_state_lock:
+                    self._timeline_janitor_last_tick_at = tick_at
+                try:
+                    if not self._acquire_coordinator_lease(TIMELINE_TRIM_COORDINATOR_LEASE):
+                        logger.debug(
+                            "binary-security global timeline janitor skipped because coordinator lease not held: instance_id=%s",
+                            str(self.instance_id or "").strip() or None,
+                        )
+                    else:
+                        summary = self._run_timeline_trim_pass()
+                        with self._timeline_janitor_state_lock:
+                            self._timeline_janitor_last_success_at = tick_at
+                            self._timeline_janitor_last_error = None
+                        logger.info(
+                            "binary-security global timeline janitor trim pass completed: attempted_task_count=%s trimmed_task_count=%s deleted_event_count=%s max_task_count_seen=%s duration_ms=%s",
+                            int(summary.get("attempted_task_count", 0) or 0),
+                            int(summary.get("trimmed_task_count", 0) or 0),
+                            int(summary.get("deleted_event_count", 0) or 0),
+                            int(summary.get("max_task_count_seen", 0) or 0),
+                            int(summary.get("duration_ms", 0) or 0),
+                        )
+                except Exception as exc:
+                    logger.exception("binary-security global timeline janitor failed but will continue")
+                    with self._timeline_janitor_state_lock:
+                        self._timeline_janitor_last_error = str(exc)
+                self._timeline_janitor_stop_event.wait(interval_seconds)
+        finally:
+            logger.info("binary-security global timeline janitor stopped")
+
+    def _run_timeline_trim_pass(self) -> dict[str, Any]:
+        started_at = time.monotonic()
+        batch_limit = self._timeline_trim_task_batch_size()
+        attempted_task_count = 0
+        trimmed_task_count = 0
+        deleted_event_count = 0
+        max_task_count_seen = 0
+        db = get_session_factory()()
+        try:
+            over_limit_tasks = self._find_timeline_over_limit_tasks(db, batch_limit=batch_limit)
+            attempted_task_count = len(over_limit_tasks)
+            for task_id, current_count in over_limit_tasks:
+                max_task_count_seen = max(max_task_count_seen, int(current_count or 0))
+                try:
+                    deleted = self._trim_task_timeline_to_headroom(
+                        db,
+                        task_id=task_id,
+                        current_count=current_count,
+                    )
+                except OperationalError as exc:
+                    db.rollback()
+                    if self._is_retryable_lock_error(exc):
+                        logger.warning(
+                            "binary-security global timeline janitor trim deferred by db lock: task_id=%s error_type=%s error=%s",
+                            task_id,
+                            exc.__class__.__name__,
+                            exc,
+                        )
+                        continue
+                    raise
+                if deleted > 0:
+                    trimmed_task_count += 1
+                    deleted_event_count += int(deleted or 0)
+                    logger.info(
+                        "binary-security global timeline janitor task trimmed: task_id=%s before_count=%s deleted_count=%s target_limit=%s",
+                        task_id,
+                        int(current_count or 0),
+                        int(deleted or 0),
+                        self._task_timeline_trim_target_limit(),
+                    )
+            db.commit()
+        finally:
+            db.close()
+        duration_ms = int(max(0.0, (time.monotonic() - started_at) * 1000.0))
+        return {
+            "attempted_task_count": attempted_task_count,
+            "trimmed_task_count": trimmed_task_count,
+            "deleted_event_count": deleted_event_count,
+            "max_task_count_seen": max_task_count_seen,
+            "duration_ms": duration_ms,
+        }
 
     def _watchdog_runtime_handle_snapshot(self) -> list[TaskRuntimeHandle]:
         for _ in range(3):

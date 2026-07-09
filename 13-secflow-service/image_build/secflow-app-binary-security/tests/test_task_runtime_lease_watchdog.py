@@ -92,6 +92,57 @@ class TaskRuntimeLeaseWatchdogTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.to_thread(manager._stop_runtime_lease_watchdog)
         self.assertFalse(manager._lease_watchdog_alive())
 
+    async def test_global_timeline_janitor_starts_and_stops(self):
+        manager = TaskManager()
+        manager._running = True
+        manager._acquire_coordinator_lease = lambda _lease_name: False
+
+        manager._start_global_timeline_janitor()
+        await asyncio.sleep(0.05)
+        self.assertIsNotNone(manager._timeline_janitor_last_tick_at)
+
+        manager._running = False
+        manager._timeline_janitor_stop_event.set()
+        await asyncio.to_thread(manager._stop_global_timeline_janitor)
+        thread = manager._timeline_janitor_thread
+        self.assertIsNone(thread)
+
+    def test_run_timeline_trim_pass_trims_over_limit_tasks(self):
+        manager = TaskManager()
+        manager._timeline_trim_task_batch_size = lambda: 2
+        manager._task_timeline_trim_target_limit = lambda: 9000
+        calls: list[tuple[str, int]] = []
+
+        class _Db:
+            committed = False
+            closed = False
+
+            def commit(self):
+                self.committed = True
+
+            def close(self):
+                self.closed = True
+
+        fake_db = _Db()
+        manager._find_timeline_over_limit_tasks = lambda _db, batch_limit: [("task-1", 12000), ("task-2", 15000)]
+
+        def _trim(_db, *, task_id, current_count=None):
+            calls.append((task_id, int(current_count or 0)))
+            return 3000 if task_id == "task-1" else 6000
+
+        manager._trim_task_timeline_to_headroom = _trim
+
+        with patch("app.service.task_manager.get_session_factory", return_value=lambda: fake_db):
+            summary = manager._run_timeline_trim_pass()
+
+        self.assertEqual(2, summary["attempted_task_count"])
+        self.assertEqual(2, summary["trimmed_task_count"])
+        self.assertEqual(9000, summary["deleted_event_count"])
+        self.assertEqual(15000, summary["max_task_count_seen"])
+        self.assertEqual([("task-1", 12000), ("task-2", 15000)], calls)
+        self.assertTrue(fake_db.committed)
+        self.assertTrue(fake_db.closed)
+
     def test_watchdog_records_per_task_lifecycle_events(self):
         manager = TaskManager()
         recorded: list[tuple[str, str, dict]] = []

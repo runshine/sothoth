@@ -47,7 +47,7 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             Exception(1213, "Deadlock found when trying to get lock; try restarting transaction"),
         )
 
-    def test_record_event_trims_task_timeline_to_preserve_headroom(self):
+    def test_record_event_allows_timeline_to_grow_past_limit_until_janitor_runs(self):
         task = BinarySecurityTask(
             id="task-timeline-cap",
             project_id="p1",
@@ -83,12 +83,11 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             stage_name="system_analysis",
         )
 
-        self.assertEqual(9_001, len(db.events))
-        self.assertFalse(any(event.id == "evt-00000" for event in db.events))
-        self.assertFalse(any(event.id == "evt-00999" for event in db.events))
+        self.assertEqual(10_001, len(db.events))
+        self.assertTrue(any(event.id == "evt-00000" for event in db.events))
         self.assertTrue(any(event.event_type == "overflow" for event in db.events))
 
-    def test_record_event_trims_active_task_timeline_to_preserve_headroom(self):
+    def test_record_event_allows_active_task_timeline_to_grow_past_limit_until_janitor_runs(self):
         task = BinarySecurityTask(
             id="task-active-no-inline-trim",
             project_id="p1",
@@ -124,12 +123,11 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             stage_name="system_analysis",
         )
 
-        self.assertEqual(9_001, len(db.events))
-        self.assertFalse(any(event.id == "evt-active-00000" for event in db.events))
-        self.assertFalse(any(event.id == "evt-active-00999" for event in db.events))
+        self.assertEqual(10_001, len(db.events))
+        self.assertTrue(any(event.id == "evt-active-00000" for event in db.events))
         self.assertTrue(any(event.event_type == "active-overflow" for event in db.events))
 
-    def test_timeline_capacity_helper_trims_large_overflow_down_to_headroom(self):
+    def test_trim_task_timeline_to_headroom_trims_large_overflow_down_to_headroom(self):
         task = BinarySecurityTask(
             id="task-large-overflow",
             project_id="p1",
@@ -157,9 +155,10 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             events.append(event)
         db = _ModelAwareDb(tasks=[task], events=events)
 
-        self.manager._ensure_task_timeline_capacity_for_write(db, task_id=task.id)
+        deleted_count = self.manager._trim_task_timeline_to_headroom(db, task_id=task.id, current_count=16_350)
 
         self.assertEqual(9_000, len(db.events))
+        self.assertEqual(7_350, deleted_count)
         self.assertFalse(any(event.id == "evt-large-00000" for event in db.events))
         self.assertFalse(any(event.id == "evt-large-07349" for event in db.events))
 
