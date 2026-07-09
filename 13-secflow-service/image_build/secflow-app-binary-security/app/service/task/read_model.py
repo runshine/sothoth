@@ -2431,7 +2431,7 @@ class TaskReadModelServiceMixin:
                     "last_heartbeat_at": unit.get("last_heartbeat_at"),
                     "age_seconds": unit.get("age_seconds"),
                     "reason": unit.get("reason"),
-                    "evidence": list(unit.get("evidence") or [])[:4],
+                    "evidence": list(unit.get("evidence") or [])[:6],
                 }
             )
         return spotlight
@@ -2454,6 +2454,13 @@ class TaskReadModelServiceMixin:
         has_local_owner: bool,
         fake_local_owner: bool,
         owner_count: int,
+        lease_owner: str | None,
+        lease_expires_at: datetime | None,
+        lease_active: bool,
+        row_owner_is_local: bool,
+        runtime_supported_locally: bool,
+        task_status: str,
+        runtime_phase: str | None,
         local_stage_worker_count: int,
         active_stage_item_count: int,
         local_archive_job_count: int,
@@ -2461,6 +2468,9 @@ class TaskReadModelServiceMixin:
         local_operation_alive: bool,
         operation_lock_owner: str | None,
         operation_lock_heartbeat_at: datetime | None,
+        current_operation_id: str | None,
+        active_operation_type: str | None,
+        active_operation_status: str | None,
     ) -> list[dict[str, Any]]:
         worker_handle = self._workers.get(task_id)
         operation_handle = None
@@ -2502,13 +2512,50 @@ class TaskReadModelServiceMixin:
                     {"label": "worker_last_lease_refresh_at", "value": None if worker_handle is None else task_shared._isoformat_or_none(worker_handle.last_lease_refresh_at)},
                     {"label": "worker_last_lease_verify_at", "value": None if worker_handle is None else task_shared._isoformat_or_none(worker_handle.last_lease_verify_at)},
                     {"label": "runner_task_name", "value": None if worker_handle is None else worker_handle.runner_task.get_name()},
+                    {"label": "runner_task_done", "value": None if worker_handle is None else str(worker_handle.runner_task.done()).lower()},
                     {"label": "heartbeat_task_present", "value": None if worker_handle is None else str(worker_handle.heartbeat_task is not None).lower()},
                     {"label": "heartbeat_task_name", "value": None if worker_handle is None or worker_handle.heartbeat_task is None else worker_handle.heartbeat_task.get_name()},
                     {"label": "heartbeat_task_done", "value": None if worker_handle is None or worker_handle.heartbeat_task is None else str(worker_handle.heartbeat_task.done()).lower()},
                     {"label": "local_owner", "value": str(has_local_owner).lower()},
                     {"label": "fake_local_owner", "value": str(fake_local_owner).lower()},
+                    {"label": "row_owner_is_local", "value": str(row_owner_is_local).lower()},
+                    {"label": "runtime_supported_locally", "value": str(runtime_supported_locally).lower()},
                     {"label": "local_owner_count", "value": str(owner_count)},
                     {"label": "last_local_heartbeat_at", "value": task_shared._isoformat_or_none(last_task_heartbeat_at)},
+                ],
+            },
+            {
+                "card_key": "runtime_ownership",
+                "title": "任务 Owner / 租约事实",
+                "subtitle": "row owner、lease、执行句柄之间的一致性快照",
+                "status": self._runtime_health_snapshot_status(
+                    active=lease_active,
+                    warning=bool(lease_active and ((row_owner_is_local and not runtime_supported_locally) or (current_operation_id and not local_operation_alive))),
+                    error=bool(fake_local_owner),
+                ),
+                "message": (
+                    "当前 row owner 与本地 runtime handle 一致"
+                    if row_owner_is_local and runtime_supported_locally
+                    else "当前 row owner 指向本 Pod，但本地没有真实 runtime handle，属于假 owner"
+                    if fake_local_owner
+                    else "当前 lease 由远端 owner 持有，本 Pod 仅做观察"
+                    if lease_active and not row_owner_is_local
+                    else "当前没有活跃任务 lease，等待新的 owner 接管"
+                ),
+                "rows": [
+                    {"label": "task_status", "value": task_status},
+                    {"label": "runtime_phase", "value": runtime_phase},
+                    {"label": "lease_owner", "value": lease_owner},
+                    {"label": "lease_active", "value": str(lease_active).lower()},
+                    {"label": "lease_expires_at", "value": task_shared._isoformat_or_none(lease_expires_at)},
+                    {"label": "row_owner_is_local", "value": str(row_owner_is_local).lower()},
+                    {"label": "runtime_supported_locally", "value": str(runtime_supported_locally).lower()},
+                    {"label": "has_local_owner", "value": str(has_local_owner).lower()},
+                    {"label": "fake_local_owner", "value": str(fake_local_owner).lower()},
+                    {"label": "current_operation_id", "value": current_operation_id},
+                    {"label": "active_operation_type", "value": active_operation_type},
+                    {"label": "active_operation_status", "value": active_operation_status},
+                    {"label": "local_operation_alive", "value": str(local_operation_alive).lower()},
                 ],
             },
             {
@@ -2569,6 +2616,9 @@ class TaskReadModelServiceMixin:
                     {"label": "operation_handle_present", "value": str(operation_handle is not None).lower()},
                     {"label": "operation_handle_name", "value": None if operation_handle is None else operation_handle.get_name()},
                     {"label": "operation_handle_done", "value": None if operation_handle is None else str(operation_handle.done()).lower()},
+                    {"label": "current_operation_id", "value": current_operation_id},
+                    {"label": "active_operation_type", "value": active_operation_type},
+                    {"label": "active_operation_status", "value": active_operation_status},
                     {"label": "operation_lock_owner", "value": operation_lock_owner},
                     {"label": "operation_lock_heartbeat_at", "value": task_shared._isoformat_or_none(operation_lock_heartbeat_at)},
                     {"label": "operation_worker_handles", "value": str(len(self._operation_workers))},
@@ -2816,6 +2866,9 @@ class TaskReadModelServiceMixin:
                         ("runtime_phase", runtime_phase),
                         ("local_worker_alive", local_worker_alive),
                         ("local_owner_count", owner_count),
+                        ("row_owner_is_local", row_owner_is_local),
+                        ("runtime_supported_locally", runtime_supported_locally),
+                        ("fake_local_owner", fake_local_owner),
                         ("lease_owner", lease_owner),
                         ("lease_source", lease_source),
                         ("lease_expires_at", lease_expires_at),
@@ -2993,7 +3046,9 @@ class TaskReadModelServiceMixin:
                     ),
                     evidence=[
                         ("operation_type", active_operation.operation_type if active_operation is not None else None),
+                        ("operation_id", active_operation.id if active_operation is not None else None),
                         ("operation_status", active_operation.status if active_operation is not None else None),
+                        ("local_operation_alive", local_operation_alive),
                         ("operation_lock_owner", operation_lock_owner),
                         ("operation_lock_expires_at", operation_lock_expires_at),
                     ],
@@ -3062,6 +3117,9 @@ class TaskReadModelServiceMixin:
                         ("tail_bound_active_item_count", tail_bound_active_item_count),
                         ("tail_takeover_required", tail_takeover_required),
                         ("tail_takeover_reason", tail_takeover_reason),
+                        ("row_owner_is_local", row_owner_is_local),
+                        ("runtime_supported_locally", runtime_supported_locally),
+                        ("fake_local_owner", fake_local_owner),
                         ("lease_owner", lease_owner),
                         ("lease_source", lease_source),
                         ("lease_expires_at", lease_expires_at),
@@ -3173,6 +3231,13 @@ class TaskReadModelServiceMixin:
             has_local_owner=has_local_owner,
             fake_local_owner=fake_local_owner,
             owner_count=owner_count,
+            lease_owner=lease_owner,
+            lease_expires_at=lease_expires_at,
+            lease_active=lease_active,
+            row_owner_is_local=row_owner_is_local,
+            runtime_supported_locally=runtime_supported_locally,
+            task_status=task_status,
+            runtime_phase=runtime_phase,
             local_stage_worker_count=local_stage_worker_count,
             active_stage_item_count=len(active_stage_items),
             local_archive_job_count=len(local_archive_jobs),
@@ -3180,6 +3245,9 @@ class TaskReadModelServiceMixin:
             local_operation_alive=local_operation_alive,
             operation_lock_owner=operation_lock_owner,
             operation_lock_heartbeat_at=operation_lock_heartbeat_at,
+            current_operation_id=str(getattr(task, "current_operation_id", "") or "").strip() or None,
+            active_operation_type=(str(getattr(active_operation, "operation_type", "") or "").strip() or None) if active_operation is not None else None,
+            active_operation_status=(str(getattr(active_operation, "status", "") or "").strip().lower() or None) if active_operation is not None else None,
         )
         related_loops = self._build_runtime_health_related_loops()
         return {

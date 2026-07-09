@@ -528,7 +528,7 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         self.assertEqual("terminal_delete_takeover_without_runtime_lease", decision.reason_code)
         self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, task.runtime_phase)
 
-    def test_consume_delete_queue_task_starts_orphan_delete_without_runtime_lease(self):
+    def test_consume_delete_queue_task_defers_orphan_delete_without_runtime_lease(self):
         manager = TaskManager()
         manager.instance_id = "worker-a"
         task = BinarySecurityTask(
@@ -556,25 +556,20 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
             request_payload={},
         )
         db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[], events=[])
+        asyncio.run(manager._consume_delete_queue_task(db, task.id))
 
-        original_prepare_delete = manager._prepare_delete_task
-        calls = []
-
-        async def _fake_prepare_delete(db_session, current_task):
-            del db_session
-            calls.append(current_task.id)
-
-        manager._prepare_delete_task = _fake_prepare_delete
-        try:
-            asyncio.run(manager._consume_delete_queue_task(db, task.id))
-        finally:
-            manager._prepare_delete_task = original_prepare_delete
-
-        self.assertEqual(["task-delete-orphan-consume"], calls)
-        self.assertEqual("worker-a", db.runtime_leases[0].owner_instance_id)
+        self.assertEqual([], db.runtime_leases)
         event_types = [event.event_type for event in db.events]
-        self.assertIn("task_delete_queue_consumption_started", event_types)
-        self.assertNotIn("task_delete_queue_consumption_deferred_for_active_blocker", event_types)
+        self.assertNotIn("task_delete_queue_consumption_started", event_types)
+        self.assertIn("task_delete_queue_consumption_deferred_for_active_blocker", event_types)
+        deferred = next(event for event in db.events if event.event_type == "task_delete_queue_consumption_deferred_for_active_blocker")
+        payload = dict(deferred.payload or {})
+        self.assertEqual(
+            "non_terminal_delete_waiting_for_owner_recovery_without_runtime_lease",
+            payload.get("reason_code"),
+        )
+        self.assertIsNotNone(payload.get("cooldown_until"))
+        self.assertGreater(int(payload.get("cooldown_seconds") or 0), 0)
 
     def test_consume_delete_queue_task_starts_terminal_delete_without_runtime_lease(self):
         manager = TaskManager()

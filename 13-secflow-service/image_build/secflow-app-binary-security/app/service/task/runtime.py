@@ -585,6 +585,26 @@ class TaskRuntimeServiceMixin:
         if task is not None:
             active_delete_operation = self._active_delete_queue_operation(db, task)
             if active_delete_operation is not None:
+                if self._delete_queue_requeue_cooldown_active(task):
+                    self._record_event(
+                        db,
+                        task,
+                        "delete_queue_signal_reconcile_deferred_by_cooldown",
+                        "任务已从 Redis 主队列弹出，但 delete queue 当前处于冷却窗口，暂不立即补回",
+                        level="warning",
+                        stage_name=task.current_stage,
+                        payload={
+                            "task_id": normalized_task_id,
+                            "reason": "dispatch_claim_hidden_by_delete_queue_after_redis_pop",
+                            "runtime_phase": self._task_runtime_phase(task),
+                            "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                            "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                            "signal_channel": "delete_queue",
+                            "cooldown_until": self._task_delete_queue_state(task).get("delete_requeue_cooldown_until"),
+                        },
+                    )
+                    db.commit()
+                    return
                 reenqueue_context = "dispatch_claim_hidden_delete_reenqueue"
                 reenqueue_message = "任务已从 Redis 主队列弹出，但当前处于 delete queue 隐藏态，已改为重新放回 delete queue"
                 reenqueue_reason = "dispatch_claim_hidden_by_delete_queue_after_redis_pop"
@@ -746,6 +766,8 @@ class TaskRuntimeServiceMixin:
         delete_position = delete_positions.get(task_id)
         if delete_position is not None:
             return True
+        if self._delete_queue_requeue_cooldown_active(task):
+            return False
         self._mark_task_delete_progress(
             task,
             operation_id=str(getattr(active_delete_operation, "id", "") or "").strip() or None,
@@ -805,6 +827,10 @@ class TaskRuntimeServiceMixin:
         )
         delete_takeover_decision = self._can_consume_delete_queue_task(db, task, active_operation=active_operation)
         if not delete_takeover_decision.allowed:
+            cooldown = self._mark_delete_queue_requeue_cooldown(
+                task,
+                reason=str(delete_takeover_decision.reason_code or "delete_queue_deferred"),
+            )
             self._record_event(
                 db,
                 task,
@@ -812,9 +838,11 @@ class TaskRuntimeServiceMixin:
                 "删除队列消费检测到 authoritative blocker，当前暂不接管删除",
                 stage_name=task.current_stage,
                 level="info",
-                payload=self._delete_queue_consume_decision_payload(delete_takeover_decision),
+                payload={
+                    **self._delete_queue_consume_decision_payload(delete_takeover_decision),
+                    **cooldown,
+                },
             )
-            self._force_requeue_delete_task(task.id, context="delete_queue_active_blocker")
             db.commit()
             return
         started_at = task_manager_module._now()
@@ -1866,6 +1894,8 @@ class TaskRuntimeServiceMixin:
             if not normalized_task_id:
                 continue
             if self._dispatch_claim_cooldown_active(task):
+                continue
+            if self._delete_queue_requeue_cooldown_active(task, now_value=now_value):
                 continue
             self._clear_dispatch_claim_cooldown(task)
             active_delete_operation = self._active_delete_queue_operation(db, task)

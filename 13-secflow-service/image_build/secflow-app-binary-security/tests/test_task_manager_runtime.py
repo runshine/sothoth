@@ -1697,6 +1697,55 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             dict(event.payload or {}).get("enqueue_context"),
         )
 
+    async def test_requeue_unclaimed_dispatch_task_defers_delete_hidden_task_when_cooldown_active(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-delete-hidden-cooldown",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            current_operation_id="op-delete",
+        )
+        task.cleanup_snapshot = {
+            "delete_queued": True,
+            "delete_operation_id": "op-delete",
+            "delete_mode": "delete",
+            "delete_requeue_cooldown_until": (_now() + timedelta(seconds=30)).isoformat(),
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], state_events=[])
+        main_reenqueued: list[tuple[str, str | None]] = []
+        delete_reenqueued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def force_requeue_task(self, task_id, *, context=None):
+                main_reenqueued.append((task_id, context))
+
+            async def force_requeue_delete_task(self, task_id, *, context=None):
+                delete_reenqueued.append((task_id, context))
+
+        with patch("app.service.task_manager.get_task_queue", return_value=_Queue()):
+            await manager._requeue_unclaimed_dispatch_task(db, task.id)
+
+        self.assertEqual([], main_reenqueued)
+        self.assertEqual([], delete_reenqueued)
+        event = next(row for row in db.events if row.event_type == "delete_queue_signal_reconcile_deferred_by_cooldown")
+        self.assertEqual(
+            "dispatch_claim_hidden_by_delete_queue_after_redis_pop",
+            dict(event.payload or {}).get("reason"),
+        )
+
     def test_dispatch_task_by_id_logs_claim_blocked_reason_for_missing_task_row(self):
         manager = TaskManager()
         db = _ModelAwareDb(tasks=[], events=[])
@@ -2146,10 +2195,7 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
             lease_expires_at=_now() + timedelta(minutes=5),
         )
         db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[], state_events=[])
-        requeued: list[str] = []
         prepared: list[str] = []
-
-        self.manager._force_requeue_delete_task = lambda task_id, context=None: requeued.append(task_id)
 
         async def _prepare(_db, _task):
             prepared.append(_task.id)
@@ -2159,14 +2205,14 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
 
         await self.manager._consume_delete_queue_task(db, task.id)
 
-        self.assertEqual([task.id], requeued)
         self.assertEqual([], prepared)
-        self.assertIn(
-            "task_delete_queue_consumption_deferred_for_active_blocker",
-            [row.event_type for row in db.events],
-        )
+        deferred_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_deferred_for_active_blocker")
+        payload = dict(deferred_event.payload or {})
+        self.assertEqual("active_runtime_lease_blocks_delete_consume", payload.get("reason_code"))
+        self.assertIsNotNone(payload.get("cooldown_until"))
+        self.assertGreater(int(payload.get("cooldown_seconds") or 0), 0)
 
-    async def test_consume_delete_queue_task_reclaims_expired_owner_before_processing(self):
+    async def test_consume_delete_queue_task_defers_non_terminal_task_without_runtime_lease(self):
         task = BinarySecurityTask(
             id="task-delete-expired-lease",
             project_id="project-1",
@@ -2207,15 +2253,65 @@ class TaskManagerRunningLeaseRepairTests(unittest.IsolatedAsyncioTestCase):
         self.manager.instance_id = "worker-b"
         self.manager._release_task_without_supported_runtime_owner = _release
         self.manager._prepare_delete_task = _prepare
-
         await self.manager._consume_delete_queue_task(db, task.id)
 
         self.assertEqual([], released)
-        self.assertEqual([task.id], prepared)
-        started_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_started")
-        self.assertFalse(bool(dict(started_event.payload or {}).get("owner_released_before_delete_consume")))
-        self.assertEqual("worker-b", db.runtime_leases[0].owner_instance_id)
-        self.assertEqual(TASK_RUNTIME_PHASE_OWNED_EXECUTION, task.runtime_phase)
+        self.assertEqual([], prepared)
+        self.assertEqual([], db.runtime_leases)
+        self.assertIsNone(task.runtime_phase)
+        deferred_event = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_deferred_for_active_blocker")
+        payload = dict(deferred_event.payload or {})
+        self.assertEqual(
+            "non_terminal_delete_waiting_for_owner_recovery_without_runtime_lease",
+            payload.get("reason_code"),
+        )
+        self.assertIsNotNone(payload.get("cooldown_until"))
+        self.assertGreater(int(payload.get("cooldown_seconds") or 0), 0)
+
+    async def test_ensure_delete_queue_signal_skips_requeue_when_cooldown_active(self):
+        task = BinarySecurityTask(
+            id="task-delete-cooldown-signal",
+            project_id="project-1",
+            name="task",
+            status="pending",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws",
+            current_operation_id="op-delete",
+        )
+        task.cleanup_snapshot = {
+            "delete_queued": True,
+            "delete_operation_id": "op-delete",
+            "delete_mode": "delete",
+            "delete_requeue_cooldown_until": (_now() + timedelta(seconds=30)).isoformat(),
+        }
+        operation = BinarySecurityTaskOperation(
+            id="op-delete",
+            task_id=task.id,
+            project_id=task.project_id,
+            operation_type=task_manager_module.TASK_ACTION_DELETE,
+            status="queued",
+        )
+        db = _ModelAwareDb(tasks=[task], operations=[operation], events=[], state_events=[])
+        delete_reenqueued: list[tuple[str, str | None]] = []
+
+        class _Queue:
+            async def force_requeue_delete_task(self, task_id, *, context=None):
+                delete_reenqueued.append((task_id, context))
+
+        handled = await self.manager._ensure_delete_queue_signal(
+            db,
+            task,
+            _Queue(),
+            {},
+            enqueue_context="delete_queue_reconcile",
+        )
+
+        self.assertFalse(handled)
+        self.assertEqual([], delete_reenqueued)
+        self.assertNotIn("delete_queue_signal_reconciled", [row.event_type for row in db.events])
 
     @unittest.skip("stale fake-db queue reconcile coverage is unstable in full-file runtime suite")
     async def test_reconcile_work_queues_force_reenqueues_pending_task_missing_from_redis(self):

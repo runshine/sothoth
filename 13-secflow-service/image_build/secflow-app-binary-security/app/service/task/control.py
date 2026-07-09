@@ -5,6 +5,7 @@ import json
 import shutil
 import zipfile
 import os
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -65,6 +66,48 @@ class TaskControlServiceMixin:
             "delete_last_progress_at": str(snapshot.get("delete_last_progress_at") or "").strip() or None,
             "delete_last_progress_step": str(snapshot.get("delete_last_progress_step") or "").strip() or None,
             "delete_last_error": str(snapshot.get("delete_last_error") or "").strip() or None,
+            "delete_requeue_cooldown_until": str(snapshot.get("delete_requeue_cooldown_until") or "").strip() or None,
+            "delete_requeue_cooldown_reason": str(snapshot.get("delete_requeue_cooldown_reason") or "").strip() or None,
+        }
+
+    def _delete_queue_requeue_cooldown_seconds(self: TaskManager) -> int:
+        try:
+            configured = getattr(self.cfg.queue, "dispatch_claim_handoff_cooldown_seconds", None)
+            return max(5, int(configured or 15))
+        except (TypeError, ValueError):
+            return 15
+
+    def _delete_queue_requeue_cooldown_active(self: TaskManager, task, *, now_value=None) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        state = self._task_delete_queue_state(task)
+        until = task_manager_module._parse_iso_datetime(state.get("delete_requeue_cooldown_until"))
+        if until is None:
+            return False
+        current_now = now_value or task_manager_module._now()
+        return until > current_now
+
+    def _mark_delete_queue_requeue_cooldown(
+        self: TaskManager,
+        task,
+        *,
+        reason: str,
+        cooldown_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        from app.service import task_manager as task_manager_module
+
+        snapshot = self._task_delete_snapshot_state(task)
+        now_value = task_manager_module._now()
+        effective_cooldown = max(1, int(cooldown_seconds or self._delete_queue_requeue_cooldown_seconds()))
+        until = now_value + timedelta(seconds=effective_cooldown)
+        snapshot["delete_requeue_cooldown_started_at"] = now_value.isoformat()
+        snapshot["delete_requeue_cooldown_until"] = until.isoformat()
+        snapshot["delete_requeue_cooldown_reason"] = str(reason or "").strip() or "delete_queue_waiting_for_owner_recovery"
+        task.cleanup_snapshot = snapshot
+        return {
+            "cooldown_seconds": effective_cooldown,
+            "cooldown_until": snapshot["delete_requeue_cooldown_until"],
+            "cooldown_reason": snapshot["delete_requeue_cooldown_reason"],
         }
 
     def _task_is_hidden_by_delete_queue(self: TaskManager, task) -> bool:
@@ -158,6 +201,9 @@ class TaskControlServiceMixin:
         snapshot["delete_last_progress_at"] = snapshot["delete_queue_requested_at"]
         snapshot["delete_last_progress_step"] = "queued"
         snapshot["delete_last_error"] = None
+        snapshot.pop("delete_requeue_cooldown_started_at", None)
+        snapshot.pop("delete_requeue_cooldown_until", None)
+        snapshot.pop("delete_requeue_cooldown_reason", None)
         task.cleanup_snapshot = snapshot
 
     def _mark_task_delete_consumer_started(
@@ -177,6 +223,9 @@ class TaskControlServiceMixin:
         snapshot["delete_started_at"] = task_manager_module._now().isoformat()
         snapshot["delete_last_progress_at"] = snapshot["delete_started_at"]
         snapshot["delete_last_progress_step"] = "consumer_started"
+        snapshot.pop("delete_requeue_cooldown_started_at", None)
+        snapshot.pop("delete_requeue_cooldown_until", None)
+        snapshot.pop("delete_requeue_cooldown_reason", None)
         task.cleanup_snapshot = snapshot
 
     def _mark_task_delete_terminal_failure(
@@ -195,6 +244,9 @@ class TaskControlServiceMixin:
         snapshot["delete_last_progress_at"] = None
         snapshot["delete_last_progress_step"] = None
         snapshot["delete_last_error"] = str(error_message or "").strip() or None
+        snapshot.pop("delete_requeue_cooldown_started_at", None)
+        snapshot.pop("delete_requeue_cooldown_until", None)
+        snapshot.pop("delete_requeue_cooldown_reason", None)
         task.cleanup_snapshot = snapshot
 
     def _mark_task_delete_progress(

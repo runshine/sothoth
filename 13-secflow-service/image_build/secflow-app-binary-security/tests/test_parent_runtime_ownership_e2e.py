@@ -160,14 +160,27 @@ class ParentRuntimeOwnershipE2ETests(unittest.TestCase):
             lease_expires_at=_now() + timedelta(minutes=3),
         )
         db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
-        requeued = []
-        manager._force_requeue_delete_task = lambda task_id, context=None: requeued.append(task_id)
-
         asyncio.run(manager._consume_delete_queue_task(db, task.id))
 
-        self.assertEqual([task.id], requeued)
         deferred = next(row for row in db.events if row.event_type == "task_delete_queue_consumption_deferred_for_active_blocker")
-        self.assertEqual("active_runtime_lease_blocks_delete_consume", (deferred.payload or {}).get("reason_code"))
+        deferred_payload = dict(deferred.payload or {})
+        self.assertEqual("active_runtime_lease_blocks_delete_consume", deferred_payload.get("reason_code"))
+        self.assertIsNotNone(deferred_payload.get("cooldown_until"))
+        self.assertGreater(int(deferred_payload.get("cooldown_seconds") or 0), 0)
+
+        db.runtime_leases.clear()
+        task.status = "running"
+        task.runtime_phase = TASK_RUNTIME_PHASE_OWNED_EXECUTION
+        asyncio.run(manager._consume_delete_queue_task(db, task.id))
+        deferred = db.events[-1]
+        self.assertEqual("task_delete_queue_consumption_deferred_for_active_blocker", deferred.event_type)
+        deferred_payload = dict(deferred.payload or {})
+        self.assertEqual(
+            "non_terminal_delete_waiting_for_owner_recovery_without_runtime_lease",
+            deferred_payload.get("reason_code"),
+        )
+        self.assertIsNotNone(deferred_payload.get("cooldown_until"))
+        self.assertGreater(int(deferred_payload.get("cooldown_seconds") or 0), 0)
 
         db.runtime_leases.clear()
         task.status = "failed"

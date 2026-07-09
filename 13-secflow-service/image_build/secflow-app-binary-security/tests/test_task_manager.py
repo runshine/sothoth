@@ -13174,6 +13174,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("degraded", spotlight["task_worker"]["status"])
         self.assertEqual("degraded", spotlight["task_heartbeat"]["status"])
         self.assertIn("local_task_runtime", snapshot_cards)
+        self.assertIn("runtime_ownership", snapshot_cards)
         self.assertIn("task_dispatch", related_loops)
         self.assertNotEqual("unhealthy", health["summary"]["overall_status"])
 
@@ -37970,6 +37971,10 @@ def _test_build_task_runtime_health_marks_remote_owner_as_degraded_not_unhealthy
     self.assertEqual("degraded", groups["execution"]["status"])
     self.assertEqual("degraded", spotlight["task_worker"]["status"])
     self.assertIn(snapshot_cards["local_task_runtime"]["status"], {"idle", "degraded", "healthy"})
+    ownership_rows = {row["label"]: row["value"] for row in snapshot_cards["runtime_ownership"]["rows"]}
+    self.assertEqual("remote-worker", ownership_rows["lease_owner"])
+    self.assertEqual("false", ownership_rows["row_owner_is_local"])
+    self.assertEqual("false", ownership_rows["runtime_supported_locally"])
     self.assertIn("downstream_reconcile", related_loops)
     self.assertNotEqual("unhealthy", units["task_worker"]["status"])
 
@@ -37999,6 +38004,10 @@ def _test_build_task_runtime_health_marks_fake_local_owner_unhealthy(self):
     self.assertEqual("unknown", units["task_heartbeat"]["status"])
     self.assertIn("看不到稳定的本地执行协程或 owner", units["task_worker"]["reason"])
     self.assertEqual("idle", snapshot_cards["local_task_runtime"]["status"])
+    ownership_rows = {row["label"]: row["value"] for row in snapshot_cards["runtime_ownership"]["rows"]}
+    self.assertEqual("false", ownership_rows["lease_active"])
+    self.assertEqual("false", ownership_rows["row_owner_is_local"])
+    self.assertEqual("false", ownership_rows["runtime_supported_locally"])
 
 
 def _test_build_task_runtime_health_includes_latest_lock_conflict_evidence(self):
@@ -38032,6 +38041,8 @@ def _test_build_task_runtime_health_includes_latest_lock_conflict_evidence(self)
     worker_evidence = {row["label"]: row["value"] for row in units["task_worker"]["evidence"]}
     heartbeat_evidence = {row["label"]: row["value"] for row in units["task_heartbeat"]["evidence"]}
 
+    self.assertEqual("False", worker_evidence["row_owner_is_local"])
+    self.assertEqual("False", worker_evidence["runtime_supported_locally"])
     self.assertEqual("dispatch_claim_deferred_by_lock", worker_evidence["latest_lock_conflict_type"])
     self.assertEqual(task_manager_module._isoformat_or_none(now_value), worker_evidence["latest_lock_conflict_at"])
     self.assertEqual("dispatch_claim_deferred_by_lock", heartbeat_evidence["latest_lock_conflict_type"])
