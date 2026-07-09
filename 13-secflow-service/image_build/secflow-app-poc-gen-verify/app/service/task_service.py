@@ -181,9 +181,11 @@ class TaskService:
     ) -> dict:
         cfg = get_config()
         task_id = f"poc-{_task_id_stamp()}-{uuid.uuid4().hex[:8]}"
-        work_dir = cfg.state_root / "tasks" / task_id
-        work_dir.mkdir(parents=True, exist_ok=True)
-        out_dir = output_dir or default_output_dir(entry_function, binary_dir, work_dir)
+        # default work dir on the fileserver (mounted at /data, shared by api+worker) so
+        # logs / session records / artifacts live with the task and are readable from the
+        # detail view. Naming matches the `poc` CLI default (<entry>_<bindir>_<ts>).
+        workspaces_base = cfg.fileserver_root / project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
+        out_dir = output_dir or default_output_dir(entry_function, binary_dir, workspaces_base)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         row = AppPocTask(
             task_id=task_id,
@@ -269,7 +271,7 @@ class TaskService:
 
     def get_task_logs(self, db: Session, task_id: str, *, tail_lines: int = 500) -> dict:
         row = self._get_or_404(db, task_id)
-        log_path = self._log_path(row.task_id)
+        log_path = self._log_path(row.output_dir)
         content = ""
         if log_path.is_file():
             try:
@@ -535,17 +537,20 @@ class TaskService:
 
             timeout = int(row.timeout or cfg.default_timeout)
             model = row.model or cfg.default_model
-            work_dir = cfg.state_root / "tasks" / task_id
-            work_dir.mkdir(parents=True, exist_ok=True)
+            # work dir = the task's output_dir on the fileserver (shared by api+worker);
+            # the runner log + the poc CLI's per-stage logs/sessions/artifacts all live here.
             if not row.output_dir:
-                row.output_dir = default_output_dir(row.entry_function, row.binary_dir, work_dir)
+                workspaces_base = cfg.fileserver_root / row.project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
+                row.output_dir = default_output_dir(row.entry_function, row.binary_dir, workspaces_base)
                 db.commit()
                 db.refresh(row)
+            work_dir = Path(row.output_dir)
+            work_dir.mkdir(parents=True, exist_ok=True)
             log_path = str(work_dir / "poc_cli.log")
             cmd = build_poc_cmd(
                 poc_bin=cfg.poc_bin, entry_function=row.entry_function,
                 vuln_report_path=row.vuln_report_path, binary_dir=row.binary_dir,
-                output_dir=row.output_dir, timeout=timeout, model=model,
+                output_dir=row.output_dir, model=model,
                 effort=row.effort, session_name=row.session_name,
                 session_id=row.session_id, session_dir=row.session_dir,
             )
@@ -670,8 +675,9 @@ class TaskService:
         return t
 
     # ── serialization ─────────────────────────────────────────────────────────
-    def _log_path(self, task_id: str) -> Path:
-        return get_config().state_root / "tasks" / task_id / "poc_cli.log"
+    def _log_path(self, output_dir: Optional[str]) -> Path:
+        """Runner log lives in the task's work dir (output_dir/poc_cli.log)."""
+        return Path(output_dir) / "poc_cli.log" if output_dir else Path("")
 
     def _row_to_dict(self, row: AppPocTask, *, include_heavy: bool = True) -> dict:
         return {
@@ -708,7 +714,7 @@ class TaskService:
             "control_version": int(row.control_version or 0),
             "dispatch_status": row.dispatch_status,
             "celery_task_id": row.celery_task_id,
-            "log_path": str(self._log_path(row.task_id)),
+            "log_path": str(self._log_path(row.output_dir)),
             "is_deleted": row.is_deleted,
         }
 

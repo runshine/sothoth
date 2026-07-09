@@ -44,7 +44,6 @@ def build_poc_cmd(
     vuln_report_path: str,
     binary_dir: str,
     output_dir: str,
-    timeout: int,
     model: Optional[str] = None,
     effort: Optional[str] = None,
     session_name: Optional[str] = None,
@@ -52,8 +51,10 @@ def build_poc_cmd(
     session_dir: Optional[str] = None,
 ) -> list[str]:
     """Build the `poc` CLI argv from task fields."""
+    # NOTE: the `poc` CLI has no --timeout flag (it rejects unknown args → exit 2).
+    # The timeout is enforced by run_poc_cli's process-group timer, not the CLI.
     cmd = [poc_bin, "-e", entry_function, "-r", vuln_report_path,
-           "-b", binary_dir, "-o", output_dir, "--timeout", str(timeout)]
+           "-b", binary_dir, "-o", output_dir]
     if model:
         cmd += ["--model", model]
     if effort:
