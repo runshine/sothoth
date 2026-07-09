@@ -417,7 +417,7 @@ class TaskService:
         target = _safe_session_path(Path(row.output_dir), rel_path)
         if not target.is_file():
             raise HTTPException(status_code=404, detail=f"会话文件不存在: {rel_path}")
-        content = _read_tail(target, max_lines=tail_lines, max_bytes=524288)
+        content = _read_tail(target, max_lines=tail_lines, max_bytes=2097152)
         try:
             size = target.stat().st_size
         except OSError:
