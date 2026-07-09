@@ -174,7 +174,7 @@ class _MockGaiaSourceDownstreamService:
                 }
             ]
         }
-        (output_dir / "entry-details.json").write_text(json.dumps(entry_payload), encoding="utf-8")
+        (output_dir / "functions.list").write_text(json.dumps(entry_payload), encoding="utf-8")
         return output_dir, entry_payload
 
     def _build_dataflow_output(self, task_id: str) -> Path:

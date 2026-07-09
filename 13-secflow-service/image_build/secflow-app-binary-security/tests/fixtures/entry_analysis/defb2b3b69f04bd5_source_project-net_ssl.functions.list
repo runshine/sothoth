@@ -1,0 +1,374 @@
+[
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/cj/network_security/include/net_network_security_ffi.h",
+    "line": 22,
+    "function": "FfiOHOSNetworkSecurityCertVerificationCert",
+    "taints": [
+      "cert"
+    ],
+    "function_description": "FFI 导出的证书校验接口，接收外部传入的证书 blob 数据用于网络安全校验。",
+    "entry_reason": "函数通过 FFI_EXPORT 对外暴露，参数 cert（CCertBlob 证书数据）由外部调用方直接传入，是模块边界入口接收外部可控数据的被动型入口。",
+    "taint_details": [
+      {
+        "name": "cert",
+        "description": "外部传入的证书 blob 数据，承载待校验的证书内容",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "ae4c159d0f0a",
+    "signature": "namespace OHOS::NetStack::NetworkSecurity",
+    "start_line": 22,
+    "end_line": 27,
+    "body_lines": 6,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.86,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/js/napi/net_ssl/net_ssl_module/src/net_ssl_module.cpp",
+    "line": 81,
+    "function": "NetSslModuleExports::VerifyCertification",
+    "taints": [
+      "info"
+    ],
+    "function_description": "NAPI 导出函数，将 JS 层通过回调信息传入的证书验证请求转发到 SslExec::AsyncRunVerify 异步执行。",
+    "entry_reason": "参数 info (napi_callback_info) 携带 JS 调用者传入的参数，是 NAPI 模块对外暴露的最外层边界入口，数据来自模块外部的 Node.js 运行时。",
+    "taint_details": [
+      {
+        "name": "info",
+        "description": "napi_callback_info，承载 JS 调用者传入的回调参数列表，经 ModuleTemplate 解析后构造 CertContext 用于证书验证",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "add4611648d9",
+    "signature": "napi_value NetSslModuleExports::VerifyCertification(napi_env env, napi_callback_info info)",
+    "start_line": 81,
+    "end_line": 90,
+    "body_lines": 10,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.78,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/js/napi/net_ssl/net_ssl_module/src/net_ssl_module.cpp",
+    "line": 92,
+    "function": "NetSslModuleExports::VerifyCertificationSync",
+    "taints": [
+      "info"
+    ],
+    "function_description": "NAPI 模块导出的同步证书验证函数，从 JS 回调信息中解析证书参数，调用 NetStackVerifyCertification 进行验证并返回结果。",
+    "entry_reason": "函数是 NAPI 模块导出函数，直接暴露给 JavaScript 外部调用方。参数 info 为 napi_callback_info，携带 JS 调用方传入的参数；函数体通过 napi_get_cb_info 主动提取外部数据到 params，再经 ParseParams 解析为证书 blob 供验证使用。属于模块最外层边界入口。",
+    "taint_details": [
+      {
+        "name": "info",
+        "description": "napi_callback_info 回调信息，由 NAPI 运行时传入，携带 JavaScript 调用方提供的全部参数（如证书 blob 数据），经 napi_get_cb_info 提取后进入函数处理流程。",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "7358866b21f5",
+    "signature": "napi_value NetSslModuleExports::VerifyCertificationSync(napi_env env, napi_callback_info info)",
+    "start_line": 92,
+    "end_line": 117,
+    "body_lines": 26,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.78,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/js/napi/net_ssl/net_ssl_module/src/net_ssl_module.cpp",
+    "line": 134,
+    "function": "NetSslModuleExports::IsCleartextPermitted",
+    "taints": [
+      "info"
+    ],
+    "function_description": "N-API 原生模块导出函数，从 JavaScript 调用方接收参数，解析后查询 NetworkSecurityConfig 的明文传输许可状态并返回布尔结果。",
+    "entry_reason": "作为 N-API 模块对 JS 侧暴露的导出函数，参数 info (napi_callback_info) 携带 JS 调用上下文与外部可控参数；函数体调用 napi_get_cb_info 主动从 info 提取 JS 传入的实际参数（params），再经 ParseParams 解析，属于模块边界入口接收外部数据。",
+    "taint_details": [
+      {
+        "name": "info",
+        "description": "napi_callback_info 句柄，承载 JavaScript 调用方传入的参数上下文，经 napi_get_cb_info 提取为 params 后被 ParseParams 解析为外部可控输入",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "8703e7a0e7cb",
+    "signature": "napi_value NetSslModuleExports::IsCleartextPermitted(napi_env env, napi_callback_info info)",
+    "start_line": 134,
+    "end_line": 164,
+    "body_lines": 31,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.86,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/js/napi/net_ssl/net_ssl_module/src/net_ssl_module.cpp",
+    "line": 166,
+    "function": "NetSslModuleExports::IsCleartextPermittedByHostName",
+    "taints": [
+      "info"
+    ],
+    "function_description": "NAPI 导出方法，接收 JS 调用者传入的 hostname 参数，查询 NetworkSecurityConfig 判断该主机是否允许明文传输，返回布尔结果。",
+    "entry_reason": "函数通过 NAPI 框架导出给 JavaScript 调用，napi_callback_info info 携带 JS 端传入的参数；函数体调用 napi_get_cb_info 从 info 提取 params，再 ParseParams 得到 hostname_，hostname 是外部可控数据。tag=P 因为外部数据经参数 info 被动传入；entry_role=boundary 因为这是模块对外暴露的 NAPI 公开 API。",
+    "taint_details": [
+      {
+        "name": "info",
+        "description": "napi_callback_info，承载 JS 调用者传入的实参（hostname），经 napi_get_cb_info 提取并解析为 context->hostname_",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "00f98e244f95",
+    "signature": "napi_value NetSslModuleExports::IsCleartextPermittedByHostName(napi_env env, napi_callback_info info)",
+    "start_line": 166,
+    "end_line": 198,
+    "body_lines": 33,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.78,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/cj/network_security/src/net_network_security_ffi.cpp",
+    "line": 20,
+    "function": "FfiOHOSNetworkSecurityCertVerificationCert",
+    "taints": [
+      "cert",
+      "cert.certData"
+    ],
+    "function_description": "FFI 边界函数，接收外部传入的证书数据（CCertBlob），构造 CertBlob 后调用 NetStackVerifyCertification 进行证书验证并返回结果。",
+    "entry_reason": "extern \"C\" FFI 入口，被 napi/JS 外部层直接调用；参数 cert 承载外部证书数据（certType、certData），是被动接收外部不可信数据的边界函数。",
+    "taint_details": [
+      {
+        "name": "cert",
+        "description": "CCertBlob 参数，承载外部传入的证书类型与证书数据（含数据指针与长度）",
+        "description_source": "agent"
+      },
+      {
+        "name": "cert.certData",
+        "description": "证书数据载荷，包含 size（长度）与 head（数据指针），来自外部对端证书",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "cd401de35d15",
+    "signature": "namespace OHOS::NetStack::NetworkSecurity",
+    "start_line": 20,
+    "end_line": 40,
+    "body_lines": 21,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.86,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/js/napi/net_ssl/async_context/src/cert_context.cpp",
+    "line": 62,
+    "function": "CertContext::ParseParams",
+    "taints": [
+      "params"
+    ],
+    "function_description": "CertContext::ParseParams 解析 Node-API 调用方（JavaScript）传入的 napi_value 参数数组，按参数数量提取证书 blob 与客户端证书 blob 并设置解析状态/错误码。",
+    "entry_reason": "签名参数 params（napi_value *）承载 JavaScript 调用方传入的外部数据；函数体通过 params[0]/params[1] 调用 ParseCertBlobFromValue 实际读取并解析外部证书数据，属被动型外部输入入口。函数名不含生命周期标志，亦非纯构造/发送，故 keep。",
+    "taint_details": [
+      {
+        "name": "params",
+        "description": "napi_value 数组，承载 JavaScript 调用方传入的证书/客户端证书原始数据，经 ParseCertBlobFromValue 解析为 certBlob_/certBlobClient_。",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "17642f04ea56",
+    "signature": "void CertContext::ParseParams(napi_value *params, size_t paramsCount)",
+    "start_line": 62,
+    "end_line": 77,
+    "body_lines": 16,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.78,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/js/napi/net_ssl/async_context/src/cert_context.cpp",
+    "line": 90,
+    "function": "CertContext::ParseCertBlobFromValue",
+    "taints": [
+      "value"
+    ],
+    "function_description": "从传入的 napi_value（JS 对象）中解析 type 和 data 字段，构造 CertBlob 结构体。",
+    "entry_reason": "参数 value 是 napi_value 类型，承载来自 Node.js 外部层的 JS 对象数据；函数体通过 napi_get_named_property 读取该外部对象的 type/data 属性，属于被动接收外部可控数据。",
+    "taint_details": [
+      {
+        "name": "value",
+        "description": "napi_value 类型参数，承载外部 JS 层传入的证书对象（含 type/data 字段），是外部可控数据源",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "5f3576af3d3b",
+    "signature": "CertBlob *CertContext::ParseCertBlobFromValue(napi_env env, napi_value value)",
+    "start_line": 90,
+    "end_line": 101,
+    "body_lines": 12,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.86,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/js/napi/net_ssl/async_context/src/cert_context.cpp",
+    "line": 103,
+    "function": "CertContext::ParseCertBlobFromData",
+    "taints": [
+      "dataValue",
+      "typeValue"
+    ],
+    "function_description": "从 JS 层传入的 napi_value 中解析证书数据（PEM 字符串或 DER arraybuffer），按证书类型提取原始字节并构造 CertBlob 返回。",
+    "entry_reason": "dataValue 与 typeValue 参数承载来自 JS 外部调用方的证书数据，函数体主动调用 napi 提取 API 从中读取外部可控内容，属于模块边界处接收原始外部数据。",
+    "taint_details": [
+      {
+        "name": "dataValue",
+        "description": "JS 层传入的证书数据载体，PEM 时为字符串、DER 时为 ArrayBuffer，函数提取其字节作为证书载荷",
+        "description_source": "agent"
+      },
+      {
+        "name": "typeValue",
+        "description": "JS 层传入的证书类型枚举值，决定解析走 PEM 或 DER 分支",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "1d36ea1449ee",
+    "signature": "CertBlob *CertContext::ParseCertBlobFromData(napi_env env, napi_value value, napi_value typeValue, napi_value dataValue)",
+    "start_line": 103,
+    "end_line": 148,
+    "body_lines": 46,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.86,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/interfaces/innerkits/net_ssl/include/net_ssl.h",
+    "line": 21,
+    "function": "NetStackVerifyCertification",
+    "taints": [
+      "cert"
+    ],
+    "function_description": "证书验证函数，接收待验证的证书 blob 并用系统预置证书或用户指定 CA 证书进行校验，返回 0 表示验证成功。",
+    "entry_reason": "参数 cert 类型为 CertBlob*，文档注释为 'Certificates to be verified'，即待验证的证书。在 SSL/TLS 场景中，待验证证书是握手阶段从远端对等方接收的不可信外部数据，通过参数被动传入函数，属被动型外部入口。",
+    "taint_details": [
+      {
+        "name": "cert",
+        "description": "待验证的证书数据，承载远端对等方在 TLS 握手阶段提供的外部不可信证书，是验证逻辑处理的污点源",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "44f6d84465b7",
+    "signature": "namespace OHOS",
+    "start_line": 21,
+    "end_line": 41,
+    "body_lines": 21,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.86,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/native/net_ssl/net_ssl.cpp",
+    "line": 25,
+    "function": "NetStackVerifyCertification",
+    "taints": [
+      "cert"
+    ],
+    "function_description": "证书认证校验函数，接收外部对端在 TLS 握手期间提供的证书 blob 并委托 VerifyCert 进行验证。",
+    "entry_reason": "参数 cert 为 CertBlob 指针，承载 TLS 握手中来自远程对端的外部证书数据；函数体直接引用 cert（空指针检查后传入 VerifyCert），属被动型(P)外部输入入口。函数非生命周期函数、非纯构造/发送、非 FSM action，故 keep。",
+    "taint_details": [
+      {
+        "name": "cert",
+        "description": "外部对端证书 blob，包含待验证的证书数据，源自 TLS 握手远端",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "d24a22a4db38",
+    "signature": "uint32_t NetStackVerifyCertification(const CertBlob *cert)",
+    "start_line": 25,
+    "end_line": 32,
+    "body_lines": 8,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.78,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  },
+  {
+    "tag": "P",
+    "file": "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/native/net_ssl/net_ssl.cpp",
+    "line": 34,
+    "function": "NetStackVerifyCertification",
+    "taints": [
+      "cert"
+    ],
+    "function_description": "验证对端提交的证书（cert）是否由本地 CA（caCert）签发/可信，是 SSL/TLS 证书校验的对外入口。",
+    "entry_reason": "cert 参数承载对端在网络握手阶段提交的证书 blob，是外部可控数据；函数为模块公开的证书验证 API（boundary），由上层在收到对端证书后调用以完成信任校验。",
+    "taint_details": [
+      {
+        "name": "cert",
+        "description": "待验证的对端证书 blob（CertBlob *），来源于远程 peer，可被攻击者伪造/控制，是核心外部输入污点",
+        "description_source": "agent"
+      }
+    ],
+    "func_hash": "7b7d09dc1d73",
+    "signature": "uint32_t NetStackVerifyCertification(const CertBlob *cert, const CertBlob *caCert)",
+    "start_line": 34,
+    "end_line": 41,
+    "body_lines": 8,
+    "entry_category": "外部入口",
+    "entry_role": "boundary",
+    "entry_confidence": 0.78,
+    "definition_kind": "definition",
+    "is_definition_found": true,
+    "function_description_source": "agent",
+    "entry_reason_source": "agent"
+  }
+]

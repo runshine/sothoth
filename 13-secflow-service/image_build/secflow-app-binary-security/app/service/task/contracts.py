@@ -1111,78 +1111,14 @@ class TaskContractServiceMixin:
                 )
             return task_manager_module._deduplicate_entry_keys(rows)
 
-        function_list_candidates = [
-            artifact_root / "entry-details.json",
-            artifact_root / "functions.list",
-            artifact_root / "output" / "entry-details.json",
-            artifact_root / "output" / "functions.list",
-        ]
-        if artifact_root.is_dir() and not any(candidate.is_file() for candidate in function_list_candidates):
-            recursive_matches = sorted(artifact_root.rglob("functions.list"))
-            if len(recursive_matches) == 1:
-                function_list_candidates.append(recursive_matches[0])
-        for candidate in function_list_candidates:
-            if candidate.is_file():
-                try:
-                    rows = _rows_from_payload(json.loads(task_manager_module._read_text(candidate) or "[]"), candidate)
-                    if rows:
-                        return rows
-                except Exception:
-                    pass
-
-        json_candidates = [
-            artifact_root / "result.json",
-            artifact_root / "result_json",
-            artifact_root / "entry-list.json",
-        ]
-        for candidate in json_candidates:
-            if candidate.is_file():
-                payload = json.loads(task_manager_module._read_text(candidate) or "{}")
-                rows = _rows_from_payload(payload, candidate)
-                if rows:
-                    return rows
-        entry_file = artifact_root / "entry-list.md"
-        content = task_manager_module._read_text(entry_file)
-        rows = []
-        for line in content.splitlines():
-            parts = [part.strip() for part in line.split("|")]
-            if parts and not parts[0]:
-                parts = parts[1:]
-            if parts and not parts[-1]:
-                parts = parts[:-1]
-            if len(parts) >= 7 and parts[1].isdigit():
-                file_name = parts[2]
-                function_name = task_manager_module._normalize_entry_function_name(parts[3])
-                line_no = parts[4]
-                if file_name and function_name:
-                    taint_params = [part.strip() for part in parts[5].split(",") if part.strip()] if len(parts) > 5 else []
-                    rows.append(
-                        self._build_entry_output_contract(
-                            module,
-                            {
-                                "entry_key": task_manager_module._slug(
-                                    f"{module['module_key']}-{function_name}-{line_no}"
-                                ),
-                                "file_name": file_name,
-                                "function_name": function_name,
-                                "raw_function_name": parts[3],
-                                "line_no": line_no,
-                                "tag": "P",
-                                "definition_kind": "definition",
-                                "taint_params": taint_params,
-                                "function_description": task_manager_module._default_entry_function_description(function_name),
-                                "function_description_source": "default",
-                                "entry_reason": task_manager_module._default_entry_reason("P", function_name),
-                                "entry_reason_source": "default",
-                                "taint_details": task_manager_module._normalize_entry_taint_details({"taint_details": []}, taint_params),
-                                "entry_file": str(entry_file),
-                            },
-                            source_dir=resolved_source_dir,
-                            module_input_path=resolved_module_input_path,
-                            source_root_path=resolved_source_root_path,
-                        )
-                    )
-        return task_manager_module._deduplicate_entry_keys(rows)
+        candidate = artifact_root / "functions.list"
+        if not candidate.is_file():
+            return []
+        try:
+            rows = _rows_from_payload(json.loads(task_manager_module._read_text(candidate) or "[]"), candidate)
+        except Exception:
+            return []
+        return rows
 
     def _build_dataflow_output_contract(
         self: TaskManager,

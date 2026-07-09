@@ -7356,10 +7356,10 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
             self.assertTrue((root / "high_risk_modules.json").is_file())
             self.assertEqual(str((modules_dir / "busybox")), modules[0]["source_dir"])
 
-    def test_parse_entries_prefers_json_payload(self):
+    def test_parse_entries_reads_only_functions_list(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "result.json").write_text(
+            (root / "functions.list").write_text(
                 '{"entries":[{"file_name":"main.c","function_name":"int handle_req(int argc, char **argv)","line_no":12}]}',
                 encoding="utf-8",
             )
@@ -7374,18 +7374,46 @@ class TaskManagerTests(_TaskManagerQueuePatchedMixin, unittest.TestCase):
             self.assertIn("module_input_path", rows[0])
             self.assertIn("source_root_path", rows[0])
 
-    def test_parse_entries_falls_back_to_markdown_table(self):
+    def test_parse_entries_ignores_non_functions_list_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "entry-list.md").write_text(
-                "| idx | no | file | function | line | desc | risk |\n| --- | --- | --- | --- | --- | --- | --- |\n| 1 | 1 | app.c | parse_input | 99 | d | h |\n",
+            (root / "entry-details.json").write_text(
+                '{"entries":[{"file_name":"app.c","function_name":"parse_input","line_no":99}]}',
                 encoding="utf-8",
             )
 
             rows = self.manager._parse_entries(root, {"module_key": "mod", "module_name": "mod", "source_dir": "/src"})
 
-            self.assertEqual(1, len(rows))
-            self.assertEqual("parse_input", rows[0]["function_name"])
+            self.assertEqual([], rows)
+
+    def test_parse_entries_with_real_env1_functions_list_fixture(self):
+        fixture = (
+            Path(__file__).resolve().parent
+            / "fixtures"
+            / "entry_analysis"
+            / "defb2b3b69f04bd5_source_project-net_ssl.functions.list"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shutil.copy2(fixture, root / "functions.list")
+
+            rows = self.manager._parse_entries(
+                root,
+                {
+                    "module_key": "source_project-net_ssl",
+                    "module_name": "net_ssl",
+                    "source_dir": "/src/net_ssl",
+                },
+            )
+
+            self.assertEqual(12, len(rows))
+            self.assertEqual("FfiOHOSNetworkSecurityCertVerificationCert", rows[0]["function_name"])
+            self.assertEqual(
+                "OpenHarmony_v2_40_repo_vul_20260706/OpenHarmony_v2_40_repo_vul/openharmony_v2_discovery_193/repo-vul/foundation/communication/netstack/frameworks/cj/network_security/include/net_network_security_ffi.h",
+                rows[0]["file_name"],
+            )
+            self.assertEqual(["cert"], rows[0]["taint_params"])
+            self.assertEqual("NetStackVerifyCertification", rows[-1]["function_name"])
 
     def test_build_stage_summaries_aggregates_downstream_statuses(self):
         task = BinarySecurityTask(id="t1", project_id="p1", name="task", firmware_path="/tmp/in", output_root="/tmp/out", workspace_root="/tmp/ws", status="running", current_stage="firmware_unpack")
