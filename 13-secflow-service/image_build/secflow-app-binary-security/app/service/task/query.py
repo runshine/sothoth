@@ -40,11 +40,13 @@ from app.schemas import (
     BinarySecurityStageItemPageResponse,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskEventResponse,
+    BinarySecurityTaskEventSummaryResponse,
     BinarySecurityTaskListResponse,
     BinarySecurityTaskResponse,
     BinarySecurityTaskOperationPageResponse,
     BinarySecuritySyncEventPageResponse,
     BinarySecuritySyncEventResponse,
+    BinarySecuritySyncEventSummaryResponse,
     BinarySecurityTimelineResponse,
 )
 from . import shared as task_shared
@@ -1351,7 +1353,25 @@ class TaskQueryServiceMixin:
         page_size: int = 200,
     ) -> BinarySecurityTimelineResponse:
         task = self._task_or_404(db, project_id, task_id)
-        query = db.query(BinarySecurityEvent).filter(BinarySecurityEvent.task_id == task.id)
+        query = (
+            db.query(BinarySecurityEvent)
+            .options(
+                load_only(
+                    BinarySecurityEvent.id,
+                    BinarySecurityEvent.task_id,
+                    BinarySecurityEvent.project_id,
+                    BinarySecurityEvent.stage_name,
+                    BinarySecurityEvent.item_id,
+                    BinarySecurityEvent.item_key,
+                    BinarySecurityEvent.level,
+                    BinarySecurityEvent.event_type,
+                    BinarySecurityEvent.message,
+                    BinarySecurityEvent.payload_json,
+                    BinarySecurityEvent.created_at,
+                )
+            )
+            .filter(BinarySecurityEvent.task_id == task.id)
+        )
         total = query.count()
         page = max(1, int(page or 1))
         page_size = min(1000, max(10, int(page_size or 200)))
@@ -1364,33 +1384,29 @@ class TaskQueryServiceMixin:
             page=page,
             page_size=page_size,
             has_more=offset + len(events) < total,
-            events=[
-                BinarySecurityTaskEventResponse(
-                    id=event.id,
-                    stage_name=event.stage_name,
-                    item_id=event.item_id,
-                    item_key=event.item_key,
-                    level=event.level,
-                    event_type=event.event_type,
-                    message=self._timeline_event_display_message(event),
-                    payload=self._timeline_response_payload(event),
-                    recorder_instance_id=self._timeline_recorder_value(event, "instance_id"),
-                    recorder_hostname=self._timeline_recorder_value(event, "hostname"),
-                    recorder_pod_name=self._timeline_recorder_value(event, "pod_name"),
-                    recorder_node_name=self._timeline_recorder_value(event, "node_name"),
-                    recorder_role=self._timeline_recorder_value(event, "role"),
-                    origin_instance_id=self._timeline_origin_value(event, "emitted_by_instance_id"),
-                    origin_hostname=self._timeline_origin_value(event, "emitted_by_hostname"),
-                    origin_pod_name=self._timeline_origin_value(event, "emitted_by_pod_name"),
-                    origin_node_name=self._timeline_origin_value(event, "emitted_by_node_name"),
-                    origin_role=self._timeline_origin_value(event, "emitted_by_role"),
-                    compressed=bool(getattr(event, "_timeline_compressed", False)),
-                    repeat_count=int(getattr(event, "_timeline_repeat_count", 1) or 1),
-                    created_at=event.created_at,
-                )
-                for event in timeline_events
-            ],
+            events=[self._timeline_event_summary_response(event) for event in timeline_events],
         )
+
+    def get_timeline_event(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        event_id: str,
+    ) -> BinarySecurityTaskEventResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        event = (
+            db.query(BinarySecurityEvent)
+            .filter(
+                BinarySecurityEvent.task_id == task.id,
+                BinarySecurityEvent.id == str(event_id or "").strip(),
+            )
+            .first()
+        )
+        if event is None:
+            raise NotFoundError("事件不存在")
+        return self._timeline_event_response(event)
 
     def get_sync_events(
         self: TaskManager,
@@ -1413,7 +1429,41 @@ class TaskQueryServiceMixin:
         sort_order: str = "desc",
     ) -> BinarySecuritySyncEventPageResponse:
         task = self._task_or_404(db, project_id, task_id)
-        query = db.query(BinarySecuritySyncEvent).filter(BinarySecuritySyncEvent.task_id == task.id)
+        query = (
+            db.query(BinarySecuritySyncEvent)
+            .options(
+                load_only(
+                    BinarySecuritySyncEvent.id,
+                    BinarySecuritySyncEvent.stage_name,
+                    BinarySecuritySyncEvent.item_id,
+                    BinarySecuritySyncEvent.item_key,
+                    BinarySecuritySyncEvent.item_name,
+                    BinarySecuritySyncEvent.downstream_service,
+                    BinarySecuritySyncEvent.downstream_task_id,
+                    BinarySecuritySyncEvent.operation,
+                    BinarySecuritySyncEvent.event_type,
+                    BinarySecuritySyncEvent.sync_status,
+                    BinarySecuritySyncEvent.outcome,
+                    BinarySecuritySyncEvent.state_applied,
+                    BinarySecuritySyncEvent.error_type,
+                    BinarySecuritySyncEvent.error_message,
+                    BinarySecuritySyncEvent.http_status,
+                    BinarySecuritySyncEvent.recorder_instance_id,
+                    BinarySecuritySyncEvent.recorder_hostname,
+                    BinarySecuritySyncEvent.recorder_pod_name,
+                    BinarySecuritySyncEvent.recorder_node_name,
+                    BinarySecuritySyncEvent.recorder_role,
+                    BinarySecuritySyncEvent.origin_instance_id,
+                    BinarySecuritySyncEvent.origin_hostname,
+                    BinarySecuritySyncEvent.origin_pod_name,
+                    BinarySecuritySyncEvent.origin_node_name,
+                    BinarySecuritySyncEvent.origin_role,
+                    BinarySecuritySyncEvent.created_at,
+                    BinarySecuritySyncEvent.payload_json,
+                )
+            )
+            .filter(BinarySecuritySyncEvent.task_id == task.id)
+        )
         normalized_stage_name = str(stage_name or "").strip()
         if normalized_stage_name:
             query = query.filter(BinarySecuritySyncEvent.stage_name == normalized_stage_name)
@@ -1442,33 +1492,99 @@ class TaskQueryServiceMixin:
         }
         sort_column = sort_map.get(str(sort_by or "").strip(), BinarySecuritySyncEvent.created_at)
         order_expr = sort_column.asc() if str(sort_order or "").strip().lower() == "asc" else sort_column.desc()
-        rows = query.order_by(order_expr, BinarySecuritySyncEvent.id.desc()).all()
         if has_error is not None:
-            rows = [
-                row for row in rows
-                if (bool(getattr(row, "error_type", None) or getattr(row, "error_message", None)) == bool(has_error))
-            ]
+            if bool(has_error):
+                query = query.filter(
+                    or_(
+                        BinarySecuritySyncEvent.error_type.isnot(None),
+                        BinarySecuritySyncEvent.error_message.isnot(None),
+                    )
+                )
+            else:
+                query = query.filter(
+                    BinarySecuritySyncEvent.error_type.is_(None),
+                    BinarySecuritySyncEvent.error_message.is_(None),
+                )
         if state_applied is not None:
-            rows = [row for row in rows if bool(getattr(row, "state_applied", None)) == bool(state_applied)]
+            query = query.filter(BinarySecuritySyncEvent.state_applied.is_(bool(state_applied)))
         normalized_search = str(search or "").strip().lower()
         if normalized_search:
-            rows = [
-                row for row in rows
-                if normalized_search in " ".join([
-                    str(getattr(row, "item_id", "") or ""),
-                    str(getattr(row, "item_key", "") or ""),
-                    str(getattr(row, "item_name", "") or ""),
-                    str(getattr(row, "downstream_task_id", "") or ""),
-                ]).lower()
-            ]
-        total = len(rows)
-        rows = rows[(page - 1) * page_size : (page - 1) * page_size + page_size]
+            like_value = f"%{normalized_search}%"
+            query = query.filter(
+                or_(
+                    BinarySecuritySyncEvent.item_id.ilike(like_value),
+                    BinarySecuritySyncEvent.item_key.ilike(like_value),
+                    BinarySecuritySyncEvent.item_name.ilike(like_value),
+                    BinarySecuritySyncEvent.downstream_task_id.ilike(like_value),
+                )
+            )
+        total = query.count()
+        rows = (
+            query
+            .order_by(order_expr, BinarySecuritySyncEvent.id.desc())
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+            .all()
+        )
         return BinarySecuritySyncEventPageResponse(
             task_id=task.id,
             total=total,
             page=page,
             page_size=page_size,
-            items=[self._sync_event_response(row) for row in rows],
+            items=[self._sync_event_summary_response(row) for row in rows],
+        )
+
+    def get_sync_event(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+        event_id: str,
+    ) -> BinarySecuritySyncEventResponse:
+        task = self._task_or_404(db, project_id, task_id)
+        event = (
+            db.query(BinarySecuritySyncEvent)
+            .filter(
+                BinarySecuritySyncEvent.task_id == task.id,
+                BinarySecuritySyncEvent.id == str(event_id or "").strip(),
+            )
+            .first()
+        )
+        if event is None:
+            raise NotFoundError("同步记录不存在")
+        return self._sync_event_response(event)
+
+    def _sync_event_summary_response(self: TaskManager, event: BinarySecuritySyncEvent) -> BinarySecuritySyncEventSummaryResponse:
+        payload_available = bool(str(getattr(event, "payload_json", "") or "").strip())
+        return BinarySecuritySyncEventSummaryResponse(
+            id=event.id,
+            stage_name=event.stage_name,
+            item_id=event.item_id,
+            item_key=event.item_key,
+            item_name=event.item_name,
+            downstream_service=event.downstream_service,
+            downstream_task_id=event.downstream_task_id,
+            operation=event.operation,
+            event_type=event.event_type,
+            sync_status=event.sync_status,
+            outcome=event.outcome,
+            state_applied=event.state_applied,
+            error_type=event.error_type,
+            error_message=event.error_message,
+            http_status=event.http_status,
+            payload_available=payload_available,
+            recorder_instance_id=event.recorder_instance_id,
+            recorder_hostname=event.recorder_hostname,
+            recorder_pod_name=event.recorder_pod_name,
+            recorder_node_name=event.recorder_node_name,
+            recorder_role=event.recorder_role,
+            origin_instance_id=event.origin_instance_id,
+            origin_hostname=event.origin_hostname,
+            origin_pod_name=event.origin_pod_name,
+            origin_node_name=event.origin_node_name,
+            origin_role=event.origin_role,
+            created_at=event.created_at,
         )
 
     def _sync_event_response(self: TaskManager, event: BinarySecuritySyncEvent) -> BinarySecuritySyncEventResponse:
@@ -1489,6 +1605,7 @@ class TaskQueryServiceMixin:
             error_type=event.error_type,
             error_message=event.error_message,
             http_status=event.http_status,
+            payload_available=bool(str(getattr(event, "payload_json", "") or "").strip()),
             payload=payload,
             recorder_instance_id=event.recorder_instance_id,
             recorder_hostname=event.recorder_hostname,
@@ -1503,17 +1620,57 @@ class TaskQueryServiceMixin:
             created_at=event.created_at,
         )
 
+    def _timeline_event_summary_response(self: TaskManager, event: BinarySecurityEvent) -> BinarySecurityTaskEventSummaryResponse:
+        payload = self._timeline_response_payload(event)
+        return BinarySecurityTaskEventSummaryResponse(
+            id=event.id,
+            stage_name=event.stage_name,
+            item_id=event.item_id,
+            item_key=event.item_key,
+            level=event.level,
+            event_type=event.event_type,
+            message=self._timeline_event_display_message(event),
+            payload_available=bool(payload),
+            recorder_instance_id=self._timeline_recorder_value(event, "instance_id"),
+            recorder_hostname=self._timeline_recorder_value(event, "hostname"),
+            recorder_pod_name=self._timeline_recorder_value(event, "pod_name"),
+            recorder_node_name=self._timeline_recorder_value(event, "node_name"),
+            recorder_role=self._timeline_recorder_value(event, "role"),
+            origin_instance_id=self._timeline_origin_value(event, "emitted_by_instance_id"),
+            origin_hostname=self._timeline_origin_value(event, "emitted_by_hostname"),
+            origin_pod_name=self._timeline_origin_value(event, "emitted_by_pod_name"),
+            origin_node_name=self._timeline_origin_value(event, "emitted_by_node_name"),
+            origin_role=self._timeline_origin_value(event, "emitted_by_role"),
+            compressed=bool(getattr(event, "_timeline_compressed", False)),
+            repeat_count=int(getattr(event, "_timeline_repeat_count", 1) or 1),
+            created_at=event.created_at,
+        )
+
+    def _timeline_event_response(self: TaskManager, event: BinarySecurityEvent) -> BinarySecurityTaskEventResponse:
+        summary = self._timeline_event_summary_response(event)
+        return BinarySecurityTaskEventResponse(
+            **summary.model_dump(),
+            payload=dict(self._timeline_response_payload(event) or {}),
+        )
+
     def _timeline_response_payload(self: TaskManager, event: BinarySecurityEvent) -> dict[str, Any]:
-        return getattr(event, "_timeline_payload", event.payload)
+        payload = getattr(event, "_timeline_payload", None)
+        if payload is not None:
+            return payload
+        base_payload = getattr(event, "_timeline_base_payload", None)
+        if base_payload is None:
+            base_payload = dict(event.payload or {})
+            event._timeline_base_payload = base_payload
+        return base_payload
 
     def _timeline_recorder_value(self: TaskManager, event: BinarySecurityEvent, key: str) -> str | None:
-        payload = dict(self._timeline_response_payload(event) or {})
+        payload = self._timeline_response_payload(event)
         recorder = dict(payload.get("recorder") or {})
         value = str(recorder.get(key) or "").strip()
         return value or None
 
     def _timeline_origin_value(self: TaskManager, event: BinarySecurityEvent, key: str) -> str | None:
-        payload = dict(self._timeline_response_payload(event) or {})
+        payload = self._timeline_response_payload(event)
         origin = dict(payload.get("event_origin") or {})
         value = str(origin.get(key) or "").strip()
         return value or None
@@ -1538,7 +1695,7 @@ class TaskQueryServiceMixin:
             else:
                 first_event = grouped[0]
                 last_event = grouped[-1]
-                payload = dict(first_event.payload or {})
+                payload = dict(self._timeline_response_payload(first_event) or {})
                 payload["compressed_event_ids"] = [item.id for item in grouped]
                 payload["compressed_repeat_count"] = len(grouped)
                 payload["compressed_first_created_at"] = task_shared._isoformat_or_none(first_event.created_at)
@@ -1555,6 +1712,11 @@ class TaskQueryServiceMixin:
         message = str(getattr(event, "message", "") or "系统事件")
         repeat_count = int(getattr(event, "_timeline_repeat_count", 1) or 1)
         compressed = bool(getattr(event, "_timeline_compressed", False))
+        if str(getattr(event, "event_type", "") or "").strip() == "parent_task_state_transition":
+            payload = self._timeline_response_payload(event)
+            changed_fields = payload.get("changed_fields")
+            if isinstance(changed_fields, list) and changed_fields:
+                message = f"父任务主状态已更新: {', '.join(str(item) for item in changed_fields if str(item).strip())}"
         if compressed and repeat_count > 1:
             return f"{message} · 已压缩 {repeat_count} 次"
         return message
@@ -1576,8 +1738,8 @@ class TaskQueryServiceMixin:
     ) -> bool:
         if not self._should_compress_timeline_event(left) or not self._should_compress_timeline_event(right):
             return False
-        left_payload = left.payload or {}
-        right_payload = right.payload or {}
+        left_payload = self._timeline_response_payload(left) or {}
+        right_payload = self._timeline_response_payload(right) or {}
         left_recorder = dict(left_payload.get("recorder") or {})
         right_recorder = dict(right_payload.get("recorder") or {})
         return (

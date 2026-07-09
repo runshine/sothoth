@@ -87,25 +87,44 @@ class _FakeQuery:
 
     def filter(self, *args, **kwargs):
         del kwargs
-        rows = list(self._rows)
-        for criterion in args:
+        def _resolved_value(value):
+            if getattr(value, "__class__", None) is not None and value.__class__.__name__ == "Null":
+                return None
+            return getattr(value, "value", value)
+
+        def _matches(row, criterion):
             left = getattr(criterion, "left", None)
             operator = getattr(criterion, "operator", None)
             right = getattr(criterion, "right", None)
             field_name = getattr(left, "name", None)
-            if not field_name or operator is None:
-                continue
-            if operator is operators.eq:
-                expected = getattr(right, "value", right)
-                rows = [row for row in rows if getattr(row, field_name, None) == expected]
-                continue
-            if operator is operators.in_op:
-                values = getattr(right, "value", right)
-                if values is None:
-                    continue
-                allowed = set(values)
-                rows = [row for row in rows if getattr(row, field_name, None) in allowed]
-                continue
+            if field_name and operator is not None:
+                current = getattr(row, field_name, None)
+                if operator is operators.eq:
+                    expected = _resolved_value(right)
+                    return current == expected
+                if operator is operators.in_op:
+                    values = _resolved_value(right)
+                    if values is None:
+                        return True
+                    return current in set(values)
+                if operator is operators.is_:
+                    expected = _resolved_value(right)
+                    return current is expected
+                if operator is operators.is_not:
+                    expected = _resolved_value(right)
+                    return current is not expected
+            clauses = getattr(criterion, "clauses", None)
+            if clauses is not None:
+                clause_list = list(clauses)
+                clause_operator = getattr(criterion, "operator", None)
+                if clause_operator is operators.or_:
+                    return any(_matches(row, clause) for clause in clause_list)
+                return all(_matches(row, clause) for clause in clause_list)
+            return True
+
+        rows = list(self._rows)
+        for criterion in args:
+            rows = [row for row in rows if _matches(row, criterion)]
         return self._clone(rows)
 
     def order_by(self, *args, **kwargs):
@@ -11400,11 +11419,10 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         changed = self.manager._requeue_stale_operations(db)
 
-        self.assertTrue(changed)
+        self.assertFalse(changed)
         self.assertEqual("failed", task.status)
-        self.assertEqual(["t1"], queued)
-        self.assertIn("task_runtime_released_without_local_owner", events)
-        self.assertIn("parent_takeover_recovery_committed", events)
+        self.assertEqual([], queued)
+        self.assertIn("runtime_recovery_skipped_for_common_terminal_task", events)
         self.assertEqual("running", operation.status)
 
     def test_requeue_stale_operations_releases_stale_dispatch_owner_for_active_operation(self):
@@ -35919,13 +35937,15 @@ def _test_http_429_timeline_events_are_compressed(self):
 
     with patch.object(task_manager_module, "get_session_factory", return_value=lambda: db):
         timeline = TaskManager().get_timeline(db, project_id="p1", task_id="task429")
+        detail = TaskManager().get_timeline_event(db, project_id="p1", task_id="task429", event_id="evt429-1")
 
     self.assertEqual(1, len(timeline.events))
     self.assertTrue(timeline.events[0].compressed)
     self.assertEqual(2, timeline.events[0].repeat_count)
     self.assertIn("已压缩 2 次", timeline.events[0].message)
-    self.assertTrue(str(timeline.events[0].payload.get("compressed_first_created_at") or "").endswith("+08:00"))
-    self.assertTrue(str(timeline.events[0].payload.get("compressed_last_created_at") or "").endswith("+08:00"))
+    self.assertTrue(timeline.events[0].payload_available)
+    self.assertTrue(str(detail.payload.get("compressed_first_created_at") or "").endswith("+08:00"))
+    self.assertTrue(str(detail.payload.get("compressed_last_created_at") or "").endswith("+08:00"))
 
 
 def _test_defer_item_after_downstream_transport_error_preserves_vuln_replacement_marker(self):
@@ -47752,6 +47772,52 @@ def _test_get_sync_events_returns_paginated_filtered_records(self):
     self.assertEqual(1, page.total)
     self.assertEqual("syncevt-2", page.items[0].id)
     self.assertEqual("UpstreamError", page.items[0].error_type)
+    self.assertTrue(page.items[0].payload_available)
+    self.assertFalse(hasattr(page.items[0], "payload"))
+
+
+def _test_get_sync_event_returns_full_payload_for_single_record(self):
+    task = BinarySecurityTask(
+        id="task-sync-detail",
+        project_id="p1",
+        name="source",
+        task_type=TASK_TYPE_SOURCE,
+        status="running",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    row = BinarySecuritySyncEvent(
+        id="syncevt-detail-1",
+        project_id="p1",
+        task_id=task.id,
+        stage_name="dataflow_vuln_scan",
+        item_id="item-1",
+        item_key="entry-1",
+        item_name="EntryOne",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dfa-1",
+        operation="downstream_sync",
+        event_type="applied",
+        sync_status="synced",
+        outcome="success",
+        state_applied=True,
+        created_at=_now(),
+    )
+    row.payload = {"seq": 1, "raw": {"foo": "bar"}}
+    db = _ModelAwareDb(tasks=[task], events=[])
+    db.sync_events = [row]
+
+    detail = self.manager.get_sync_event(
+        db,
+        project_id="p1",
+        task_id=task.id,
+        event_id=row.id,
+    )
+    self.assertEqual(row.id, detail.id)
+    self.assertTrue(detail.payload_available)
+    self.assertEqual({"seq": 1, "raw": {"foo": "bar"}}, detail.payload)
 
 
 def _test_update_task_policy_falls_back_to_shared_dispatch_without_owner(self):
@@ -48183,6 +48249,7 @@ TaskManagerTests.test_reducer_stage_worker_start_requested_does_not_materialize_
 TaskManagerTests.test_ensure_stage_run_records_timeline_event_when_created = _test_ensure_stage_run_records_timeline_event_when_created
 TaskManagerTests.test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage = _test_ensure_stage_inputs_available_rebuilds_system_summary_before_dataflow_stage
 TaskManagerTests.test_get_sync_events_returns_paginated_filtered_records = _test_get_sync_events_returns_paginated_filtered_records
+TaskManagerTests.test_get_sync_event_returns_full_payload_for_single_record = _test_get_sync_event_returns_full_payload_for_single_record
 TaskManagerTests.test_update_task_policy_falls_back_to_shared_dispatch_without_owner = _test_update_task_policy_falls_back_to_shared_dispatch_without_owner
 TaskManagerTests.test_local_runtime_sync_maintenance_drains_due_task_sync_requests = _test_local_runtime_sync_maintenance_drains_due_task_sync_requests
 TaskManagerTests.test_local_runtime_sync_maintenance_consumes_owner_signal = _test_local_runtime_sync_maintenance_consumes_owner_signal

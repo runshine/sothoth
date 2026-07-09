@@ -36,6 +36,7 @@ from app.schemas import (
     BinarySecurityStateEventInboxPageResponse,
     BinarySecurityStageItemPageResponse,
     BinarySecuritySyncEventPageResponse,
+    BinarySecuritySyncEventResponse,
     BinarySecurityTaskConcurrencyUpdatePayload,
     BinarySecurityTaskCreate,
     BinarySecurityTaskPolicyUpdatePayload,
@@ -43,6 +44,7 @@ from app.schemas import (
     BinarySecurityUploadCompletePayload,
     BinarySecurityTaskDetailResponse,
     BinarySecurityTaskListResponse,
+    BinarySecurityTaskEventResponse,
     BinarySecurityTaskOperationPageResponse,
     BinarySecurityTaskPrepareResponse,
     BinarySecurityTimelineResponse,
@@ -490,6 +492,22 @@ def get_timeline(
     )
 
 
+@router.get("/projects/{project_id}/tasks/{task_id}/timeline/{event_id}", response_model=BinarySecurityTaskEventResponse)
+def get_timeline_event(
+    project_id: str,
+    task_id: str,
+    event_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_timeline_event(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        event_id=event_id,
+    )
+
+
 @router.get("/projects/{project_id}/tasks/{task_id}/sync-events", response_model=BinarySecuritySyncEventPageResponse)
 def get_sync_events(
     project_id: str,
@@ -527,6 +545,22 @@ def get_sync_events(
         page_size=page_size,
         sort_by=sort_by,
         sort_order=sort_order,
+    )
+
+
+@router.get("/projects/{project_id}/tasks/{task_id}/sync-events/{event_id}", response_model=BinarySecuritySyncEventResponse)
+def get_sync_event(
+    project_id: str,
+    task_id: str,
+    event_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    return get_task_manager().get_sync_event(
+        db,
+        project_id=project_id,
+        task_id=task_id,
+        event_id=event_id,
     )
 
 

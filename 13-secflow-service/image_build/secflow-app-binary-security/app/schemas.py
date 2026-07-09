@@ -847,7 +847,7 @@ class BinarySecurityAbnormalReasonHistoryResponse(BinarySecurityBaseModel):
     items: list[BinarySecurityAbnormalReasonEventSummary] = Field(default_factory=list)
 
 
-class BinarySecurityTaskEventResponse(BinarySecurityBaseModel):
+class BinarySecurityTaskEventSummaryResponse(BinarySecurityBaseModel):
     id: str
     stage_name: Optional[str] = None
     item_id: Optional[str] = None
@@ -855,7 +855,7 @@ class BinarySecurityTaskEventResponse(BinarySecurityBaseModel):
     level: str
     event_type: str
     message: str
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload_available: bool = False
     recorder_instance_id: Optional[str] = None
     recorder_hostname: Optional[str] = None
     recorder_pod_name: Optional[str] = None
@@ -871,16 +871,20 @@ class BinarySecurityTaskEventResponse(BinarySecurityBaseModel):
     created_at: datetime
 
 
+class BinarySecurityTaskEventResponse(BinarySecurityTaskEventSummaryResponse):
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class BinarySecurityTimelineResponse(BinarySecurityBaseModel):
     task_id: str
     total: int = 0
     page: int = 1
     page_size: int = 200
     has_more: bool = False
-    events: list[BinarySecurityTaskEventResponse] = Field(default_factory=list)
+    events: list[BinarySecurityTaskEventSummaryResponse] = Field(default_factory=list)
 
 
-class BinarySecuritySyncEventResponse(BinarySecurityBaseModel):
+class BinarySecuritySyncEventSummaryResponse(BinarySecurityBaseModel):
     id: str
     stage_name: Optional[str] = None
     item_id: Optional[str] = None
@@ -896,7 +900,7 @@ class BinarySecuritySyncEventResponse(BinarySecurityBaseModel):
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     http_status: Optional[int] = None
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload_available: bool = False
     recorder_instance_id: Optional[str] = None
     recorder_hostname: Optional[str] = None
     recorder_pod_name: Optional[str] = None
@@ -910,12 +914,16 @@ class BinarySecuritySyncEventResponse(BinarySecurityBaseModel):
     created_at: datetime
 
 
+class BinarySecuritySyncEventResponse(BinarySecuritySyncEventSummaryResponse):
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
 class BinarySecuritySyncEventPageResponse(BinarySecurityBaseModel):
     task_id: str
     total: int = 0
     page: int = 1
     page_size: int = 100
-    items: list[BinarySecuritySyncEventResponse] = Field(default_factory=list)
+    items: list[BinarySecuritySyncEventSummaryResponse] = Field(default_factory=list)
 
 
 class BinarySecurityArtifactEntry(BinarySecurityBaseModel):

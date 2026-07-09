@@ -111,6 +111,36 @@ class TaskQueryServiceTests(unittest.TestCase):
 
         self.assertEqual(2, len(timeline.events))
         self.assertFalse(any(event.compressed for event in timeline.events))
+        self.assertTrue(all(event.payload_available for event in timeline.events))
+        self.assertFalse(hasattr(timeline.events[0], "payload"))
+
+    def test_get_timeline_event_returns_full_payload_for_single_record(self):
+        task = BinarySecurityTask(
+            id="task-3",
+            project_id="p1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+        )
+        event = BinarySecurityEvent(
+            id="evt-detail-1",
+            task_id=task.id,
+            project_id=task.project_id,
+            event_type="parent_task_state_transition",
+            message="state updated",
+            stage_name="system_analysis",
+            level="info",
+            payload={"changed_fields": ["status", "dispatcher_instance_id"], "raw": {"hello": "world"}},
+            created_at=datetime.now(timezone.utc),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], events=[event])
+
+        detail = self.manager.get_timeline_event(db, project_id="p1", task_id=task.id, event_id=event.id)
+
+        self.assertEqual(event.id, detail.id)
+        self.assertTrue(detail.payload_available)
+        self.assertEqual({"changed_fields": ["status", "dispatcher_instance_id"], "raw": {"hello": "world"}}, detail.payload)
+        self.assertIn("status", detail.message)
 
     def test_get_artifacts_groups_b2s_results_without_write_side_effects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
