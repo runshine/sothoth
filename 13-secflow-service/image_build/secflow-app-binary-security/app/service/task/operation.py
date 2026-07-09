@@ -427,6 +427,51 @@ class TaskOperationServiceMixin:
             {"cancel_targets": [dict(target) for target in targets if isinstance(target, dict)]},
         )
 
+    @staticmethod
+    def _cancel_targets_require_verify_rebuild(targets: list[dict[str, Any]]) -> bool:
+        normalized_targets = [dict(target) for target in list(targets or []) if isinstance(target, dict)]
+        if len(normalized_targets) >= 100:
+            return True
+        return any(str(target.get("target_type") or "").strip() == "stage_item" for target in normalized_targets)
+
+    def _normalize_cancel_targets_for_verify(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        from app.service import task_manager as task_manager_module
+
+        existing_targets = [
+            dict(target)
+            for target in list(self._operation_result_data(operation).get("cancel_targets") or [])
+            if isinstance(target, dict)
+        ]
+        if not self._cancel_targets_require_verify_rebuild(existing_targets):
+            return existing_targets, False
+        rebuilt_targets = self._collect_cancel_targets(db, task)
+        self._store_cancel_targets(operation, rebuilt_targets, workspace_root=task.workspace_root)
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "cancel_targets_rebuilt_for_compatibility",
+            "检测到历史取消目标集合与当前语义不兼容，已按新规则重建收敛目标",
+            level="warning",
+            stage_name=operation.target_stage,
+            payload={
+                "previous_target_count": len(existing_targets),
+                "rebuilt_target_count": len(rebuilt_targets),
+                "rebuild_reason": (
+                    "target_count_threshold"
+                    if len(existing_targets) >= 100
+                    else "legacy_stage_item_targets_present"
+                ),
+            },
+        )
+        self._commit_or_rollback(db)
+        return rebuilt_targets, True
+
     def _update_cancel_verify_state(
         self: TaskManager,
         operation: BinarySecurityTaskOperation,
@@ -5059,6 +5104,18 @@ class TaskOperationServiceMixin:
             }
 
         async def _verify_quiesced() -> dict[str, Any]:
+            self._set_task_status(
+                db,
+                task,
+                task_manager_module.TASK_STATUS_CANCELLING,
+                reason="取消操作仍在等待收敛，保持任务为取消中",
+                source="task_operation",
+                stage_name=operation.target_stage,
+            )
+            task.finished_at = None
+            task.last_error = None
+            task.current_operation_id = operation.id
+            self._commit_or_rollback(db)
             timeout_seconds = self._cancel_verify_timeout_seconds()
             max_attempts = self._cancel_verify_max_attempts()
             result_payload = dict(self._operation_result_data(operation) or {})
@@ -5076,11 +5133,7 @@ class TaskOperationServiceMixin:
             while True:
                 refreshed_targets: list[dict[str, Any]] = []
                 blocking_targets: list[dict[str, Any]] = []
-                stored_targets = [
-                    dict(target)
-                    for target in list(self._operation_result_data(operation).get("cancel_targets") or [])
-                    if isinstance(target, dict)
-                ]
+                stored_targets, _rebuilt = self._normalize_cancel_targets_for_verify(db, task, operation)
                 task_items = {
                     item.id: item
                     for item in db.query(task_manager_module.BinarySecurityStageItem)
@@ -5089,14 +5142,13 @@ class TaskOperationServiceMixin:
                 }
                 for target in stored_targets:
                     target_type = str(target.get("target_type") or "").strip()
+                    if target_type == "stage_item":
+                        continue
                     previous_observed_status = str(target.get("terminal_observation_status") or "unknown")
                     observed_status = previous_observed_status
                     if target_type == "local_worker":
                         local_worker = self._workers.get(task.id)
                         observed_status = "running" if local_worker is not None and not local_worker.done() else "cancelled"
-                    elif target_type == "stage_item":
-                        item = task_items.get(str(target.get("item_id") or ""))
-                        observed_status = self._normalize_item_status(item.status) if item is not None else "missing"
                     elif target_type == "downstream_task":
                         ref = {
                             "service": target.get("downstream_service"),

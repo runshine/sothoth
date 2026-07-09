@@ -14445,6 +14445,116 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertEqual("downstream_task", targets[0].get("target_type"))
         self.assertEqual("dvs_1", targets[0].get("downstream_task_id"))
 
+    def test_normalize_cancel_targets_for_verify_rebuilds_legacy_stage_item_targets(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        bound_item = BinarySecurityStageItem(
+            id="si-bound",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            status="running",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs_1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="dataflow_vuln_scan",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "stage_item",
+                    "stage_name": "dataflow_vuln_scan",
+                    "item_id": "si-legacy",
+                    "item_key": "legacy",
+                    "blocking": True,
+                    "terminal_observation_status": "pending",
+                }
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[bound_item], operations=[operation])
+
+        targets, rebuilt = self.manager._normalize_cancel_targets_for_verify(db, task, operation)
+
+        self.assertTrue(rebuilt)
+        self.assertEqual(1, len(targets))
+        self.assertEqual("downstream_task", targets[0].get("target_type"))
+        self.assertEqual("dvs_1", targets[0].get("downstream_task_id"))
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("cancel_targets_rebuilt_for_compatibility", event_types)
+
+    def test_normalize_cancel_targets_for_verify_rebuilds_when_target_count_reaches_threshold(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        bound_item = BinarySecurityStageItem(
+            id="si-bound",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="entry_analysis",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "entry_analysis",
+                    "item_id": f"legacy-{index}",
+                    "item_key": f"module-{index}",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": f"eat_{index}",
+                    "project_id": "p1",
+                    "blocking": True,
+                }
+                for index in range(100)
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[bound_item], operations=[operation])
+
+        targets, rebuilt = self.manager._normalize_cancel_targets_for_verify(db, task, operation)
+
+        self.assertTrue(rebuilt)
+        self.assertEqual(1, len(targets))
+        self.assertEqual("eat_1", targets[0].get("downstream_task_id"))
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("cancel_targets_rebuilt_for_compatibility", event_types)
+
     def test_collect_cancel_targets_skips_terminal_superseded_old_child(self):
         task = BinarySecurityTask(
             id="t1",
@@ -14719,6 +14829,82 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         event_types = [getattr(event, "event_type", "") for event in db.added]
         self.assertIn("task_cancel_succeeded", event_types)
         self.assertIn("main_state_write_blocked", event_types)
+
+    def test_run_cancel_operation_steps_verify_restores_cancelling_main_state(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="entry_analysis",
+            current_operation_id="op-old",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si1",
+            task_id="t1",
+            project_id="p1",
+            stage_name="entry_analysis",
+            item_key="module-1",
+            status="cancelled",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat_1",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="entry_analysis",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "entry_analysis",
+                    "item_id": "si1",
+                    "item_key": "module-1",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": "eat_1",
+                    "project_id": "p1",
+                    "blocking": True,
+                    "cancel_request_status": "requested",
+                    "terminal_observation_status": "unknown",
+                }
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], stage_items=[item], operations=[operation])
+        db.expire_all = lambda: None
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_fetch_child_ref_payload(ref, token):
+            del ref, token
+            return {"task_id": "eat_1", "status": "running"}
+
+        controller = self.manager._downstream_tasks()
+        original_write = self.manager._write_task_metadata_async
+        original_timeout = self.manager._cancel_verify_timeout_seconds
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        self.manager._cancel_verify_timeout_seconds = lambda: 0
+        try:
+            with patch.object(controller, "fetch_child_ref_payload", side_effect=fake_fetch_child_ref_payload):
+                result = asyncio.run(
+                    self.manager._run_cancel_operation_steps(db, task, operation, "verify_downstream_quiesced")
+                )
+        finally:
+            self.manager._write_task_metadata_async = original_write
+            self.manager._cancel_verify_timeout_seconds = original_timeout
+
+        self.assertEqual({"operation_incomplete": True, "result": "retry"}, result)
+        self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
+        self.assertEqual("op1", task.current_operation_id)
 
     def test_run_cancel_operation_steps_treats_passed_downstream_as_terminal(self):
         task = BinarySecurityTask(
