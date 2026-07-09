@@ -5,7 +5,7 @@ from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from app.model import BinarySecurityStageItem, BinarySecurityTask, BinarySecurityTaskRuntimeLease, TASK_TYPE_SOURCE
+from app.model import BinarySecurityArchiveJob, BinarySecurityStageItem, BinarySecurityTask, BinarySecurityTaskRuntimeLease, TASK_TYPE_SOURCE
 from app.service import task_manager as task_manager_module
 from app.service.task_manager import TaskManager, UpstreamError, _now
 from test_task_manager import _AppendingModelAwareDb, _FakeTaskSyncQueue, _ModelAwareDb
@@ -751,6 +751,79 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         payload = dict(reconcile_event.payload or {})
         self.assertTrue(payload["task_sync_queue_only"])
         self.assertFalse(payload["shared_dispatch_enqueued"])
+
+    def test_reconcile_missing_task_sync_requests_backfills_authoritative_archive_fact_instead_of_requeue(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-inline-backfill",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si-sync-inline-backfill",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-sync-inline-backfill",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-a",
+            status="success",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs-inline-backfill",
+            result={
+                "downstream": {
+                    "task_id": "dvs-inline-backfill",
+                    "status": "passed",
+                },
+            },
+        )
+        archive_job = BinarySecurityArchiveJob(
+            id="aj-sync-inline-backfill",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name=item.stage_name,
+            item_id=item.id,
+            item_key=item.item_key,
+            downstream_service=item.downstream_service,
+            downstream_task_id=item.downstream_task_id,
+            archive_status="success",
+            archive_root="/tmp/archive",
+            started_at=_now(),
+        )
+        archive_job.payload = {
+            "mapped_status": "success",
+            "downstream_payload": {
+                "task_id": "dvs-inline-backfill",
+                "status": "passed",
+            },
+            "bound_downstream_task_id": "dvs-inline-backfill",
+        }
+        db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job], events=[])
+        fake_queue = _FakeTaskSyncQueue()
+        original_get_queue = task_manager_module.get_task_queue
+        original_enqueue = manager._enqueue_task
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+            manager._enqueue_task = lambda *_args, **_kwargs: None
+            repaired = asyncio.run(manager._reconcile_missing_task_sync_requests(db, task))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            manager._enqueue_task = original_enqueue
+
+        observation = dict(item.result.get("sync_observation") or {})
+        self.assertEqual(1, repaired)
+        self.assertEqual([], fake_queue.entries_by_task.get(task.id, []))
+        self.assertEqual("synced", item.result.get("sync_status"))
+        self.assertEqual("passed", item.result.get("downstream_status"))
+        self.assertTrue(observation.get("state_applied"))
+        self.assertTrue(any(event.event_type == "authoritative_archive_sync_backfilled" for event in db.events))
+        self.assertFalse(any(event.event_type == "task_sync_request_reconcile_requeued" for event in db.events))
 
     def test_drain_task_sync_queue_failure_does_not_persist_retry_budget_state(self):
         manager = TaskManager()

@@ -6240,10 +6240,35 @@ class TaskManager(
         now_value = _now()
         repaired = 0
         for entry in expected:
+            operation = str(entry.get("operation") or "").strip()
+            item_ids = [str(current_id).strip() for current_id in list(entry.get("item_ids") or []) if str(current_id).strip()]
+            if operation == "child_sync" and len(item_ids) == 1:
+                stage_item = (
+                    db.query(BinarySecurityStageItem)
+                    .filter(
+                        BinarySecurityStageItem.task_id == task.id,
+                        BinarySecurityStageItem.id == item_ids[0],
+                    )
+                    .first()
+                )
+                if stage_item is not None and self._backfill_authoritative_archive_sync_facts_if_possible(
+                    db,
+                    task,
+                    stage_item,
+                    archive_jobs=self._stage_archive_jobs_by_item(
+                        db,
+                        task.id,
+                        stage_item.stage_name,
+                    ).get(str(stage_item.id or ""), []),
+                    repair_source="task_sync_reconcile",
+                    observed_at=now_value,
+                ):
+                    repaired += 1
+                    continue
             dedupe_key = self._task_sync_request_dedupe_key(
-                operation=str(entry.get("operation") or "").strip(),
+                operation=operation,
                 stage_name=entry.get("stage_name"),
-                item_ids=entry.get("item_ids"),
+                item_ids=item_ids,
                 archive_job_ids=entry.get("archive_job_ids"),
             )
             if dedupe_key in existing_dedupe_keys:
@@ -6251,11 +6276,11 @@ class TaskManager(
             await self._enqueue_task_sync_request(
                 task,
                 db=db,
-                operation=str(entry.get("operation") or "").strip(),
+                operation=operation,
                 source="task_sync_reconcile",
                 reason=str(entry.get("reason") or "repair_missing_or_stale_sync_queue_entry").strip(),
                 stage_name=entry.get("stage_name"),
-                item_ids=list(entry.get("item_ids") or []),
+                item_ids=item_ids,
                 archive_job_ids=list(entry.get("archive_job_ids") or []),
                 force=bool(entry.get("force")),
                 source_event_type=str(entry.get("source_event_type") or "task_sync_queue_repair").strip(),

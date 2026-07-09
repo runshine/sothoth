@@ -149,41 +149,15 @@ class TaskItemSyncServiceMixin:
                 },
             )
             return True
-        if self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
-            authoritative_status = self._item_authoritative_child_status(item)
-            if self._item_needs_terminal_sync_backfill(item, mapped_status=authoritative_status):
-                downstream_payload = dict(self._load_stage_item_result_payload(item).get("downstream") or {})
-                downstream_status = self._string_or_none(downstream_payload.get("status")) or authoritative_status
-                if self._persist_child_sync_observation(
-                    db,
-                    task=task,
-                    item=item,
-                    change_source="archive_reconcile",
-                    sync_status="synced",
-                    synced_at=task_manager_module._now(),
-                    status_raw=downstream_status,
-                    mapped_status=authoritative_status,
-                    downstream_status=downstream_status,
-                    state_applied=True,
-                    last_sync_result="success",
-                    clear_error_state=True,
-                ):
-                    self._record_event(
-                        db,
-                        task,
-                        "authoritative_archive_sync_backfilled",
-                        "authoritative child 已成功且归档已存在，已补齐缺失的同步事实",
-                        stage_name=item.stage_name,
-                        item=item,
-                        payload={
-                            "repair_source": "archive_reconcile",
-                            "downstream_task_id": self._item_authoritative_downstream_task_id(item),
-                            "downstream_status": downstream_status,
-                            "mapped_status": authoritative_status,
-                            "state_applied": True,
-                        },
-                    )
-                    return True
+        if self._backfill_authoritative_archive_sync_facts_if_possible(
+            db,
+            task,
+            item,
+            archive_jobs=archive_jobs,
+            repair_source="archive_reconcile",
+            observed_at=task_manager_module._now(),
+        ):
+            return True
         refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs)
         authoritative_task_id = self._item_authoritative_downstream_task_id(item)
         archive_root = str(refs.get("archive_root") or refs.get("artifact_root") or "").strip()
@@ -381,6 +355,55 @@ class TaskItemSyncServiceMixin:
         if state_applied is None:
             state_applied = result.get("downstream_state_applied")
         return state_applied is None
+
+    def _backfill_authoritative_archive_sync_facts_if_possible(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        archive_jobs: list[BinarySecurityArchiveJob] | None = None,
+        repair_source: str,
+        observed_at: datetime,
+    ) -> bool:
+        if not self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+            return False
+        authoritative_status = self._item_authoritative_child_status(item)
+        if not self._item_needs_terminal_sync_backfill(item, mapped_status=authoritative_status):
+            return False
+        downstream_payload = dict(self._load_stage_item_result_payload(item).get("downstream") or {})
+        downstream_status = self._string_or_none(downstream_payload.get("status")) or authoritative_status
+        if not self._persist_child_sync_observation(
+            db,
+            task=task,
+            item=item,
+            change_source=repair_source,
+            sync_status="synced",
+            synced_at=observed_at,
+            status_raw=downstream_status,
+            mapped_status=authoritative_status,
+            downstream_status=downstream_status,
+            state_applied=True,
+            last_sync_result="success",
+            clear_error_state=True,
+        ):
+            return False
+        self._record_event(
+            db,
+            task,
+            "authoritative_archive_sync_backfilled",
+            "authoritative child 已成功且归档已存在，已补齐缺失的同步事实",
+            stage_name=item.stage_name,
+            item=item,
+            payload={
+                "repair_source": repair_source,
+                "downstream_task_id": self._item_authoritative_downstream_task_id(item),
+                "downstream_status": downstream_status,
+                "mapped_status": authoritative_status,
+                "state_applied": True,
+            },
+        )
+        return True
 
     def _compute_item_downstream_action(
         self: TaskManager,
