@@ -343,17 +343,6 @@ class TaskOperationServiceMixin:
             if str(item.downstream_service or "").strip() and str(item.downstream_task_id or "").strip()
         }
         for item in stage_items:
-            normalized_status = self._normalize_item_status(item.status)
-            if normalized_status in {"pending", "queued", "running", "dispatching"}:
-                targets.append(
-                    {
-                        "target_type": "stage_item",
-                        "stage_name": item.stage_name,
-                        "item_id": item.id,
-                        "item_key": item.item_key,
-                        "blocking": True,
-                    }
-                )
             downstream_service = str(item.downstream_service or "").strip()
             downstream_task_id = str(item.downstream_task_id or "").strip()
             if downstream_service and downstream_task_id:

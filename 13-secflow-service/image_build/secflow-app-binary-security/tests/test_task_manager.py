@@ -14379,6 +14379,72 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         downstream_targets = [target for target in targets if target.get("target_type") == "downstream_task"]
         self.assertEqual(["eat_1"], [target.get("downstream_task_id") for target in downstream_targets])
 
+    def test_collect_cancel_targets_skips_unbound_active_stage_items(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        unbound_pending = BinarySecurityStageItem(
+            id="si-unbound-pending",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            status="pending",
+        )
+        unbound_running = BinarySecurityStageItem(
+            id="si-unbound-running",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-2",
+            status="running",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[unbound_pending, unbound_running])
+
+        targets = self.manager._collect_cancel_targets(db, task)
+
+        self.assertEqual([], targets)
+
+    def test_collect_cancel_targets_keeps_bound_active_downstream_children(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        bound_item = BinarySecurityStageItem(
+            id="si-bound",
+            task_id="t1",
+            project_id="p1",
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-1",
+            status="running",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="dvs_1",
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[bound_item])
+
+        targets = self.manager._collect_cancel_targets(db, task)
+
+        self.assertEqual(1, len(targets))
+        self.assertEqual("downstream_task", targets[0].get("target_type"))
+        self.assertEqual("dvs_1", targets[0].get("downstream_task_id"))
+
     def test_collect_cancel_targets_skips_terminal_superseded_old_child(self):
         task = BinarySecurityTask(
             id="t1",

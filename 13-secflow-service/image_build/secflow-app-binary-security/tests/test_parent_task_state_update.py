@@ -26,6 +26,7 @@ class ParentTaskStateUpdateTests(unittest.TestCase):
             task_manager_module.TASK_ACTION_CANCEL,
             task_manager_module.TASK_ACTION_DELETE,
             task_manager_module.TASK_ACTION_FINISH_SUCCESS,
+            task_manager_module.TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS,
             "force_reset_to_pending",
         }
 
