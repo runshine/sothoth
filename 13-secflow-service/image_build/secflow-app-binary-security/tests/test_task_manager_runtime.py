@@ -5451,7 +5451,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
         )()
         self.assertFalse(manager._item_downstream_sync_stale(item))
 
-    def test_item_downstream_sync_stale_forces_periodic_sync_within_60_seconds_budget(self):
+    def test_item_downstream_sync_stale_uses_independent_stale_threshold(self):
         manager = TaskManager()
         manager.cfg.scheduler.stage_item_sync_stale_seconds = 300
         manager.cfg.scheduler.downstream_reconcile_interval_seconds = 60
@@ -5471,7 +5471,7 @@ class StreamingTailTakeoverTests(unittest.IsolatedAsyncioTestCase):
                 },
             },
         )()
-        self.assertTrue(manager._item_downstream_sync_stale(item))
+        self.assertFalse(manager._item_downstream_sync_stale(item))
 
     def test_aggregate_stage_items_holds_pending_when_sync_degraded(self):
         manager = TaskManager()

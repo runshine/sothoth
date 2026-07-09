@@ -1386,14 +1386,7 @@ class TaskManager(
 
     def _stage_item_sync_stale_seconds(self) -> int:
         configured = int(getattr(self.cfg.scheduler, "stage_item_sync_stale_seconds", 300) or 300)
-        periodic_sync_upper_bound_seconds = max(
-            60,
-            int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 60) or 60),
-        )
-        return max(
-            30,
-            min(configured, periodic_sync_upper_bound_seconds),
-        )
+        return max(30, configured)
 
     def _stage_orchestration_max_consecutive_errors(self) -> int:
         return max(1, int(getattr(self.cfg.scheduler, "stage_orchestration_max_consecutive_errors", 10) or 10))
