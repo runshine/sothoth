@@ -8059,7 +8059,7 @@ class TaskManager(
             kg_state = dict((task.summary or {}).get("knowledge_graph_state") or {})
             return [
                 {
-                    "module_key": "knowledge-graph-source-project",
+                    "module_key": self._knowledge_graph_source_project_key(),
                     "module_name": "source-project",
                     "module_kind": "knowledge_graph_module",
                     "source_stage": "knowledge_graph_entry_fetch",
@@ -8214,7 +8214,7 @@ class TaskManager(
             "candidate_entries": selected,
             "candidate_entries_by_module": [
                 {
-                    "module_key": "knowledge-graph-source-project",
+                    "module_key": self._knowledge_graph_source_project_key(),
                     "module_name": "source-project",
                     "raw_entry_count": len(sorted_entries),
                     "selected_entry_count": len(selected),
@@ -8653,7 +8653,7 @@ class TaskManager(
         return self._normalize_entry_result_module(
             task,
             {
-                "module_key": "knowledge-graph-source-project",
+                "module_key": self._knowledge_graph_source_project_key(),
                 "source_project_key": self._knowledge_graph_source_project_key(),
                 "module_name": "source-project",
                 "module_kind": "knowledge_graph_module",
