@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import Boolean, Column, DateTime, Index, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -493,6 +493,11 @@ class BinarySecurityStageItem(Base, JsonMixin):
 class BinarySecurityEvent(Base, JsonMixin):
     __tablename__ = "secflow_binary_security_event"
     __mapper_args__ = {"confirm_deleted_rows": False}
+    __table_args__ = (
+        # Timeline reads filter by task_id and sort by created_at; the composite
+        # index avoids scanning the global created_at index for large event tables.
+        Index("ix_bse_task_created_at", "task_id", "created_at"),
+    )
 
     id = Column(String(48), primary_key=True)
     task_id = Column(String(32), nullable=False, index=True)
@@ -1004,6 +1009,13 @@ def _ensure_compat_columns(engine) -> None:
                 f"ALTER TABLE {event_table} ADD COLUMN operation_id VARCHAR(48) NULL"
             )
         _execute_compat_statements(statements)
+        indexes = {index["name"] for index in inspector.get_indexes(event_table)}
+        index_statements = []
+        if "ix_bse_task_created_at" not in indexes:
+            index_statements.append(
+                f"CREATE INDEX ix_bse_task_created_at ON {event_table} (task_id, created_at)"
+            )
+        _execute_compat_statements(index_statements)
     sync_event_table = BinarySecuritySyncEvent.__tablename__
     if inspector.has_table(sync_event_table):
         columns = {column["name"] for column in inspector.get_columns(sync_event_table)}

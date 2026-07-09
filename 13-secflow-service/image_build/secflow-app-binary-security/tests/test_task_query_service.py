@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from app.model import BinarySecurityEvent, BinarySecurityTask
+from sqlalchemy import create_engine, inspect
+
+from app.model import Base, BinarySecurityEvent, BinarySecurityTask
 from app.service.task_manager import TaskManager
 from test_task_manager import _AppendingModelAwareDb
 
@@ -141,6 +143,15 @@ class TaskQueryServiceTests(unittest.TestCase):
         self.assertTrue(detail.payload_available)
         self.assertEqual({"changed_fields": ["status", "dispatcher_instance_id"], "raw": {"hello": "world"}}, detail.payload)
         self.assertIn("status", detail.message)
+
+    def test_event_table_declares_task_created_at_index(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+
+        indexes = {index["name"]: tuple(index["column_names"]) for index in inspect(engine).get_indexes("secflow_binary_security_event")}
+
+        self.assertIn("ix_bse_task_created_at", indexes)
+        self.assertEqual(("task_id", "created_at"), indexes["ix_bse_task_created_at"])
 
     def test_get_artifacts_groups_b2s_results_without_write_side_effects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
