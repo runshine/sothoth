@@ -14830,6 +14830,92 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
         self.assertIn("task_cancel_succeeded", event_types)
         self.assertIn("main_state_write_blocked", event_types)
 
+    def test_run_cancel_operation_steps_requests_real_downstream_cancel_before_verify(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="running",
+            current_stage="entry_analysis",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="entry_analysis",
+        )
+        operation.result_payload = {
+            "cancel_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "entry_analysis",
+                    "item_id": "si1",
+                    "item_key": "module-1",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": "eat_1",
+                    "project_id": "p1",
+                    "blocking": True,
+                    "cancel_request_status": "pending",
+                    "terminal_observation_status": "unknown",
+                }
+            ]
+        }
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+        db.expire_all = lambda: None
+
+        async def fake_write_task_metadata_async(*args, **kwargs):
+            return None
+
+        async def fake_fetch_child_ref_payload(ref, token):
+            del ref, token
+            return {"task_id": "eat_1", "status": "cancelled"}
+
+        controller = self.manager._downstream_tasks()
+        original_write = self.manager._write_task_metadata_async
+        self.manager._write_task_metadata_async = fake_write_task_metadata_async
+        try:
+            with (
+                patch.object(self.manager, "_prepare_cancel_task", AsyncMock(return_value=["entry_analysis"])),
+                patch.object(self.manager, "_cancel_downstream_refs", AsyncMock()) as cancel_refs_mock,
+                patch.object(controller, "fetch_child_ref_payload", side_effect=fake_fetch_child_ref_payload),
+            ):
+                asyncio.run(
+                    self.manager._run_cancel_operation_steps(
+                        db,
+                        task,
+                        operation,
+                        task_manager_module.TASK_OPERATION_STEP_CANCEL_DOWNSTREAM_TARGETS,
+                    )
+                )
+        finally:
+            self.manager._write_task_metadata_async = original_write
+
+        cancel_refs_mock.assert_awaited_once()
+        cancel_refs = cancel_refs_mock.await_args.args[2]
+        self.assertEqual(
+            [
+                {
+                    "service": "entry_analyse",
+                    "task_id": "eat_1",
+                    "project_id": "p1",
+                    "stage_name": "entry_analysis",
+                    "item_id": "si1",
+                    "item_key": "module-1",
+                }
+            ],
+            cancel_refs,
+        )
+        targets = list(dict(operation.result_payload or {}).get("cancel_targets") or [])
+        self.assertEqual("requested", targets[0].get("cancel_request_status"))
+        self.assertEqual("cancelled", targets[0].get("terminal_observation_status"))
+
     def test_run_cancel_operation_steps_verify_restores_cancelling_main_state(self):
         task = BinarySecurityTask(
             id="t1",

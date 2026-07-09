@@ -5092,6 +5092,24 @@ class TaskOperationServiceMixin:
                 for target in list(self._operation_result_data(operation).get("cancel_targets") or [])
                 if isinstance(target, dict)
             ]
+            downstream_refs = self._dedupe_downstream_refs(
+                [
+                    {
+                        "service": str(target.get("downstream_service") or "").strip(),
+                        "task_id": str(target.get("downstream_task_id") or "").strip(),
+                        "project_id": str(target.get("project_id") or task.project_id or "").strip(),
+                        "stage_name": str(target.get("stage_name") or "").strip(),
+                        "item_id": str(target.get("item_id") or "").strip(),
+                        "item_key": str(target.get("item_key") or "").strip(),
+                    }
+                    for target in targets
+                    if str(target.get("target_type") or "").strip() == "downstream_task"
+                    and str(target.get("downstream_service") or "").strip()
+                    and str(target.get("downstream_task_id") or "").strip()
+                ]
+            )
+            if downstream_refs:
+                await self._cancel_downstream_refs(db, task, downstream_refs, self._service_token())
             for target in targets:
                 if str(target.get("target_type") or "") == "downstream_task":
                     target["cancel_request_status"] = "requested"
