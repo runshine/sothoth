@@ -675,15 +675,6 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                     "GET",
                     "/api/app/entry-analyse/tasks/ea-404",
                     httpx.Response(
-                        200,
-                        json={"task_id": "ea-404", "status": "running"},
-                        request=httpx.Request("GET", "http://entry/api/app/entry-analyse/tasks/ea-404"),
-                    ),
-                )
-                downstream.queue_override(
-                    "GET",
-                    "/api/app/entry-analyse/tasks/ea-404",
-                    httpx.Response(
                         404,
                         json={"detail": "missing"},
                         request=httpx.Request("GET", "http://entry/api/app/entry-analyse/tasks/ea-404"),
@@ -697,10 +688,23 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                         token="mock-token",
                     )
                 )
+                sync_result = asyncio.run(
+                    self.manager.sync_downstream_status(
+                        db,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        stage_name="entry_analysis",
+                        item_ids=[str(created_item.id)],
+                        apply_state=True,
+                    )
+                )
 
-        self.assertEqual("downstream_missing", result["status"])
+        self.assertEqual("running", result["status"])
+        self.assertEqual("authoritative_sync", result["deferred_mode"])
+        self.assertTrue(result["authoritative_waiting"])
         self.assertEqual("downstream_missing", created_item.status)
-        self.assertEqual(2, len(db.archive_jobs))
+        self.assertGreaterEqual(sync_result.synced_downstream_count, 1)
+        self.assertEqual(1, len(db.archive_jobs))
 
     def test_source_workflow_mock_e2e_dataflow_invalid_input_fails_without_recovery(self):
         tmpdir, _root, task, db, queue, downstream, http_client, firmware = self._build_runtime_fixture()
@@ -828,15 +832,6 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                     "GET",
                     "/api/app/dataflow-vuln-scan/tasks/dfa-404",
                     httpx.Response(
-                        200,
-                        json={"task_id": "dfa-404", "status": "running", "analysis_status": "running"},
-                        request=httpx.Request("GET", "http://dfa/api/app/dataflow-vuln-scan/tasks/dfa-404"),
-                    ),
-                )
-                downstream.queue_override(
-                    "GET",
-                    "/api/app/dataflow-vuln-scan/tasks/dfa-404",
-                    httpx.Response(
                         404,
                         json={"detail": "missing"},
                         request=httpx.Request("GET", "http://dfa/api/app/dataflow-vuln-scan/tasks/dfa-404"),
@@ -850,9 +845,22 @@ class SourceWorkflowDownstreamMockE2ETests(unittest.TestCase):
                         token="mock-token",
                     )
                 )
+                sync_result = asyncio.run(
+                    self.manager.sync_downstream_status(
+                        db,
+                        project_id=task.project_id,
+                        task_id=task.id,
+                        stage_name="dataflow_vuln_scan",
+                        item_ids=[str(created_item.id)],
+                        apply_state=True,
+                    )
+                )
 
-        self.assertEqual("downstream_missing", result["status"])
+        self.assertEqual("running", result["status"])
+        self.assertEqual("authoritative_sync", result["deferred_mode"])
+        self.assertTrue(result["authoritative_waiting"])
         self.assertEqual("downstream_missing", created_item.status)
+        self.assertGreaterEqual(sync_result.synced_downstream_count, 1)
         self.assertGreaterEqual(len(db.archive_jobs), 2)
 
     def test_source_workflow_mock_e2e_archive_blocked_when_downstream_output_missing(self):

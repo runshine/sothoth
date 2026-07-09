@@ -4759,7 +4759,7 @@ class TaskRuntimeServiceMixin:
             )
             session.commit()
             self._release_session_connection_before_wait(session)
-            active_payload = await self._active_downstream_payload(task, item, token)
+            active_payload = None
             created = None
             retry_strategy = None
             retry_strategy_status = None
@@ -4781,30 +4781,7 @@ class TaskRuntimeServiceMixin:
                     self._store_retry_item_action(task, action_snapshot)
                     session.commit()
                     active_payload = None
-            if active_payload is not None:
-                self._apply_observed_active_downstream_child(
-                    task,
-                    item,
-                    payload=active_payload,
-                    extra_result_updates={"project_id": task.project_id},
-                )
-                self._commit_stage_item_active_state(session, task, stage_run)
-                self._release_session_connection_before_wait(session)
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                    session,
-                    task,
-                    item,
-                    operation="firmware_unpack",
-                    response_item=input_file,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                    success_statuses={"success"},
-                    failure_statuses={"failed", "cancelled"},
-                )
-                if deferred is not None:
-                    return deferred
-                created = None
-            else:
-                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+            if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
                     self._release_session_connection_before_wait(session)
                     control = await self._downstream_control_existing_task(
                         session,
@@ -4815,41 +4792,35 @@ class TaskRuntimeServiceMixin:
                     )
                     outcome = str(control.get("outcome") or "")
                     if outcome == "accepted":
-                        created = dict(control.get("payload") or {})
-                    elif outcome == "already_running":
-                        payload = dict(control.get("payload") or {})
-                        self._apply_observed_active_downstream_child(
-                            task,
-                            item,
-                            payload=payload,
-                            extra_result_updates={"project_id": task.project_id},
-                        )
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        self._release_session_connection_before_wait(session)
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                        return await self._defer_item_to_sync_maintenance_child_sync(
                             session,
                             task,
                             item,
                             operation="firmware_unpack",
                             response_item=input_file,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"success"},
-                            failure_statuses={"failed", "cancelled"},
-                        )
-                        if deferred is not None:
-                            return deferred
-                        created = None
-                    elif outcome == "already_terminal":
-                        payload = dict(control.get("payload") or {})
-                        self._apply_observed_downstream_ref_binding(
-                            task,
-                            item,
-                            payload=payload,
+                            binding_payload=dict(control.get("payload") or {}),
                             extra_result_updates={"project_id": task.project_id},
                         )
-                        session.commit()
-                        status = self._status_from_downstream_payload(payload, success_statuses={"success"})
-                        created = None
+                    elif outcome == "already_running":
+                        return await self._defer_item_to_sync_maintenance_child_sync(
+                            session,
+                            task,
+                            item,
+                            operation="firmware_unpack",
+                            response_item=input_file,
+                            binding_payload=dict(control.get("payload") or {}),
+                            extra_result_updates={"project_id": task.project_id},
+                        )
+                    elif outcome == "already_terminal":
+                        return await self._defer_item_to_sync_maintenance_child_sync(
+                            session,
+                            task,
+                            item,
+                            operation="firmware_unpack",
+                            response_item=input_file,
+                            binding_payload=dict(control.get("payload") or {}),
+                            extra_result_updates={"project_id": task.project_id},
+                        )
                     elif outcome == "not_found":
                         item.status = "downstream_missing"
                         item.error_message = str(control.get("error_message") or "下游子任务不存在")
@@ -4867,67 +4838,23 @@ class TaskRuntimeServiceMixin:
                         )
                     else:
                         raise ValidationError(str(control.get("error_message") or "下游重试失败"))
-                else:
-                    self._release_session_connection_before_wait(session)
-                    current_child_payload = await self._active_downstream_payload(task, item, token)
-                    if current_child_payload is not None and str(item.downstream_task_id or "").strip():
-                        current_child_status = self._map_downstream_status(str(current_child_payload.get("status") or "")) or "running"
-                        item.status = current_child_status
-                        item.started_at = item.started_at or _now()
-                        self._merge_stage_item_result_fields(
-                            task,
-                            item,
-                            stage_name=stage_run.stage_name,
-                            updates={"project_id": task.project_id},
-                        )
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        self._record_downstream_item_disposition(
-                            session,
-                            task,
-                            item,
-                            event_type="downstream_child_adopted",
-                            message="已接管当前仍在运行中的 authoritative 下游子任务",
-                            payload={
-                                "stage_name": item.stage_name,
-                                "item_id": item.id,
-                                "item_key": item.item_key,
-                                "downstream_task_id": item.downstream_task_id,
-                                "adopted_status": current_child_status,
-                                "reason": "authoritative_child_already_active",
-                            },
-                        )
-                        session.commit()
-                        self._release_session_connection_before_wait(session)
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                            session,
-                            task,
-                            item,
-                            operation="firmware_unpack",
-                            response_item=input_file,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"success"},
-                            failure_statuses={"failed", "cancelled"},
-                        )
-                        if deferred is not None:
-                            return deferred
-                        created = None
-                    elif str(item.downstream_task_id or "").strip():
-                        return self._defer_item_after_downstream_transport_error(
-                            session,
-                            task,
-                            item,
-                            operation="firmware_unpack_observe",
-                            exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
-                            response_item=input_file,
-                        )
-                    else:
-                        return await self._defer_item_to_sync_maintenance_child_create(
-                            session,
-                            task,
-                            item,
-                            operation="firmware_unpack",
-                            response_item=input_file,
-                        )
+            elif str(item.downstream_task_id or "").strip():
+                return await self._defer_item_to_sync_maintenance_child_sync(
+                    session,
+                    task,
+                    item,
+                    operation="firmware_unpack",
+                    response_item=input_file,
+                    extra_result_updates={"project_id": task.project_id},
+                )
+            else:
+                return await self._defer_item_to_sync_maintenance_child_create(
+                    session,
+                    task,
+                    item,
+                    operation="firmware_unpack",
+                    response_item=input_file,
+                )
             if created is not None:
                 item = self._reattach_stage_item_after_async_wait(session, item)
                 self._apply_created_downstream_child(
@@ -4943,20 +4870,14 @@ class TaskRuntimeServiceMixin:
                     },
                     extra_result_updates={"project_id": task.project_id},
                 )
-                session.commit()
-                self._release_session_connection_before_wait(session)
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                return await self._defer_item_to_sync_maintenance_child_sync(
                     session,
                     task,
                     item,
                     operation="firmware_unpack",
                     response_item=input_file,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                    success_statuses={"success"},
-                    failure_statuses={"failed", "cancelled"},
+                    extra_result_updates={"project_id": task.project_id},
                 )
-                if deferred is not None:
-                    return deferred
             mapped_status = (
                 "success"
                 if status == "success"
@@ -5098,7 +5019,7 @@ class TaskRuntimeServiceMixin:
             )
             session.commit()
             self._release_session_connection_before_wait(session)
-            active_payload = await self._active_downstream_payload(task, item)
+            active_payload = None
             retry_strategy = None
             retry_strategy_status = None
             if retrying:
@@ -5119,44 +5040,21 @@ class TaskRuntimeServiceMixin:
                     self._store_retry_item_action(task, action_snapshot)
                     session.commit()
                     active_payload = None
-            if active_payload is not None:
-                self._apply_observed_active_downstream_child(
-                    task,
-                    item,
-                    payload=active_payload,
-                )
-                self._commit_stage_item_active_state(session, task, stage_run)
-                self._release_session_connection_before_wait(session)
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+            if str(item.downstream_task_id or "").strip():
+                return await self._defer_item_to_sync_maintenance_child_sync(
                     session,
                     task,
                     item,
                     operation="system_analysis",
                     response_item=firmware,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
-                    success_statuses={"passed", "success"},
-                    failure_statuses={"failed", "error", "cancelled"},
                 )
-                if deferred is not None:
-                    return deferred
-            else:
-                if str(item.downstream_task_id or "").strip():
-                    return self._defer_item_after_downstream_transport_error(
-                        session,
-                        task,
-                        item,
-                        operation="system_analysis_observe",
-                        exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
-                        response_item=firmware,
-                    )
-                else:
-                    return await self._defer_item_to_sync_maintenance_child_create(
-                        session,
-                        task,
-                        item,
-                        operation="system_analysis",
-                        response_item=firmware,
-                    )
+            return await self._defer_item_to_sync_maintenance_child_create(
+                session,
+                task,
+                item,
+                operation="system_analysis",
+                response_item=firmware,
+            )
             result_payload = {}
             if status == "success":
                 try:
@@ -5330,7 +5228,7 @@ class TaskRuntimeServiceMixin:
             )
             session.commit()
             elf_tasks = self._build_module_elf_tasks(module)
-            active_payload = await self._active_downstream_payload(task, item, token)
+            active_payload = None
             retry_strategy = None
             retry_strategy_status = None
             if retrying:
@@ -5350,111 +5248,57 @@ class TaskRuntimeServiceMixin:
                 session.commit()
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None
-            if active_payload is not None:
-                self._apply_observed_active_downstream_child(
-                    task,
-                    item,
-                    payload=active_payload,
-                    fallback_status=str(item.status or "running") or "running",
-                )
-                self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+            if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+                control = await self._downstream_control_existing_task(
                     session,
-                    task,
-                    item,
-                    operation="binary_to_source",
-                    response_item=module,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                    success_statuses={"success", "partial_success", "completed"},
-                    failure_statuses={"failed", "cancelled"},
+                    stage_name=stage_run.stage_name,
+                    task=task,
+                    item=item,
+                    token=token,
                 )
-                if deferred is not None:
-                    return deferred
-            else:
-                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
-                    control = await self._downstream_control_existing_task(
-                        session,
-                        stage_name=stage_run.stage_name,
-                        task=task,
-                        item=item,
-                        token=token,
-                    )
-                    outcome = str(control.get("outcome") or "")
-                    if outcome == "accepted":
-                        created = dict(control.get("payload") or {})
-                        self._apply_observed_active_downstream_child(
-                            task,
-                            item,
-                            payload=created,
-                            extra_result_updates={"project_id": task.project_id},
-                        )
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                            session,
-                            task,
-                            item,
-                            operation="binary_to_source",
-                            response_item=module,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"success", "partial_success", "completed"},
-                            failure_statuses={"failed", "cancelled"},
-                        )
-                        if deferred is not None:
-                            return deferred
-                    elif outcome == "already_running":
-                        payload = dict(control.get("payload") or {})
-                        self._apply_observed_active_downstream_child(
-                            task,
-                            item,
-                            payload=payload,
-                            extra_result_updates={"project_id": task.project_id},
-                        )
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                            session,
-                            task,
-                            item,
-                            operation="binary_to_source",
-                            response_item=module,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"success", "partial_success", "completed"},
-                            failure_statuses={"failed", "cancelled"},
-                        )
-                        if deferred is not None:
-                            return deferred
-                    elif outcome == "already_terminal":
-                        payload = dict(control.get("payload") or {})
-                        self._apply_observed_downstream_ref_binding(task, item, payload=payload)
-                        session.commit()
-                        status = self._status_from_downstream_payload(
-                            payload,
-                            success_statuses={"success", "partial_success", "completed"},
-                        )
-                    elif outcome == "not_found":
-                        item.status = "downstream_missing"
-                        item.error_message = str(control.get("error_message") or "下游子任务不存在")
-                        item.finished_at = _now()
-                        session.commit()
-                        return {"status": "downstream_missing", "error": item.error_message, "item": module}
-                    elif outcome == "transport_error":
-                        return self._defer_item_after_downstream_transport_error(
-                            session,
-                            task,
-                            item,
-                            operation="binary_to_source",
-                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
-                            response_item=module,
-                        )
-                    else:
-                        raise ValidationError(str(control.get("error_message") or "下游重试失败"))
-                else:
-                    return await self._defer_item_to_sync_maintenance_child_create(
+                outcome = str(control.get("outcome") or "")
+                if outcome in {"accepted", "already_running", "already_terminal"}:
+                    return await self._defer_item_to_sync_maintenance_child_sync(
                         session,
                         task,
                         item,
                         operation="binary_to_source",
                         response_item=module,
+                        binding_payload=dict(control.get("payload") or {}),
+                        extra_result_updates={"project_id": task.project_id},
                     )
+                if outcome == "not_found":
+                    item.status = "downstream_missing"
+                    item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                    item.finished_at = _now()
+                    session.commit()
+                    return {"status": "downstream_missing", "error": item.error_message, "item": module}
+                if outcome == "transport_error":
+                    return self._defer_item_after_downstream_transport_error(
+                        session,
+                        task,
+                        item,
+                        operation="binary_to_source",
+                        exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                        response_item=module,
+                    )
+                raise ValidationError(str(control.get("error_message") or "下游重试失败"))
+            if str(item.downstream_task_id or "").strip():
+                return await self._defer_item_to_sync_maintenance_child_sync(
+                    session,
+                    task,
+                    item,
+                    operation="binary_to_source",
+                    response_item=module,
+                    extra_result_updates={"project_id": task.project_id},
+                )
+            return await self._defer_item_to_sync_maintenance_child_create(
+                session,
+                task,
+                item,
+                operation="binary_to_source",
+                response_item=module,
+            )
             self._merge_stage_item_result_fields(
                 task,
                 item,
@@ -5647,7 +5491,7 @@ class TaskRuntimeServiceMixin:
                 auto_retrying=auto_retrying,
             )
             session.commit()
-            active_payload = await self._active_downstream_payload(task, item, token)
+            active_payload = None
             created = None
             retry_strategy = None
             retry_strategy_status = None
@@ -5668,73 +5512,21 @@ class TaskRuntimeServiceMixin:
                 session.commit()
                 if retry_strategy == RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL:
                     active_payload = None
-            if active_payload is not None:
-                self._apply_observed_active_downstream_child(
-                    task,
-                    item,
-                    payload=active_payload,
-                )
-                self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+            if str(item.downstream_task_id or "").strip():
+                return await self._defer_item_to_sync_maintenance_child_sync(
                     session,
                     task,
                     item,
                     operation="entry_analysis",
-                    response_item=entry_input,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                    success_statuses={"passed", "success"},
-                    failure_statuses={"failed", "error", "cancelled"},
+                    response_item=entry_input if "entry_input" in locals() else module,
                 )
-                if deferred is not None:
-                    return deferred
-                created = None
-            else:
-                if str(item.downstream_task_id or "").strip():
-                    terminal_payload = None
-                    try:
-                        terminal_payload = await self._downstream_fetch_item_payload(task, item, token or "")
-                    except Exception:
-                        terminal_payload = None
-                    terminal_status = self._map_downstream_status(
-                        str((terminal_payload or {}).get("status") or "")
-                    )
-                    if terminal_payload is not None and terminal_status in {
-                        "success",
-                        "partial_success",
-                        "failed",
-                        "cancelled",
-                        "downstream_missing",
-                    }:
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                            session,
-                            task,
-                            item,
-                            operation="entry_analysis",
-                            response_item=entry_input if "entry_input" in locals() else module,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"passed", "success"},
-                            failure_statuses={"failed", "error", "cancelled"},
-                        )
-                        if deferred is not None:
-                            return deferred
-                        created = None
-                    else:
-                        return self._defer_item_after_downstream_transport_error(
-                            session,
-                            task,
-                            item,
-                            operation="entry_analysis_observe",
-                            exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
-                            response_item=entry_input if "entry_input" in locals() else module,
-                        )
-                else:
-                    return await self._defer_item_to_sync_maintenance_child_create(
-                        session,
-                        task,
-                        item,
-                        operation="entry_analysis",
-                        response_item=entry_input if "entry_input" in locals() else module,
-                    )
+            return await self._defer_item_to_sync_maintenance_child_create(
+                session,
+                task,
+                item,
+                operation="entry_analysis",
+                response_item=entry_input if "entry_input" in locals() else module,
+            )
             service_output = self._materialize_stage_artifact(
                 self._service_output_path(
                     task,
@@ -5918,7 +5710,7 @@ class TaskRuntimeServiceMixin:
                 auto_retrying=auto_retrying,
             )
             session.commit()
-            active_payload = await self._active_downstream_payload(task, item, token)
+            active_payload = None
             retry_strategy = None
             retry_strategy_status = None
             if retrying:
@@ -5995,146 +5787,55 @@ class TaskRuntimeServiceMixin:
             line_hint = ""
             if definition_line:
                 line_hint = definition_line if definition_line.upper().startswith("L") else f"L{definition_line}"
-            dataflow_success_statuses = {"passed", "success", "completed_limited"}
-            dataflow_failure_statuses = {"failed", "error", "cancelled", "invalid_input"}
-            if active_payload is not None:
-                self._apply_observed_active_downstream_child(
-                    task,
-                    item,
-                    payload=active_payload,
+            if retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
+                control = await self._downstream_control_existing_task(
+                    session,
+                    stage_name=stage_run.stage_name,
+                    task=task,
+                    item=item,
+                    token=self._resolve_downstream_token(token),
                 )
-                self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                outcome = str(control.get("outcome") or "")
+                if outcome in {"accepted", "already_running", "already_terminal"}:
+                    return await self._defer_item_to_sync_maintenance_child_sync(
+                        session,
+                        task,
+                        item,
+                        operation="dataflow_vuln_scan",
+                        response_item=entry,
+                        binding_payload=dict(control.get("payload") or {}),
+                    )
+                if outcome == "not_found":
+                    item.status = "downstream_missing"
+                    item.error_message = str(control.get("error_message") or "下游子任务不存在")
+                    item.finished_at = _now()
+                    session.commit()
+                    return {"status": "downstream_missing", "error": item.error_message, "item": entry}
+                if outcome == "transport_error":
+                    return self._defer_item_after_downstream_transport_error(
+                        session,
+                        task,
+                        item,
+                        operation="dataflow_vuln_scan",
+                        exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
+                        response_item=entry,
+                    )
+                raise ValidationError(str(control.get("error_message") or "下游重试失败"))
+            if str(item.downstream_task_id or "").strip():
+                return await self._defer_item_to_sync_maintenance_child_sync(
                     session,
                     task,
                     item,
                     operation="dataflow_vuln_scan",
                     response_item=entry,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
-                    success_statuses=dataflow_success_statuses,
-                    failure_statuses=dataflow_failure_statuses,
                 )
-                if deferred is not None:
-                    return deferred
-            else:
-                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
-                    session.commit()
-                    payload = await self._downstream_fetch_item_payload(task, item, None)
-                    status = self._status_from_downstream_payload(payload, success_statuses=dataflow_success_statuses)
-                elif retrying and retry_strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE and self._has_retryable_downstream_task(item):
-                    control = await self._downstream_control_existing_task(
-                        session,
-                        stage_name=stage_run.stage_name,
-                        task=task,
-                        item=item,
-                        token=self._resolve_downstream_token(token),
-                    )
-                    outcome = str(control.get("outcome") or "")
-                    if outcome == "accepted":
-                        created = dict(control.get("payload") or {})
-                        self._apply_observed_active_downstream_child(
-                            task,
-                            item,
-                            payload=created,
-                        )
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                            session,
-                            task,
-                            item,
-                            operation="dataflow_vuln_scan",
-                            response_item=entry,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses=dataflow_success_statuses,
-                            failure_statuses=dataflow_failure_statuses,
-                        )
-                        if deferred is not None:
-                            return deferred
-                    elif outcome == "already_running":
-                        payload = dict(control.get("payload") or {})
-                        self._apply_observed_active_downstream_child(
-                            task,
-                            item,
-                            payload=payload,
-                        )
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                            session,
-                            task,
-                            item,
-                            operation="dataflow_vuln_scan",
-                            response_item=entry,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses=dataflow_success_statuses,
-                            failure_statuses=dataflow_failure_statuses,
-                        )
-                        if deferred is not None:
-                            return deferred
-                    elif outcome == "already_terminal":
-                        payload = dict(control.get("payload") or {})
-                        self._apply_observed_downstream_ref_binding(task, item, payload=payload)
-                        session.commit()
-                        status = self._status_from_downstream_payload(payload, success_statuses=dataflow_success_statuses)
-                    elif outcome == "not_found":
-                        item.status = "downstream_missing"
-                        item.error_message = str(control.get("error_message") or "下游子任务不存在")
-                        item.finished_at = _now()
-                        session.commit()
-                        return {"status": "downstream_missing", "error": item.error_message, "item": entry}
-                    elif outcome == "transport_error":
-                        return self._defer_item_after_downstream_transport_error(
-                            session,
-                            task,
-                            item,
-                            operation="dataflow_vuln_scan",
-                            exc=UpstreamError(str(control.get("error_message") or "下游通信异常")),
-                            response_item=entry,
-                        )
-                    else:
-                        raise ValidationError(str(control.get("error_message") or "下游重试失败"))
-                else:
-                    current_child_payload = await self._active_downstream_payload(task, item, token)
-                    if current_child_payload is not None and str(item.downstream_task_id or "").strip():
-                        current_child_status = self._map_downstream_status(str(current_child_payload.get("status") or "")) or "running"
-                        item.status = current_child_status
-                        item.started_at = item.started_at or _now()
-                        self._commit_stage_item_active_state(session, task, stage_run)
-                        self._record_downstream_item_disposition(
-                            session,
-                            task,
-                            item,
-                            event_type="downstream_child_adopted",
-                            message="已接管当前仍在运行中的 authoritative 下游子任务",
-                            payload={
-                                "stage_name": item.stage_name,
-                                "item_id": item.id,
-                                "item_key": item.item_key,
-                                "downstream_task_id": item.downstream_task_id,
-                                "adopted_status": current_child_status,
-                                "reason": "authoritative_child_already_active",
-                            },
-                        )
-                        session.commit()
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
-                            session,
-                            task,
-                            item,
-                            operation="dataflow_vuln_scan",
-                            response_item=entry,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, None),
-                            success_statuses=dataflow_success_statuses,
-                            failure_statuses=dataflow_failure_statuses,
-                        )
-                        if deferred is not None:
-                            return deferred
-                    else:
-                        return await self._defer_item_to_sync_maintenance_child_create(
-                            session,
-                            task,
-                            item,
-                            operation="dataflow_vuln_scan",
-                            response_item=entry,
-                        )
+            return await self._defer_item_to_sync_maintenance_child_create(
+                session,
+                task,
+                item,
+                operation="dataflow_vuln_scan",
+                response_item=entry,
+            )
             artifact_root = self._service_output_dir(
                 task,
                 item.downstream_service or stage_run.stage_name,
@@ -6299,7 +6000,7 @@ class TaskRuntimeServiceMixin:
                 auto_retrying=auto_retrying,
             )
             session.commit()
-            active_payload = await self._active_downstream_payload(task, item, token)
+            active_payload = None
             retry_strategy = None
             retry_strategy_status = None
             force_recreate_vuln_child = False
@@ -6366,136 +6067,36 @@ class TaskRuntimeServiceMixin:
                                 "old_downstream_status": retry_strategy_status,
                             },
                         )
-                        session.commit()
-                        status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+                        return await self._defer_item_to_sync_maintenance_child_sync(
                             session,
                             task,
                             item,
                             operation="dataflow_vuln_scan",
                             response_item=dataflow_result,
-                            fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                            success_statuses={"success", "succeeded", "completed"},
-                            failure_statuses={"failed", "cancelled"},
                         )
-                        if deferred is not None:
-                            return deferred
-                        artifacts = await self._downstream_fetch_item_artifacts(item, token or "")
-                        archive_payload = {
-                            **payload,
-                            "artifacts": artifacts,
-                            "workspace_root": artifacts.get("workspace_root"),
-                        }
-                        mapped_status = (
-                            "success"
-                            if status == "success"
-                            else "cancelled"
-                            if status == "cancelled"
-                            else "downstream_missing"
-                            if status == "downstream_missing"
-                            else "failed"
-                        )
-                        item.status = mapped_status
-                        item.finished_at = _now()
-                        archived_dir, archive_job = await self._queue_archive_and_wait(
-                            session,
-                            task,
-                            item,
-                            payload=archive_payload,
-                            mapped_status=mapped_status,
-                            before_status="running",
-                        )
-                        if mapped_status != "success":
-                            item.error_message = payload.get("error") or payload.get("error_message")
-                            session.commit()
-                            return {"status": mapped_status, "error": item.error_message, "item": dataflow_result}
-                        if archived_dir is None:
-                            error = archive_job.error_message if archive_job is not None else "总任务产物归档失败"
-                            item.error_message = error
-                            session.commit()
-                            return {
-                                "status": "archive_blocked",
-                                "error": error,
-                                "item": dataflow_result,
-                                "archive_blocked": True,
-                            }
-                        result = {
-                            **dataflow_result,
-                            "workspace_root": artifacts.get("workspace_root"),
-                            "artifact_files": artifacts.get("files", []),
-                            "downstream": self._lightweight_downstream_payload(payload),
-                            "artifacts": artifacts,
-                        }
-                        self._persist_stage_item_result(
-                            task,
-                            item,
-                            stage_name=stage_run.stage_name,
-                            result=result,
-                        )
-                        item.output_ref = {
-                            **(item.output_ref or {}),
-                            "workspace_root": artifacts.get("workspace_root"),
-                            "archive_root": str(archived_dir),
-                        }
-                        session.commit()
-                        return {
-                            "status": item.status,
-                            "item": result,
-                            "error": payload.get("error") or payload.get("error_message"),
-                        }
                 elif retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
                     active_payload = None
-            if active_payload is not None:
-                self._apply_observed_active_downstream_child(
-                    task,
-                    item,
-                    payload=active_payload,
-                    fallback_status="pending",
-                    binding_message="下游已创建，状态待同步",
-                )
-                self._commit_stage_item_active_state(session, task, stage_run)
-                status, payload, deferred = await self._poll_item_until_local_terminal_or_defer(
+            if str(item.downstream_task_id or "").strip():
+                return await self._defer_item_to_sync_maintenance_child_sync(
                     session,
                     task,
                     item,
                     operation="dataflow_vuln_scan",
                     response_item=dataflow_result,
-                    fetcher=lambda: self._downstream_fetch_item_payload(task, item, token or ""),
-                    success_statuses={"success", "succeeded", "completed"},
-                    failure_statuses={"failed", "cancelled"},
                 )
-                if deferred is not None:
-                    return deferred
-                created = None
-            else:
-                if retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item):
-                    payload = await self._downstream_fetch_item_payload(task, item, token or "")
-                    status = self._status_from_downstream_payload(
-                        payload,
-                        success_statuses={"success", "succeeded", "completed"},
-                    )
-                if str(item.downstream_task_id or "").strip():
-                    return self._defer_item_after_downstream_transport_error(
-                        session,
-                        task,
-                        item,
-                        operation="dataflow_vuln_scan_observe",
-                        exc=UpstreamError("已存在 authoritative 下游绑定，当前仅继续观测，不自动创建替换 child"),
-                        response_item=dataflow_result,
-                    )
-                elif not (retrying and retry_strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS and self._has_retryable_downstream_task(item)):
-                    dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
-                    source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
-                    if not dataflow_input_dir:
-                        raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
-                    if not source_dir:
-                        raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
-                    return await self._defer_item_to_sync_maintenance_child_create(
-                        session,
-                        task,
-                        item,
-                        operation="dataflow_vuln_scan",
-                        response_item=dataflow_result,
-                    )
+            dataflow_input_dir = self._resolve_vuln_scan_dataflow_input_dir(dataflow_result)
+            source_dir = str(dataflow_result.get("source_root_path") or dataflow_result.get("source_dir") or "")
+            if not dataflow_input_dir:
+                raise ValidationError("数据流漏洞挖掘输入缺少 data_flow_root/dataflow_dir")
+            if not source_dir:
+                raise ValidationError("数据流漏洞挖掘输入缺少 source_dir")
+            return await self._defer_item_to_sync_maintenance_child_create(
+                session,
+                task,
+                item,
+                operation="dataflow_vuln_scan",
+                response_item=dataflow_result,
+            )
             artifacts = await self._downstream_fetch_item_artifacts(item, token or "")
             archive_payload = {**payload, "artifacts": artifacts, "workspace_root": artifacts.get("workspace_root")}
             mapped_status = (

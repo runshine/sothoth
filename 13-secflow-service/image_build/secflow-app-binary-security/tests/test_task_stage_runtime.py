@@ -171,6 +171,8 @@ class TaskStageRuntimeTests(unittest.TestCase):
             patch.object(self.manager, "_latest_stage_run", side_effect=lambda _db, _task_id, stage: kg_run if stage == "knowledge_graph_entry_fetch" else dataflow_run if stage == "dataflow_vuln_scan" else None),
             patch.object(self.manager, "_effective_entry_inputs", side_effect=lambda *_args, **_kwargs: effective_inputs.pop(0)),
             patch.object(self.manager, "_stage_items", return_value=[seeded_item]),
+            patch.object(self.manager, "_stage_parallelism", return_value=5),
+            patch.object(self.manager, "_queued_stage_child_create_item_ids", return_value=set()),
             patch.object(self.manager, "_run_async_blocking", side_effect=lambda value: value),
             patch.object(self.manager, "_stage_knowledge_graph_entry_fetch", new=Mock(return_value=True)) as refresh_kg,
             patch.object(self.manager, "_prepare_stage_items_for_execution", return_value=[]) as prepare_items,
@@ -187,6 +189,116 @@ class TaskStageRuntimeTests(unittest.TestCase):
         self.assertTrue(payload.get("dataflow_reseeded"))
         self.assertTrue(payload.get("dataflow_child_create_enqueued"))
         self.assertEqual(["entry-b"], payload.get("new_entry_keys_sample"))
+
+    def test_refresh_kg_streaming_inputs_if_needed_limits_reseed_child_create_to_available_slots(self):
+        task = BinarySecurityTask(
+            id="task-kg-reseed-limit",
+            project_id="project-1",
+            name="task",
+            workspace_root="/tmp/ws",
+            output_root="/tmp/out",
+            task_type="source",
+            status="running",
+            current_stage="dataflow_vuln_scan",
+        )
+        task.policy = {"pipeline_mode": "mixed_streaming", "pipeline_profile": "kg_source_vuln_scan"}
+        kg_run = BinarySecurityStageRun(
+            id="sr-kg",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="knowledge_graph_entry_fetch",
+            sequence_no=1,
+            status="running",
+        )
+        dataflow_run = BinarySecurityStageRun(
+            id="sr-dvs",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_name="dataflow_vuln_scan",
+            sequence_no=2,
+            status="running",
+        )
+        active_item = BinarySecurityStageItem(
+            id="si-entry-active",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-active",
+            item_name="fn_active",
+            parent_key="mod-a",
+            item_identity_key="entry-active::mod-a",
+            status="running",
+            downstream_service="dataflow_vuln_scan",
+            downstream_task_id="child-active",
+        )
+        candidate_item_b = BinarySecurityStageItem(
+            id="si-entry-b",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-b",
+            item_name="fn_b",
+            parent_key="mod-a",
+            item_identity_key="entry-b::mod-a",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+        )
+        candidate_item_c = BinarySecurityStageItem(
+            id="si-entry-c",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id=dataflow_run.id,
+            stage_name="dataflow_vuln_scan",
+            item_key="entry-c",
+            item_name="fn_c",
+            parent_key="mod-a",
+            item_identity_key="entry-c::mod-a",
+            status="queued",
+            downstream_service="dataflow_vuln_scan",
+        )
+        db = _ModelAwareDb(
+            tasks=[task],
+            stage_runs=[kg_run, dataflow_run],
+            stage_items=[active_item, candidate_item_b, candidate_item_c],
+            events=[],
+        )
+
+        before_entry = {"entry_key": "entry-a", "function_name": "fn_a", "module_key": "mod-a"}
+        after_entry_b = {"entry_key": "entry-b", "function_name": "fn_b", "module_key": "mod-a"}
+        after_entry_c = {"entry_key": "entry-c", "function_name": "fn_c", "module_key": "mod-a"}
+        effective_inputs = [
+            [before_entry],
+            [before_entry, after_entry_b, after_entry_c],
+            [before_entry, after_entry_b, after_entry_c],
+        ]
+
+        with (
+            patch.object(self.manager, "_streaming_mode_enabled", return_value=True),
+            patch.object(self.manager, "_pipeline_profile", return_value="kg_source_vuln_scan"),
+            patch.object(self.manager, "_latest_stage_run", side_effect=lambda _db, _task_id, stage: kg_run if stage == "knowledge_graph_entry_fetch" else dataflow_run if stage == "dataflow_vuln_scan" else None),
+            patch.object(self.manager, "_effective_entry_inputs", side_effect=lambda *_args, **_kwargs: effective_inputs.pop(0)),
+            patch.object(self.manager, "_stage_items", return_value=[active_item, candidate_item_b, candidate_item_c]),
+            patch.object(self.manager, "_stage_parallelism", return_value=2),
+            patch.object(self.manager, "_queued_stage_child_create_item_ids", return_value=set()),
+            patch.object(self.manager, "_child_counts_as_active_for_parallelism", side_effect=lambda item: str(getattr(item, "id", "")) == "si-entry-active"),
+            patch.object(self.manager, "_run_async_blocking", side_effect=lambda value: value),
+            patch.object(self.manager, "_stage_knowledge_graph_entry_fetch", new=Mock(return_value=True)),
+            patch.object(self.manager, "_prepare_stage_items_for_execution", return_value=[]) as prepare_items,
+            patch.object(self.manager, "_enqueue_task_sync_request", new=Mock(return_value={"queued": True})) as enqueue_sync,
+        ):
+            changed = self.manager._refresh_kg_streaming_inputs_if_needed(db, task)
+
+        self.assertTrue(changed)
+        prepare_items.assert_called_once()
+        enqueue_sync.assert_called_once()
+        self.assertEqual(["si-entry-b"], enqueue_sync.call_args.kwargs["item_ids"])
+        payload = dict(db.events[-1].payload or {})
+        self.assertEqual(2, payload.get("child_create_candidate_count"))
+        self.assertEqual(1, payload.get("child_create_scheduled_count"))
+        self.assertEqual(1, payload.get("child_create_deferred_count"))
+        self.assertEqual(1, payload.get("available_slots_at_enqueue"))
 
     def test_reconcile_retry_affected_stages_in_session_deduplicates_and_avoids_compatibility_facade(self):
         task = BinarySecurityTask(id="task-1", project_id="project-1", name="task", workspace_root="/tmp/ws", output_root="/tmp/out")

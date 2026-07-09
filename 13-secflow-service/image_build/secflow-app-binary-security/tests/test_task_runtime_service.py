@@ -324,46 +324,48 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
             "task_type": TASK_TYPE_BINARY,
         }
 
-        async def _fake_poll(*args, **kwargs):
-            del args, kwargs
-            return "success", {"task_id": "sa-child", "status": "passed"}, None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            archive_root = Path(tmpdir)
-            with (
-                patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-                patch.object(self.manager, "_upsert_stage_item", return_value=item),
-                patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
-                patch.object(
-                    self.manager,
-                    "_classify_retry_downstream_strategy",
-                    return_value=(task_manager_module.RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, "running"),
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
+            patch.object(
+                self.manager,
+                "_classify_retry_downstream_strategy",
+                return_value=(task_manager_module.RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, "running"),
+            ),
+            patch.object(
+                self.manager,
+                "_prepare_retry_child_for_reuse_or_recreate",
+                new=AsyncMock(return_value={"strategy": "adopt_active"}),
+            ),
+            patch.object(self.manager, "_store_retry_item_action"),
+            patch.object(self.manager, "_has_retryable_downstream_task", return_value=True),
+            patch.object(
+                self.manager,
+                "_downstream_control_existing_task",
+                new=AsyncMock(return_value={"outcome": "already_running", "payload": {"task_id": "sa-child", "status": "running"}}),
+            ) as control_mock,
+            patch.object(
+                self.manager,
+                "_defer_item_to_sync_maintenance_child_sync",
+                new=AsyncMock(
+                    return_value={
+                        "status": "running",
+                        "item": dict(firmware),
+                        "deferred_mode": "authoritative_sync",
+                        "authoritative_waiting": True,
+                    }
                 ),
-                patch.object(
-                    self.manager,
-                    "_prepare_retry_child_for_reuse_or_recreate",
-                    new=AsyncMock(return_value={"strategy": "adopt_active"}),
-                ),
-                patch.object(self.manager, "_store_retry_item_action"),
-                patch.object(self.manager, "_has_retryable_downstream_task", return_value=True),
-                patch.object(
-                    self.manager,
-                    "_downstream_control_existing_task",
-                    new=AsyncMock(return_value={"outcome": "already_running", "payload": {"task_id": "sa-child", "status": "running"}}),
-                ) as control_mock,
-                patch.object(self.manager, "_downstream_create_task", new=AsyncMock(side_effect=AssertionError("should reuse active child"))),
-                patch.object(self.manager, "_poll_item_until_local_terminal_or_defer", side_effect=_fake_poll),
-                patch.object(self.manager, "_downstream_fetch_item_result", new=AsyncMock(return_value={"summary": "ok"})),
-                patch.object(self.manager, "_queue_archive_and_wait", new=AsyncMock(return_value=(archive_root, None))),
-                patch.object(self.manager, "_parse_system_analysis_modules", return_value=[{"module_key": "m1", "risk_level": "高"}]),
-            ):
-                result = asyncio.run(self.manager._run_system_analysis_item(task, stage_run, firmware, retrying=True))
+            ) as sync_handoff_mock,
+        ):
+            result = asyncio.run(self.manager._run_system_analysis_item(task, stage_run, firmware, retrying=True))
 
         self.assertEqual("running", result["status"])
-        self.assertEqual("running", item.status)
-        self.assertEqual("sa-old", item.downstream_task_id)
+        self.assertEqual("authoritative_sync", result["deferred_mode"])
+        self.assertTrue(result["authoritative_waiting"])
         self.assertEqual("fw-1", result["item"]["firmware_key"])
         control_mock.assert_not_awaited()
+        sync_handoff_mock.assert_awaited_once()
 
     def test_run_system_analysis_item_defers_child_create_to_sync_maintenance_without_legacy_direct_path(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="system-archive")
@@ -433,47 +435,53 @@ class TaskRuntimeServiceBehaviorTests(unittest.TestCase):
         fake_session = _ModelAwareDb(stage_items=[item])
         input_file = {"firmware_key": "fw-1", "filename": "firmware.bin", "firmware_name": "firmware"}
 
-        async def _fake_poll(*args, **kwargs):
-            del args, kwargs
-            return "success", {"task_id": "fw-child", "status": "success"}, None
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            archive_root = Path(tmpdir)
-            with (
-                patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
-                patch.object(self.manager, "_upsert_stage_item", return_value=item),
-                patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
-                patch.object(
-                    self.manager,
-                    "_classify_retry_downstream_strategy",
-                    return_value=(task_manager_module.RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, "running"),
+        with (
+            patch.object(task_manager_module, "get_session_factory", return_value=lambda: fake_session),
+            patch.object(self.manager, "_upsert_stage_item", return_value=item),
+            patch.object(self.manager, "_active_downstream_payload", new=AsyncMock(return_value=None)),
+            patch.object(
+                self.manager,
+                "_classify_retry_downstream_strategy",
+                return_value=(task_manager_module.RETRY_CHILD_STRATEGY_ADOPT_ACTIVE, "running"),
+            ),
+            patch.object(
+                self.manager,
+                "_prepare_retry_child_for_reuse_or_recreate",
+                new=AsyncMock(return_value={"strategy": "adopt_active"}),
+            ),
+            patch.object(self.manager, "_store_retry_item_action"),
+            patch.object(self.manager, "_has_retryable_downstream_task", return_value=True),
+            patch.object(
+                self.manager,
+                "_downstream_control_existing_task",
+                new=AsyncMock(return_value={"outcome": "already_running", "payload": {"task_id": "fw-child", "status": "running"}}),
+            ) as control_mock,
+            patch.object(
+                self.manager,
+                "_defer_item_to_sync_maintenance_child_sync",
+                new=AsyncMock(
+                    return_value={
+                        "status": "running",
+                        "item": {
+                            **input_file,
+                            "input_path": str(Path(task.workspace_root) / "input" / "firmware.bin"),
+                        },
+                        "deferred_mode": "authoritative_sync",
+                        "authoritative_waiting": True,
+                    }
                 ),
-                patch.object(
-                    self.manager,
-                    "_prepare_retry_child_for_reuse_or_recreate",
-                    new=AsyncMock(return_value={"strategy": "adopt_active"}),
-                ),
-                patch.object(self.manager, "_store_retry_item_action"),
-                patch.object(self.manager, "_has_retryable_downstream_task", return_value=True),
-                patch.object(
-                    self.manager,
-                    "_downstream_control_existing_task",
-                    new=AsyncMock(return_value={"outcome": "already_running", "payload": {"task_id": "fw-child", "status": "running"}}),
-                ) as control_mock,
-                patch.object(self.manager, "_downstream_create_task", new=AsyncMock(side_effect=AssertionError("should reuse active child"))),
-                patch.object(self.manager, "_poll_item_until_local_terminal_or_defer", side_effect=_fake_poll),
-                patch.object(self.manager, "_queue_archive_and_wait", new=AsyncMock(return_value=(archive_root, None))),
-            ):
-                result = asyncio.run(
-                    self.manager._run_firmware_item(task, stage_run, input_file, token="tok", retrying=True)
-                )
+            ) as sync_handoff_mock,
+        ):
+            result = asyncio.run(
+                self.manager._run_firmware_item(task, stage_run, input_file, token="tok", retrying=True)
+            )
 
-        self.assertEqual("success", result["status"])
-        self.assertEqual("success", item.status)
-        self.assertEqual("fw-child", item.downstream_task_id)
+        self.assertEqual("running", result["status"])
+        self.assertEqual("authoritative_sync", result["deferred_mode"])
+        self.assertTrue(result["authoritative_waiting"])
         self.assertEqual(str(Path(task.workspace_root) / "input" / "firmware.bin"), result["item"]["input_path"])
-        self.assertEqual(str(archive_root), result["item"]["unpacked_root"])
         control_mock.assert_awaited_once()
+        sync_handoff_mock.assert_awaited_once()
 
     def test_run_firmware_item_defers_child_create_to_sync_maintenance_without_legacy_direct_path(self):
         task = self._task(task_type=TASK_TYPE_BINARY, name="firmware-failed")

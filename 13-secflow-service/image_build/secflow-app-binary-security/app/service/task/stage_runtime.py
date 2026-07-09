@@ -15,6 +15,59 @@ if TYPE_CHECKING:
 
 
 class TaskStageRuntimeMixin:
+    def _queued_stage_child_create_item_ids(
+        self: TaskManager,
+        task_id: str,
+        stage_name: str,
+    ) -> set[str]:
+        normalized_task_id = str(task_id or "").strip()
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_task_id or not normalized_stage_name:
+            return set()
+        queued_entries = self._run_async_blocking(
+            task_manager_module.get_task_queue().list_task_sync_requests(
+                normalized_task_id,
+                context="kg_reseed_sync_queue_list",
+            )
+        ) or []
+        queued_item_ids: set[str] = set()
+        for entry in list(queued_entries or []):
+            if str(entry.get("operation") or "").strip() != "child_create":
+                continue
+            if str(entry.get("stage_name") or "").strip() != normalized_stage_name:
+                continue
+            for item_id in list(entry.get("item_ids") or []):
+                normalized_item_id = str(item_id or "").strip()
+                if normalized_item_id:
+                    queued_item_ids.add(normalized_item_id)
+        return queued_item_ids
+
+    def _available_stage_child_create_slots(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+        *,
+        stage_items: list[BinarySecurityStageItem] | None = None,
+    ) -> int:
+        normalized_stage_name = str(stage_name or "").strip()
+        if not normalized_stage_name:
+            return 0
+        items = stage_items if stage_items is not None else self._stage_items(db, task.id, normalized_stage_name)
+        active_count = sum(1 for item in items if self._child_counts_as_active_for_parallelism(item))
+        queued_create_item_ids = self._queued_stage_child_create_item_ids(task.id, normalized_stage_name)
+        queued_unbound_count = sum(
+            1
+            for item in items
+            if str(getattr(item, "id", "") or "").strip() in queued_create_item_ids
+            and not str(getattr(item, "downstream_task_id", "") or "").strip()
+            and not self._child_counts_as_active_for_parallelism(item)
+        )
+        return max(
+            0,
+            int(self._stage_parallelism(task, normalized_stage_name)) - active_count - queued_unbound_count,
+        )
+
     def _stage_has_authoritative_progress_facts(
         self: TaskManager,
         db: Session,
@@ -292,6 +345,8 @@ class TaskStageRuntimeMixin:
         }
         new_entry_keys = sorted(current_entry_keys - previous_entry_keys)
         created_item_ids: list[str] = []
+        scheduled_item_ids: list[str] = []
+        available_slots = 0
         if new_entry_keys:
             dataflow_stage_run = self._latest_stage_run(db, task.id, "dataflow_vuln_scan")
             if dataflow_stage_run is not None:
@@ -331,7 +386,14 @@ class TaskStageRuntimeMixin:
                         and not str(item.downstream_task_id or "").strip()
                     )
                 ]
-                if created_item_ids:
+                child_create_candidate_count = len(created_item_ids)
+                available_slots = self._available_stage_child_create_slots(
+                    db,
+                    task,
+                    "dataflow_vuln_scan",
+                )
+                scheduled_item_ids = created_item_ids[:available_slots] if available_slots > 0 else []
+                if scheduled_item_ids:
                     self._run_async_blocking(
                         self._enqueue_task_sync_request(
                             task,
@@ -340,11 +402,15 @@ class TaskStageRuntimeMixin:
                             source="knowledge_graph_incremental_reseed",
                             reason="knowledge_graph_incremental_reseed_child_create",
                             stage_name="dataflow_vuln_scan",
-                            item_ids=created_item_ids,
+                            item_ids=scheduled_item_ids,
                             source_event_type="knowledge_graph_entry_incremental_inputs_materialized",
                             payload={
                                 "new_entry_keys": new_entry_keys[:50],
                                 "new_entry_count": len(new_entry_keys),
+                                "child_create_candidate_count": child_create_candidate_count,
+                                "child_create_scheduled_count": len(scheduled_item_ids),
+                                "child_create_deferred_count": max(0, child_create_candidate_count - len(scheduled_item_ids)),
+                                "available_slots_at_enqueue": available_slots,
                             },
                             priority=10,
                         )
@@ -362,8 +428,12 @@ class TaskStageRuntimeMixin:
                     "previous_entry_count": len(previous_entry_keys),
                     "current_entry_count": len(current_entry_keys),
                     "dataflow_reseeded": dataflow_stage_run is not None,
-                    "dataflow_child_create_enqueued": bool(created_item_ids),
+                    "dataflow_child_create_enqueued": bool(scheduled_item_ids),
                     "created_item_count": len(created_item_ids),
+                    "child_create_candidate_count": len(created_item_ids),
+                    "child_create_scheduled_count": len(scheduled_item_ids),
+                    "child_create_deferred_count": max(0, len(created_item_ids) - len(scheduled_item_ids)),
+                    "available_slots_at_enqueue": available_slots if new_entry_keys else 0,
                 },
             )
         return refreshed or bool(new_entry_keys)

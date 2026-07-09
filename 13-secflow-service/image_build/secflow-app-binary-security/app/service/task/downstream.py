@@ -78,23 +78,6 @@ class TaskDownstreamServiceMixin:
             returned_status = observed_status
         else:
             returned_status = "pending"
-        item.status = "running" if str(item.downstream_task_id or "").strip() else item.status
-        item.finished_at = None
-        self._mark_stage_item_sync_observation(
-            item,
-            sync_status="observed",
-            synced_at=task_manager_module._now(),
-            error_message=None,
-            error_type=None,
-            http_status=None,
-            status_raw=str((payload or {}).get("status") or observed_status),
-            mapped_status=observed_status,
-            downstream_status=str((payload or {}).get("status") or observed_status),
-            state_applied=False,
-            downstream_payload=payload,
-            clear_error_state=False,
-        )
-        session.commit()
         previous_result = dict(self._load_stage_item_result_payload(item) or {})
         returned_item = dict(response_item or {})
         if previous_result:
@@ -110,6 +93,91 @@ class TaskDownstreamServiceMixin:
             "sync_degraded": False,
             "authoritative_waiting": True,
         }
+
+    async def _defer_item_to_sync_maintenance_child_sync(
+        self,
+        session: Session,
+        task: BinarySecurityTask,
+        item: BinarySecurityStageItem,
+        *,
+        operation: str,
+        response_item: dict[str, Any],
+        binding_payload: dict[str, Any] | None = None,
+        binding_message: str | None = "已检测到 authoritative 下游绑定，等待 sync maintenance 统一同步状态",
+        extra_result_updates: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        item = self._refresh_stage_item_authoritative_state(session, item)
+        if binding_payload:
+            self._apply_observed_downstream_ref_binding(
+                task,
+                item,
+                payload=binding_payload,
+                extra_result_updates=extra_result_updates,
+            )
+            if binding_message is not None and str(item.downstream_task_id or "").strip():
+                self._mark_downstream_binding_created(item, message=binding_message)
+        elif extra_result_updates:
+            self._merge_stage_item_result_fields(
+                task,
+                item,
+                stage_name=item.stage_name,
+                updates=extra_result_updates,
+            )
+        item_id = str(getattr(item, "id", "") or "").strip() or None
+        stage_name = str(getattr(item, "stage_name", "") or "").strip() or None
+        current_status = str(getattr(item, "status", "") or "").strip().lower()
+        if current_status not in {"pending", "queued", "dispatching", "running"}:
+            item.status = "queued"
+        item.finished_at = None
+        item.error_message = None
+        self._clear_stage_item_sync_observation_errors(item)
+        if item_id:
+            await self._enqueue_task_sync_request(
+                task,
+                db=session,
+                operation="child_sync",
+                source="runtime_direct_child_sync_redirect",
+                reason=f"{str(operation or '').strip() or 'downstream'}_child_sync_redirected_to_sync_maintenance",
+                stage_name=stage_name,
+                item_ids=[item_id],
+                force=True,
+                source_event_type="downstream_status_sync_requested",
+                payload={
+                    "redirected_from_runtime": True,
+                    "item_id": item_id,
+                    "item_key": str(getattr(item, "item_key", "") or "").strip() or None,
+                    "downstream_service": str(getattr(item, "downstream_service", "") or "").strip() or None,
+                    "downstream_task_id": str(getattr(item, "downstream_task_id", "") or "").strip() or None,
+                },
+                priority=20,
+            )
+        self._record_event(
+            session,
+            task,
+            "downstream_status_sync_requested",
+            "已将下游子任务状态同步转交 sync maintenance 统一执行",
+            stage_name=stage_name,
+            item=item,
+            payload={
+                "operation": operation,
+                "item_id": item_id,
+                "item_key": str(getattr(item, "item_key", "") or "").strip() or None,
+                "downstream_service": str(getattr(item, "downstream_service", "") or "").strip() or None,
+                "downstream_task_id": str(getattr(item, "downstream_task_id", "") or "").strip() or None,
+                "redirected_from_runtime": True,
+            },
+        )
+        session.commit()
+        local_status = str(item.status or "").strip().lower() or None
+        return self._defer_item_with_previous_authoritative_result(
+            session,
+            task,
+            item,
+            operation=operation,
+            response_item=response_item,
+            local_status=local_status,
+            payload=binding_payload,
+        )
 
     async def _poll_item_until_local_terminal_or_defer(
         self: TaskManager,
@@ -131,14 +199,13 @@ class TaskDownstreamServiceMixin:
             item=item,
         )
         if str(status or "").strip().lower() in {"pending", "queued", "dispatching", "running"}:
-            return None, None, self._defer_item_with_previous_authoritative_result(
+            return None, None, await self._defer_item_to_sync_maintenance_child_sync(
                 session,
                 task,
                 item,
                 operation=operation,
                 response_item=response_item,
-                local_status=status,
-                payload=payload,
+                binding_payload=payload,
             )
         return status, payload, None
 
