@@ -43164,6 +43164,110 @@ def _test_sync_downstream_status_system_analysis_success_creates_archive_job(sel
     self.assertEqual("success", db.archive_jobs[0].payload.get("mapped_status"))
 
 
+def _test_sync_downstream_status_backfills_missing_terminal_sync_fields_for_selected_success_item(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-sync-backfill",
+        project_id="p1",
+        name="firmware",
+        status="running",
+        current_stage="system_analysis",
+        task_type=TASK_TYPE_BINARY,
+        firmware_source="upload",
+        firmware_path="/fw.bin",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    run = BinarySecurityStageRun(
+        id="sr-sync-backfill",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="system_analysis",
+        sequence_no=2,
+        status="success",
+    )
+    item = BinarySecurityStageItem(
+        id="si-sync-backfill",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id=run.id,
+        stage_name="system_analysis",
+        item_key="fw1",
+        item_name="fw1",
+        status="success",
+        downstream_service="system_analyse",
+        downstream_task_id="sat-backfill-1",
+        result={
+            "summary": {"modules": 1},
+        },
+    )
+    db = _AppendingModelAwareDb(tasks=[task], stage_runs=[run], stage_items=[item], archive_jobs=[], events=[])
+
+    async def _fetch(_task, _item, _token):
+        return {
+            "task_id": "sat-backfill-1",
+            "status": "passed",
+            "updated_at": "2026-07-09T00:00:00+00:00",
+            "finished_at": "2026-07-09T00:00:00+00:00",
+            "result": {"output_root": "/tmp/system-analysis/sat-backfill-1/output"},
+        }
+
+    async def _archive_success(db_arg, task_arg, item_arg, *, payload, mapped_status, before_status):
+        del before_status
+        job = BinarySecurityArchiveJob(
+            id="aj-sync-backfill",
+            task_id=task_arg.id,
+            project_id=task_arg.project_id,
+            stage_name=item_arg.stage_name,
+            item_id=item_arg.id,
+            item_key=item_arg.item_key,
+            downstream_service=item_arg.downstream_service,
+            downstream_task_id=item_arg.downstream_task_id,
+            archive_status="archived",
+            archive_root="/tmp/archive",
+            started_at=_now(),
+        )
+        job.payload = {"mapped_status": mapped_status, "downstream_payload": dict(payload or {})}
+        db_arg.archive_jobs.append(job)
+        return Path("/tmp/archive"), job
+
+    original_fetch = manager._fetch_downstream_task_payload
+    original_queue_archive = manager._queue_archive_and_wait
+    original_write = manager._write_task_metadata_async
+    original_enqueue = manager._enqueue_task
+    try:
+        manager._fetch_downstream_task_payload = _fetch
+        manager._queue_archive_and_wait = _archive_success
+        manager._write_task_metadata_async = AsyncMock(return_value=None)
+        manager._enqueue_task = lambda *_args, **_kwargs: None
+        resp = asyncio.run(
+            manager.sync_downstream_status(
+                db,
+                project_id=task.project_id,
+                task_id=task.id,
+                stage_name="system_analysis",
+                item_ids=[item.id],
+                apply_state=False,
+            )
+        )
+    finally:
+        manager._fetch_downstream_task_payload = original_fetch
+        manager._queue_archive_and_wait = original_queue_archive
+        manager._write_task_metadata_async = original_write
+        manager._enqueue_task = original_enqueue
+
+    observation = dict(item.result.get("sync_observation") or {})
+    self.assertEqual(1, resp.synced_downstream_count)
+    self.assertEqual("synced", item.result.get("sync_status"))
+    self.assertEqual("passed", item.result.get("downstream_status"))
+    self.assertTrue(observation.get("state_applied"))
+    self.assertEqual("success", observation.get("mapped_status"))
+    self.assertNotIn(
+        "downstream_sync_skipped",
+        [getattr(event, "event_type", None) for event in db.events],
+    )
+
+
 def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -46599,6 +46703,7 @@ TaskManagerTests.test_process_readless_reconcile_records_incomplete_tail_reason 
 TaskManagerTests.test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync = _test_process_readless_reconcile_tail_task_keeps_cross_stage_item_sync
 TaskManagerTests.test_process_readless_reconcile_preserves_item_layer_commit_when_task_layer_conflicts = _test_process_readless_reconcile_preserves_item_layer_commit_when_task_layer_conflicts
 TaskManagerTests.test_sync_downstream_status_system_analysis_success_creates_archive_job = _test_sync_downstream_status_system_analysis_success_creates_archive_job
+TaskManagerTests.test_sync_downstream_status_backfills_missing_terminal_sync_fields_for_selected_success_item = _test_sync_downstream_status_backfills_missing_terminal_sync_fields_for_selected_success_item
 TaskManagerTests.test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled = _test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled
 TaskManagerTests.test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate = _test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate
 TaskManagerTests.test_continue_stage_input_error_delegates_to_system_analysis_handler = _test_continue_stage_input_error_delegates_to_system_analysis_handler

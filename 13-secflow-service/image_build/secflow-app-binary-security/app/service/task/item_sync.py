@@ -321,6 +321,30 @@ class TaskItemSyncServiceMixin:
                 return False
         return not bool(state_applied)
 
+    def _item_needs_terminal_sync_backfill(
+        self: TaskManager,
+        item: BinarySecurityStageItem,
+        *,
+        mapped_status: str | None,
+    ) -> bool:
+        normalized_mapped_status = self._normalize_downstream_status(mapped_status) or str(mapped_status or "").strip().lower()
+        if normalized_mapped_status not in self._TERMINAL_CHILD_STATUSES:
+            return False
+        item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower()
+        if item_status != normalized_mapped_status:
+            return False
+        replacement = self._replacement_in_progress_state(item)
+        if replacement.get("replacement_in_progress") or replacement.get("binding_cleared"):
+            return False
+        if self._item_missing_recorded_downstream_status(item):
+            return True
+        result = self._load_stage_item_result_payload(item)
+        sync_observation = self._stage_item_sync_observation(item)
+        state_applied = sync_observation.get("state_applied")
+        if state_applied is None:
+            state_applied = result.get("downstream_state_applied")
+        return state_applied is None
+
     def _compute_item_downstream_action(
         self: TaskManager,
         task: BinarySecurityTask | None,
@@ -1968,6 +1992,10 @@ class TaskItemSyncServiceMixin:
                     downstream_status = str(payload.get("status") or "").lower()
                     mapped_status = self._map_downstream_status(downstream_status)
                     current_item_status = self._normalize_downstream_status(item.status) or str(item.status or "").strip().lower() or None
+                    needs_terminal_sync_backfill = self._item_needs_terminal_sync_backfill(
+                        item,
+                        mapped_status=mapped_status,
+                    )
                     if not observed_apply_state and stage_name and not item_id:
                         observed_apply_state = bool(
                             force
@@ -2266,7 +2294,9 @@ class TaskItemSyncServiceMixin:
                                 payload=payload,
                             )
                             error_message = None if recovery_applied else observed_error_message
-                            should_apply = observed_apply_state and (mapped_status != before_status or force)
+                            should_apply = (
+                                observed_apply_state and (mapped_status != before_status or force)
+                            ) or needs_terminal_sync_backfill
                             if should_apply:
                                 if not self._apply_child_state_with_savepoint(
                                     db,
@@ -2410,6 +2440,7 @@ class TaskItemSyncServiceMixin:
                             and mapped_status in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES
                             and current_item_status in task_manager_module.ARCHIVE_SUCCESS_MAPPED_STATUSES
                             and not apply_state
+                            and not needs_terminal_sync_backfill
                         ):
                             self._refresh_stage_item_downstream_observation(
                                 item,
