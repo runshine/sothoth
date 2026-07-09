@@ -19,7 +19,7 @@ from app.service.task_manager import (
     ValidationError,
     _now,
 )
-from test_task_manager import _AppendingModelAwareDb, _ModelAwareDb
+from test_task_manager import _AppendingModelAwareDb, _FakeTaskSyncQueue, _ModelAwareDb
 
 
 class TaskOperationFinalizePathTests(unittest.TestCase):
@@ -593,9 +593,12 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
         )
         db = _AppendingModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[runtime_lease], events=[])
         original_factory = task_manager_module.get_session_factory
+        original_queue = task_manager_module.get_task_queue
         original_runner = manager._run_task_operation_steps
+        fake_queue = _FakeTaskSyncQueue()
         try:
             task_manager_module.get_session_factory = lambda: (lambda: db)
+            task_manager_module.get_task_queue = lambda: fake_queue
 
             async def _fake_run_task_operation_steps(_db, current_task, current_operation):
                 current_task.status = "cancelling"
@@ -606,6 +609,7 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
             changed = asyncio.run(manager._run_current_task_operation(task.id))
         finally:
             task_manager_module.get_session_factory = original_factory
+            task_manager_module.get_task_queue = original_queue
             manager._run_task_operation_steps = original_runner
 
         self.assertFalse(changed)
@@ -613,6 +617,7 @@ class TaskOperationFinalizePathTests(unittest.TestCase):
         self.assertEqual(operation.id, task.current_operation_id)
         self.assertEqual("running", operation.status)
         self.assertIsNone(operation.finished_at)
+        self.assertEqual([], fake_queue.pushed_tasks)
 
     def test_run_current_task_operation_finalizes_requeue_applied_operation_inline(self):
         manager = TaskManager()

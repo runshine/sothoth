@@ -414,6 +414,55 @@ class TaskOperationServiceMixin:
     def _cancel_verify_max_attempts() -> int:
         return 5
 
+    def _requeue_cancel_verify_resume(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        attempt_count: int,
+        max_attempts: int,
+        blocking_targets: list[dict[str, Any]] | None = None,
+        reason: str,
+        auto_reconciled: bool,
+    ) -> None:
+        normalized_blocking_targets = [
+            dict(target) for target in list(blocking_targets or []) if isinstance(target, dict)
+        ]
+        self._enqueue_task(task.id)
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "task_cancel_quiesce_retry_requeued",
+            "取消收敛核验已重新投递任务，等待下一轮继续恢复执行",
+            level="info" if auto_reconciled else "warning",
+            stage_name=operation.target_stage,
+            payload={
+                "attempt_count": max(0, int(attempt_count)),
+                "max_attempts": max(1, int(max_attempts)),
+                "blocking_target_count": len(normalized_blocking_targets),
+                "blocking_targets": normalized_blocking_targets,
+                "reason": str(reason or "").strip() or "cancel_verify_retry",
+                "auto_reconciled": bool(auto_reconciled),
+            },
+        )
+
+    def _can_resume_stale_cancel_verify_operation(
+        self: TaskManager,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if str(getattr(operation, "operation_type", "") or "").strip() != task_manager_module.TASK_ACTION_CANCEL:
+            return False
+        if str(getattr(operation, "current_step", "") or "").strip() != task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED:
+            return False
+        current_operation_id = str(getattr(task, "current_operation_id", "") or "").strip()
+        operation_id = str(getattr(operation, "id", "") or "").strip()
+        return current_operation_id in {"", operation_id}
+
     def _store_cancel_targets(
         self: TaskManager,
         operation: BinarySecurityTaskOperation,
@@ -4234,12 +4283,30 @@ class TaskOperationServiceMixin:
         from app.service import task_manager as task_manager_module
 
         operation_type = str(getattr(operation, "operation_type", "") or "").strip()
-        if operation_type not in self._operation_requeue_family_types():
-            return False
         age_seconds = self._task_operation_age_seconds(operation)
         if age_seconds is None or age_seconds < float(self._operation_stale_threshold_seconds()):
             return False
         task_manager_module.observe_control_operation_stale(operation_type, age_seconds=age_seconds)
+        if self._can_resume_stale_cancel_verify_operation(task, operation):
+            cancel_state = self._cancel_state_from_operation(task, operation)
+            blocking_targets = [
+                dict(target)
+                for target in list(dict(self._operation_result_data(operation) or {}).get("last_blocking_targets") or [])
+                if isinstance(target, dict)
+            ]
+            self._requeue_cancel_verify_resume(
+                db,
+                task,
+                operation,
+                attempt_count=int(cancel_state.get("cancel_verify_attempt_count") or 0),
+                max_attempts=int(cancel_state.get("cancel_verify_max_attempts") or self._cancel_verify_max_attempts()),
+                blocking_targets=blocking_targets,
+                reason="cancel_verify_stale_resume",
+                auto_reconciled=True,
+            )
+            return True
+        if operation_type not in self._operation_requeue_family_types():
+            return False
         if self._operation_requeue_applied(task, operation, db=db):
             finalized = self._finalize_task_operation_after_requeue(
                 db,
@@ -5260,6 +5327,16 @@ class TaskOperationServiceMixin:
                                 "max_attempts": max_attempts,
                                 "blocking_targets": blocking_targets,
                             },
+                        )
+                        self._requeue_cancel_verify_resume(
+                            db,
+                            task,
+                            operation,
+                            attempt_count=next_attempt_count,
+                            max_attempts=max_attempts,
+                            blocking_targets=blocking_targets,
+                            reason="cancel_verify_retry",
+                            auto_reconciled=False,
                         )
                         self._commit_or_rollback(db)
                         return {
