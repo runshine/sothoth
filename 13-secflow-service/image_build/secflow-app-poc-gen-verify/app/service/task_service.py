@@ -535,7 +535,6 @@ class TaskService:
                          "vuln_report_path": row.vuln_report_path},
             )
 
-            timeout = int(row.timeout or cfg.default_timeout)
             model = row.model or cfg.default_model
             # work dir = the task's output_dir on the fileserver (shared by api+worker);
             # the runner log + the poc CLI's per-stage logs/sessions/artifacts all live here.
@@ -586,7 +585,7 @@ class TaskService:
 
             result = run_poc_cli(
                 cmd=cmd, work_dir=work_dir, log_path=log_path,
-                output_dir=row.output_dir, timeout=timeout,
+                output_dir=row.output_dir,
                 on_popen=_on_popen, should_abort=_should_abort,
             )
 

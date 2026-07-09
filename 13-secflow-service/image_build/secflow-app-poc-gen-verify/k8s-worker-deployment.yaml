@@ -30,7 +30,7 @@ spec:
             - { name: TZ, value: Asia/Shanghai }
             - { name: SERVICE_YAML, value: /app/service.yaml }
             - { name: POC_ROLE, value: worker }
-            - { name: POC_GEN_VERIFY_STATE_ROOT, value: /var/lib/secflow-poc-gen-verify }
+            - { name: POC_GEN_VERIFY_STATE_ROOT, value: /tmp/secflow-poc-gen-verify }
             - { name: POC_GEN_VERIFY_WORKSPACE, value: /workspace }
             - { name: POC_GEN_VERIFY_POC_BIN, value: poc }
             - { name: POC_GEN_VERIFY_CLAUDE_MODEL, value: glm-5.2 }
@@ -48,10 +48,8 @@ spec:
             - secretRef: { name: secflow-app-poc-gen-verify-secret, optional: true }
           volumeMounts:
             - { name: cfg, mountPath: /app/service.yaml, subPath: service.yaml }
-            - { name: poc-data, mountPath: /var/lib/secflow-poc-gen-verify }
-            - { name: poc-data, mountPath: /workspace, subPath: workspace }
             - { name: fileserver, mountPath: /data }   # shared platform fileserver -> /data/files/{project_id}
-          resources: { requests: { cpu: "2", memory: "4Gi" }, limits: { cpu: "8", memory: "16Gi" } }
+          resources: { requests: { cpu: "2", memory: "4Gi" }, limits: { cpu: "4", memory: "8Gi" } }
           # worker runs celery (not uvicorn) — liveness via process check
           livenessProbe:
             exec: { command: ["sh", "-c", "pgrep -f 'celery.*app.celery_app' >/dev/null"] }
@@ -64,7 +62,5 @@ spec:
       volumes:
         - name: cfg
           configMap: { name: secflow-app-poc-gen-verify-config, items: [{ key: service.yaml, path: service.yaml }] }
-        - name: poc-data
-          persistentVolumeClaim: { claimName: secflow-app-poc-gen-verify-data-nfs-pvc }
         - name: fileserver
           persistentVolumeClaim: { claimName: secflow-platform-fileserver-data-nfs-pvc }

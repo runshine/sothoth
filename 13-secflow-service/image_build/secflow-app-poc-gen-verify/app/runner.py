@@ -16,7 +16,6 @@ import re
 import shlex
 import signal
 import subprocess
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -94,11 +93,13 @@ def run_poc_cli(
     work_dir: Path,
     log_path: str,
     output_dir: str,
-    timeout: int,
     on_popen: Optional[Callable[[subprocess.Popen], None]] = None,
     should_abort: Optional[Callable[[], bool]] = None,
 ) -> dict:
-    """Run the `poc` CLI, stream stdout to `log_path`, kill the group on timeout/abort.
+    """Run the `poc` CLI, stream stdout to `log_path`, kill the group on abort.
+
+    No timeout: the `poc` CLI (claude + gdb) runs until it finishes or is aborted
+    (cancel → should_abort → killpg).
 
     - `on_popen(proc)`: called right after Popen so the caller can record the pgid
       (for Celery revoke killpg) and register a kill handle.
@@ -122,9 +123,6 @@ def run_poc_cli(
             )
             if on_popen:
                 on_popen(proc)
-            timer = threading.Timer(timeout, lambda: _kill_pg(proc, killed))
-            timer.daemon = True
-            timer.start()
             assert proc.stdout is not None
             for line in proc.stdout:
                 logfh.write(line)
@@ -133,7 +131,6 @@ def run_poc_cli(
                     _kill_pg(proc, killed)
                     break
             proc.wait()
-            timer.cancel()
             rc = proc.returncode
         art_dir = Path(output_dir) / "output"  # the `poc` prompt saves under {输出目录}/output
         artifacts = sorted(p.name for p in art_dir.iterdir()) if art_dir.is_dir() else []
@@ -142,8 +139,8 @@ def run_poc_cli(
                 "error": f"{type(exc).__name__}: {exc}", "timed_out": False}
 
     if killed["flag"]:
-        status = "timeout"
-        error = f"timeout after {timeout}s"
+        status = "cancelled"
+        error = "aborted"
     elif rc == 0:
         status = "succeeded"
         error = None
@@ -151,4 +148,4 @@ def run_poc_cli(
         status = "failed"
         error = f"poc exit code {rc}"
     return {"returncode": rc, "artifacts": artifacts, "status": status,
-            "error": error, "timed_out": killed["flag"]}
+            "error": error, "timed_out": False}

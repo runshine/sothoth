@@ -25,7 +25,7 @@ spec:
             - { name: POC_ROLE, value: api }
             - { name: POC_ENABLE_PUBLIC_API, value: "true" }
             - { name: POC_ENABLE_REGISTRY, value: "true" }
-            - { name: POC_GEN_VERIFY_STATE_ROOT, value: /var/lib/secflow-poc-gen-verify }
+            - { name: POC_GEN_VERIFY_STATE_ROOT, value: /tmp/secflow-poc-gen-verify }
             - { name: POC_GEN_VERIFY_WORKSPACE, value: /workspace }
             - { name: POC_GEN_VERIFY_POC_BIN, value: poc }
             - { name: POC_GEN_VERIFY_CLAUDE_MODEL, value: glm-5.2 }
@@ -40,16 +40,12 @@ spec:
             - secretRef: { name: secflow-app-poc-gen-verify-secret, optional: true }
           volumeMounts:
             - { name: cfg, mountPath: /app/service.yaml, subPath: service.yaml }
-            - { name: poc-data, mountPath: /var/lib/secflow-poc-gen-verify }
-            - { name: poc-data, mountPath: /workspace, subPath: workspace }
             - { name: fileserver, mountPath: /data }   # shared platform fileserver -> /data/files/{project_id}
-          resources: { requests: { cpu: "1", memory: "2Gi" }, limits: { cpu: "4", memory: "8Gi" } }
+          resources: { requests: { cpu: "2", memory: "4Gi" }, limits: { cpu: "2", memory: "4Gi" } }
           readinessProbe: { httpGet: { path: /api/app/poc-gen-verify/ready, port: http }, initialDelaySeconds: 20, periodSeconds: 15 }
           livenessProbe:  { httpGet: { path: /api/app/poc-gen-verify/health, port: http }, initialDelaySeconds: 30, periodSeconds: 30 }
       volumes:
         - name: cfg
           configMap: { name: secflow-app-poc-gen-verify-config, items: [{ key: service.yaml, path: service.yaml }] }
-        - name: poc-data
-          persistentVolumeClaim: { claimName: secflow-app-poc-gen-verify-data-nfs-pvc }
         - name: fileserver
           persistentVolumeClaim: { claimName: secflow-platform-fileserver-data-nfs-pvc }

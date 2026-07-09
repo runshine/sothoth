@@ -189,9 +189,16 @@ class Dispatcher:
                     row.execution_heartbeat_at is None
                     or (now - row.execution_heartbeat_at).total_seconds() > STALE_HEARTBEAT_SECONDS
                 )
-                if in_active and not heartbeat_stale:
-                    continue  # genuinely running
-                # orphan (not in active) or stuck (in active but no heartbeat) → reset
+                # The DB lease heartbeat is the ground truth: a fresh heartbeat means the
+                # worker is alive and running the task. celery inspect.active() is
+                # unreliable under load (short timeout, false-negatives) — do NOT reset a
+                # task just because it's missing from the active set; that caused a 60s
+                # reset-loop (worker loses lease → re-queue → re-run from scratch). Only
+                # reset when the heartbeat has actually gone stale (worker dead/stuck).
+                if not heartbeat_stale:
+                    continue
+                # heartbeat stale → orphan (not in active) or stuck (in active but not
+                # heartbeating) → revoke + reset to pending for re-queue.
                 if cid:
                     try:
                         celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
