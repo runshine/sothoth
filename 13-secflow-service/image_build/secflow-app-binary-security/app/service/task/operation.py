@@ -1203,6 +1203,11 @@ class TaskOperationServiceMixin:
         actions: list[dict[str, Any]] = []
         abnormal_statuses = set(getattr(task_manager_module, "RETRY_CHILD_ABNORMAL_STATUSES", {"failed", "cancelled", "downstream_missing"}))
         recreate_strategy = getattr(task_manager_module, "RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL", "recreate_from_abnormal")
+        sync_confirmation_strategy = getattr(
+            task_manager_module,
+            "RETRY_CHILD_STRATEGY_SYNC_CONFIRMATION_REQUIRED",
+            "sync_confirmation_required",
+        )
         for item in self._retry_target_items(db, task, target_stage=target_stage):
             active_payload = None
             if str(item.downstream_task_id or "").strip():
@@ -1221,7 +1226,14 @@ class TaskOperationServiceMixin:
                     or self._latest_observed_downstream_status(item)
                     or (str(item.status or "").strip().lower() or None)
                 )
-                if normalized_current_status in abnormal_statuses:
+                has_authoritative_failed_fact = (
+                    self._stage_item_last_synced_at_value(item) is not None
+                    and normalized_current_status in abnormal_statuses
+                )
+                if strategy == recreate_strategy and has_authoritative_failed_fact and self._stage_item_has_active_sync_error(item):
+                    strategy = sync_confirmation_strategy
+                    observed_status = normalized_current_status
+                elif normalized_current_status in abnormal_statuses:
                     strategy = recreate_strategy
                     observed_status = normalized_current_status
             action = self._retry_item_action_snapshot(
@@ -1231,8 +1243,28 @@ class TaskOperationServiceMixin:
                 old_downstream_task_id=str(item.downstream_task_id or "").strip() or None,
                 cleanup_performed=False,
                 binding_cleared=False,
+                verification_status="deferred" if strategy == sync_confirmation_strategy else None,
+                error="downstream_status_confirmation_required" if strategy == sync_confirmation_strategy else None,
             )
             actions.append(action)
+            if strategy == getattr(task_manager_module, "RETRY_CHILD_STRATEGY_REUSE_SUCCESS", "reuse_success"):
+                archive_jobs = self._stage_archive_jobs_by_item(db, task.id, str(item.stage_name or "").strip()).get(str(item.id or ""), [])
+                if not self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+                    self._record_downstream_item_disposition(
+                        db,
+                        task,
+                        item,
+                        event_type="retry_item_reuse_success_child_archive_compensation_pending",
+                        message="重试复用成功的下游子任务，但 authoritative archive 尚未完成，后续将补归档收口",
+                        payload={
+                            "stage_name": item.stage_name,
+                            "item_id": item.id,
+                            "item_key": item.item_key,
+                            "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                            "strategy": strategy,
+                            "observed_status": observed_status,
+                        },
+                    )
         self._set_retry_item_actions(task, actions)
         return actions
 
@@ -1589,6 +1621,108 @@ class TaskOperationServiceMixin:
             )
         except AttributeError:
             pass
+        recreate_strategy = getattr(task_manager_module, "RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL", "recreate_from_abnormal")
+        sync_confirmation_strategy = getattr(
+            task_manager_module,
+            "RETRY_CHILD_STRATEGY_SYNC_CONFIRMATION_REQUIRED",
+            "sync_confirmation_required",
+        )
+        confirmation_blocked_items: list[dict[str, Any]] = []
+        archive_compensation_items: list[dict[str, Any]] = []
+        archive_jobs_by_item = self._stage_archive_jobs_by_item(db, task.id, target_stage)
+        existing_actions_by_item_id = {
+            str(action.get("item_id") or "").strip(): dict(action)
+            for action in self._retry_item_actions(task)
+            if str(action.get("item_id") or "").strip()
+        }
+        for item in retry_items:
+            existing_action = existing_actions_by_item_id.get(str(item.id or "").strip(), {})
+            refreshed_strategy = str(existing_action.get("strategy") or "").strip() or recreate_strategy
+            refreshed_status = str(existing_action.get("observed_status") or "").strip() or None
+            classified_strategy, classified_status = self._classify_retry_downstream_strategy(item, task=task)
+            if classified_strategy == getattr(task_manager_module, "RETRY_CHILD_STRATEGY_REUSE_SUCCESS", "reuse_success"):
+                refreshed_strategy = classified_strategy
+                refreshed_status = classified_status
+            elif (
+                refreshed_strategy == recreate_strategy
+                and str(item.downstream_task_id or "").strip()
+                and self._stage_item_last_synced_at_value(item) is not None
+                and (
+                    self._normalize_downstream_status(self._stage_item_observed_downstream_status(item))
+                    in getattr(task_manager_module, "RETRY_CHILD_ABNORMAL_STATUSES", {"failed", "cancelled", "downstream_missing"})
+                )
+                and self._stage_item_has_active_sync_error(item)
+            ):
+                refreshed_strategy = sync_confirmation_strategy
+                refreshed_status = (
+                    classified_status
+                    or self._normalize_downstream_status(self._stage_item_observed_downstream_status(item))
+                    or self._normalize_downstream_status(item.status)
+                )
+            action_updates = {
+                "strategy": refreshed_strategy,
+                "observed_status": refreshed_status,
+            }
+            if refreshed_strategy == sync_confirmation_strategy:
+                action_updates.update(
+                    {
+                        "verification_status": "deferred",
+                        "error": "downstream_status_confirmation_required",
+                    }
+                )
+                confirmation_blocked_items.append(
+                    {
+                        "item_id": str(item.id or "").strip() or None,
+                        "item_key": str(item.item_key or "").strip() or None,
+                        "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                        "status": str(item.status or "").strip() or None,
+                        "sync_status": self._stage_item_sync_status_value(item),
+                        "last_sync_result": self._stage_item_sync_observation(item).get("last_result"),
+                    }
+                )
+            elif refreshed_strategy == getattr(task_manager_module, "RETRY_CHILD_STRATEGY_REUSE_SUCCESS", "reuse_success"):
+                archive_jobs = archive_jobs_by_item.get(str(item.id or "").strip(), [])
+                if not self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+                    archive_compensation_items.append(
+                        {
+                            "item_id": str(item.id or "").strip() or None,
+                            "item_key": str(item.item_key or "").strip() or None,
+                            "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                        }
+                    )
+            self._update_retry_item_action(
+                task,
+                item_id=item.id,
+                updates=action_updates,
+            )
+        if archive_compensation_items:
+            self._record_event(
+                db,
+                task,
+                "retry_reuse_success_children_archive_compensation_pending",
+                "失败项重试复用了成功的下游子任务，但其中部分 authoritative archive 仍待补齐",
+                stage_name=target_stage,
+                payload={
+                    "target_stage": target_stage,
+                    "item_count": len(archive_compensation_items),
+                    "items": archive_compensation_items,
+                },
+            )
+        if confirmation_blocked_items:
+            self._record_event(
+                db,
+                task,
+                "retry_failed_items_sync_confirmation_required",
+                "失败项仍绑定既有下游子任务，但最新状态确认尚未收敛，已阻止破坏性清理重建",
+                level="warning",
+                stage_name=target_stage,
+                payload={
+                    "target_stage": target_stage,
+                    "item_count": len(confirmation_blocked_items),
+                    "items": confirmation_blocked_items,
+                },
+            )
+            raise ValidationError("目标失败项的既有下游子任务最新状态尚未确认，已禁止清理重建；请等待同步收敛后重试")
         target_index = stage_sequence.index(target_stage)
         affected_stages = stage_sequence[target_index:]
         validation_affected_stages = list(affected_stages)

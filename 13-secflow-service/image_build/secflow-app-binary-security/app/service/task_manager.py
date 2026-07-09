@@ -467,6 +467,7 @@ TASK_CANCEL_BLOCKING_TARGETS_PREVIEW_LIMIT = 20
 RETRY_CHILD_STRATEGY_REUSE_SUCCESS = "reuse_success"
 RETRY_CHILD_STRATEGY_ADOPT_ACTIVE = "adopt_active"
 RETRY_CHILD_STRATEGY_RECREATE_FROM_ABNORMAL = "recreate_from_abnormal"
+RETRY_CHILD_STRATEGY_SYNC_CONFIRMATION_REQUIRED = "sync_confirmation_required"
 RETRY_CHILD_ABNORMAL_STATUSES = {"failed", "cancelled", "downstream_missing"}
 TASK_OPERATION_SAGA_STEPS = (
     TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
@@ -12513,6 +12514,15 @@ class TaskManager(
             elif strategy == RETRY_CHILD_STRATEGY_REUSE_SUCCESS:
                 if str(item.status or "").strip() != "success":
                     issues.append({"item_key": item_key, "issue": "success_child_not_preserved", "status": item.status})
+            elif strategy == RETRY_CHILD_STRATEGY_SYNC_CONFIRMATION_REQUIRED:
+                issues.append(
+                    {
+                        "item_key": item_key,
+                        "issue": "downstream_status_confirmation_required",
+                        "status": item.status,
+                        "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    }
+                )
             elif strategy == RETRY_CHILD_STRATEGY_ADOPT_ACTIVE:
                 if not str(item.downstream_task_id or "").strip():
                     issues.append({"item_key": item_key, "issue": "active_binding_missing"})
