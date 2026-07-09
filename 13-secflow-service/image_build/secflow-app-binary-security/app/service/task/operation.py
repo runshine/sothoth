@@ -1291,6 +1291,186 @@ class TaskOperationServiceMixin:
         )
         return plan
 
+    async def _operation_collect_clear_dataflow_stage_items_plan(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        target_stage = "dataflow_vuln_scan"
+        stage_items = list(self._stage_items(db, task.id, target_stage) or [])
+        downstream_refs = self._retry_downstream_refs_for_stages(db, task, [target_stage])
+        plan = {
+            "operation_type": operation.operation_type,
+            "target_stage": target_stage,
+            "affected_stages": [target_stage],
+            "downstream_refs": [dict(ref) for ref in downstream_refs],
+            "downstream_ref_count": len(downstream_refs),
+            "stage_item_count": len(stage_items),
+            "stage_item_ids": [
+                str(getattr(item, "id", "") or "").strip()
+                for item in stage_items
+                if str(getattr(item, "id", "") or "").strip()
+            ],
+        }
+        self._update_operation_result_payload(
+            operation,
+            {"cleanup_plan": plan},
+            workspace_root=task.workspace_root,
+        )
+        return plan
+
+    async def _operation_execute_clear_dataflow_stage_items_cleanup(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+    ) -> dict[str, Any]:
+        from app.service import task_manager as task_manager_module
+
+        target_stage = "dataflow_vuln_scan"
+        plan = dict(self._operation_result_data(operation).get("cleanup_plan") or {})
+        affected_stages = [target_stage]
+        downstream_refs = [dict(ref) for ref in (plan.get("downstream_refs") or []) if isinstance(ref, dict)]
+        if not downstream_refs:
+            downstream_refs, _ = self._retry_cleanup_refs(db, task, affected_stages)
+
+        self._record_event(
+            db,
+            task,
+            "dataflow_stage_clear_items_started",
+            "开始清空数据流漏洞挖掘阶段子项",
+            stage_name=target_stage,
+            payload={
+                "stage_name": target_stage,
+                "operation_type": operation.operation_type,
+                "downstream_ref_count": len(downstream_refs),
+            },
+            operation_id=operation.id,
+        )
+        self._invalidate_task_execution(task)
+        if downstream_refs:
+            self._record_event(
+                db,
+                task,
+                "dataflow_stage_clear_items_downstream_cleanup_started",
+                "开始清理数据流漏洞挖掘阶段已绑定的下游子任务",
+                stage_name=target_stage,
+                payload={
+                    "stage_name": target_stage,
+                    "downstream_ref_count": len(downstream_refs),
+                },
+                operation_id=operation.id,
+            )
+            await self._cleanup_downstream_refs(db, task, downstream_refs, self._service_token())
+
+        downstream_cleanup_results = [
+            dict(result)
+            for result in list(getattr(self, "_last_downstream_cleanup_results", []) or [])
+            if isinstance(result, dict)
+        ]
+        downstream_cleanup_blocking_refs = [
+            dict(result)
+            for result in downstream_cleanup_results
+            if bool(result.get("blocking"))
+        ]
+        downstream_cleanup_deferred_refs = [
+            dict(result)
+            for result in downstream_cleanup_results
+            if bool(result.get("deferred"))
+        ]
+        cleanup_partial_failed = bool(downstream_cleanup_deferred_refs or downstream_cleanup_blocking_refs)
+        if cleanup_partial_failed:
+            self._record_event(
+                db,
+                task,
+                "dataflow_stage_clear_items_deferred",
+                "数据流漏洞挖掘阶段下游清理未完成，本轮不提交阶段清空",
+                level="warning",
+                stage_name=target_stage,
+                payload={
+                    "stage_name": target_stage,
+                    "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
+                    "downstream_cleanup_deferred_refs": downstream_cleanup_deferred_refs,
+                    "cleanup_partial_failed": True,
+                },
+                operation_id=operation.id,
+            )
+            self._update_operation_result_payload(
+                operation,
+                {
+                    "cleanup_result": {
+                        "target_stage": target_stage,
+                        "affected_stages": affected_stages,
+                        "downstream_ref_count": len(downstream_refs),
+                        "downstream_cleanup_results": downstream_cleanup_results,
+                        "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
+                        "downstream_cleanup_deferred_refs": downstream_cleanup_deferred_refs,
+                        "cleanup_partial_failed": True,
+                    },
+                },
+                workspace_root=task.workspace_root,
+            )
+            self._raise_if_restart_cleanup_incomplete(
+                cleanup_partial_failed=True,
+                deferred_refs=downstream_cleanup_deferred_refs,
+                blocking_refs=downstream_cleanup_blocking_refs,
+                context="clear_dataflow_stage_items",
+            )
+
+        self._clear_single_stage_outputs(task, target_stage)
+        deleted_archive_job_count = self._delete_archive_children_for_stages(db, task, affected_stages)
+        deleted_stage_item_count = self._delete_stage_items_for_stages(db, task.id, affected_stages)
+        deleted_timeline_event_count = self._delete_timeline_rows_for_stages(db, task.id, affected_stages)
+        deleted_state_event_count = self._delete_state_event_rows_for_stages(db, task.id, affected_stages)
+        stage_run = db.query(task_manager_module.BinarySecurityStageRun).filter(
+            task_manager_module.BinarySecurityStageRun.task_id == task.id,
+            task_manager_module.BinarySecurityStageRun.stage_name == target_stage,
+        ).first()
+        if stage_run is not None:
+            self._reset_stage_run_for_retry(task, stage_run, increment_retry=False)
+
+        cleanup_summary = {
+            "target_stage": target_stage,
+            "affected_stages": affected_stages,
+            "downstream_ref_count": len(downstream_refs),
+            "deleted_stage_item_count": deleted_stage_item_count,
+            "deleted_archive_job_count": deleted_archive_job_count,
+            "deleted_state_event_count": deleted_state_event_count,
+            "deleted_timeline_event_count": deleted_timeline_event_count,
+            "downstream_cleanup_results": downstream_cleanup_results,
+            "downstream_cleanup_blocking_refs": downstream_cleanup_blocking_refs,
+            "downstream_cleanup_deferred_refs": downstream_cleanup_deferred_refs,
+            "cleanup_partial_failed": False,
+            "reopened_from_terminal_status": str(getattr(task, "status", "") or "").strip() or None,
+        }
+        self._update_operation_result_payload(
+            operation,
+            {
+                "cleanup_plan": {
+                    **plan,
+                    "target_stage": target_stage,
+                    "affected_stages": affected_stages,
+                    "downstream_refs": downstream_refs,
+                },
+                "cleanup_result": cleanup_summary,
+            },
+            workspace_root=task.workspace_root,
+        )
+        self._record_event(
+            db,
+            task,
+            "dataflow_stage_clear_items_committed",
+            "数据流漏洞挖掘阶段子项已清空，准备重新调度",
+            stage_name=target_stage,
+            payload={
+                "stage_name": target_stage,
+                **cleanup_summary,
+            },
+            operation_id=operation.id,
+        )
+        return cleanup_summary
+
     async def _operation_execute_retry_stage_full_cleanup(
         self: TaskManager,
         db: Session,
@@ -4103,6 +4283,8 @@ class TaskOperationServiceMixin:
             return None
         if operation.operation_type == task_manager_module.TASK_ACTION_RETRY_STAGE_FULL:
             resume_step = await self._run_retry_stage_full_operation_steps(db, task, operation, resume_step)
+        elif operation.operation_type == task_manager_module.TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS:
+            resume_step = await self._run_clear_dataflow_stage_items_operation_steps(db, task, operation, resume_step)
         else:
             prepare_step = task_manager_module.TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN
             if resume_step == prepare_step:
@@ -4370,6 +4552,21 @@ class TaskOperationServiceMixin:
         if not requeue_applied:
             db.commit()
             return
+        if operation.operation_type == task_manager_module.TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS:
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "dataflow_stage_reopen_scheduled",
+                "数据流漏洞挖掘阶段已重新进入待调度状态",
+                stage_name=operation.target_stage or task.current_stage,
+                payload={
+                    "stage_name": operation.target_stage or task.current_stage,
+                    "operation_id": operation.id,
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "runtime_phase": str(self._task_runtime_phase(task) or "").strip() or None,
+                },
+            )
         self._record_operation_step_finished(
             db,
             task,
@@ -5340,6 +5537,65 @@ class TaskOperationServiceMixin:
                 "后台操作开始清理下游子任务",
                 "后台操作下游子任务清理完成",
                 self._operation_execute_retry_stage_full_cleanup,
+                task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK,
+            ),
+        )
+        for step_name, start_message, finish_message, handler, next_step in step_flow:
+            if resume_step != step_name:
+                continue
+            self._record_operation_step_started(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=f"{start_message}: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload={"operation_type": operation.operation_type},
+            )
+            db.commit()
+            try:
+                payload = await handler(db, task, operation)
+            except Exception as exc:
+                self._record_operation_step_failed(
+                    db,
+                    task,
+                    operation,
+                    step_name=step_name,
+                    error=exc,
+                    stage_name=operation.target_stage,
+                )
+                db.commit()
+                raise
+            self._record_operation_step_finished(
+                db,
+                task,
+                operation,
+                step_name=step_name,
+                message=f"{finish_message}: {operation.operation_type}",
+                stage_name=operation.target_stage,
+                payload=payload,
+                next_step=next_step,
+            )
+            db.commit()
+            resume_step = next_step
+        return resume_step
+
+    async def _run_clear_dataflow_stage_items_operation_steps(self: TaskManager, db: Session, task, operation, resume_step: str) -> str:
+        from app.service import task_manager as task_manager_module
+
+        step_flow = (
+            (
+                task_manager_module.TASK_OPERATION_STEP_COLLECT_CLEANUP_PLAN,
+                "后台操作开始收集数据流阶段清理计划",
+                "后台操作数据流阶段清理计划收集完成",
+                self._operation_collect_clear_dataflow_stage_items_plan,
+                task_manager_module.TASK_OPERATION_STEP_CANCEL_DOWNSTREAM,
+            ),
+            (
+                task_manager_module.TASK_OPERATION_STEP_CANCEL_DOWNSTREAM,
+                "后台操作开始清空数据流阶段子项",
+                "后台操作数据流阶段子项清空完成",
+                self._operation_execute_clear_dataflow_stage_items_cleanup,
                 task_manager_module.TASK_OPERATION_STEP_REQUEUE_TASK,
             ),
         )

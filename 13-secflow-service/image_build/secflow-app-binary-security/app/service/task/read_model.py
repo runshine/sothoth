@@ -192,6 +192,8 @@ class TaskReadModelServiceMixin:
             "can_retry_stage": False,
             "can_retry_stage_failed_items": False,
             "can_retry_stage_full": False,
+            "can_clear_dataflow_stage_items": False,
+            "clear_dataflow_stage_items_reason": blocking_reason,
             "can_retry_archive": False,
             "can_retry_archive_failed_items": False,
             "can_retry_archive_full": False,
@@ -3429,6 +3431,8 @@ class TaskReadModelServiceMixin:
             "can_retry_stage": False,
             "can_retry_stage_failed_items": False,
             "can_retry_stage_full": False,
+            "can_clear_dataflow_stage_items": False,
+            "clear_dataflow_stage_items_reason": "列表页不提供阶段子项清空能力，请进入详情页操作",
             "can_retry_archive": False,
             "can_retry_archive_failed_items": False,
             "can_retry_archive_full": False,
@@ -3562,6 +3566,11 @@ class TaskReadModelServiceMixin:
         can_retry_failed_items = bool(task_retry_failed_supported)
         can_retry_stage = (has_stage_retry or has_stage_retry_failed) and not running
         can_retry_stage_failed_items = (has_stage_retry_failed or has_item_level_stage_retry_failed) and not streaming_auto_progressing
+        can_clear_dataflow_stage_items, clear_dataflow_stage_items_reason = self._clear_dataflow_stage_items_support(
+            db,
+            task,
+            "dataflow_vuln_scan",
+        )
         can_delete = True
         blocked_policy_statuses = {"dispatching", "running"}
         can_edit_policy = task.status not in blocked_policy_statuses
@@ -3620,6 +3629,8 @@ class TaskReadModelServiceMixin:
             "can_retry_stage": can_retry_stage,
             "can_retry_stage_failed_items": can_retry_stage_failed_items,
             "can_retry_stage_full": has_stage_retry and not running,
+            "can_clear_dataflow_stage_items": bool(can_clear_dataflow_stage_items),
+            "clear_dataflow_stage_items_reason": clear_dataflow_stage_items_reason,
             "can_retry_archive": can_retry_archive,
             "can_retry_archive_failed_items": can_retry_archive,
             "can_retry_archive_full": can_retry_archive,

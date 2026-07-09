@@ -395,6 +395,7 @@ TASK_ACTION_RETRY = "retry"
 TASK_ACTION_RETRY_FAILED_ITEMS = "retry_failed_items"
 TASK_ACTION_RETRY_STAGE_FAILED_ITEMS = "retry_stage_failed_items"
 TASK_ACTION_RETRY_STAGE_FULL = "retry_stage_full"
+TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS = "clear_dataflow_stage_items"
 TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS = "retry_archive_failed_items"
 TASK_ACTION_RETRY_ARCHIVE_FULL = "retry_archive_full"
 TASK_ACTION_CANCEL = "cancel"
@@ -406,6 +407,7 @@ TASK_PENDING_ACTIONS = {
     TASK_ACTION_RETRY_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FULL,
+    TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FULL,
 }
@@ -415,6 +417,7 @@ TASK_OPERATION_CONTROL_SERIAL_ONLY_TYPES = {
     TASK_ACTION_RETRY_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FAILED_ITEMS,
     TASK_ACTION_RETRY_STAGE_FULL,
+    TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FAILED_ITEMS,
     TASK_ACTION_RETRY_ARCHIVE_FULL,
     TASK_ACTION_CANCEL,
@@ -13196,6 +13199,39 @@ class TaskManager(
                 return False, f"上游阶段 {STAGE_TITLES.get(upstream_stage, upstream_stage)} 尚未执行，不能完全重试当前阶段"
             if str(upstream_run.status or "").strip() != "success":
                 return False, f"上游阶段 {STAGE_TITLES.get(upstream_stage, upstream_stage)} 尚未成功，不能完全重试当前阶段"
+        return True, None
+
+    def _clear_dataflow_stage_items_support(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+        stage_name: str,
+    ) -> tuple[bool, str | None]:
+        from app.service import task_manager as task_manager_module
+
+        normalized_stage = normalize_stage_name(stage_name)
+        if normalized_stage != "dataflow_vuln_scan":
+            return False, "当前仅支持清空数据流漏洞挖掘阶段子项"
+        active_operation = self._active_operation(db, task.id)
+        if active_operation is not None:
+            return False, f"当前任务已有进行中的操作: {active_operation.operation_type}"
+        terminal_statuses = {"success", "partial_success", "failed", "cancelled", "downstream_missing"}
+        current_status = str(getattr(task, "status", "") or "").strip().lower()
+        if current_status not in terminal_statuses:
+            return False, f"当前任务状态不允许清空数据流阶段子项: {task.status}"
+        if not self._entry_analysis_authoritative_items_ready(db, task):
+            rebuild_state = self._entry_analysis_authoritative_rebuild_required(db, task)
+            message = str(rebuild_state.get("reason") or "").strip()
+            return False, message or "入口分析 authoritative 输入尚未就绪，无法重建数据流阶段"
+        if not bool(self._effective_entry_inputs(task, db)):
+            return False, "入口分析当前无 authoritative entries，无法重建数据流阶段"
+        dataflow_items = list(self._stage_items(db, task.id, normalized_stage) or [])
+        dataflow_run = db.query(BinarySecurityStageRun).filter(
+            BinarySecurityStageRun.task_id == task.id,
+            BinarySecurityStageRun.stage_name == normalized_stage,
+        ).first()
+        if not dataflow_items and dataflow_run is None:
+            return False, "当前任务尚未生成数据流漏洞挖掘阶段，无需清空"
         return True, None
 
     def _normalize_cancelled_task_active_children(self, db: Session, task: BinarySecurityTask) -> None:

@@ -770,6 +770,24 @@ def retry_stage_full(
     return BinarySecurityActionResponse(task_id=task_id, operation_id=operation.id if operation else None, accepted=True, action="retry_stage_full", status="accepted", message=f"阶段 {stage_name} 的完全重试已受理")
 
 
+@router.post("/projects/{project_id}/tasks/{task_id}/stages/dataflow_vuln_scan/clear-items", response_model=BinarySecurityActionResponse)
+def clear_dataflow_stage_items(
+    project_id: str,
+    task_id: str,
+    _: TokenUser = Depends(get_current_context),
+    db: Session = Depends(get_db),
+):
+    operation = get_task_manager().clear_dataflow_stage_items(db, project_id=project_id, task_id=task_id)
+    return BinarySecurityActionResponse(
+        task_id=task_id,
+        operation_id=operation.id if operation else None,
+        accepted=True,
+        action="clear_dataflow_stage_items",
+        status="accepted",
+        message="数据流漏洞挖掘阶段清空已受理",
+    )
+
+
 @router.post("/projects/{project_id}/tasks/{task_id}/stages/{stage_name}/archive/retry", response_model=BinarySecurityActionResponse)
 def retry_stage_archive(
     project_id: str,

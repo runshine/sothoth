@@ -2415,6 +2415,53 @@ class TaskControlServiceMixin:
         )
         return operation
 
+    def clear_dataflow_stage_items(
+        self: TaskManager,
+        db: Session,
+        *,
+        project_id: str,
+        task_id: str,
+    ) -> BinarySecurityTaskOperation:
+        from app.service import task_manager as task_manager_module
+
+        task = self._task_or_404(db, project_id, task_id)
+        supported, reason = self._clear_dataflow_stage_items_support(db, task, "dataflow_vuln_scan")
+        if not supported:
+            raise ValidationError(reason or "当前任务不支持清空数据流漏洞挖掘阶段子项")
+        task.execution_mode = task_manager_module.TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS
+        task.target_stage_name = "dataflow_vuln_scan"
+        task.current_stage = "dataflow_vuln_scan"
+        self._set_retry_plan(
+            task,
+            {
+                "target_stage": "dataflow_vuln_scan",
+                "mode": task_manager_module.TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS,
+                "retry_item_keys": [],
+                "preserve_success_items": False,
+                "archive_mode": "clear_dataflow_only",
+                "cleared_business_stages": [],
+                "cleared_archive_stages": [],
+            },
+        )
+        operation = self._queue_task_operation(
+            db,
+            task,
+            operation_type=task_manager_module.TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS,
+            target_stage="dataflow_vuln_scan",
+            requested_by=task.created_by,
+            request_payload={"target_stage": "dataflow_vuln_scan"},
+            accepted_event_type="dataflow_stage_clear_items_accepted",
+            accepted_message="数据流漏洞挖掘阶段清空已受理，后台正在清理本阶段旧子项并准备重新调度",
+        )
+        task.current_operation_id = operation.id
+        db.commit()
+        self._request_local_worker_control_wakeup_nowait(
+            task.id,
+            task_manager_module.TASK_ACTION_CLEAR_DATAFLOW_STAGE_ITEMS,
+            operation_id=operation.id,
+        )
+        return operation
+
     def retry_stage_archive(self: TaskManager, db: Session, *, project_id: str, task_id: str, stage_name: str) -> BinarySecurityTaskOperation:
         return self.retry_stage_archive_failed_items(db, project_id=project_id, task_id=task_id, stage_name=stage_name)
 
