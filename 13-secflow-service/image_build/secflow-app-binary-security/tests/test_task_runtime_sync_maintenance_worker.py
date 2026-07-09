@@ -247,6 +247,7 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
             (),
             {
                 "consume_owner_signal": AsyncMock(return_value=None),
+                "has_due_task_sync_request": AsyncMock(return_value=False),
             },
         )()
         with patch("app.service.task_manager.get_task_queue", return_value=fake_queue):
@@ -254,6 +255,51 @@ class TaskRuntimeSyncMaintenanceWorkerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(processed)
         self.assertEqual(["reconcile", "drain"], calls)
+
+    async def test_sync_maintenance_skips_empty_high_frequency_pass_without_signal_due_or_periodic_reconcile(self):
+        manager = TaskManager()
+        manager._running = True
+        manager.instance_id = "worker-a"
+        handle = task_manager_module.TaskRuntimeHandle(
+            task_id="task-1",
+            runner_task=asyncio.current_task(),
+            heartbeat_task=None,
+            claimed_at=_now(),
+            execution_token="exec-1",
+            lease_owner_instance_id="worker-a",
+            active_commit_succeeded=True,
+            lease_established=True,
+        )
+        handle.last_sync_maintenance_progress_at = _now()
+        manager._workers["task-1"] = handle
+        manager._verify_local_runtime_lease_or_abort = lambda *_args, **_kwargs: task_manager_module._RuntimeLeaseOwnershipDecision(
+            should_continue=True,
+            runtime_lease_present=True,
+            runtime_lease_active=True,
+            runtime_lease_owner="worker-a",
+            local_handle_alive=True,
+        )
+
+        reconcile = AsyncMock(return_value=0)
+        drain = AsyncMock(return_value=False)
+        manager._reconcile_periodic_task_sync_requests = reconcile
+        manager._drain_local_runtime_sync_queue_once = drain
+
+        fake_queue = type(
+            "_FakeQueue",
+            (),
+            {
+                "consume_owner_signal": AsyncMock(return_value=None),
+                "has_due_task_sync_request": AsyncMock(return_value=False),
+            },
+        )()
+        with patch("app.service.task_manager.get_task_queue", return_value=fake_queue):
+            processed = await manager._service_local_runtime_sync_maintenance("task-1")
+
+        self.assertFalse(processed)
+        reconcile.assert_not_awaited()
+        drain.assert_not_awaited()
+        fake_queue.has_due_task_sync_request.assert_awaited_once()
 
     async def test_sync_maintenance_worker_thread_does_not_exit_only_because_runner_task_is_done(self):
         manager = TaskManager()

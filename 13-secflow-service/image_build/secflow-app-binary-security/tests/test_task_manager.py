@@ -47851,7 +47851,7 @@ def _test_local_runtime_sync_maintenance_drains_due_task_sync_requests(self):
         manager._drain_local_runtime_sync_queue_once = _fake_helper
         with (
             patch.object(fake_queue, "consume_owner_signal", new=AsyncMock(return_value=None)),
-            patch.object(fake_queue, "has_due_task_sync_request", new=AsyncMock(return_value=True)),
+            patch.object(fake_queue, "has_due_task_sync_request", new=AsyncMock(return_value=False)),
             patch.object(task_manager_module, "get_task_queue", return_value=fake_queue),
             patch.object(manager, "_reconcile_periodic_task_sync_requests", new=AsyncMock(return_value=0)),
             patch.object(

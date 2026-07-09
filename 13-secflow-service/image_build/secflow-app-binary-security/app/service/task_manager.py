@@ -2284,6 +2284,29 @@ class TaskManager(
         heartbeat_interval = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
         return max(1, min(5, heartbeat_interval))
 
+    def _runtime_sync_maintenance_poll_interval_seconds(self) -> int:
+        heartbeat_interval = max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15))
+        return max(1, heartbeat_interval // 2)
+
+    def _runtime_sync_maintenance_periodic_interval_seconds(self) -> int:
+        return max(60, int(getattr(self.cfg.scheduler, "downstream_reconcile_interval_seconds", 60) or 60))
+
+    def _runtime_sync_maintenance_should_run_periodic_reconcile(
+        self,
+        handle: TaskRuntimeHandle | None,
+        *,
+        now_value: datetime | None = None,
+    ) -> bool:
+        if handle is None:
+            return False
+        current_now = now_value or _now()
+        last_progress_at = getattr(handle, "last_sync_maintenance_progress_at", None)
+        if last_progress_at is None:
+            return True
+        return (
+            current_now - last_progress_at
+        ).total_seconds() >= float(self._runtime_sync_maintenance_periodic_interval_seconds())
+
     def _lease_watchdog_alive(self) -> bool:
         thread = self._lease_watchdog_thread
         return bool(thread is not None and thread.is_alive())
@@ -2930,10 +2953,7 @@ class TaskManager(
             await asyncio.sleep(interval_seconds)
 
     async def _run_task_sync_maintenance(self, task_id: str) -> None:
-        interval_seconds = max(
-            1,
-            int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
-        )
+        interval_seconds = self._runtime_sync_maintenance_poll_interval_seconds()
         logger.info("binary-security sync maintenance worker started: task_id=%s", task_id)
         await asyncio.to_thread(
             self._record_sync_maintenance_lifecycle_event,
@@ -3014,10 +3034,7 @@ class TaskManager(
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             owns_loop = True
-        interval_seconds = max(
-            1,
-            int(max(5, int(getattr(self.cfg.scheduler, "heartbeat_update_interval_seconds", 0) or 15)) // 2),
-        )
+        interval_seconds = self._runtime_sync_maintenance_poll_interval_seconds()
         logger.info("binary-security sync maintenance worker started: task_id=%s", task_id)
         self._record_sync_maintenance_lifecycle_event(
             task_id,
@@ -3205,7 +3222,8 @@ class TaskManager(
         ):
             return False
         consume_reason: str | None = None
-        owner_signal_payload = await get_task_queue().consume_owner_signal(
+        queue = get_task_queue()
+        owner_signal_payload = await queue.consume_owner_signal(
             str(self.instance_id or "").strip() or None,
             normalized_task_id,
             context="owner_signal_consume",
@@ -3214,7 +3232,21 @@ class TaskManager(
             consume_reason = str(owner_signal_payload.get("context") or "owner_signal").strip() or "owner_signal"
         handle.sync_maintenance_in_progress = True
         try:
-            proactively_enqueued = await self._reconcile_periodic_task_sync_requests(normalized_task_id)
+            should_run_periodic_reconcile = bool(
+                consume_reason
+                or self._runtime_sync_maintenance_should_run_periodic_reconcile(handle)
+            )
+            has_due_request = False
+            if not should_run_periodic_reconcile:
+                has_due_request = await queue.has_due_task_sync_request(
+                    normalized_task_id,
+                    context="task_sync_due_check",
+                )
+                if not has_due_request:
+                    return False
+            proactively_enqueued = 0
+            if should_run_periodic_reconcile:
+                proactively_enqueued = await self._reconcile_periodic_task_sync_requests(normalized_task_id)
             processed = await self._drain_local_runtime_sync_queue_once(
                 normalized_task_id,
                 reason=consume_reason or "periodic_reconcile",
@@ -4978,6 +5010,17 @@ class TaskManager(
         snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
         return bool(snapshot.runtime_lease_active and snapshot.runtime_lease_owner)
 
+    @staticmethod
+    def _task_has_common_terminal_status(task: BinarySecurityTask | None) -> bool:
+        if task is None:
+            return False
+        return str(getattr(task, "status", "") or "").strip().lower() in {
+            "success",
+            "partial_success",
+            "failed",
+            "cancelled",
+        }
+
     def _task_has_healthy_active_owner_runtime(
         self,
         db: Session | None,
@@ -5041,6 +5084,23 @@ class TaskManager(
         active_operation=None,
         reason: str,
     ) -> bool:
+        if self._task_has_common_terminal_status(task):
+            self._record_event(
+                db,
+                task,
+                "runtime_recovery_skipped_for_common_terminal_task",
+                "任务已进入常见终态，跳过 stale recovery 以避免重新打开主任务状态",
+                level="info",
+                stage_name=task.current_stage,
+                payload={
+                    "reason": reason,
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    "recovery_action": "release_task_without_supported_runtime_owner",
+                },
+            )
+            return False
         snapshot = self._parent_runtime_ownership_snapshot(db, task, active_operation=active_operation)
         active_runtime_lease_owner = snapshot.runtime_lease_owner if snapshot.runtime_lease_active else None
         guard = self._should_preserve_parent_runtime_ownership(snapshot, reason=reason)
@@ -6590,7 +6650,6 @@ class TaskManager(
     async def _drain_task_sync_queue(self, db: Session, task: BinarySecurityTask) -> bool:
         entry = await get_task_queue().pop_task_sync_request(task.id, context="task_sync_pop")
         if entry is None:
-            await self._repair_task_sync_queue_on_runtime_start(db, task)
             await self._reconcile_missing_task_sync_requests(db, task)
             entry = await get_task_queue().pop_task_sync_request(task.id, context="task_sync_pop")
         if entry is None:

@@ -1681,6 +1681,23 @@ class TaskRuntimeStateServiceMixin:
     ) -> bool:
         if bool(getattr(task, "_owned_execution_requeue_emitted", False)):
             return False
+        if self._task_has_common_terminal_status(task):
+            self._record_event(
+                db,
+                task,
+                "runtime_recovery_skipped_for_common_terminal_task",
+                "任务已进入常见终态，跳过 owned execution 接管重排队以避免重新打开主任务状态",
+                level="info",
+                stage_name=stage_name or task.current_stage,
+                payload={
+                    "reason": reason,
+                    "task_status": str(getattr(task, "status", "") or "").strip() or None,
+                    "runtime_phase": self._task_runtime_phase(task),
+                    "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                    "recovery_action": "requeue_owned_execution_takeover",
+                },
+            )
+            return False
         from app.service import task_manager as task_manager_module
 
         task_query = db.query(task_manager_module.BinarySecurityTask).filter(

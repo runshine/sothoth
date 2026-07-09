@@ -748,6 +748,82 @@ class ParentRuntimeControlRecoveryTests(_TaskManagerQueuePatchedMixin, unittest.
         self.assertIn("runtime_lease_clear_deferred_by_lock", event_types)
         self.assertIn("owned_execution_reclaim_deferred_by_lock", event_types)
 
+    def test_release_task_without_supported_runtime_owner_skips_common_terminal_task(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-terminal-skip-release",
+            project_id="p1",
+            name="source-task",
+            status="cancelled",
+            current_stage="dataflow_vuln_scan",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+            cleanup_snapshot={},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-stale",
+            heartbeat_at=_now(),
+            lease_expires_at=_now() - timedelta(seconds=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        released = asyncio.run(
+            manager._release_task_without_supported_runtime_owner_async(
+                db,
+                task,
+                reason="unit_test_terminal_skip",
+            )
+        )
+
+        self.assertFalse(released)
+        self.assertEqual("cancelled", task.status)
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("runtime_recovery_skipped_for_common_terminal_task", event_types)
+
+    def test_requeue_owned_execution_takeover_skips_common_terminal_task(self):
+        manager = TaskManager()
+        now = _now()
+        task = BinarySecurityTask(
+            id="task-terminal-skip-requeue",
+            project_id="p1",
+            name="source-task",
+            status="failed",
+            current_stage="entry_analysis",
+            runtime_phase=TASK_RUNTIME_PHASE_TERMINAL,
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/output",
+            workspace_root="/workspace",
+            cleanup_snapshot={},
+        )
+        lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-stale",
+            heartbeat_at=now,
+            lease_expires_at=now - timedelta(seconds=5),
+        )
+        db = _AppendingModelAwareDb(tasks=[task], runtime_leases=[lease], events=[])
+
+        requeued = manager._requeue_owned_execution_takeover(
+            db,
+            task,
+            stage_name="dataflow_vuln_scan",
+            reason="unit_test_terminal_skip_requeue",
+            event_type="owned_execution_takeover_requeued",
+            message="requeue",
+        )
+
+        self.assertFalse(requeued)
+        self.assertEqual("failed", task.status)
+        event_types = [event.event_type for event in db.events]
+        self.assertIn("runtime_recovery_skipped_for_common_terminal_task", event_types)
+
 
 if __name__ == "__main__":
     unittest.main()

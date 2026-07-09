@@ -752,6 +752,42 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertTrue(payload["task_sync_queue_only"])
         self.assertFalse(payload["shared_dispatch_enqueued"])
 
+    def test_drain_task_sync_queue_empty_branch_uses_only_runtime_reconcile_not_runtime_start_repair(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-empty-reconcile-only",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        db = _AppendingModelAwareDb(tasks=[task], events=[], runtime_leases=[_runtime_lease(task, manager.instance_id)])
+        fake_queue = _FakeTaskSyncQueue()
+        original_get_queue = task_manager_module.get_task_queue
+        original_repair = manager._repair_task_sync_queue_on_runtime_start
+        original_reconcile = manager._reconcile_missing_task_sync_requests
+        repair_mock = AsyncMock(return_value=1)
+        reconcile_mock = AsyncMock(return_value=0)
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+            manager._repair_task_sync_queue_on_runtime_start = repair_mock
+            manager._reconcile_missing_task_sync_requests = reconcile_mock
+
+            changed = asyncio.run(manager._drain_task_sync_queue(db, task))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            manager._repair_task_sync_queue_on_runtime_start = original_repair
+            manager._reconcile_missing_task_sync_requests = original_reconcile
+
+        self.assertFalse(changed)
+        repair_mock.assert_not_awaited()
+        reconcile_mock.assert_awaited_once()
+
     def test_reconcile_missing_task_sync_requests_backfills_authoritative_archive_fact_instead_of_requeue(self):
         manager = TaskManager()
         task = BinarySecurityTask(
