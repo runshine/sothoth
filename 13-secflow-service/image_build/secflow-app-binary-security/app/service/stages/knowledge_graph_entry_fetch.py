@@ -24,7 +24,14 @@ class KnowledgeGraphEntryFetchStageHandler(BinarySecurityStageHandler):
     def build_inputs(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> list[dict[str, Any]]:
         del db
         source_dir = str((task.summary or {}).get("input_dir") or "").strip()
-        return [{"source_project_key": "knowledge_graph_source_project", "source_dir": source_dir, "module_name": "source-project"}] if source_dir else []
+        return [
+            {
+                "source_project_key": manager._knowledge_graph_source_project_key(),
+                "module_key": manager._knowledge_graph_source_project_key(),
+                "source_dir": source_dir,
+                "module_name": "source-project",
+            }
+        ] if source_dir else []
 
     def continue_stage_input_error(self, manager: TaskManager, db: Session, task: BinarySecurityTask) -> str | None:
         del manager, db

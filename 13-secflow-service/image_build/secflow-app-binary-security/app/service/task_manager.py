@@ -7924,8 +7924,11 @@ class TaskManager(
         if key:
             return key
         if self._pipeline_profile(task) == PIPELINE_PROFILE_KG_SOURCE_VULN_SCAN:
-            return "knowledge-graph-source-project"
+            return self._knowledge_graph_source_project_key()
         return ""
+
+    def _knowledge_graph_source_project_key(self) -> str:
+        return "knowledge-graph-source-project"
 
     def _entry_result_module_name(self, task: BinarySecurityTask, module: dict[str, Any] | None = None) -> str:
         payload = dict(module or {})
@@ -8093,7 +8096,7 @@ class TaskManager(
             else (
                 [
                     {
-                        "module_key": "knowledge-graph-source-project",
+                        "module_key": self._knowledge_graph_source_project_key(),
                         "module_name": "source-project",
                         "module_kind": "knowledge_graph_module",
                         "source_stage": "knowledge_graph_entry_fetch",
@@ -8185,12 +8188,12 @@ class TaskManager(
                 "selection_source": "auto_policy",
                 "candidate_entries": normalized_entries,
                 "candidate_entries_by_module": [
-                    {
-                        "module_key": "knowledge-graph-source-project",
-                        "module_name": "source-project",
-                        "raw_entry_count": len(normalized_entries),
-                        "selected_entry_count": len(normalized_entries),
-                        "truncated": False,
+                {
+                    "module_key": self._knowledge_graph_source_project_key(),
+                    "module_name": "source-project",
+                    "raw_entry_count": len(normalized_entries),
+                    "selected_entry_count": len(normalized_entries),
+                    "truncated": False,
                     }
                 ],
                 "truncated_module_count": 0,
@@ -8651,6 +8654,7 @@ class TaskManager(
             task,
             {
                 "module_key": "knowledge-graph-source-project",
+                "source_project_key": self._knowledge_graph_source_project_key(),
                 "module_name": "source-project",
                 "module_kind": "knowledge_graph_module",
                 "source_stage": "knowledge_graph_entry_fetch",
@@ -8702,7 +8706,8 @@ class TaskManager(
             "entry_key": entry_key,
             "firmware_key": SOURCE_TASK_INPUT_KEY,
             "firmware_name": task.name,
-            "module_key": "knowledge_graph_source_project",
+            "module_key": self._knowledge_graph_source_project_key(),
+            "source_project_key": self._knowledge_graph_source_project_key(),
             "module_name": module_name,
             "module_dir": input_dir,
             "descriptor_root": input_dir,

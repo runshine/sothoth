@@ -47268,7 +47268,7 @@ def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
                         "function_description_source": "knowledge_graph_audit_sources",
                         "entry_reason": "channel=http",
                         "entry_reason_source": "knowledge_graph_audit_sources",
-                        "module_key": "knowledge_graph_source_project",
+                        "module_key": "knowledge-graph-source-project",
                         "module_name": "source-project",
                         "source_root_path": str(input_dir),
                         "source_root": str(input_dir),
@@ -47299,7 +47299,7 @@ def _test_stage_knowledge_graph_entry_fetch_succeeds_and_updates_summary(self):
                         "function_description_source": "knowledge_graph_audit_sources",
                         "entry_reason": "channel=http",
                         "entry_reason_source": "knowledge_graph_audit_sources",
-                        "module_key": "knowledge_graph_source_project",
+                        "module_key": "knowledge-graph-source-project",
                         "module_name": "source-project",
                         "source_root_path": str(input_dir),
                         "source_root": str(input_dir),
@@ -47378,7 +47378,7 @@ def _test_build_stage_overview_nodes_marks_knowledge_graph_virtual_archive_succe
         ],
         "entry_results": [
             {
-                "module_key": "knowledge_graph_source_project",
+                "module_key": "knowledge-graph-source-project",
                 "module_name": "source-project",
                 "entries": [
                     {
@@ -47406,7 +47406,7 @@ def _test_build_stage_overview_nodes_marks_knowledge_graph_virtual_archive_succe
         project_id="p1",
         stage_run_id=stage_run.id,
         stage_name="knowledge_graph_entry_fetch",
-        item_key="knowledge_graph_source_project",
+        item_key="knowledge-graph-source-project",
         status="success",
         downstream_service="knowledge_graph_audit_sources",
         downstream_task_id="kg-entry-1",
@@ -47451,21 +47451,21 @@ def _test_workflow_ready_for_finalization_supports_knowledge_graph_virtual_archi
         ],
         "entry_results": [
             {
-                "module_key": "knowledge_graph_source_project",
+                "module_key": "knowledge-graph-source-project",
                 "module_name": "source-project",
                 "completion_state": "success",
                 "completion_ready": True,
                 "entries": [
-                    {"entry_key": "src-1", "function_name": "sink", "module_key": "knowledge_graph_source_project"}
+                    {"entry_key": "src-1", "function_name": "sink", "module_key": "knowledge-graph-source-project"}
                 ],
                 "entry_count": 1,
             }
         ],
         "dataflow_results": [
-            {"entry_key": "src-1", "module_key": "knowledge_graph_source_project", "verdict": "clean"}
+            {"entry_key": "src-1", "module_key": "knowledge-graph-source-project", "verdict": "clean"}
         ],
         "vuln_results": [
-            {"entry_key": "src-1", "module_key": "knowledge_graph_source_project", "verdict": "clean"}
+            {"entry_key": "src-1", "module_key": "knowledge-graph-source-project", "verdict": "clean"}
         ],
     }
     kg_run = BinarySecurityStageRun(
@@ -47483,7 +47483,7 @@ def _test_workflow_ready_for_finalization_supports_knowledge_graph_virtual_archi
         project_id=task.project_id,
         stage_run_id=kg_run.id,
         stage_name="knowledge_graph_entry_fetch",
-        item_key="knowledge_graph_source_project",
+        item_key="knowledge-graph-source-project",
         item_name="source-project",
         status="success",
         downstream_service="knowledge_graph_audit_sources",
