@@ -639,6 +639,58 @@ class TaskStateMachineMixin:
         self._invalidate_task_execution(task)
         return True
 
+    def _recover_succeeded_stuck_cancelling_task_state(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        if str(task.status or "").strip() != task_manager_module.TASK_STATUS_CANCELLING:
+            return False
+        if self._active_operation(db, task.id) is not None:
+            return False
+        operation = self._latest_cancel_operation(db, task.id)
+        if operation is None:
+            return False
+        if str(operation.operation_type or "").strip() != task_manager_module.TASK_ACTION_CANCEL:
+            return False
+        if str(operation.status or "").strip() in task_manager_module.TASK_OPERATION_ACTIVE_STATUSES:
+            return False
+        if str(operation.status or "").strip() != "succeeded":
+            return False
+        if self._task_has_active_reconcile_items(db, task):
+            return False
+        finished_at = getattr(operation, "finished_at", None) or task.finished_at or task_manager_module._now()
+        self._record_event(
+            db,
+            task,
+            "stuck_cancelling_task_finalized_to_cancelled",
+            "取消流程已完成但主任务仍停留在 cancelling，已自动收口为 cancelled",
+            level="warning",
+            stage_name=task.current_stage,
+            payload={
+                "latest_cancel_operation_id": str(getattr(operation, "id", "") or "").strip() or None,
+                "latest_cancel_operation_status": str(getattr(operation, "status", "") or "").strip() or None,
+                "latest_cancel_operation_finished_at": task_manager_module._isoformat_or_none(getattr(operation, "finished_at", None)),
+                "current_operation_id": str(getattr(task, "current_operation_id", "") or "").strip() or None,
+                "runtime_phase": self._task_runtime_phase(task),
+            },
+        )
+        self._apply_terminal_state_update(
+            db,
+            task,
+            reason="取消流程已成功完成，修正残留 cancelling 主状态为 cancelled",
+            status="cancelled",
+            stage_name=task.current_stage,
+            runtime_phase=task_manager_module.TASK_RUNTIME_PHASE_TERMINAL,
+            finished_at=finished_at,
+            source="state_machine",
+        )
+        task.current_operation_id = None
+        self._invalidate_task_execution(task)
+        return True
+
     @staticmethod
     def _clear_failure_fields_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
         cleaned = dict(summary or {})
@@ -3705,6 +3757,8 @@ class TaskStateMachineMixin:
             return True
         if self._recover_failed_cancelled_task_state(db, task):
             return True
+        if self._recover_succeeded_stuck_cancelling_task_state(db, task):
+            return True
         active_operation = self._active_operation(db, task.id)
         if task.status == "cancelled":
             self._apply_terminal_state_update(
@@ -4927,6 +4981,10 @@ class TaskStateMachineMixin:
         from app.service import task_manager as task_manager_module
 
         if self._ensure_task_remains_cancelling(db, task) is not None:
+            self._last_task_heartbeat_at.pop(task.id, None)
+            self._sync_task_abnormal_reason_snapshot(db, task, None)
+            return True
+        if self._recover_succeeded_stuck_cancelling_task_state(db, task):
             self._last_task_heartbeat_at.pop(task.id, None)
             self._sync_task_abnormal_reason_snapshot(db, task, None)
             return True

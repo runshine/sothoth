@@ -38555,6 +38555,94 @@ def _test_refresh_task_status_after_sync_clears_fake_local_owner(self):
     self.assertIn("parent_takeover_recovery_committed", event_types)
 
 
+def _test_refresh_task_status_after_sync_finalizes_stuck_cancelling_after_cancel_succeeded(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-stuck-cancelling-sync",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-succeeded",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        status="succeeded",
+        finished_at=_now(),
+    )
+    stage_item = BinarySecurityStageItem(
+        id="si-sync-terminal",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="cancelled",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], stage_items=[stage_item], stage_runs=[])
+
+    refreshed = manager._refresh_task_status_after_sync_early_return(db, task)
+
+    self.assertTrue(refreshed)
+    self.assertEqual("cancelled", task.status)
+    self.assertEqual(TASK_RUNTIME_PHASE_TERMINAL, manager._task_runtime_phase(task))
+    self.assertIsNone(task.current_operation_id)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("stuck_cancelling_task_finalized_to_cancelled", event_types)
+
+
+def _test_refresh_task_status_after_sync_keeps_legitimate_cancelling_with_active_items(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-legit-cancelling-sync",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-cancel-succeeded-but-active-child",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        status="succeeded",
+        finished_at=_now(),
+    )
+    stage_item = BinarySecurityStageItem(
+        id="si-sync-running",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="running",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-1",
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], stage_items=[stage_item], stage_runs=[])
+
+    refreshed = manager._refresh_task_status_after_sync_early_return(db, task)
+
+    self.assertFalse(refreshed)
+    self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
+    event_types = [event.event_type for event in db.events]
+    self.assertNotIn("stuck_cancelling_task_finalized_to_cancelled", event_types)
+
+
 def _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry(self):
     manager = TaskManager()
     manager.instance_id = "local-worker"
