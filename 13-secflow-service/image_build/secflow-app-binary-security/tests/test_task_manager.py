@@ -43268,6 +43268,73 @@ def _test_sync_downstream_status_backfills_missing_terminal_sync_fields_for_sele
     )
 
 
+def _test_reconcile_authoritative_archive_item_backfills_missing_sync_facts_for_terminal_success(self):
+    manager = TaskManager()
+    task = BinarySecurityTask(
+        id="task-archive-backfill",
+        project_id="p1",
+        name="source",
+        status="running",
+        current_stage="dataflow_vuln_scan",
+        task_type=TASK_TYPE_SOURCE,
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+    )
+    item = BinarySecurityStageItem(
+        id="si-archive-backfill",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_run_id="sr-archive-backfill",
+        stage_name="dataflow_vuln_scan",
+        item_key="entry-1",
+        status="success",
+        downstream_service="dataflow_vuln_scan",
+        downstream_task_id="dvs-archive-backfill",
+        result={
+            "downstream": {
+                "task_id": "dvs-archive-backfill",
+                "status": "passed",
+            },
+        },
+    )
+    archive_job = BinarySecurityArchiveJob(
+        id="aj-archive-backfill",
+        task_id=task.id,
+        project_id=task.project_id,
+        stage_name=item.stage_name,
+        item_id=item.id,
+        item_key=item.item_key,
+        downstream_service=item.downstream_service,
+        downstream_task_id=item.downstream_task_id,
+        archive_status="success",
+        archive_root="/tmp/archive",
+        started_at=_now(),
+    )
+    archive_job.payload = {
+        "mapped_status": "success",
+        "downstream_payload": {
+            "task_id": "dvs-archive-backfill",
+            "status": "passed",
+        },
+        "bound_downstream_task_id": "dvs-archive-backfill",
+    }
+    db = _AppendingModelAwareDb(tasks=[task], stage_items=[item], archive_jobs=[archive_job], events=[])
+
+    repaired = manager._reconcile_authoritative_archive_item(db, task, item)
+
+    observation = dict(item.result.get("sync_observation") or {})
+    self.assertTrue(repaired)
+    self.assertEqual("synced", item.result.get("sync_status"))
+    self.assertEqual("passed", item.result.get("downstream_status"))
+    self.assertTrue(observation.get("state_applied"))
+    self.assertEqual("success", observation.get("mapped_status"))
+    self.assertEqual("passed", observation.get("downstream_status"))
+    self.assertTrue(any(getattr(event, "event_type", None) == "authoritative_archive_sync_backfilled" for event in db.events))
+    self.assertTrue(any(getattr(row, "event_type", None) == "succeeded" for row in db.sync_events))
+
+
 def _test_requeue_released_running_locked_requeues_streaming_tail_with_active_items(self):
     manager = TaskManager()
     task = BinarySecurityTask(
@@ -46704,6 +46771,7 @@ TaskManagerTests.test_process_readless_reconcile_tail_task_keeps_cross_stage_ite
 TaskManagerTests.test_process_readless_reconcile_preserves_item_layer_commit_when_task_layer_conflicts = _test_process_readless_reconcile_preserves_item_layer_commit_when_task_layer_conflicts
 TaskManagerTests.test_sync_downstream_status_system_analysis_success_creates_archive_job = _test_sync_downstream_status_system_analysis_success_creates_archive_job
 TaskManagerTests.test_sync_downstream_status_backfills_missing_terminal_sync_fields_for_selected_success_item = _test_sync_downstream_status_backfills_missing_terminal_sync_fields_for_selected_success_item
+TaskManagerTests.test_reconcile_authoritative_archive_item_backfills_missing_sync_facts_for_terminal_success = _test_reconcile_authoritative_archive_item_backfills_missing_sync_facts_for_terminal_success
 TaskManagerTests.test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled = _test_run_entry_item_retry_recreates_child_when_existing_downstream_is_terminal_cancelled
 TaskManagerTests.test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate = _test_run_entry_item_non_retry_keeps_terminal_cancelled_child_without_recreate
 TaskManagerTests.test_continue_stage_input_error_delegates_to_system_analysis_handler = _test_continue_stage_input_error_delegates_to_system_analysis_handler

@@ -126,6 +126,8 @@ class TaskItemSyncServiceMixin:
         task: BinarySecurityTask,
         item: BinarySecurityStageItem,
     ) -> bool:
+        from app.service import task_manager as task_manager_module
+
         archive_jobs = self._stage_archive_jobs_by_item(db, task.id, item.stage_name).get(str(item.id or ""), [])
         repaired = self._repair_false_replacement_state_for_authoritative_success(
             item,
@@ -147,6 +149,41 @@ class TaskItemSyncServiceMixin:
                 },
             )
             return True
+        if self._item_has_authoritative_archive_success(item, archive_jobs=archive_jobs):
+            authoritative_status = self._item_authoritative_child_status(item)
+            if self._item_needs_terminal_sync_backfill(item, mapped_status=authoritative_status):
+                downstream_payload = dict(self._load_stage_item_result_payload(item).get("downstream") or {})
+                downstream_status = self._string_or_none(downstream_payload.get("status")) or authoritative_status
+                if self._persist_child_sync_observation(
+                    db,
+                    task=task,
+                    item=item,
+                    change_source="archive_reconcile",
+                    sync_status="synced",
+                    synced_at=task_manager_module._now(),
+                    status_raw=downstream_status,
+                    mapped_status=authoritative_status,
+                    downstream_status=downstream_status,
+                    state_applied=True,
+                    last_sync_result="success",
+                    clear_error_state=True,
+                ):
+                    self._record_event(
+                        db,
+                        task,
+                        "authoritative_archive_sync_backfilled",
+                        "authoritative child 已成功且归档已存在，已补齐缺失的同步事实",
+                        stage_name=item.stage_name,
+                        item=item,
+                        payload={
+                            "repair_source": "archive_reconcile",
+                            "downstream_task_id": self._item_authoritative_downstream_task_id(item),
+                            "downstream_status": downstream_status,
+                            "mapped_status": authoritative_status,
+                            "state_applied": True,
+                        },
+                    )
+                    return True
         refs = self._item_authoritative_archive_refs(item, archive_jobs=archive_jobs)
         authoritative_task_id = self._item_authoritative_downstream_task_id(item)
         archive_root = str(refs.get("archive_root") or refs.get("artifact_root") or "").strip()
