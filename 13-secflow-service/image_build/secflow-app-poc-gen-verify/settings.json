@@ -1,6 +1,6 @@
 {
   "env": {
-    "ANTHROPIC_BASE_URL": "https://dashscope.aliyuncs.com/apps/anthropic",
+    "ANTHROPIC_BASE_URL": "http://172.31.29.10",
     "ANTHROPIC_MODEL": "glm-5.2",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5.2",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5.2",

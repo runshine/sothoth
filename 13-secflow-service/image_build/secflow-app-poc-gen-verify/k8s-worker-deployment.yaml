@@ -5,7 +5,7 @@ metadata:
   namespace: secflow-ns
   labels: { name: secflow-app-poc-gen-verify, role: worker }
 spec:
-  replicas: 2
+  replicas: 1
   strategy:
     type: RollingUpdate
     rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }   # only 1 worker down at a time
@@ -14,6 +14,7 @@ spec:
     metadata: { labels: { name: secflow-app-poc-gen-verify, role: worker } }
     spec:
       securityContext: { fsGroup: 1000 }
+      imagePullSecrets: [{ name: ghcr-secret }]   # private ghcr.io/runshine/* pull secret
       containers:
         - name: poc-gen-verify-worker
           image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
@@ -37,7 +38,8 @@ spec:
             - { name: POC_LEASE_TTL_SECONDS, value: "300" }
             - { name: POC_HEARTBEAT_INTERVAL_SECONDS, value: "60" }
             - { name: POC_CELERY_MAX_TASKS_PER_CHILD, value: "10" }
-            - { name: ANTHROPIC_BASE_URL, value: "https://dashscope.aliyuncs.com/apps/anthropic" }
+            # LOCAL_GLM (模型配置中心): http://172.31.29.10 speaks Anthropic /v1/messages
+            - { name: ANTHROPIC_BASE_URL, value: "http://172.31.29.10" }
             - { name: ANTHROPIC_MODEL, value: glm-5.2 }
             - { name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, value: "1" }
             - name: POC_POD_NAME

@@ -5,12 +5,13 @@ metadata:
   namespace: secflow-ns
   labels: { name: secflow-app-poc-gen-verify, role: api }
 spec:
-  replicas: 2
+  replicas: 1
   selector: { matchLabels: { name: secflow-app-poc-gen-verify, role: api } }
   template:
     metadata: { labels: { name: secflow-app-poc-gen-verify, role: api } }
     spec:
       securityContext: { fsGroup: 1000 }
+      imagePullSecrets: [{ name: ghcr-secret }]   # private ghcr.io/runshine/* pull secret
       containers:
         - name: secflow-app-poc-gen-verify
           image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
@@ -29,7 +30,8 @@ spec:
             - { name: POC_GEN_VERIFY_POC_BIN, value: poc }
             - { name: POC_GEN_VERIFY_CLAUDE_MODEL, value: glm-5.2 }
             - { name: POC_SCHEDULER_HOST, value: secflow-app-poc-gen-verify-redis }
-            - { name: ANTHROPIC_BASE_URL, value: "https://dashscope.aliyuncs.com/apps/anthropic" }
+            # LOCAL_GLM (模型配置中心): http://172.31.29.10 speaks Anthropic /v1/messages
+            - { name: ANTHROPIC_BASE_URL, value: "http://172.31.29.10" }
             - { name: ANTHROPIC_MODEL, value: glm-5.2 }
             - { name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, value: "1" }
             - name: POC_POD_NAME

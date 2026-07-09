@@ -47,7 +47,7 @@ services:
       POC_GEN_VERIFY_POC_BIN: poc
       POC_GEN_VERIFY_CLAUDE_MODEL: glm-5.2
       POC_SCHEDULER_HOST: redis
-      ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
+      ANTHROPIC_BASE_URL: "http://172.31.29.10"   # LOCAL_GLM (模型配置中心)
       ANTHROPIC_MODEL: glm-5.2
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
       TZ: Asia/Shanghai
@@ -77,7 +77,7 @@ services:
       POC_LEASE_TTL_SECONDS: "300"
       POC_HEARTBEAT_INTERVAL_SECONDS: "60"
       POC_CELERY_MAX_TASKS_PER_CHILD: "10"
-      ANTHROPIC_BASE_URL: "https://dashscope.aliyuncs.com/apps/anthropic"
+      ANTHROPIC_BASE_URL: "http://172.31.29.10"   # LOCAL_GLM (模型配置中心)
       ANTHROPIC_MODEL: glm-5.2
       CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
       TZ: Asia/Shanghai

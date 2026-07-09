@@ -1,0 +1,68 @@
+name: build-secflow-app-poc-gen-verify-image
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'v2.*'
+    paths:
+      - .github/workflows/build-secflow-app-poc-gen-verify-image.yaml
+      - 13-secflow-service/image_build/secflow-app-poc-gen-verify/**
+
+# amd64-only: the SecFlow cluster nodes are all x86-64. Mirrors the other
+# build-secflow-app-*-image workflows but skips arm64 + manifest-merge so the
+# `:latest` tag is publishable as soon as the single amd64 build finishes.
+# To go multi-arch later, copy the build-arm64 + merge-manifest jobs from
+# build-secflow-app-binary-to-source-image.yaml.
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      date_tag: ${{ steps.date.outputs.date_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: Generate date tag
+        id: date
+        env:
+          MAIN_REPO_SHA: ${{ github.sha }}
+        run: |
+          SHORT_SHA="${MAIN_REPO_SHA::7}"
+          COMMIT_TS="$(git show -s --format=%ct "${MAIN_REPO_SHA}")"
+          DATE_TAG="$(TZ=Asia/Shanghai date -d "@${COMMIT_TS}" +'%Y%m%d-%H%M%S')-${SHORT_SHA}"
+          echo "date_tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
+
+  build-amd64:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.PRIVATE_REPO_PAT }}
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.repository_owner }}" --password-stdin
+
+      - name: Build and push amd64 image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg SECFLOW_BUILD_VERSION=${{ needs.prepare.outputs.date_tag }} \
+            --cache-from type=gha,scope=secflow-app-poc-gen-verify-amd64 \
+            --cache-to type=gha,scope=secflow-app-poc-gen-verify-amd64,mode=max \
+            --file 13-secflow-service/image_build/secflow-app-poc-gen-verify/Dockerfile \
+            --tag ghcr.io/runshine/secflow-app-poc-gen-verify:latest \
+            --tag ghcr.io/runshine/secflow-app-poc-gen-verify:${{ needs.prepare.outputs.date_tag }} \
+            --push \
+            13-secflow-service/image_build/secflow-app-poc-gen-verify/
