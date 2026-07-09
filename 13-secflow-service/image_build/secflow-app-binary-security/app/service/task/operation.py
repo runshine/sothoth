@@ -463,6 +463,94 @@ class TaskOperationServiceMixin:
         operation_id = str(getattr(operation, "id", "") or "").strip()
         return current_operation_id in {"", operation_id}
 
+    def _advance_stale_cancel_verify_timeout(
+        self: TaskManager,
+        db: Session,
+        task: BinarySecurityTask,
+        operation: BinarySecurityTaskOperation,
+        *,
+        attempt_count: int,
+        max_attempts: int,
+        blocking_targets: list[dict[str, Any]] | None = None,
+        auto_reconciled: bool,
+    ) -> bool:
+        from app.service import task_manager as task_manager_module
+
+        normalized_blocking_targets = [
+            dict(target) for target in list(blocking_targets or []) if isinstance(target, dict)
+        ]
+        next_attempt_count = max(0, int(attempt_count)) + 1
+        normalized_max_attempts = max(1, int(max_attempts))
+        self._update_cancel_verify_state(
+            operation,
+            attempt_count=next_attempt_count,
+            max_attempts=normalized_max_attempts,
+            last_blocking_targets=normalized_blocking_targets,
+            ignored_blocking_targets=(
+                normalized_blocking_targets if next_attempt_count > normalized_max_attempts else []
+            ),
+            force_cancelled_after_verify_retries=next_attempt_count > normalized_max_attempts,
+        )
+        if next_attempt_count <= normalized_max_attempts:
+            self._requeue_cancel_verify_resume(
+                db,
+                task,
+                operation,
+                attempt_count=next_attempt_count,
+                max_attempts=normalized_max_attempts,
+                blocking_targets=normalized_blocking_targets,
+                reason=(
+                    "cancel_verify_stale_resume"
+                    if auto_reconciled
+                    else "cancel_verify_retry"
+                ),
+                auto_reconciled=auto_reconciled,
+            )
+            return True
+        self._record_operation_event(
+            db,
+            task,
+            operation,
+            "task_cancel_quiesce_retry_exhausted",
+            "取消收敛重试已达上限，将忽略残留子任务并强制完成父任务取消",
+            level="warning",
+            stage_name=operation.target_stage,
+            payload={
+                "attempt_count": next_attempt_count,
+                "max_attempts": normalized_max_attempts,
+                "ignored_blocking_targets": normalized_blocking_targets,
+                "auto_reconciled": bool(auto_reconciled),
+            },
+        )
+        for target in normalized_blocking_targets:
+            self._record_operation_event(
+                db,
+                task,
+                operation,
+                "task_cancel_target_ignored_after_retry_exhausted",
+                "该子任务未在取消收敛窗口内进入终态，已被忽略",
+                level="warning",
+                stage_name=str(target.get("stage_name") or operation.target_stage or "").strip() or None,
+                payload={
+                    **dict(target),
+                    "ignored": True,
+                    "reason": "cancel_quiesce_retry_exhausted",
+                    "auto_reconciled": bool(auto_reconciled),
+                },
+            )
+        operation.current_step = task_manager_module.TASK_OPERATION_STEP_FINALIZE_TASK_CANCELLED
+        self._requeue_cancel_verify_resume(
+            db,
+            task,
+            operation,
+            attempt_count=next_attempt_count,
+            max_attempts=normalized_max_attempts,
+            blocking_targets=normalized_blocking_targets,
+            reason="cancel_verify_force_finalize_after_stale_resume",
+            auto_reconciled=auto_reconciled,
+        )
+        return True
+
     def _store_cancel_targets(
         self: TaskManager,
         operation: BinarySecurityTaskOperation,
@@ -4294,14 +4382,13 @@ class TaskOperationServiceMixin:
                 for target in list(dict(self._operation_result_data(operation) or {}).get("last_blocking_targets") or [])
                 if isinstance(target, dict)
             ]
-            self._requeue_cancel_verify_resume(
+            self._advance_stale_cancel_verify_timeout(
                 db,
                 task,
                 operation,
                 attempt_count=int(cancel_state.get("cancel_verify_attempt_count") or 0),
                 max_attempts=int(cancel_state.get("cancel_verify_max_attempts") or self._cancel_verify_max_attempts()),
                 blocking_targets=blocking_targets,
-                reason="cancel_verify_stale_resume",
                 auto_reconciled=True,
             )
             return True

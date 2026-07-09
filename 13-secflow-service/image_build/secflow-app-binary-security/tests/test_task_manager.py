@@ -15195,7 +15195,65 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         self.assertTrue(changed)
         self.assertEqual([{"task_id": "t1", "context": "task_enqueue"}], self.fake_task_queue.pushed_tasks)
+        cancel_state = self.manager._cancel_state_from_operation(task, operation)
+        self.assertEqual(3, cancel_state["cancel_verify_attempt_count"])
         event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("task_cancel_quiesce_retry_requeued", event_types)
+
+    def test_reconcile_stale_task_operation_force_finalizes_exhausted_cancel_verify_resume(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="binary",
+            status="cancelling",
+            current_stage="entry_analysis",
+            current_operation_id="op1",
+            task_type=TASK_TYPE_BINARY,
+            firmware_source="project_filesystem",
+            firmware_path="/fw",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        operation = BinarySecurityTaskOperation(
+            id="op1",
+            task_id="t1",
+            project_id="p1",
+            operation_type="cancel",
+            status="running",
+            target_stage="entry_analysis",
+            current_step="verify_downstream_quiesced",
+        )
+        operation.result_payload = {
+            "cancel_verify_attempt_count": 5,
+            "cancel_verify_max_attempts": 5,
+            "last_blocking_targets": [
+                {
+                    "target_type": "downstream_task",
+                    "stage_name": "entry_analysis",
+                    "item_id": "si1",
+                    "item_key": "module-1",
+                    "downstream_service": "entry_analyse",
+                    "downstream_task_id": "eat_1",
+                    "project_id": "p1",
+                    "blocking": True,
+                }
+            ],
+        }
+        operation.updated_at = _now() - timedelta(seconds=120)
+        db = _ModelAwareDb(tasks=[task], operations=[operation])
+
+        changed = self.manager._reconcile_stale_task_operation(db, task, operation)
+
+        self.assertTrue(changed)
+        self.assertEqual([{"task_id": "t1", "context": "task_enqueue"}], self.fake_task_queue.pushed_tasks)
+        self.assertEqual("finalize_task_cancelled", operation.current_step)
+        cancel_state = self.manager._cancel_state_from_operation(task, operation)
+        self.assertEqual(6, cancel_state["cancel_verify_attempt_count"])
+        self.assertTrue(cancel_state["cancel_force_finalize"])
+        self.assertEqual(1, cancel_state["cancel_ignored_targets_count"])
+        event_types = [getattr(event, "event_type", "") for event in db.added]
+        self.assertIn("task_cancel_quiesce_retry_exhausted", event_types)
+        self.assertIn("task_cancel_target_ignored_after_retry_exhausted", event_types)
         self.assertIn("task_cancel_quiesce_retry_requeued", event_types)
 
     def test_run_cancel_operation_steps_force_finalizes_after_quiesce_retry_exhausted(self):
