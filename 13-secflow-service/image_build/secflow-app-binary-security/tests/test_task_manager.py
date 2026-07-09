@@ -39359,7 +39359,52 @@ def _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_o
     self.assertEqual("old-worker", db.runtime_leases[0].owner_instance_id)
     self.assertEqual(operation.id, task.current_operation_id)
     event_types = [event.event_type for event in db.events]
-    self.assertIn("local_owner_runtime_restart_started", event_types)
+    self.assertIn("retry_takeover_suppressed_active_lease", event_types)
+    self.assertNotIn("local_owner_runtime_restart_started", event_types)
+
+
+def _test_dispatch_task_by_id_does_not_restart_local_runtime_for_foreign_owner_cancel_operation(self):
+    manager = TaskManager()
+    manager.instance_id = "local-worker"
+    task = BinarySecurityTask(
+        id="task-foreign-owner-cancel",
+        project_id="p1",
+        name="source",
+        status=task_manager_module.TASK_STATUS_CANCELLING,
+        task_type=TASK_TYPE_SOURCE,
+        current_stage="dataflow_vuln_scan",
+        firmware_source="project_filesystem",
+        firmware_path="/src",
+        output_root="/o",
+        workspace_root="/w",
+        current_operation_id="op-foreign-cancel",
+        runtime_phase=TASK_RUNTIME_PHASE_OWNED_EXECUTION,
+    )
+    operation = BinarySecurityTaskOperation(
+        id="op-foreign-cancel",
+        task_id=task.id,
+        project_id=task.project_id,
+        operation_type=task_manager_module.TASK_ACTION_CANCEL,
+        status="running",
+        current_step=task_manager_module.TASK_OPERATION_STEP_VERIFY_DOWNSTREAM_QUIESCED,
+    )
+    lease = BinarySecurityTaskRuntimeLease(
+        task_id=task.id,
+        owner_instance_id="old-worker",
+        heartbeat_at=_now(),
+        lease_expires_at=_now() + timedelta(seconds=120),
+    )
+    db = _ModelAwareDb(tasks=[task], operations=[operation], runtime_leases=[lease])
+    manager._enqueue_task = lambda task_id: None
+
+    claimed = manager._dispatch_task_by_id(db, task.id)
+
+    self.assertIsNone(claimed)
+    self.assertEqual(task_manager_module.TASK_STATUS_CANCELLING, task.status)
+    self.assertEqual("old-worker", db.runtime_leases[0].owner_instance_id)
+    event_types = [event.event_type for event in db.events]
+    self.assertIn("cancel_takeover_suppressed_active_lease", event_types)
+    self.assertNotIn("local_owner_runtime_restart_started", event_types)
 
 
 def _test_dispatch_task_by_id_suppresses_foreign_owner_delete_operation_without_expired_runtime_lease(self):
@@ -45746,6 +45791,7 @@ TaskManagerTests.test_dispatch_task_by_id_claims_ownerless_active_operation = _t
 TaskManagerTests.test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle = _test_dispatch_task_by_id_claims_queued_cancel_operation_without_runtime_handle
 TaskManagerTests.test_refresh_task_status_after_sync_clears_fake_local_owner = _test_refresh_task_status_after_sync_clears_fake_local_owner
 TaskManagerTests.test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry = _test_dispatch_task_by_id_suppresses_unsupported_foreign_owner_with_queued_operation_before_lease_expiry
+TaskManagerTests.test_dispatch_task_by_id_does_not_restart_local_runtime_for_foreign_owner_cancel_operation = _test_dispatch_task_by_id_does_not_restart_local_runtime_for_foreign_owner_cancel_operation
 TaskManagerTests.test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run = _test_claim_pending_tasks_restores_owned_execution_runtime_phase_before_run
 TaskManagerTests.test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption = _test_run_task_cancel_operation_keeps_task_cancelling_before_operation_consumption
 TaskManagerTests.test_reconcile_stale_retry_family_operation_to_succeeded_when_requeue_applied = _test_reconcile_stale_retry_family_operation_to_succeeded_when_requeue_applied

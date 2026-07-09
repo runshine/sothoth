@@ -276,7 +276,8 @@ class ParentRuntimeControlPathTests(unittest.TestCase):
         self.assertEqual("running", task.status)
         self.assertEqual(operation.id, task.current_operation_id)
         event_types = [event.event_type for event in db.events]
-        self.assertIn("local_owner_runtime_restart_started", event_types)
+        self.assertIn("delete_takeover_suppressed_active_lease", event_types)
+        self.assertNotIn("local_owner_runtime_restart_started", event_types)
 
     def test_dispatch_task_by_id_clears_stale_delete_queue_hidden_state_for_pending_task(self):
         manager = TaskManager()

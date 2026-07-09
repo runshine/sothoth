@@ -2383,8 +2383,14 @@ class TaskRuntimeServiceMixin:
         local_handle_present = local_handle is not None
         local_handle_done = not self._local_runtime_owner_alive(task_id) if local_handle is not None else False
         local_handle_cancel_requested = bool(getattr(local_handle, "cancel_requested", False)) if local_handle is not None else False
+        owner_runtime_snapshot = self._parent_runtime_ownership_snapshot(
+            db,
+            task,
+            active_operation=current_operation,
+        )
         same_owner_active_lease = bool(
-            self._task_has_supported_runtime_owner(db, task, active_operation=current_operation)
+            owner_runtime_snapshot.runtime_lease_active
+            and owner_runtime_snapshot.runtime_lease_owner == str(self.instance_id or "").strip()
         )
         if owner_guarded_control_operation and same_owner_active_lease:
             if local_handle_present and not local_handle_done and not local_handle_cancel_requested:
@@ -2558,7 +2564,7 @@ class TaskRuntimeServiceMixin:
                 active_operation=current_operation,
             )
         if has_active_operation and not operation_allows_runtime_resume:
-            if self._task_has_supported_runtime_owner(db, task, active_operation=current_operation):
+            if same_owner_active_lease:
                 self._log_dispatch_claim_blocked(
                     task_id,
                     reason="active_operation_blocks_runtime_resume_but_same_owner_supported",
