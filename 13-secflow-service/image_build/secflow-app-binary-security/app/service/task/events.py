@@ -21,14 +21,10 @@ if TYPE_CHECKING:
 
 
 class TaskEventServiceMixin:
-    def _defer_inline_event_trim_for_task(
-        self: TaskManager,
-        task: BinarySecurityTask | None,
-    ) -> bool:
-        if task is None:
-            return False
-        normalized_status = str(getattr(task, "status", "") or "").strip().lower()
-        return normalized_status in {"pending", "dispatching", "running", "cancelling"}
+    def _task_timeline_trim_batch_size(self: TaskManager) -> int:
+        from app.service import task_manager as task_manager_module
+
+        return max(1, min(1_000, int(task_manager_module.DB_TIMELINE_EVENT_LIMIT or 10_000)))
 
     def _suppress_event_trim_lock_error(
         self: TaskManager,
@@ -256,6 +252,7 @@ class TaskEventServiceMixin:
             return
         from app.service import task_manager as task_manager_module
 
+        self._ensure_task_timeline_capacity_for_write(db, task_id=task.id, incoming_events=1)
         event = task_manager_module.BinarySecurityEvent(
             id=f"evt_{uuid.uuid4().hex[:24]}",
             task_id=task.id,
@@ -278,8 +275,7 @@ class TaskEventServiceMixin:
             state_event=False,
         )
         db.add(event)
-        if not self._defer_inline_event_trim_for_task(task):
-            self._trim_task_timeline_events(db, task_id=task.id)
+        self._ensure_task_timeline_capacity_for_write(db, task_id=task.id)
 
     def _sync_event_origin_value(self: TaskManager, payload: dict[str, Any] | None, key: str) -> str | None:
         origin = dict((payload or {}).get("event_origin") or {})
@@ -552,7 +548,10 @@ class TaskEventServiceMixin:
         try:
             current_count = 0
             if hasattr(db, "events"):
-                current_count = len(getattr(db, "events") or [])
+                current_count = len([
+                    event for event in (getattr(db, "events") or [])
+                    if str(getattr(event, "task_id", "") or "").strip() == str(task_id or "").strip()
+                ])
             else:
                 current_count = (
                     db.query(task_manager_module.BinarySecurityEvent)
@@ -575,6 +574,42 @@ class TaskEventServiceMixin:
                 db.delete(stale_event)
         except OperationalError as exc:
             if self._suppress_event_trim_lock_error(exc, task_id=task_id, trim_kind="timeline event"):
+                return
+            raise
+
+    def _ensure_task_timeline_capacity_for_write(
+        self: TaskManager,
+        db: Session,
+        *,
+        task_id: str,
+        incoming_events: int = 0,
+    ) -> None:
+        from app.service import task_manager as task_manager_module
+
+        effective_limit = int(task_manager_module.DB_TIMELINE_EVENT_LIMIT or 10_000)
+        if effective_limit <= 0 or not hasattr(db, "query"):
+            return
+        normalized_incoming = max(0, int(incoming_events or 0))
+        try:
+            current_count = 0
+            if hasattr(db, "events"):
+                current_count = len([
+                    event for event in (getattr(db, "events") or [])
+                    if str(getattr(event, "task_id", "") or "").strip() == str(task_id or "").strip()
+                ])
+            else:
+                current_count = (
+                    db.query(task_manager_module.BinarySecurityEvent)
+                    .filter(task_manager_module.BinarySecurityEvent.task_id == task_id)
+                    .count()
+                )
+            if current_count + normalized_incoming <= effective_limit:
+                return
+            trim_batch_size = self._task_timeline_trim_batch_size()
+            keep_limit = max(0, effective_limit - trim_batch_size)
+            self._trim_task_timeline_events(db, task_id=task_id, keep_limit=keep_limit)
+        except OperationalError as exc:
+            if self._suppress_event_trim_lock_error(exc, task_id=task_id, trim_kind="timeline capacity guard"):
                 return
             raise
 

@@ -47,7 +47,7 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             Exception(1213, "Deadlock found when trying to get lock; try restarting transaction"),
         )
 
-    def test_record_event_trims_task_timeline_to_limit(self):
+    def test_record_event_trims_task_timeline_to_preserve_headroom(self):
         task = BinarySecurityTask(
             id="task-timeline-cap",
             project_id="p1",
@@ -83,11 +83,12 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             stage_name="system_analysis",
         )
 
-        self.assertEqual(10_000, len(db.events))
+        self.assertEqual(9_001, len(db.events))
         self.assertFalse(any(event.id == "evt-00000" for event in db.events))
+        self.assertFalse(any(event.id == "evt-00999" for event in db.events))
         self.assertTrue(any(event.event_type == "overflow" for event in db.events))
 
-    def test_record_event_skips_inline_trim_for_active_task(self):
+    def test_record_event_trims_active_task_timeline_to_preserve_headroom(self):
         task = BinarySecurityTask(
             id="task-active-no-inline-trim",
             project_id="p1",
@@ -123,8 +124,44 @@ class TaskEventServiceBehaviorTests(unittest.TestCase):
             stage_name="system_analysis",
         )
 
-        self.assertEqual(10_001, len(db.events))
+        self.assertEqual(9_001, len(db.events))
+        self.assertFalse(any(event.id == "evt-active-00000" for event in db.events))
+        self.assertFalse(any(event.id == "evt-active-00999" for event in db.events))
         self.assertTrue(any(event.event_type == "active-overflow" for event in db.events))
+
+    def test_timeline_capacity_helper_trims_large_overflow_down_to_headroom(self):
+        task = BinarySecurityTask(
+            id="task-large-overflow",
+            project_id="p1",
+            name="timeline-large-overflow",
+            status="running",
+            current_stage="system_analysis",
+            task_type=TASK_TYPE_SOURCE,
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/out",
+            workspace_root="/ws",
+        )
+        events = []
+        base_time = _now() - timedelta(seconds=16350)
+        for index in range(16_350):
+            event = BinarySecurityEvent(
+                id=f"evt-large-{index:05d}",
+                task_id=task.id,
+                project_id=task.project_id,
+                level="info",
+                event_type="seed",
+                message=f"seed-{index}",
+            )
+            event.created_at = base_time + timedelta(seconds=index)
+            events.append(event)
+        db = _ModelAwareDb(tasks=[task], events=events)
+
+        self.manager._ensure_task_timeline_capacity_for_write(db, task_id=task.id)
+
+        self.assertEqual(9_000, len(db.events))
+        self.assertFalse(any(event.id == "evt-large-00000" for event in db.events))
+        self.assertFalse(any(event.id == "evt-large-07349" for event in db.events))
 
     def test_trim_task_timeline_events_suppresses_retryable_lock_error(self):
         task = BinarySecurityTask(

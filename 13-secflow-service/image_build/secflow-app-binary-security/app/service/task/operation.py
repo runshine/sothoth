@@ -563,6 +563,7 @@ class TaskOperationServiceMixin:
         requested_by: str | None,
         request_source: str = "api",
         request_payload: dict[str, Any] | None = None,
+        bind_to_task: bool = True,
     ) -> BinarySecurityTaskOperation:
         from app.service import task_manager as task_manager_module
 
@@ -598,7 +599,8 @@ class TaskOperationServiceMixin:
             workspace_root=task.workspace_root,
         )
         db.add(operation)
-        task.current_operation_id = operation.id
+        if bind_to_task:
+            task.current_operation_id = operation.id
         self._record_operation_event(
             db,
             task,
@@ -622,6 +624,7 @@ class TaskOperationServiceMixin:
         request_payload: dict[str, Any] | None = None,
         accepted_event_type: str,
         accepted_message: str,
+        bind_to_task: bool = True,
     ) -> BinarySecurityTaskOperation:
         from app.service import task_manager as task_manager_module
 
@@ -632,9 +635,11 @@ class TaskOperationServiceMixin:
             target_stage=target_stage,
             requested_by=requested_by,
             request_payload=request_payload,
+            bind_to_task=bind_to_task,
         )
         operation.status = "queued"
-        task.current_operation_id = operation.id
+        if bind_to_task:
+            task.current_operation_id = operation.id
         self._record_operation_event(
             db,
             task,

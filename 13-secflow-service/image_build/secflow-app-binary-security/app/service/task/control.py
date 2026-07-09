@@ -1455,6 +1455,7 @@ class TaskControlServiceMixin:
             if active_item_count <= 0 and active_stage_count <= 0:
                 task_manager_module.observe_task_operation("cancel", "already_cancelled")
                 return BinarySecurityActionResponse(task_id=task_id, message="任务已取消")
+        owner_can_apply_cancel = self._task_runtime_owner_matches_current_instance(db, task)
         operation = self._queue_task_operation(
             db,
             task,
@@ -1464,42 +1465,47 @@ class TaskControlServiceMixin:
             request_payload={"current_stage": task.current_stage},
             accepted_event_type="task_cancel_accepted",
             accepted_message="任务取消已受理，后台正在停止执行并清理下游任务",
+            bind_to_task=owner_can_apply_cancel,
         )
-        self._set_task_status(
-            db,
-            task,
-            task_manager_module.TASK_STATUS_CANCELLING,
-            reason="收到取消请求",
-            source="task_control",
-            stage_name=task.current_stage,
-        )
-        task.finished_at = None
-        task.last_error = None
-        task.current_operation_id = operation.id
-        db.commit()
-        wakeup_requested = await self._request_local_worker_control_wakeup(
-            task.id,
-            task_manager_module.TASK_ACTION_CANCEL,
-            operation_id=operation.id,
-            wait_for_runner=False,
-        )
-        if wakeup_requested:
-            self._record_event(
+        if owner_can_apply_cancel:
+            self._set_task_status(
                 db,
                 task,
-                "local_owner_control_wakeup_requested",
-                "已通知当前 owner 原地处理取消控制操作",
+                task_manager_module.TASK_STATUS_CANCELLING,
+                reason="收到取消请求",
+                source="task_control",
                 stage_name=task.current_stage,
-                payload={
-                    "operation_id": operation.id,
-                    "operation_type": task_manager_module.TASK_ACTION_CANCEL,
-                    "runtime_lease_owner": str(
-                        getattr(self._runtime_lease_for_task(db, getattr(task, "id", None)), "owner_instance_id", "") or ""
-                    ).strip() or None,
-                },
             )
+            task.finished_at = None
+            task.last_error = None
+            task.current_operation_id = operation.id
             db.commit()
-        self._enqueue_task(task.id)
+            wakeup_requested = await self._request_local_worker_control_wakeup(
+                task.id,
+                task_manager_module.TASK_ACTION_CANCEL,
+                operation_id=operation.id,
+                wait_for_runner=False,
+            )
+            if wakeup_requested:
+                self._record_event(
+                    db,
+                    task,
+                    "local_owner_control_wakeup_requested",
+                    "已通知当前 owner 原地处理取消控制操作",
+                    stage_name=task.current_stage,
+                    payload={
+                        "operation_id": operation.id,
+                        "operation_type": task_manager_module.TASK_ACTION_CANCEL,
+                        "runtime_lease_owner": str(
+                            getattr(self._runtime_lease_for_task(db, getattr(task, "id", None)), "owner_instance_id", "") or ""
+                        ).strip() or None,
+                    },
+                )
+                db.commit()
+            self._enqueue_task(task.id)
+            task_status_after_accept = task_manager_module.TASK_STATUS_CANCELLING
+        else:
+            task_status_after_accept = str(getattr(task, "status", "") or "").strip() or None
         task_manager_module.observe_task_operation("cancel", "accepted")
         return BinarySecurityActionResponse(
             task_id=task_id,
@@ -1508,7 +1514,7 @@ class TaskControlServiceMixin:
             action="cancel",
             status="accepted",
             message="任务取消已受理，后台正在停止执行并清理下游任务",
-            task_status_after_accept=task_manager_module.TASK_STATUS_CANCELLING,
+            task_status_after_accept=task_status_after_accept,
         )
 
     async def delete_task(

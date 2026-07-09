@@ -13648,6 +13648,7 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             name="source",
             status="running",
             task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
             firmware_source="project_filesystem",
             firmware_path="/src",
             output_root="/o",
@@ -13669,7 +13670,14 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             sequence_no=1,
             status="running",
         )
-        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id="t1",
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            last_renewed_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[stage_run], stage_items=[item], runtime_leases=[runtime_lease])
         wakeups: list[str] = []
         enqueued: list[str] = []
 
@@ -13712,7 +13720,14 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
             output_root="/o",
             workspace_root="/w",
         )
-        db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[])
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id="t1",
+            owner_instance_id=self.manager.instance_id,
+            heartbeat_at=_now(),
+            last_renewed_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], runtime_leases=[runtime_lease])
         enqueued: list[str] = []
 
         async def fake_request_local_worker_control_wakeup(*_args, **_kwargs):
@@ -13725,6 +13740,50 @@ class BinaryToSourceClientTests(_TaskManagerQueuePatchedMixin, unittest.Isolated
 
         self.assertEqual(["t1", "t1"], enqueued)
         self.assertEqual("accepted", response.status)
+
+    def test_cancel_task_non_owner_only_queues_operation_without_mutating_task(self):
+        task = BinarySecurityTask(
+            id="t1",
+            project_id="p1",
+            name="source",
+            status="running",
+            task_type=TASK_TYPE_SOURCE,
+            current_stage="system_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        runtime_lease = BinarySecurityTaskRuntimeLease(
+            task_id="t1",
+            owner_instance_id="worker-other",
+            heartbeat_at=_now(),
+            last_renewed_at=_now(),
+            lease_expires_at=_now() + timedelta(minutes=5),
+        )
+        db = _ModelAwareDb(tasks=[task], stage_runs=[], stage_items=[], runtime_leases=[runtime_lease])
+        wakeups: list[str] = []
+        enqueued: list[str] = []
+
+        async def fake_request_local_worker_control_wakeup(task_id: str, operation_type: str, *, operation_id=None, wait_for_runner: bool):
+            wakeups.append(f"{task_id}:{operation_type}:{wait_for_runner}:{bool(operation_id)}")
+            return True
+
+        self.manager._request_local_worker_control_wakeup = fake_request_local_worker_control_wakeup
+        self.manager._enqueue_task = lambda task_id, *_args, **_kwargs: enqueued.append(task_id)
+
+        response = asyncio.run(self.manager.cancel_task(db, project_id="p1", task_id="t1"))
+
+        self.assertEqual([], wakeups)
+        self.assertEqual(["t1"], enqueued)
+        self.assertEqual("running", task.status)
+        self.assertIsNone(task.current_operation_id)
+        self.assertEqual("accepted", response.status)
+        self.assertEqual("running", response.task_status_after_accept)
+        operations = [row for row in db.added if row.__class__.__name__ == "BinarySecurityTaskOperation"]
+        self.assertEqual(1, len(operations))
+        self.assertEqual(task_manager_module.TASK_ACTION_CANCEL, operations[0].operation_type)
+        self.assertEqual("queued", operations[0].status)
 
     def test_delete_task_enqueues_async_delete_queue_on_accept(self):
         task = BinarySecurityTask(
