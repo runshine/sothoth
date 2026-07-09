@@ -185,3 +185,5 @@ def get_service_yaml() -> ServiceYaml:
     if _service_yaml is None:
         _service_yaml = load_service_yaml()
     return _service_yaml
+
+# timeout mechanism removed per request (runner runs until done/aborted)
