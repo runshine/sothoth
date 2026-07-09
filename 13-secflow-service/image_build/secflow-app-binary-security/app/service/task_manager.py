@@ -3294,15 +3294,15 @@ class TaskManager(
                 and str(getattr(lease, "owner_instance_id", "") or "").strip() == str(self.instance_id or "").strip()
             ):
                 return 0
-            repaired = await self._reconcile_missing_task_sync_requests(session, task)
-            if repaired:
+            enqueued = await self._enqueue_periodic_task_sync_requests(session, task)
+            if enqueued:
                 session.commit()
                 logger.info(
-                    "binary-security local runtime sync maintenance enqueued periodic sync requests: task_id=%s repaired=%s",
+                    "binary-security local runtime sync maintenance enqueued periodic sync requests: task_id=%s enqueued=%s",
                     task_id,
-                    repaired,
+                    enqueued,
                 )
-            return repaired
+            return enqueued
         finally:
             session.close()
 
@@ -6511,6 +6511,44 @@ class TaskManager(
             existing_dedupe_keys.add(dedupe_key)
         return repaired
 
+    async def _enqueue_periodic_task_sync_requests(self, db: Session, task: BinarySecurityTask) -> int:
+        expected = self._build_periodic_sync_requests_from_db(db, task)
+        if not expected:
+            return 0
+        existing = await get_task_queue().list_task_sync_requests(task.id, context="task_sync_periodic_list")
+        existing_dedupe_keys = {
+            str(entry.get("dedupe_key") or "").strip()
+            for entry in existing
+            if str(entry.get("dedupe_key") or "").strip()
+        }
+        enqueued = 0
+        for entry in expected:
+            dedupe_key = self._task_sync_request_dedupe_key(
+                operation=str(entry.get("operation") or "").strip(),
+                stage_name=entry.get("stage_name"),
+                item_ids=entry.get("item_ids"),
+                archive_job_ids=entry.get("archive_job_ids"),
+            )
+            if dedupe_key in existing_dedupe_keys:
+                continue
+            await self._enqueue_task_sync_request(
+                task,
+                db=db,
+                operation=str(entry.get("operation") or "").strip(),
+                source=str(entry.get("source") or "periodic_runtime_sync").strip() or "periodic_runtime_sync",
+                reason=str(entry.get("reason") or "periodic_downstream_sync_due").strip() or "periodic_downstream_sync_due",
+                stage_name=entry.get("stage_name"),
+                item_ids=list(entry.get("item_ids") or []),
+                archive_job_ids=list(entry.get("archive_job_ids") or []),
+                force=bool(entry.get("force")),
+                source_event_type=str(entry.get("source_event_type") or "downstream_sync_periodic").strip() or "downstream_sync_periodic",
+                payload=dict(entry.get("payload") or {}),
+                priority=int(entry.get("priority") or 100),
+            )
+            enqueued += 1
+            existing_dedupe_keys.add(dedupe_key)
+        return enqueued
+
     def _build_expected_sync_requests_from_db(
         self,
         db: Session,
@@ -6558,6 +6596,67 @@ class TaskManager(
                     "cross_stage_sync": bool(normalized_stage and normalized_stage != str(normalize_stage_name(task.current_stage) or "").strip()),
                 },
                 "priority": 10 if operation == "child_create" else 20 if work_item.get("missing_recorded_status") else 30,
+            }
+            dedupe_key = self._task_sync_request_dedupe_key(
+                operation=entry["operation"],
+                stage_name=entry.get("stage_name"),
+                item_ids=entry.get("item_ids"),
+                archive_job_ids=entry.get("archive_job_ids"),
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            expected.append(entry)
+        return expected
+
+    def _build_periodic_sync_requests_from_db(
+        self,
+        db: Session,
+        task: BinarySecurityTask,
+    ) -> list[dict[str, Any]]:
+        expected: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        candidate_items = self._task_reconcile_candidate_items(
+            db,
+            task,
+            force=False,
+            include_failed_terminal_items=True,
+        )
+        workset = self._build_task_downstream_workset(
+            db,
+            task,
+            items=candidate_items,
+            force=False,
+            for_task_status=str(task.status or "").strip().lower() or None,
+        )
+        for work_item in workset:
+            item = work_item["item"]
+            normalized_stage = work_item["stage_name"]
+            observed_status = self._latest_observed_downstream_status(item)
+            operation = str(work_item.get("operation") or "").strip()
+            if operation != "child_sync":
+                continue
+            entry = {
+                "operation": "child_sync",
+                "source": "periodic_runtime_sync",
+                "reason": str(work_item.get("reason") or "periodic_downstream_sync_due").strip() or "periodic_downstream_sync_due",
+                "source_event_type": "downstream_sync_periodic",
+                "stage_name": normalized_stage,
+                "item_ids": [str(item.id or "").strip()] if str(item.id or "").strip() else [],
+                "archive_job_ids": [],
+                "force": bool(work_item.get("force")),
+                "payload": {
+                    "item_key": str(item.item_key or "").strip() or None,
+                    "downstream_task_id": str(item.downstream_task_id or "").strip() or None,
+                    "observed_downstream_status": observed_status,
+                    "decision_reason": work_item.get("reason"),
+                    "blocked_reason": work_item.get("blocked_reason"),
+                    "stage_parallelism": int(work_item.get("stage_parallelism") or 0),
+                    "active_child_count": int(work_item.get("active_child_count") or 0),
+                    "cross_stage_sync": bool(normalized_stage and normalized_stage != str(normalize_stage_name(task.current_stage) or "").strip()),
+                    "periodic_sync": True,
+                },
+                "priority": 20 if work_item.get("missing_recorded_status") else 30,
             }
             dedupe_key = self._task_sync_request_dedupe_key(
                 operation=entry["operation"],

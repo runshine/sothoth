@@ -202,12 +202,17 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
                 super().__init__(**kwargs)
                 self.commit_count = 0
                 self.rollback_count = 0
+                self.expire_all_count = 0
 
             def commit(self):
                 self.commit_count += 1
 
             def rollback(self):
                 self.rollback_count += 1
+                return None
+
+            def expire_all(self):
+                self.expire_all_count += 1
                 return None
 
         task1 = self._task(id="task-1", current_stage="system_analysis")
@@ -240,6 +245,7 @@ class TaskRuntimeStateServiceBehaviorTests(unittest.TestCase):
         self.assertEqual(0, task_db_1.rollback_count)
         self.assertEqual(0, task_db_2.commit_count)
         self.assertEqual(1, task_db_2.rollback_count)
+        self.assertEqual(1, outer_db.expire_all_count)
 
     def test_repair_running_lease_invariant_single_task_locked_ignores_pending_claim_marker_for_running_task(self):
         task = self._task(

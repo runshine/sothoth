@@ -1447,6 +1447,7 @@ class TaskRuntimeServiceMixin:
                     if changed:
                         task_db.commit()
                         repaired = True
+                        db.expire_all()
                     else:
                         task_db.rollback()
                 except OperationalError as exc:
@@ -2664,6 +2665,25 @@ class TaskRuntimeServiceMixin:
                         reason="dispatch_claim_after_runtime_lease_missing_without_owner",
                     )
                 if not released:
+                    refreshed_takeover_decision = self._stale_parent_runtime_takeover_decision(
+                        db,
+                        task,
+                        active_operation=current_operation,
+                    )
+                    if refreshed_takeover_decision.runtime_lease_active:
+                        self._log_dispatch_claim_blocked(
+                            task_id,
+                            reason="active_nonpending_takeover_suppressed_active_lease",
+                            task=task,
+                            current_operation=current_operation,
+                        )
+                        self._set_dispatch_claim_decision(
+                            task_id=task_id,
+                            claimed_task_id=None,
+                            blocked_reason="active_nonpending_takeover_suppressed_active_lease",
+                            should_requeue=False,
+                        )
+                        return None
                     self._log_dispatch_claim_blocked(
                         task_id,
                         reason="dispatch_claim_blocked_stale_owner_release_failed",

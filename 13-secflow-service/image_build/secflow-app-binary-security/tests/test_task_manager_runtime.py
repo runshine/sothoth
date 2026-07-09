@@ -2118,6 +2118,72 @@ class TaskManagerDispatchLoopTests(unittest.IsolatedAsyncioTestCase):
             manager._dispatch_claim_decision(),
         )
 
+    def test_dispatch_task_by_id_suppresses_stale_release_failed_when_new_lease_appears(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-new"
+        task = BinarySecurityTask(
+            id="task-release-refreshed",
+            project_id="project-1",
+            name="task",
+            status="running",
+            task_type=TASK_TYPE_BINARY,
+            current_stage="system_analysis",
+            firmware_path="/tmp/fw.bin",
+            output_root="/tmp/out",
+            workspace_root="/tmp/ws-release-refreshed",
+            runtime_phase="owned_execution",
+        )
+        expired_lease = BinarySecurityTaskRuntimeLease(
+            task_id=task.id,
+            owner_instance_id="worker-old",
+            heartbeat_at=_now() - timedelta(minutes=2),
+            lease_expires_at=_now() - timedelta(minutes=1),
+        )
+        db = _ModelAwareDb(tasks=[task], events=[], runtime_leases=[expired_lease])
+        manager._release_task_without_supported_runtime_owner = lambda *_args, **_kwargs: False
+
+        stale_decisions = [
+            SimpleNamespace(
+                runtime_lease_active=False,
+                runtime_lease_owner=None,
+                local_handle_alive=False,
+                supported_control_operation_active=False,
+                allow_takeover=True,
+                allow_reenqueue=True,
+                allow_claim=True,
+                decision_reason="runtime_lease_missing_or_expired",
+            ),
+            SimpleNamespace(
+                runtime_lease_active=True,
+                runtime_lease_owner="worker-fresh",
+                local_handle_alive=False,
+                supported_control_operation_active=False,
+                allow_takeover=False,
+                allow_reenqueue=False,
+                allow_claim=False,
+                decision_reason="active_runtime_lease",
+            ),
+        ]
+
+        with patch.object(
+            manager,
+            "_stale_parent_runtime_takeover_decision",
+            side_effect=lambda *_args, **_kwargs: stale_decisions.pop(0),
+        ):
+            claimed = manager._dispatch_task_by_id(db, task.id)
+
+        self.assertIsNone(claimed)
+        self.assertEqual(
+            {
+                "task_id": task.id,
+                "claimed_task_id": None,
+                "blocked_reason": "active_nonpending_takeover_suppressed_active_lease",
+                "should_requeue": False,
+                "cooldown_seconds": None,
+            },
+            manager._dispatch_claim_decision(),
+        )
+
     def test_dispatch_task_by_id_keeps_parent_takeover_pending_claim_until_active_execution_commit(self):
         manager = TaskManager()
         manager.instance_id = "worker-new"

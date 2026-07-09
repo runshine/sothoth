@@ -752,6 +752,124 @@ class TaskSyncQueuePathTests(unittest.TestCase):
         self.assertTrue(payload["task_sync_queue_only"])
         self.assertFalse(payload["shared_dispatch_enqueued"])
 
+    def test_build_periodic_sync_requests_from_db_only_includes_child_sync_candidates(self):
+        manager = TaskManager()
+        task = BinarySecurityTask(
+            id="task-sync-periodic-build",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        stale_item = BinarySecurityStageItem(
+            id="si-periodic-stale",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-periodic-stale",
+            stage_name="entry_analysis",
+            item_key="entry-a",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-periodic-stale",
+            result={
+                "downstream": {
+                    "task_id": "eat-periodic-stale",
+                    "status": "running",
+                },
+                "last_sync_attempt_at": (_now() - timedelta(seconds=600)).isoformat(),
+                "sync_status": "synced",
+            },
+        )
+        create_item = BinarySecurityStageItem(
+            id="si-periodic-create",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-periodic-create",
+            stage_name="entry_analysis",
+            item_key="entry-b",
+            status="pending",
+            downstream_service="entry_analyse",
+            downstream_task_id=None,
+            result={},
+        )
+        db = _ModelAwareDb(tasks=[task], stage_items=[stale_item, create_item], events=[])
+
+        expected = manager._build_periodic_sync_requests_from_db(db, task)
+
+        self.assertEqual(1, len(expected))
+        self.assertEqual("child_sync", expected[0]["operation"])
+        self.assertEqual(["si-periodic-stale"], expected[0]["item_ids"])
+        self.assertEqual("periodic_runtime_sync", expected[0]["source"])
+        self.assertTrue(expected[0]["payload"]["periodic_sync"])
+
+    def test_reconcile_periodic_task_sync_requests_enqueues_without_repair_event(self):
+        manager = TaskManager()
+        manager.instance_id = "worker-a"
+        task = BinarySecurityTask(
+            id="task-sync-periodic-reconcile",
+            project_id="p1",
+            name="sync",
+            task_type=TASK_TYPE_SOURCE,
+            status="running",
+            current_stage="entry_analysis",
+            firmware_source="project_filesystem",
+            firmware_path="/src",
+            output_root="/o",
+            workspace_root="/w",
+        )
+        item = BinarySecurityStageItem(
+            id="si-periodic-reconcile",
+            task_id=task.id,
+            project_id=task.project_id,
+            stage_run_id="sr-periodic-reconcile",
+            stage_name="entry_analysis",
+            item_key="entry-a",
+            status="running",
+            downstream_service="entry_analyse",
+            downstream_task_id="eat-periodic-reconcile",
+            result={
+                "downstream": {
+                    "task_id": "eat-periodic-reconcile",
+                    "status": "running",
+                },
+                "last_sync_attempt_at": (_now() - timedelta(seconds=600)).isoformat(),
+                "sync_status": "synced",
+            },
+        )
+        db = _AppendingModelAwareDb(
+            tasks=[task],
+            stage_items=[item],
+            events=[],
+            runtime_leases=[_runtime_lease(task, manager.instance_id)],
+        )
+        fake_queue = _FakeTaskSyncQueue()
+        original_get_queue = task_manager_module.get_task_queue
+        original_factory = task_manager_module.get_session_factory
+        original_enqueue = manager._enqueue_task
+        try:
+            task_manager_module.get_task_queue = lambda: fake_queue
+            task_manager_module.get_session_factory = lambda: (lambda: db)
+            manager._enqueue_task = lambda *_args, **_kwargs: None
+
+            enqueued = asyncio.run(manager._reconcile_periodic_task_sync_requests(task.id))
+        finally:
+            task_manager_module.get_task_queue = original_get_queue
+            task_manager_module.get_session_factory = original_factory
+            manager._enqueue_task = original_enqueue
+
+        self.assertEqual(1, enqueued)
+        entries = fake_queue.entries_by_task[task.id]
+        self.assertEqual(1, len(entries))
+        self.assertEqual("child_sync", entries[0]["operation"])
+        self.assertEqual("periodic_runtime_sync", entries[0]["source"])
+        self.assertEqual("active_child_stale_sync", entries[0]["reason"])
+        self.assertFalse(any(event.event_type == "task_sync_request_reconcile_requeued" for event in db.events))
+
     def test_drain_task_sync_queue_empty_branch_uses_only_runtime_reconcile_not_runtime_start_repair(self):
         manager = TaskManager()
         task = BinarySecurityTask(
