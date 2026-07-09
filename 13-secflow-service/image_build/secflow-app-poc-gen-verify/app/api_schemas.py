@@ -50,6 +50,7 @@ class PocTaskStatus(BaseModel):
     session_id: Optional[str] = None
     session_dir: Optional[str] = None
     timeout: Optional[int] = None
+    cli_command: Optional[str] = None
     status: TaskStatus
     error: Optional[str] = None
     returncode: Optional[int] = None
@@ -111,6 +112,35 @@ class PocArtifactContentResponse(BaseModel):
     name: str
     content: str
     size: int
+
+
+class PocSessionFile(BaseModel):
+    name: str
+    rel_path: str
+    size: int
+    mtime: float
+    kind: str
+    stage: str
+    claude_cmd: str = ""
+    session_id: str = ""
+    jsonl: str = ""
+    prompt_file: str = ""
+    is_active: bool = False
+
+
+class PocSessionListResponse(BaseModel):
+    task_id: str
+    output_dir: str
+    sessions: List[PocSessionFile]
+
+
+class PocSessionContentResponse(BaseModel):
+    task_id: str
+    rel_path: str
+    name: str
+    content: str
+    size: int
+    tail_lines: int
 
 
 class ActionResponse(BaseModel):

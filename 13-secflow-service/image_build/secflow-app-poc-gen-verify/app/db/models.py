@@ -50,6 +50,11 @@ class AppPocTask(Base):
     session_dir: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     timeout: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
+    # The actual `poc` CLI command (shlex.join of the argv built by _execute_task),
+    # persisted at execution start so the detail view can show the real cmd while the
+    # task is still running (before stages_json/result_json are set at terminal state).
+    cli_command: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # status: pending | running | succeeded | failed | timeout | cancelled
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", index=True)
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

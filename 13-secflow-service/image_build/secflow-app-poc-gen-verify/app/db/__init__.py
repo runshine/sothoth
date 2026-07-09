@@ -31,8 +31,15 @@ class Migration:
 
 
 # Fresh tables are created by create_all; this list is for future additive
-# columns/indexes on existing deployments. Empty for now.
-_MIGRATIONS: list[Migration] = []
+# columns/indexes on existing deployments.
+_MIGRATIONS: list[Migration] = [
+    Migration(
+        kind="column",
+        table_name="secflow_app_poc_tasks",
+        name="cli_command",
+        statement="ALTER TABLE secflow_app_poc_tasks ADD COLUMN cli_command TEXT NULL",
+    ),
+]
 
 
 def _migration_exists(engine, migration: Migration) -> bool:

@@ -16,6 +16,9 @@ from .api_schemas import (
     ActionResponse,
     PocArtifactContentResponse,
     PocArtifactsResponse,
+    PocSessionContentResponse,
+    PocSessionFile,
+    PocSessionListResponse,
     PocTaskCreateResponse,
     PocTaskListResponse,
     PocTaskLogsResponse,
@@ -137,3 +140,20 @@ def list_artifacts(task_id: str, db: Session = Depends(get_db)) -> PocArtifactsR
 @router.get("/tasks/{task_id}/artifacts/{name}", response_model=PocArtifactContentResponse)
 def get_artifact_content(task_id: str, name: str, db: Session = Depends(get_db)) -> PocArtifactContentResponse:
     return PocArtifactContentResponse(**get_task_service().get_artifact_content(db, task_id, name))
+
+
+@router.get("/tasks/{task_id}/sessions", response_model=PocSessionListResponse)
+def list_sessions(task_id: str, db: Session = Depends(get_db)) -> PocSessionListResponse:
+    """List the `poc` CLI's per-stage session files (logs / stream-json / prompts / transcripts)."""
+    return PocSessionListResponse(**get_task_service().list_sessions(db, task_id))
+
+
+@router.get("/tasks/{task_id}/sessions/file", response_model=PocSessionContentResponse)
+def get_session_file(
+    task_id: str,
+    path: str = Query(..., description="会话文件相对路径 (相对 output_dir)"),
+    tail: int = Query(1000, ge=1, le=5000),
+    db: Session = Depends(get_db),
+) -> PocSessionContentResponse:
+    """Return a bounded tail of a session file (seek-from-end; .jsonl is never full-parsed)."""
+    return PocSessionContentResponse(**get_task_service().get_session_content(db, task_id, path, tail_lines=tail))

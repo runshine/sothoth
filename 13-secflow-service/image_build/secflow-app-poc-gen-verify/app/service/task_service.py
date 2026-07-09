@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shlex
 import signal
 import threading
 import time
@@ -81,6 +83,79 @@ def _record_task_event(
     except Exception:
         logger.debug("failed to record task event %s", event_type, exc_info=True)
         db.rollback()
+
+
+# ── session-file helpers (for the detail view's "会话记录" tab) ───────────────
+# Mirror the containment pattern from secflow-app-entry-analyse `_resolve_session_path`
+# and secflow-app-dataflow-vuln-scan `_safe_session_file`: resolve under output_dir,
+# reject traversal, whitelist suffixes. The per-stage .log header is parsed for the
+# `claude -p …` cmd; .jsonl/transcripts are served as raw seek-from-end tails (never
+# full-parsed — a multi-hour claude stream-json can be hundreds of MB).
+_SESSION_SUFFIXES = {".log", ".jsonl", ".txt"}
+_LOG_HEADER_RE = re.compile(r"^#\s*(\w+)=(.*)$")
+
+
+def _stage_of(name: str) -> str:
+    """stage1 / stage2 / single, from a poc_cli_<ts>_stageN.* / poc_prompt_stageN.* name."""
+    m = re.search(r"_stage(\d+)", name)
+    return f"stage{m.group(1)}" if m else "single"
+
+
+def _safe_session_path(output_dir: Path, rel: str) -> Path:
+    """Resolve `rel` under `output_dir`; reject absolute/`..` and non-whitelisted suffixes."""
+    p = Path(rel or "")
+    if p.is_absolute() or ".." in p.parts:
+        raise HTTPException(status_code=400, detail="非法会话路径")
+    root = output_dir.resolve()
+    target = (root / p).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="非法会话路径")
+    if target.suffix.lower() not in _SESSION_SUFFIXES:
+        raise HTTPException(status_code=400, detail="仅支持 .log/.jsonl/.txt 会话文件")
+    return target
+
+
+def _parse_stage_log_header(path: Path) -> dict:
+    """Read only the leading `# key=value` header lines of a per-stage .log (cmd/session_id/...)."""
+    meta: dict = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for _ in range(25):
+                line = fh.readline()
+                if not line:
+                    break
+                m = _LOG_HEADER_RE.match(line.rstrip("\n"))
+                if m:
+                    meta[m.group(1)] = m.group(2).strip()
+                # header is a contiguous block of `# …` lines; stop at the first non-# line once we have meta
+                if meta and not line.startswith("#"):
+                    break
+    except OSError:
+        pass
+    return meta
+
+
+def _read_tail(path: Path, *, max_lines: int, max_bytes: int) -> str:
+    """Seek-from-end bounded tail — does NOT load the whole file into memory."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    if size == 0:
+        return ""
+    start = max(0, size - max_bytes)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            fh.seek(start)
+            data = fh.read(max_bytes)
+    except OSError as exc:
+        return f"[failed to read: {exc}]"
+    lines = data.splitlines()
+    if len(lines) > max_lines:
+        lines = lines[-max_lines:]
+    return "\n".join(lines)
 
 
 class TaskService:
@@ -264,6 +339,96 @@ class TaskService:
             raise HTTPException(status_code=500, detail=f"读取产物失败: {exc}")
         return {"task_id": row.task_id, "name": safe, "content": content, "size": len(content)}
 
+    # ── session files (per-stage claude logs / stream-json / prompts / transcripts) ─
+    def list_sessions(self, db: Session, task_id: str) -> dict:
+        """List the `poc` CLI's per-stage session files under output_dir.
+
+        Top-level: poc_cli_<ts>_stageN.{log,jsonl} + poc_prompt_stageN.txt.
+        Transcripts: output_dir/.claude/projects/**/*.jsonl (claude's own session records).
+        The `output/` artifacts subdir is skipped (served by /artifacts). Each .log carries
+        its claude cmd + session_id in the header. Files survive across restart epochs (only
+        `output/` is cleaned) — distinguish by mtime; `is_active` flags recency.
+        """
+        row = self._get_or_404(db, task_id)
+        if not row.output_dir:
+            raise HTTPException(status_code=404, detail="任务无输出目录")
+        root = Path(row.output_dir)
+        if not root.is_dir():
+            return {"task_id": row.task_id, "output_dir": row.output_dir, "sessions": []}
+        now = time.time()
+        items: list[dict] = []
+        for p in sorted(list(root.glob("poc_cli_*")) + list(root.glob("poc_prompt_*"))):
+            if not p.is_file():
+                continue
+            meta = _parse_stage_log_header(p) if p.suffix == ".log" else {}
+            items.append(self._session_item(p, root, _stage_of(p.name), meta, now))
+        claude_dir = root / ".claude"
+        if claude_dir.is_dir():
+            for p in sorted(claude_dir.rglob("*.jsonl")):
+                if p.is_file():
+                    items.append(self._session_item(p, root, "transcript", {}, now))
+        # honor a user-overridden session_dir (transcripts may live outside output_dir)
+        sid = row.session_dir
+        if sid and Path(sid).is_dir():
+            sid_root = Path(sid).resolve()
+            try:
+                claude_root = claude_dir.resolve()
+            except OSError:
+                claude_root = claude_dir
+            if sid_root != claude_root:
+                for p in sorted(Path(sid).rglob("*.jsonl")):
+                    if p.is_file():
+                        items.append(self._session_item(p, Path(sid), "transcript", {}, now))
+        items.sort(key=lambda x: (x.get("stage", ""), -x.get("mtime", 0)))
+        return {"task_id": row.task_id, "output_dir": row.output_dir, "sessions": items}
+
+    def _session_item(self, p: Path, root: Path, stage: str, meta: dict, now: float) -> dict:
+        try:
+            st = p.stat()
+            mtime = st.st_mtime
+            size = st.st_size
+        except OSError:
+            mtime, size = 0.0, 0
+        try:
+            rel = str(p.relative_to(root)).replace("\\", "/")
+        except ValueError:
+            rel = p.name
+        return {
+            "name": p.name,
+            "rel_path": rel,
+            "size": size,
+            "mtime": mtime,
+            "kind": p.suffix.lstrip(".") if p.suffix else "file",
+            "stage": stage,
+            "claude_cmd": meta.get("cmd", ""),
+            "session_id": meta.get("session_id", ""),
+            "jsonl": meta.get("jsonl", ""),
+            "prompt_file": meta.get("prompt_file", ""),
+            "is_active": (now - mtime) <= 120,
+        }
+
+    def get_session_content(self, db: Session, task_id: str, rel_path: str, *, tail_lines: int = 1000) -> dict:
+        """Return a bounded tail of a session file (seek-from-end; never full-parses .jsonl)."""
+        row = self._get_or_404(db, task_id)
+        if not row.output_dir:
+            raise HTTPException(status_code=404, detail="任务无输出目录")
+        target = _safe_session_path(Path(row.output_dir), rel_path)
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"会话文件不存在: {rel_path}")
+        content = _read_tail(target, max_lines=tail_lines, max_bytes=524288)
+        try:
+            size = target.stat().st_size
+        except OSError:
+            size = 0
+        return {
+            "task_id": row.task_id,
+            "rel_path": rel_path,
+            "name": target.name,
+            "content": content,
+            "size": size,
+            "tail_lines": tail_lines,
+        }
+
     # ── cancel / restart ──────────────────────────────────────────────────────
     def _revoke_celery_task(self, row: AppPocTask) -> None:
         cid = getattr(row, "celery_task_id", None)
@@ -324,6 +489,7 @@ class TaskService:
         row.returncode = None
         row.artifacts_json = None
         row.error = None
+        row.cli_command = None
         row.execution_owner_id = None
         row.execution_lease_until = None
         row.execution_heartbeat_at = None
@@ -383,6 +549,13 @@ class TaskService:
                 effort=row.effort, session_name=row.session_name,
                 session_id=row.session_id, session_dir=row.session_dir,
             )
+
+            # Persist the actual `poc` CLI command so the detail view can show the
+            # real cmd (all flags) while the task is running — before stages_json /
+            # result_json are written at terminal state.
+            row.cli_command = shlex.join(cmd)
+            db.commit()
+            db.refresh(row)
 
             lease_thread = self._start_lease_heartbeat(task_id, epoch, control_version, handle)
 
@@ -516,6 +689,7 @@ class TaskService:
             "session_id": row.session_id,
             "session_dir": row.session_dir,
             "timeout": row.timeout,
+            "cli_command": row.cli_command,
             "status": row.status,
             "error": row.error,
             "returncode": row.returncode,
