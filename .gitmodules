@@ -86,3 +86,7 @@
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-analyse
 	url = https://github.com/ict-bin/data_flow_analyse
+[submodule "13-secflow-service/image_build/secflow-app-binary-security"]
+	path = 13-secflow-service/image_build/secflow-app-binary-security
+	url = https://github.com/GaiaSecHW/secflow-app-binary-security.git
+	branch = main
