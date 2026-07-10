@@ -26,7 +26,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
       bash ca-certificates curl git iproute2 jq procps ripgrep tini unzip \
       build-essential gcc g++ make binutils libc-dev \
-      tmux gdb \
+      tmux gdb file xxd \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /app/requirements.txt
