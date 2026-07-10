@@ -90,3 +90,7 @@
 	path = 13-secflow-service/image_build/secflow-app-binary-security
 	url = https://github.com/GaiaSecHW/secflow-app-binary-security.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-app-firmware-unpacker"]
+	path = 13-secflow-service/image_build/secflow-app-firmware-unpacker
+	url = https://github.com/GaiaSecHW/secflow-app-firmware-unpacker.git
+	branch = main
