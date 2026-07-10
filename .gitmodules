@@ -7,7 +7,7 @@
 	url = https://github.com/ict-bin/system_analyse.git
 [submodule "13-secflow-service/image_build/secflow-app-entry-analyse"]
 	path = 13-secflow-service/image_build/secflow-app-entry-analyse
-	url = https://github.com/ict-bin/entry_analyse.git
+	url = https://github.com/GaiaSecHW/secflow-app-entry-analyse.git
 [submodule "13-secflow-service/image_build/secflow-app-dataflow-vuln-scan"]
 	path = 13-secflow-service/image_build/secflow-app-dataflow-vuln-scan
 	url = https://github.com/GaiaSecHW/secflow-app-dataflow-vuln-scan.git
