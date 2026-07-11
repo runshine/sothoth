@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-platform-diagnostic-assistant
+  namespace: secflow-ns
+  labels:
+    app: secflow-platform-diagnostic-assistant
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: secflow-platform-diagnostic-assistant
+  template:
+    metadata:
+      labels:
+        app: secflow-platform-diagnostic-assistant
+    spec:
+      serviceAccountName: secflow-platform-diagnostic-assistant
+      containers:
+        - name: diagnostic-assistant
+          image: ghcr.io/runshine/secflow-platform-diagnostic-assistant:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: SERVICE_YAML
+              value: /app-config/service.yaml
+          volumeMounts:
+            - name: app-config
+              mountPath: /app-config
+              readOnly: true
+            - name: app-data
+              mountPath: /data/diagnostic-assistant
+          readinessProbe:
+            httpGet:
+              path: /api/diagnostic-assistant/healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /api/diagnostic-assistant/healthz
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: app-config
+          configMap:
+            name: secflow-platform-diagnostic-assistant-config
+        - name: app-data
+          emptyDir: {}
