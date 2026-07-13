@@ -76,7 +76,6 @@ def create_task(req: PocTaskRequest, db: Session = Depends(get_db)) -> PocTaskCr
         session_name=req.session_name,
         session_id=req.session_id,
         session_dir=req.session_dir,
-        timeout=req.timeout,
         created_by=req.created_by,
     )
     return PocTaskCreateResponse(
@@ -119,6 +118,15 @@ def cancel_task(task_id: str, db: Session = Depends(get_db)) -> PocTaskStatus:
 @router.post("/tasks/{task_id}/restart", response_model=PocTaskStatus, status_code=201)
 def restart_task(task_id: str, db: Session = Depends(get_db)) -> PocTaskStatus:
     return PocTaskStatus(**get_task_service().restart_task(db, task_id))
+
+@router.delete("/tasks/{task_id}")
+def delete_task(
+    task_id: str,
+    delete_files: bool = Query(True, description="是否同时删除输出目录文件"),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete a task (and optionally its output files)."""
+    return get_task_service().delete_task(db, task_id, delete_files=delete_files)
 
 
 @router.get("/tasks/{task_id}/logs", response_model=PocTaskLogsResponse)

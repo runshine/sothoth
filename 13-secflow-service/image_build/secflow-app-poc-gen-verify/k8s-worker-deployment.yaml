@@ -15,6 +15,14 @@ spec:
     spec:
       securityContext: { fsGroup: 1000 }
       imagePullSecrets: [{ name: ghcr-secret }]   # private ghcr.io/runshine/* pull secret
+      initContainers:
+        - name: chmod-inputs
+          image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
+          imagePullPolicy: IfNotPresent
+          securityContext: { runAsUser: 0 }
+          command: [sh, -c, "find /data/files -path '*secflow-app-poc-gen-verify*' -exec chmod a+rX {} + 2>/dev/null || true"]
+          volumeMounts:
+            - { name: fileserver, mountPath: /data }
       containers:
         - name: poc-gen-verify-worker
           image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest

@@ -24,7 +24,7 @@ class PocTaskRequest(BaseModel):
     session_name: Optional[str] = Field(None, description="会话名 (传给 claude -n)")
     session_id: Optional[str] = Field(None, description="会话 UUID (传给 claude --session-id)")
     session_dir: Optional[str] = Field(None, description="会话存储目录 (传给 poc --session-dir)")
-    timeout: Optional[int] = Field(None, ge=60, le=14400, description="超时秒数")
+    timeout: Optional[int] = None
     created_by: Optional[str] = None
 
 
@@ -49,7 +49,7 @@ class PocTaskStatus(BaseModel):
     session_name: Optional[str] = None
     session_id: Optional[str] = None
     session_dir: Optional[str] = None
-    timeout: Optional[int] = None
+    timeout: Optional[int] = None  # legacy field (unused — no timeout mechanism)
     cli_command: Optional[str] = None
     status: TaskStatus
     error: Optional[str] = None
@@ -83,7 +83,7 @@ class PocTaskStatsResponse(BaseModel):
     running: int = 0
     succeeded: int = 0
     failed: int = 0
-    timeout: int = 0
+    timeout: int = 0  # legacy (unused — no timeout mechanism)
     cancelled: int = 0
 
 

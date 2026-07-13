@@ -31,7 +31,6 @@ class Settings:
         # fileserver shared volume (mounted in pods at /data); per-project work dirs
         # are generated under <fileserver_root>/<project_id>/app/secflow-app-poc-gen-verify/workspaces/
         self.fileserver_root = Path(os.getenv("POC_GEN_VERIFY_FILESERVER_ROOT", "/data/files"))
-        self.default_timeout = int(os.getenv("POC_GEN_VERIFY_DEFAULT_TIMEOUT", "7200"))
         self.default_model = os.getenv("POC_GEN_VERIFY_CLAUDE_MODEL", "glm-5.2")
         self.poc_bin = os.getenv("POC_GEN_VERIFY_POC_BIN", "poc")
         self.host = os.getenv("POC_GEN_VERIFY_HOST", "0.0.0.0")

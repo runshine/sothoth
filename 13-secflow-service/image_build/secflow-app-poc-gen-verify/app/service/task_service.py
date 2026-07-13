@@ -175,7 +175,6 @@ class TaskService:
         session_name: Optional[str] = None,
         session_id: Optional[str] = None,
         session_dir: Optional[str] = None,
-        timeout: Optional[int] = None,
         task_description: Optional[str] = None,
         created_by: Optional[str] = None,
     ) -> dict:
@@ -201,7 +200,6 @@ class TaskService:
             session_name=session_name,
             session_id=session_id,
             session_dir=session_dir,
-            timeout=timeout if timeout is not None else cfg.default_timeout,
             status="pending",
             execution_epoch=0,
             control_version=0,
@@ -262,7 +260,6 @@ class TaskService:
             "running": counts.get("running", 0),
             "succeeded": counts.get("succeeded", 0),
             "failed": counts.get("failed", 0),
-            "timeout": counts.get("timeout", 0),
             "cancelled": counts.get("cancelled", 0),
         }
 
@@ -312,6 +309,40 @@ class TaskService:
                 for e in events
             ],
         }
+
+    def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
+        """Soft-delete a task (is_deleted=True). Optionally clean output_dir + revoke celery."""
+        row = self._get_or_404(db, task_id)
+        # revoke any running celery task
+        self._revoke_celery_task(row)
+        # kill local poc group if running
+        h = _RUNNING.get(task_id)
+        if h and h.get("pgid"):
+            try:
+                os.killpg(h["pgid"], signal.SIGKILL)
+            except OSError:
+                pass
+            h["stop"].set()
+        # clean output files
+        if delete_files and row.output_dir:
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(row.output_dir, ignore_errors=True)
+            except Exception as exc:
+                logger.warning("delete output failed: %s", exc)
+        row.is_deleted = True
+        row.status = "cancelled"
+        row.finished_at = now_local()
+        row.execution_owner_id = None
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
+        row.dispatch_status = None
+        row.celery_task_id = None
+        db.commit()
+        db.refresh(row)
+        _record_task_event(db, row, "task_deleted", "任务已删除", level="warning",
+                           status="cancelled", payload={"delete_files": delete_files})
+        return {"task_id": row.task_id, "status": "deleted"}
 
     def list_artifacts(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -735,7 +766,6 @@ class TaskService:
             "session_name": row.session_name,
             "session_id": row.session_id,
             "session_dir": row.session_dir,
-            "timeout": row.timeout,
             "cli_command": row.cli_command,
             "status": row.status,
             "error": row.error,
