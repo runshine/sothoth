@@ -185,7 +185,7 @@ class TaskService:
         # logs / session records / artifacts live with the task and are readable from the
         # detail view. Naming matches the `poc` CLI default (<entry>_<bindir>_<ts>).
         workspaces_base = cfg.fileserver_root / project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
-        out_dir = output_dir or default_output_dir(entry_function, binary_dir, workspaces_base)
+        out_dir = output_dir or default_output_dir((entry_function or ""), binary_dir, workspaces_base)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
         row = AppPocTask(
             task_id=task_id,

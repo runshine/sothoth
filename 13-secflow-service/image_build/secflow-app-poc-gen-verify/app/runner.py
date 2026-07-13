@@ -29,8 +29,9 @@ def _slug(x: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", x).strip("_") or "poc"
 
 
-def default_output_dir(entry: str, bindir: str, base: Path) -> str:
-    """`<entry>_<bindir-basename>_<ts>` under `base` (mirrors the `poc` CLI's -o default)."""
+def default_output_dir(entry: Optional[str], bindir: str, base: Path) -> str:
+    """`<entry|poc>_<bindir-basename>_<ts>` under `base` (mirrors the `poc` CLI's -o default)."""
+    entry = entry or ""
     bname = Path(bindir).name if bindir else "bindir"
     name = f"{_slug(entry)}_{_slug(bname)}_{time.strftime('%Y%m%d_%H%M%S')}"
     return str(base / name)
