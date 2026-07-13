@@ -15,7 +15,7 @@ class PocTaskRequest(BaseModel):
     project_id: str = Field(..., description="项目 ID (任务归属)")
     task_name: Optional[str] = Field(None, description="任务名; 为空则自动生成")
     task_description: Optional[str] = None
-    entry_function: str = Field(..., min_length=1, description="数据流入口函数 (poc -e)")
+    entry_function: Optional[str] = Field(None, description="数据流入口函数 (poc -e); 省略则 Stage0 从漏洞报告提取")
     vuln_report_path: str = Field(..., description="漏洞报告路径 (poc -r)")
     binary_dir: str = Field(..., description="全二进制文件目录 (poc -b)")
     output_dir: Optional[str] = Field(None, description="输出目录 (poc -o); 为空则服务生成时间戳目录")
@@ -40,7 +40,7 @@ class PocTaskStatus(BaseModel):
     project_id: str
     task_name: str
     task_description: Optional[str] = None
-    entry_function: str
+    entry_function: Optional[str] = None
     vuln_report_path: str
     binary_dir: str
     output_dir: str

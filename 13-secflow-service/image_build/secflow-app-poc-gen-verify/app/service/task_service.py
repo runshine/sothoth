@@ -166,7 +166,7 @@ class TaskService:
         *,
         project_id: str,
         task_name: str,
-        entry_function: str,
+        entry_function: Optional[str] = None,
         vuln_report_path: str,
         binary_dir: str,
         output_dir: Optional[str] = None,
@@ -190,9 +190,9 @@ class TaskService:
         row = AppPocTask(
             task_id=task_id,
             project_id=project_id,
-            task_name=task_name or f"PoC: {entry_function}",
+            task_name=task_name or (f"PoC: {entry_function}" if entry_function else "PoC"),
             task_description=task_description,
-            entry_function=entry_function,
+            entry_function=(entry_function or ""),
             vuln_report_path=vuln_report_path,
             binary_dir=binary_dir,
             output_dir=out_dir,
@@ -340,6 +340,39 @@ class TaskService:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"读取产物失败: {exc}")
         return {"task_id": row.task_id, "name": safe, "content": content, "size": len(content)}
+
+    def get_artifact_path(self, db: Session, task_id: str, name: str) -> Path:
+        """Return the safe filesystem path of an artifact (for FileResponse download)."""
+        row = self._get_or_404(db, task_id)
+        if not row.output_dir:
+            raise HTTPException(status_code=404, detail="任务无输出目录")
+        safe = Path(name).name
+        if safe != name or "/" in name or ".." in name:
+            raise HTTPException(status_code=400, detail="非法的产物文件名")
+        target = Path(row.output_dir) / "output" / safe
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"产物不存在: {safe}")
+        return target
+
+    def get_artifact_paths(self, db: Session, task_id: str, names: Optional[list[str]] = None) -> list[Path]:
+        """Return safe paths for a batch (names list, or all on_disk files)."""
+        row = self._get_or_404(db, task_id)
+        if not row.output_dir:
+            raise HTTPException(status_code=404, detail="任务无输出目录")
+        art_dir = Path(row.output_dir) / "output"
+        if not art_dir.is_dir():
+            return []
+        if names:
+            paths: list[Path] = []
+            for n in names:
+                safe = Path(n).name
+                if safe != n or "/" in n or ".." in n:
+                    continue
+                p = art_dir / safe
+                if p.is_file():
+                    paths.append(p)
+            return paths
+        return sorted(p for p in art_dir.iterdir() if p.is_file())
 
     # ── session files (per-stage claude logs / stream-json / prompts / transcripts) ─
     def list_sessions(self, db: Session, task_id: str) -> dict:
@@ -588,6 +621,15 @@ class TaskService:
                 output_dir=row.output_dir,
                 on_popen=_on_popen, should_abort=_should_abort,
             )
+
+            # backfill the entry function from Stage0's stage0_report.md (the CLI derived it)
+            if not row.entry_function and row.output_dir:
+                s0_report = Path(row.output_dir) / "output" / "stage0_report.md"
+                if s0_report.is_file():
+                    txt = s0_report.read_text(encoding="utf-8", errors="replace")
+                    m = re.search(r"入口函数\s*[:：]\s*([A-Za-z0-9_]+)", txt)
+                    if m:
+                        row.entry_function = m.group(1).strip()
 
             finished_at = now_local()
             stages = {

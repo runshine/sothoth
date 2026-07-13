@@ -6,10 +6,13 @@ worker runs the `poc` CLI. Cancel/restart revoke the Celery task via Redis contr
 """
 from __future__ import annotations
 
+import io
 import shutil
+import zipfile
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from .api_schemas import (
@@ -137,9 +140,39 @@ def list_artifacts(task_id: str, db: Session = Depends(get_db)) -> PocArtifactsR
     return PocArtifactsResponse(**get_task_service().list_artifacts(db, task_id))
 
 
+# batch download MUST be declared before /artifacts/{name} so "download" isn't captured as {name}
+@router.get("/tasks/{task_id}/artifacts/download")
+def download_artifacts_archive(
+    task_id: str,
+    names: Optional[str] = Query(None, description="逗号分隔的产物名; 省略则打包全部"),
+    db: Session = Depends(get_db),
+):
+    """Batch-download artifacts as a zip (all on_disk, or the named subset)."""
+    name_list = [n.strip() for n in names.split(",") if n.strip()] if names else None
+    paths = get_task_service().get_artifact_paths(db, task_id, name_list)
+    if not paths:
+        raise HTTPException(status_code=404, detail="无可用产物")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in paths:
+            zf.write(p, p.name)
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="poc-artifacts-{task_id}.zip"'},
+    )
+
+
 @router.get("/tasks/{task_id}/artifacts/{name}", response_model=PocArtifactContentResponse)
 def get_artifact_content(task_id: str, name: str, db: Session = Depends(get_db)) -> PocArtifactContentResponse:
     return PocArtifactContentResponse(**get_task_service().get_artifact_content(db, task_id, name))
+
+
+@router.get("/tasks/{task_id}/artifacts/{name}/download")
+def download_artifact(task_id: str, name: str, db: Session = Depends(get_db)):
+    """Download a single artifact as raw bytes (incl. binary harness / .bin)."""
+    path = get_task_service().get_artifact_path(db, task_id, name)
+    return FileResponse(str(path), filename=path.name, media_type="application/octet-stream")
 
 
 @router.get("/tasks/{task_id}/sessions", response_model=PocSessionListResponse)
