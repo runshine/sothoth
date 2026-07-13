@@ -794,6 +794,10 @@ def run_two_stage(opts, ts) -> int:
     s1_name = f"{base_name}-stage1"
     s2_name = f"{base_name}-stage2"
 
+    # set up the session dir (copy settings + strip ANTHROPIC_* env) BEFORE any stage runs
+    if opts.session_dir:
+        _setup_session_dir(opts)
+
     # --- Stage 0: derive the entry function from the report (if not given; skip in dry-run) ---
     if not opts.entry and not opts.dry_run:
         entry = _run_stage0(opts, ts)
@@ -814,9 +818,6 @@ def run_two_stage(opts, ts) -> int:
         return _dry_run_two_stage(opts, s1_prompt, s2_prompt, s1_cmd, s2_cmd,
                                   s1_sid, s2_sid, s1_name, s2_name,
                                   s1_log, s2_log, s1_prompt_path, s2_prompt_path)
-
-    if opts.session_dir:
-        _setup_session_dir(opts)
 
     # --- Stage 1 (skip if --stage2-only) ---
     if not opts.stage2_only:
