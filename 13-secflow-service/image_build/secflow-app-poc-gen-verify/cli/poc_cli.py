@@ -383,17 +383,6 @@ def _lockdown_session_settings(session_dir: Path) -> None:
                 deny.append(t)
     else:
         perms["deny"] = list(WEB_DENY_TOOLS)
-    # Strip ANTHROPIC_* from the env block so the subprocess uses the process env
-    # (the user's ~/.claude/settings.json may point to a different gateway with an
-    # expired token — e.g. DashScope). The poc CLI inherits the process env via
-    # _claude_env (os.environ.copy()), so the user must export ANTHROPIC_BASE_URL +
-    # ANTHROPIC_AUTH_TOKEN (+ ANTHROPIC_MODEL) before running poc.
-    env = cfg.get("env", {})
-    if isinstance(env, dict):
-        for k in list(env.keys()):
-            if k.startswith("ANTHROPIC"):
-                del env[k]
-        cfg["env"] = env
     sf.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
