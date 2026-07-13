@@ -145,3 +145,6 @@ Dockerfile / entrypoint.sh / .claude.json / settings.json  image + claude config
 k8s-*.yaml              api/worker/scheduler deployments + redis + service + configmap + pvc + secret.example
 requirements.txt
 ```
+
+## notes
+- image pre-installs `file` + `xxd` (per session analysis of the completed IPSEC task — the agent hit "command not found" for both).
