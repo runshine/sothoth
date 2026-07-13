@@ -173,7 +173,7 @@ PROMPT_STAGE0 = """\
 
   **阶段0任务**：
     1.阅读漏洞报告全文，理解其描述的漏洞场景与数据流路径。
-    2.提取"数据流入口函数"——即外部输入/数据进入受影响代码路径的**第一个**函数(入口/源端)。例如报告描述"IPSEC_SOCKI_PipeMsg接收报文后经…到达IPSEC_AH_HandleInputPktV4的漏洞点"，则入口函数是IPSEC_SOCKI_PipeMsg(而非漏洞点IPSEC_AH_HandleInputPktV4)。
+    2.提取"数据流入口函数"——即外部输入/数据进入受影响代码路径的**第一个**函数(入口/源端)。
     3.将提取结果写入{输出目录}/output/stage0_report.md，**单独一行**格式为"入口函数: <函数名>"(该行只有"入口函数: "前缀+函数名，无其他内容)。
 
   **阶段0约束**(必须遵守)：
@@ -417,6 +417,8 @@ def build_claude_cmd(opts, prompt: str, session_id=None, session_name=None) -> l
     two-stage mode can pass per-stage ids without mutating opts."""
     cmd = [opts.claude_bin, "-p", prompt]
     cmd += ["--output-format", opts.output_format]
+    if opts.output_format == "stream-json":
+        cmd.append("--verbose")  # claude requires --verbose with -p + stream-json
     if opts.skip_perms:
         cmd.append("--dangerously-skip-permissions")
     if opts.model:
