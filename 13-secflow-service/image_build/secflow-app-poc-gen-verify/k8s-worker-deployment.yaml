@@ -8,34 +8,31 @@ spec:
   replicas: 8
   strategy:
     type: RollingUpdate
-    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }   # only 1 worker down at a time
+    rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }
   selector: { matchLabels: { name: secflow-app-poc-gen-verify, role: worker } }
   template:
     metadata: { labels: { name: secflow-app-poc-gen-verify, role: worker } }
     spec:
-      securityContext: { fsGroup: 1000 }
-      imagePullSecrets: [{ name: ghcr-secret }]   # private ghcr.io/runshine/* pull secret
-      initContainers:
-        - name: chmod-inputs
-          image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
-          imagePullPolicy: IfNotPresent
-          securityContext: { runAsUser: 0 }
-          command: [sh, -c, "find /data/files -path '*secflow-app-poc-gen-verify*' -exec chmod a+rX {} + 2>/dev/null || true"]
-          volumeMounts:
-            - { name: fileserver, mountPath: /data }
+      imagePullSecrets: [{ name: ghcr-secret }]
       containers:
         - name: poc-gen-verify-worker
           image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
           imagePullPolicy: IfNotPresent
+          # Run as root so the worker can read any file on the fileserver
+          # (files uploaded by other services are root:600). Root + umask 022
+          # means all created files are 644/755 → the api pod (scanner) can read them.
+          # SYS_PTRACE for gdb. No more initContainer chmod — root reads everything.
           securityContext:
-            capabilities: { add: [SYS_PTRACE] }   # gdb ptrace for the poc CLI
-          # entrypoint.sh (claude config setup) MUST run before celery — the poc
-          # CLI spawns `claude`, which needs ~/.claude.json + ~/.claude/settings.json.
-          command: ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
-          args: ["celery", "-A", "app.celery_app", "worker", "-P", "prefork", "-c", "1",
-                 "--queues=poc", "--loglevel=info", "--hostname=poc-worker@%h"]
+            runAsUser: 0
+            capabilities: { add: [SYS_PTRACE] }
+          # umask 022 → files 644, dirs 755 (api pod scanner can read them).
+          # HOME=/home/scanner → entrypoint.sh finds the baked claude config there.
+          command: ["/bin/bash", "-c"]
+          args:
+            - "umask 022 && export HOME=/home/scanner && exec /usr/bin/tini -- /app/entrypoint.sh celery -A app.celery_app worker -P prefork -c 1 --queues=poc --loglevel=info --hostname=poc-worker@%h"
           env:
             - { name: TZ, value: Asia/Shanghai }
+            - { name: HOME, value: /home/scanner }
             - { name: SERVICE_YAML, value: /app/service.yaml }
             - { name: POC_ROLE, value: worker }
             - { name: POC_GEN_VERIFY_STATE_ROOT, value: /tmp/secflow-poc-gen-verify }
@@ -46,7 +43,6 @@ spec:
             - { name: POC_LEASE_TTL_SECONDS, value: "300" }
             - { name: POC_HEARTBEAT_INTERVAL_SECONDS, value: "60" }
             - { name: POC_CELERY_MAX_TASKS_PER_CHILD, value: "10" }
-            # LOCAL_GLM (模型配置中心): http://172.31.29.10 speaks Anthropic /v1/messages
             - { name: ANTHROPIC_BASE_URL, value: "http://172.31.29.10" }
             - { name: ANTHROPIC_MODEL, value: glm-5.2 }
             - { name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, value: "1" }
@@ -56,9 +52,8 @@ spec:
             - secretRef: { name: secflow-app-poc-gen-verify-secret, optional: true }
           volumeMounts:
             - { name: cfg, mountPath: /app/service.yaml, subPath: service.yaml }
-            - { name: fileserver, mountPath: /data }   # shared platform fileserver -> /data/files/{project_id}
+            - { name: fileserver, mountPath: /data }
           resources: { requests: { cpu: "2", memory: "4Gi" }, limits: { cpu: "4", memory: "8Gi" } }
-          # worker runs celery (not uvicorn) — liveness via process check
           livenessProbe:
             exec: { command: ["sh", "-c", "pgrep -f 'celery.*app.celery_app' >/dev/null"] }
             initialDelaySeconds: 30
