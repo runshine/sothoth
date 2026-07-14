@@ -21,7 +21,7 @@ from app.models import (
 from app.service.configcenter_service import ConfigCenterError, list_llm_providers
 from app.service.conversation_render_service import PiConversationRenderer
 from app.service.pi_agent_service import PiAgentError, stream_pi_agent
-from app.service.pi_runtime_service import build_session_path, prepare_pi_runtime
+from app.service.pi_runtime_service import prepare_pi_runtime
 from app.service.run_registry_service import bind_process, register_run, unregister_run
 from app.service.storage_service import (
     add_agent_event,
@@ -78,12 +78,7 @@ def create_session_endpoint(
 ) -> DiagnosticSessionSummary:
     user, _ = user_and_token
     ensure_admin_user(user)
-    session = create_session(created_by=_user_name(user), title=(payload.title or "诊断会话")[:80])
-    return bind_agent_session(
-        session.id,
-        agent_session_id=str(build_session_path(session.id)),
-        agent_id="pi",
-    )
+    return create_session(created_by=_user_name(user), title=(payload.title or "诊断会话")[:80])
 
 
 @router.get("/sessions", response_model=list[DiagnosticSessionSummary])
@@ -270,7 +265,7 @@ async def run_stream_endpoint(
                     for block in render_state.apply_event(pi_event):
                         yield {
                             "event": "conversation_block",
-                            "data": json.dumps({"block": block.model_dump(mode="json")}, ensure_ascii=False),
+                            "data": json.dumps({"block": block.model_dump()}, ensure_ascii=False),
                         }
                 continue
             if event_type == "response.trace.item":

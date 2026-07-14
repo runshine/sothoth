@@ -20,7 +20,6 @@ from app.models import (
 from app.service.conversation_render_service import (
     render_assistant_artifacts_from_events,
     render_conversation_blocks_from_events,
-    render_tool_command,
 )
 from app.service.session_log_service import append_event_log, append_message_log, read_event_log, read_message_log
 from app.service.session_log_service import delete_run_log, delete_session_log
@@ -113,22 +112,11 @@ def delete_session(session_id: int) -> bool:
     return True
 
 
-def bind_agent_session(
-    session_id: int,
-    *,
-    agent_session_id: str,
-    agent_id: str | None = None,
-    session_mode: str | None = None,
-) -> DiagnosticSessionSummary:
+def bind_agent_session(session_id: int, *, agent_session_id: str, agent_id: str, session_mode: str) -> DiagnosticSessionSummary:
     with get_conn() as conn:
-        current = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
-        if current is None:
-            raise ValueError(f"session {session_id} not found")
-        next_agent_id = agent_id if agent_id is not None else current["agent_id"]
-        next_session_mode = session_mode if session_mode is not None else current["session_mode"]
         conn.execute(
             "UPDATE diagnostic_session SET agent_session_id = ?, agent_id = ?, session_mode = ?, updated_at = ? WHERE id = ?",
-            (agent_session_id, next_agent_id, next_session_mode, _utc_now(), session_id),
+            (agent_session_id, agent_id, session_mode, _utc_now(), session_id),
         )
         row = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
     return _session_from_row(row)
@@ -234,18 +222,6 @@ def _upsert_block(items: list[DiagnosticConversationBlock], next_item: Diagnosti
     items.append(next_item)
 
 
-def _with_block_time(
-    current: DiagnosticConversationBlock | None,
-    *,
-    created_at: datetime,
-    updated_at: datetime | None = None,
-) -> tuple[datetime, datetime | None]:
-    return (
-        current.created_at if current is not None else created_at,
-        updated_at if updated_at is not None else (current.updated_at if current is not None else None),
-    )
-
-
 def _block_title_for_tool(tool_name: str) -> str:
     return tool_name or "unknown"
 
@@ -287,7 +263,6 @@ def _conversation_blocks_from_events(
                         title="thinking",
                         body="",
                         created_at=created_at,
-                        updated_at=event.created_at,
                     ),
                 )
             elif assistant_event_type == "thinking_delta" and thinking_item_id:
@@ -304,7 +279,6 @@ def _conversation_blocks_from_events(
                             title=current.title,
                             body=f"{current.body}{delta}",
                             created_at=current.created_at,
-                            updated_at=event.created_at,
                         ),
                     )
             elif assistant_event_type == "thinking_end" and thinking_item_id:
@@ -321,7 +295,6 @@ def _conversation_blocks_from_events(
                             title=current.title,
                             body=content or current.body,
                             created_at=current.created_at,
-                            updated_at=event.created_at,
                         ),
                     )
                 thinking_item_id = None
@@ -330,17 +303,16 @@ def _conversation_blocks_from_events(
                 text_item_id = f"text-{run_id}-{text_seq}"
                 _upsert_block(
                     blocks,
-                        DiagnosticConversationBlock(
-                            id=text_item_id,
-                            message_id=assistant_message_id,
-                            run_id=run_id,
-                            kind="text",
-                            title="response",
-                            body="",
-                            created_at=created_at,
-                            updated_at=event.created_at,
-                        ),
-                    )
+                    DiagnosticConversationBlock(
+                        id=text_item_id,
+                        message_id=assistant_message_id,
+                        run_id=run_id,
+                        kind="text",
+                        title="response",
+                        body="",
+                        created_at=created_at,
+                    ),
+                )
             elif assistant_event_type == "text_delta" and text_item_id:
                 delta = str(assistant_event.get("delta") or "")
                 current = next((item for item in blocks if item.id == text_item_id), None)
@@ -355,7 +327,6 @@ def _conversation_blocks_from_events(
                             title=current.title,
                             body=_merge_stream_text(current.body, delta),
                             created_at=current.created_at,
-                            updated_at=event.created_at,
                         ),
                     )
             elif assistant_event_type == "text_end" and text_item_id:
@@ -372,7 +343,6 @@ def _conversation_blocks_from_events(
                             title=current.title,
                             body=_merge_stream_text(current.body, content),
                             created_at=current.created_at,
-                            updated_at=event.created_at,
                         ),
                     )
                 text_item_id = None
@@ -381,39 +351,41 @@ def _conversation_blocks_from_events(
                 if isinstance(tool_call, dict):
                     tool_call_id = str(tool_call.get("id") or "")
                     tool_name = str(tool_call.get("name") or "unknown")
-                    body = render_tool_command(tool_name, tool_call.get("arguments")) if assistant_event_type == "toolcall_end" else ""
+                    body = ""
+                    if isinstance(tool_call.get("partialArgs"), str):
+                        body = str(tool_call.get("partialArgs") or "")
+                    elif tool_call.get("arguments") is not None:
+                        body = _stringify_tool_args(tool_call.get("arguments"))
                     if tool_call_id:
                         block_id = f"toolcall-{tool_call_id}"
                         current = next((item for item in blocks if item.id == block_id), None)
                         _upsert_block(
                             blocks,
-                        DiagnosticConversationBlock(
-                            id=block_id,
-                            message_id=assistant_message_id,
-                            run_id=run_id,
-                            kind="tool_call",
-                            title=_block_title_for_tool(tool_name),
-                            body=_merge_stream_text(current.body if current is not None else "", body),
-                            created_at=current.created_at if current is not None else created_at,
-                            updated_at=event.created_at,
-                        ),
-                    )
+                            DiagnosticConversationBlock(
+                                id=block_id,
+                                message_id=assistant_message_id,
+                                run_id=run_id,
+                                kind="tool_call",
+                                title=_block_title_for_tool(tool_name),
+                                body=_merge_stream_text(current.body if current is not None else "", body),
+                                created_at=current.created_at if current is not None else created_at,
+                            ),
+                        )
         if etype == "tool_execution_start":
             tool_id = str(pi_event.get("toolCallId") or "")
             if tool_id:
                 _upsert_block(
                     blocks,
-                        DiagnosticConversationBlock(
-                            id=f"tool-result-{tool_id}",
-                            message_id=assistant_message_id,
-                            run_id=run_id,
-                            kind="tool_result",
-                            title=_block_title_for_tool(str(pi_event.get("toolName") or "unknown")),
-                            body="",
-                            created_at=created_at,
-                            updated_at=event.created_at,
-                        ),
-                    )
+                    DiagnosticConversationBlock(
+                        id=f"tool-result-{tool_id}",
+                        message_id=assistant_message_id,
+                        run_id=run_id,
+                        kind="tool_result",
+                        title=_block_title_for_tool(str(pi_event.get("toolName") or "unknown")),
+                        body="",
+                        created_at=created_at,
+                    ),
+                )
         elif etype == "tool_execution_update":
             tool_id = str(pi_event.get("toolCallId") or "")
             if tool_id:
@@ -429,7 +401,6 @@ def _conversation_blocks_from_events(
                         title=_block_title_for_tool(str(pi_event.get("toolName") or "unknown")),
                         body=_merge_stream_text(current.body if current is not None else "", body),
                         created_at=current.created_at if current is not None else created_at,
-                        updated_at=event.created_at,
                     ),
                 )
         elif etype == "tool_execution_end":
@@ -447,7 +418,6 @@ def _conversation_blocks_from_events(
                         title=_block_title_for_tool(str(pi_event.get("toolName") or "unknown")),
                         body=_merge_stream_text(current.body if current is not None else "", body),
                         created_at=current.created_at if current is not None else created_at,
-                        updated_at=event.created_at,
                     ),
                 )
         elif etype == "message_end":
@@ -474,13 +444,10 @@ def _conversation_blocks_from_events(
                                         title="thinking",
                                         body=text,
                                         created_at=created_at,
-                                        updated_at=event.created_at,
                                     ))
                         elif item_type == "text":
                             text = str(item.get("text") or "")
                             if text.strip():
-                                if any(block.kind == "text" and block.body.strip() == text for block in blocks):
-                                    continue
                                 fallback_index += 1
                                 block_id = f"text-fallback-{run_id}-{fallback_index}"
                                 if not any(block.kind == "text" and block.body == text for block in blocks):
@@ -492,12 +459,11 @@ def _conversation_blocks_from_events(
                                         title="response",
                                         body=text,
                                         created_at=created_at,
-                                        updated_at=event.created_at,
                                     ))
                         elif item_type == "toolCall":
                             tool_name = str(item.get("name") or "unknown")
                             tool_id = str(item.get("id") or f"fallback-{run_id}-{fallback_index}")
-                            body = render_tool_command(tool_name, item.get("arguments"))
+                            body = _stringify_tool_args(item.get("arguments"))
                             block_id = f"toolcall-{tool_id}"
                             if not any(block.id == block_id for block in blocks):
                                 blocks.append(DiagnosticConversationBlock(
@@ -508,7 +474,6 @@ def _conversation_blocks_from_events(
                                     title=_block_title_for_tool(tool_name),
                                     body=body,
                                     created_at=created_at,
-                                    updated_at=event.created_at,
                                 ))
     return [
         block for block in blocks
@@ -566,7 +531,11 @@ def _assistant_artifacts_from_events(events: list[DiagnosticAgentEventRecord]) -
                 if isinstance(tool_call, dict):
                     tool_call_id = str(tool_call.get("id") or "")
                     tool_name = str(tool_call.get("name") or "unknown")
-                    body = render_tool_command(tool_name, tool_call.get("arguments")) if assistant_event_type == "toolcall_end" else ""
+                    body = ""
+                    if isinstance(tool_call.get("partialArgs"), str):
+                        body = str(tool_call.get("partialArgs") or "")
+                    elif tool_call.get("arguments") is not None:
+                        body = _stringify_tool_args(tool_call.get("arguments"))
                     if tool_call_id:
                         current = next((item for item in timeline_items if item.id == f"toolcall-{tool_call_id}"), None)
                         next_body = _merge_stream_text(current.body if current is not None else "", body)
