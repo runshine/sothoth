@@ -10,8 +10,10 @@
 - 诊断助手服务作为薄代理，转发到现有 `agent-helper` 的 `/api/ai-agents/*`
 - `GET /api/diagnostic-assistant/agents`
 - `POST /api/diagnostic-assistant/runs/stream`
+- 流式响应除原始 `pi_event` 外，还会推送 `conversation_block`，用于前端直接渲染
 - `GET /api/diagnostic-assistant/sessions/{id}/runs`
 - `GET /api/diagnostic-assistant/runs/{id}/events`
+- 会话详情和回放共用同一套渲染引擎，保证刷新后与实时展示一致
 
 ## 环境变量
 

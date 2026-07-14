@@ -36,6 +36,17 @@ class DiagnosticAssistantArtifacts(BaseModel):
     items: list[DiagnosticReadableItem] = Field(default_factory=list)
 
 
+class DiagnosticConversationBlock(BaseModel):
+    id: str
+    message_id: int | None = None
+    run_id: int | None = None
+    kind: Literal["user", "thinking", "text", "tool_call", "tool_result"]
+    title: str = ""
+    body: str = ""
+    created_at: datetime
+    running: bool = False
+
+
 class DiagnosticExecutionRecord(BaseModel):
     id: int
     session_id: int
@@ -64,6 +75,7 @@ class DiagnosticSessionDetail(BaseModel):
     session: DiagnosticSessionSummary
     messages: list[DiagnosticMessageRecord]
     assistant_artifacts: dict[int, DiagnosticAssistantArtifacts] = Field(default_factory=dict)
+    conversation_blocks: list[DiagnosticConversationBlock] = Field(default_factory=list)
 
 
 class CreateSessionRequest(BaseModel):

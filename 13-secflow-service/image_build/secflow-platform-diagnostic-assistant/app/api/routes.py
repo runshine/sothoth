@@ -19,6 +19,7 @@ from app.models import (
     DiagnosticSessionSummary,
 )
 from app.service.configcenter_service import ConfigCenterError, list_llm_providers
+from app.service.conversation_render_service import PiConversationRenderer
 from app.service.pi_agent_service import PiAgentError, stream_pi_agent
 from app.service.pi_runtime_service import prepare_pi_runtime
 from app.service.run_registry_service import bind_process, register_run, unregister_run
@@ -185,6 +186,7 @@ async def run_stream_endpoint(
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         done_marker = {"type": "__done__"}
+        render_state = PiConversationRenderer(run_id=run.id)
 
         def push(item: dict[str, Any]) -> None:
             loop.call_soon_threadsafe(queue.put_nowait, item)
@@ -260,6 +262,11 @@ async def run_stream_endpoint(
                     pi_event_type = str(pi_event.get("type") or "unknown")
                     add_agent_event(run.id, f"pi_event.{pi_event_type}", upstream_event)
                     yield {"event": "pi_event", "data": json.dumps(pi_event, ensure_ascii=False)}
+                    for block in render_state.apply_event(pi_event):
+                        yield {
+                            "event": "conversation_block",
+                            "data": json.dumps({"block": block.model_dump()}, ensure_ascii=False),
+                        }
                 continue
             if event_type == "response.trace.item":
                 stored = add_agent_event(run.id, event_type, upstream_event)

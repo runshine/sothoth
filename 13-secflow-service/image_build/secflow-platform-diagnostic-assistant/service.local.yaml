@@ -1,0 +1,28 @@
+database:
+  sqlite_path: /home/icsl/ccx/sothoth/13-secflow-service/image_build/secflow-platform-diagnostic-assistant/.runtime/diagnostic_assistant.db
+
+auth_service:
+  host: secflow.ai.icsl.huawei.com
+  port: 80
+  validate_token_path: /api/auth/validate-token
+  service_machine_token: ""
+  timeout: 10
+
+configcenter_service:
+  base_url: http://secflow.ai.icsl.huawei.com/api/configcenter
+  timeout: 30
+
+app:
+  host: 0.0.0.0
+  port: 8080
+  debug: false
+  default_provider_key: share_codex
+  kubectl_timeout_seconds: 60
+  max_command_output_bytes: 200000
+  max_history_messages: 12
+
+agent_helper:
+  base_url: http://127.0.0.1:20001
+  timeout: 60
+  default_agent_id: pi
+  default_session_mode: invoke
