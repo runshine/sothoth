@@ -297,9 +297,10 @@ def parse_args(argv=None):
                     help="claude -p output format (default: stream-json for live progress).")
     ap.add_argument("--log", default=None,
                     help="Log file path (default: <workdir>/poc_cli_<timestamp>[_stageN].log).")
-    ap.add_argument("--no-skip-permissions", dest="skip_perms", action="store_false",
-                    help="Do NOT pass --dangerously-skip-permissions.")
-    ap.set_defaults(skip_perms=True)
+    ap.add_argument("--no-skip-permissions", dest="skip_perms", action="store_true",
+                    help="Do NOT pass --dangerously-skip-permissions (default: not passed — "
+                         "relies on settings.json defaultMode:auto instead, which works as root).")
+    ap.set_defaults(skip_perms=False)
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the exact claude commands + prompts (and the gate plan) and exit (no invocation).")
     ap.add_argument("--single", action="store_true",
