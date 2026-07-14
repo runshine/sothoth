@@ -182,14 +182,18 @@ class TaskService:
         task_id = f"poc-{_task_id_stamp()}-{uuid.uuid4().hex[:8]}"
         # default work dir on the fileserver (mounted at /data, shared by api+worker) so
         # logs / session records / artifacts live with the task and are readable from the
-        # detail view. Naming matches the `poc` CLI default (<entry>_<bindir>_<ts>).
+        # detail view. Naming: <report-basename>_<bindir-basename>_<ts>.
         workspaces_base = cfg.fileserver_root / project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
-        out_dir = output_dir or default_output_dir((entry_function or ""), binary_dir, workspaces_base)
+        out_dir = output_dir or default_output_dir(vuln_report_path, binary_dir, workspaces_base)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+        # task name = <report-basename>_<bindir-basename>_<ts>
+        _rpt_stem = Path(vuln_report_path).stem if vuln_report_path else "poc"
+        _bin_name = Path(binary_dir).name if binary_dir else "bindir"
+        _ts = _task_id_stamp()
         row = AppPocTask(
             task_id=task_id,
             project_id=project_id,
-            task_name=task_name or (f"PoC: {entry_function}" if entry_function else "PoC"),
+            task_name=task_name or f"{_rpt_stem}_{_bin_name}_{_ts}",
             task_description=task_description,
             entry_function=(entry_function or ""),
             vuln_report_path=vuln_report_path,
@@ -604,7 +608,7 @@ class TaskService:
             # the runner log + the poc CLI's per-stage logs/sessions/artifacts all live here.
             if not row.output_dir:
                 workspaces_base = cfg.fileserver_root / row.project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
-                row.output_dir = default_output_dir(row.entry_function, row.binary_dir, workspaces_base)
+                row.output_dir = default_output_dir(row.vuln_report_path, row.binary_dir, workspaces_base)
                 db.commit()
                 db.refresh(row)
             work_dir = Path(row.output_dir)
