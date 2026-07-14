@@ -29,10 +29,11 @@ def _slug(x: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", x).strip("_") or "poc"
 
 
-def default_output_dir(entry: str, bindir: str, base: Path) -> str:
-    """`<entry>_<bindir-basename>_<ts>` under `base` (mirrors the `poc` CLI's -o default)."""
+def default_output_dir(report_path: Optional[str], bindir: str, base: Path) -> str:
+    """`<report-basename>_<bindir-basename>_<ts>` under `base`."""
+    rpt_stem = Path(report_path).stem if report_path else "poc"
     bname = Path(bindir).name if bindir else "bindir"
-    name = f"{_slug(entry)}_{_slug(bname)}_{time.strftime('%Y%m%d_%H%M%S')}"
+    name = f"{_slug(rpt_stem)}_{_slug(bname)}_{time.strftime('%Y%m%d_%H%M%S')}"
     return str(base / name)
 
 
@@ -52,8 +53,10 @@ def build_poc_cmd(
     """Build the `poc` CLI argv from task fields."""
     # NOTE: the `poc` CLI has no --timeout flag (it rejects unknown args → exit 2).
     # The timeout is enforced by run_poc_cli's process-group timer, not the CLI.
-    cmd = [poc_bin, "-e", entry_function, "-r", vuln_report_path,
-           "-b", binary_dir, "-o", output_dir]
+    # -e/--entry is optional: when absent, the CLI runs Stage 0 to derive it from the report.
+    cmd = [poc_bin, "-r", vuln_report_path, "-b", binary_dir, "-o", output_dir]
+    if entry_function:
+        cmd += ["-e", entry_function]
     if model:
         cmd += ["--model", model]
     if effort:

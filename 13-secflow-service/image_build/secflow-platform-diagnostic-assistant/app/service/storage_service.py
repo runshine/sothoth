@@ -10,11 +10,17 @@ from app.models import (
     DiagnosticAgentEventRecord,
     DiagnosticAgentRunRecord,
     DiagnosticAuditRecord,
+    DiagnosticConversationBlock,
     DiagnosticExecutionRecord,
     DiagnosticMessageRecord,
     DiagnosticReadableItem,
     DiagnosticSessionDetail,
     DiagnosticSessionSummary,
+)
+from app.service.conversation_render_service import (
+    render_assistant_artifacts_from_events,
+    render_conversation_blocks_from_events,
+    render_tool_command,
 )
 from app.service.session_log_service import append_event_log, append_message_log, read_event_log, read_message_log
 from app.service.session_log_service import delete_run_log, delete_session_log
@@ -107,11 +113,22 @@ def delete_session(session_id: int) -> bool:
     return True
 
 
-def bind_agent_session(session_id: int, *, agent_session_id: str, agent_id: str, session_mode: str) -> DiagnosticSessionSummary:
+def bind_agent_session(
+    session_id: int,
+    *,
+    agent_session_id: str,
+    agent_id: str | None = None,
+    session_mode: str | None = None,
+) -> DiagnosticSessionSummary:
     with get_conn() as conn:
+        current = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
+        if current is None:
+            raise ValueError(f"session {session_id} not found")
+        next_agent_id = agent_id if agent_id is not None else current["agent_id"]
+        next_session_mode = session_mode if session_mode is not None else current["session_mode"]
         conn.execute(
             "UPDATE diagnostic_session SET agent_session_id = ?, agent_id = ?, session_mode = ?, updated_at = ? WHERE id = ?",
-            (agent_session_id, agent_id, session_mode, _utc_now(), session_id),
+            (agent_session_id, next_agent_id, next_session_mode, _utc_now(), session_id),
         )
         row = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
     return _session_from_row(row)
@@ -177,11 +194,74 @@ def _stringify_tool_args(value: Any) -> str:
         return str(value)
 
 
-def _assistant_artifacts_from_events(events: list[DiagnosticAgentEventRecord]) -> DiagnosticAssistantArtifacts:
-    reasoning = ""
-    tool_calls: list[DiagnosticReadableItem] = []
-    tool_state: dict[str, DiagnosticReadableItem] = {}
-    tool_order: list[str] = []
+def _merge_stream_text(previous: str, incoming: str) -> str:
+    if not incoming:
+        return previous
+    if not previous:
+        return incoming
+    if incoming.startswith(previous):
+        return incoming
+    if previous.endswith(incoming):
+        return previous
+    return f"{previous}{incoming}"
+
+
+def _extract_partial_content_item(assistant_event: dict[str, Any]) -> dict[str, Any] | None:
+    partial = assistant_event.get("partial")
+    content_index = assistant_event.get("contentIndex")
+    if not isinstance(partial, dict) or not isinstance(content_index, int):
+        return None
+    content = partial.get("content")
+    if not isinstance(content, list) or content_index < 0 or content_index >= len(content):
+        return None
+    item = content[content_index]
+    return item if isinstance(item, dict) else None
+
+
+def _upsert_timeline_item(items: list[DiagnosticReadableItem], next_item: DiagnosticReadableItem) -> None:
+    for index, item in enumerate(items):
+        if item.id == next_item.id:
+            items[index] = next_item
+            return
+    items.append(next_item)
+
+
+def _upsert_block(items: list[DiagnosticConversationBlock], next_item: DiagnosticConversationBlock) -> None:
+    for index, item in enumerate(items):
+        if item.id == next_item.id:
+            items[index] = next_item
+            return
+    items.append(next_item)
+
+
+def _with_block_time(
+    current: DiagnosticConversationBlock | None,
+    *,
+    created_at: datetime,
+    updated_at: datetime | None = None,
+) -> tuple[datetime, datetime | None]:
+    return (
+        current.created_at if current is not None else created_at,
+        updated_at if updated_at is not None else (current.updated_at if current is not None else None),
+    )
+
+
+def _block_title_for_tool(tool_name: str) -> str:
+    return tool_name or "unknown"
+
+
+def _conversation_blocks_from_events(
+    events: list[DiagnosticAgentEventRecord],
+    *,
+    assistant_message_id: int | None,
+    run_id: int,
+    created_at: datetime,
+) -> list[DiagnosticConversationBlock]:
+    blocks: list[DiagnosticConversationBlock] = []
+    thinking_item_id: str | None = None
+    text_item_id: str | None = None
+    thinking_seq = 0
+    text_seq = 0
     for event in events:
         if not event.event_type.startswith("pi_event."):
             continue
@@ -190,59 +270,378 @@ def _assistant_artifacts_from_events(events: list[DiagnosticAgentEventRecord]) -
         if not isinstance(pi_event, dict):
             continue
         etype = str(pi_event.get("type") or "")
-        if etype in {"message_start", "message_update", "message_end"}:
-            message = pi_event.get("message")
-            if isinstance(message, dict) and message.get("role") == "assistant":
-                content = message.get("content")
-                if isinstance(content, list):
-                    reasoning = "\n\n".join(
-                        str(item.get("thinking") or "")
-                        for item in content
-                        if isinstance(item, dict) and item.get("type") == "thinking" and str(item.get("thinking") or "").strip()
-                    ).strip()
-                    tool_calls = [
-                        DiagnosticReadableItem(
-                            id=str(item.get("id") or f"tool-call-{idx}"),
-                            title=f"tool call: {str(item.get('name') or 'unknown')}",
-                            body=_stringify_tool_args(item.get("arguments")),
-                        )
-                        for idx, item in enumerate(content)
-                        if isinstance(item, dict) and item.get("type") == "toolCall"
-                    ]
-        elif etype == "tool_execution_start":
+        assistant_event = pi_event.get("assistantMessageEvent")
+        if isinstance(assistant_event, dict):
+            assistant_event_type = str(assistant_event.get("type") or "")
+            partial_content_item = _extract_partial_content_item(assistant_event)
+            if assistant_event_type == "thinking_start":
+                thinking_seq += 1
+                thinking_item_id = f"thinking-{run_id}-{thinking_seq}"
+                _upsert_block(
+                    blocks,
+                    DiagnosticConversationBlock(
+                        id=thinking_item_id,
+                        message_id=assistant_message_id,
+                        run_id=run_id,
+                        kind="thinking",
+                        title="thinking",
+                        body="",
+                        created_at=created_at,
+                        updated_at=event.created_at,
+                    ),
+                )
+            elif assistant_event_type == "thinking_delta" and thinking_item_id:
+                delta = str(assistant_event.get("delta") or "")
+                current = next((item for item in blocks if item.id == thinking_item_id), None)
+                if current is not None:
+                    _upsert_block(
+                        blocks,
+                        DiagnosticConversationBlock(
+                            id=current.id,
+                            message_id=current.message_id,
+                            run_id=current.run_id,
+                            kind=current.kind,
+                            title=current.title,
+                            body=f"{current.body}{delta}",
+                            created_at=current.created_at,
+                            updated_at=event.created_at,
+                        ),
+                    )
+            elif assistant_event_type == "thinking_end" and thinking_item_id:
+                content = str(assistant_event.get("content") or "")
+                current = next((item for item in blocks if item.id == thinking_item_id), None)
+                if current is not None:
+                    _upsert_block(
+                        blocks,
+                        DiagnosticConversationBlock(
+                            id=current.id,
+                            message_id=current.message_id,
+                            run_id=current.run_id,
+                            kind=current.kind,
+                            title=current.title,
+                            body=content or current.body,
+                            created_at=current.created_at,
+                            updated_at=event.created_at,
+                        ),
+                    )
+                thinking_item_id = None
+            elif assistant_event_type == "text_start":
+                text_seq += 1
+                text_item_id = f"text-{run_id}-{text_seq}"
+                _upsert_block(
+                    blocks,
+                        DiagnosticConversationBlock(
+                            id=text_item_id,
+                            message_id=assistant_message_id,
+                            run_id=run_id,
+                            kind="text",
+                            title="response",
+                            body="",
+                            created_at=created_at,
+                            updated_at=event.created_at,
+                        ),
+                    )
+            elif assistant_event_type == "text_delta" and text_item_id:
+                delta = str(assistant_event.get("delta") or "")
+                current = next((item for item in blocks if item.id == text_item_id), None)
+                if current is not None:
+                    _upsert_block(
+                        blocks,
+                        DiagnosticConversationBlock(
+                            id=current.id,
+                            message_id=current.message_id,
+                            run_id=current.run_id,
+                            kind=current.kind,
+                            title=current.title,
+                            body=_merge_stream_text(current.body, delta),
+                            created_at=current.created_at,
+                            updated_at=event.created_at,
+                        ),
+                    )
+            elif assistant_event_type == "text_end" and text_item_id:
+                content = str(assistant_event.get("content") or "")
+                current = next((item for item in blocks if item.id == text_item_id), None)
+                if current is not None:
+                    _upsert_block(
+                        blocks,
+                        DiagnosticConversationBlock(
+                            id=current.id,
+                            message_id=current.message_id,
+                            run_id=current.run_id,
+                            kind=current.kind,
+                            title=current.title,
+                            body=_merge_stream_text(current.body, content),
+                            created_at=current.created_at,
+                            updated_at=event.created_at,
+                        ),
+                    )
+                text_item_id = None
+            elif assistant_event_type in {"toolcall_start", "toolcall_delta", "toolcall_end"}:
+                tool_call = assistant_event.get("toolCall") if assistant_event_type == "toolcall_end" else partial_content_item
+                if isinstance(tool_call, dict):
+                    tool_call_id = str(tool_call.get("id") or "")
+                    tool_name = str(tool_call.get("name") or "unknown")
+                    body = render_tool_command(tool_name, tool_call.get("arguments")) if assistant_event_type == "toolcall_end" else ""
+                    if tool_call_id:
+                        block_id = f"toolcall-{tool_call_id}"
+                        current = next((item for item in blocks if item.id == block_id), None)
+                        _upsert_block(
+                            blocks,
+                        DiagnosticConversationBlock(
+                            id=block_id,
+                            message_id=assistant_message_id,
+                            run_id=run_id,
+                            kind="tool_call",
+                            title=_block_title_for_tool(tool_name),
+                            body=_merge_stream_text(current.body if current is not None else "", body),
+                            created_at=current.created_at if current is not None else created_at,
+                            updated_at=event.created_at,
+                        ),
+                    )
+        if etype == "tool_execution_start":
             tool_id = str(pi_event.get("toolCallId") or "")
             if tool_id:
-                tool_state[tool_id] = DiagnosticReadableItem(
-                    id=tool_id,
-                    title=f"tool start: {str(pi_event.get('toolName') or 'unknown')}",
-                    body=_stringify_tool_args(pi_event.get("args")),
-                )
-                if tool_id not in tool_order:
-                    tool_order.append(tool_id)
+                _upsert_block(
+                    blocks,
+                        DiagnosticConversationBlock(
+                            id=f"tool-result-{tool_id}",
+                            message_id=assistant_message_id,
+                            run_id=run_id,
+                            kind="tool_result",
+                            title=_block_title_for_tool(str(pi_event.get("toolName") or "unknown")),
+                            body="",
+                            created_at=created_at,
+                            updated_at=event.created_at,
+                        ),
+                    )
         elif etype == "tool_execution_update":
             tool_id = str(pi_event.get("toolCallId") or "")
             if tool_id:
-                body = "\n\n".join(_extract_text_parts(pi_event.get("partialResult"))) or "running..."
-                tool_state[tool_id] = DiagnosticReadableItem(
-                    id=tool_id,
-                    title=f"tool output: {str(pi_event.get('toolName') or 'unknown')}",
-                    body=body,
+                body = "\n\n".join(_extract_text_parts(pi_event.get("partialResult"))) or ""
+                current = next((item for item in blocks if item.id == f"tool-result-{tool_id}"), None)
+                _upsert_block(
+                    blocks,
+                    DiagnosticConversationBlock(
+                        id=f"tool-result-{tool_id}",
+                        message_id=assistant_message_id,
+                        run_id=run_id,
+                        kind="tool_result",
+                        title=_block_title_for_tool(str(pi_event.get("toolName") or "unknown")),
+                        body=_merge_stream_text(current.body if current is not None else "", body),
+                        created_at=current.created_at if current is not None else created_at,
+                        updated_at=event.created_at,
+                    ),
                 )
-                if tool_id not in tool_order:
-                    tool_order.append(tool_id)
         elif etype == "tool_execution_end":
             tool_id = str(pi_event.get("toolCallId") or "")
             if tool_id:
                 body = "\n\n".join(_extract_text_parts(pi_event.get("result"))) or "tool finished"
-                tool_state[tool_id] = DiagnosticReadableItem(
-                    id=tool_id,
-                    title=f"tool end: {str(pi_event.get('toolName') or 'unknown')}",
-                    body=body,
+                current = next((item for item in blocks if item.id == f"tool-result-{tool_id}"), None)
+                _upsert_block(
+                    blocks,
+                    DiagnosticConversationBlock(
+                        id=f"tool-result-{tool_id}",
+                        message_id=assistant_message_id,
+                        run_id=run_id,
+                        kind="tool_result",
+                        title=_block_title_for_tool(str(pi_event.get("toolName") or "unknown")),
+                        body=_merge_stream_text(current.body if current is not None else "", body),
+                        created_at=current.created_at if current is not None else created_at,
+                        updated_at=event.created_at,
+                    ),
                 )
-                if tool_id not in tool_order:
-                    tool_order.append(tool_id)
-    items = [*tool_calls, *(tool_state[tool_id] for tool_id in tool_order if tool_id in tool_state)]
-    return DiagnosticAssistantArtifacts(reasoning=reasoning, items=items)
+        elif etype == "message_end":
+            message = pi_event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                content = message.get("content")
+                if isinstance(content, list):
+                    fallback_index = 0
+                    for item in content:
+                        if not isinstance(item, dict):
+                            continue
+                        item_type = str(item.get("type") or "")
+                        if item_type == "thinking":
+                            text = str(item.get("thinking") or "")
+                            if text.strip():
+                                fallback_index += 1
+                                block_id = f"thinking-fallback-{run_id}-{fallback_index}"
+                                if not any(block.kind == "thinking" and block.body == text for block in blocks):
+                                    blocks.append(DiagnosticConversationBlock(
+                                        id=block_id,
+                                        message_id=assistant_message_id,
+                                        run_id=run_id,
+                                        kind="thinking",
+                                        title="thinking",
+                                        body=text,
+                                        created_at=created_at,
+                                        updated_at=event.created_at,
+                                    ))
+                        elif item_type == "text":
+                            text = str(item.get("text") or "")
+                            if text.strip():
+                                if any(block.kind == "text" and block.body.strip() == text for block in blocks):
+                                    continue
+                                fallback_index += 1
+                                block_id = f"text-fallback-{run_id}-{fallback_index}"
+                                if not any(block.kind == "text" and block.body == text for block in blocks):
+                                    blocks.append(DiagnosticConversationBlock(
+                                        id=block_id,
+                                        message_id=assistant_message_id,
+                                        run_id=run_id,
+                                        kind="text",
+                                        title="response",
+                                        body=text,
+                                        created_at=created_at,
+                                        updated_at=event.created_at,
+                                    ))
+                        elif item_type == "toolCall":
+                            tool_name = str(item.get("name") or "unknown")
+                            tool_id = str(item.get("id") or f"fallback-{run_id}-{fallback_index}")
+                            body = render_tool_command(tool_name, item.get("arguments"))
+                            block_id = f"toolcall-{tool_id}"
+                            if not any(block.id == block_id for block in blocks):
+                                blocks.append(DiagnosticConversationBlock(
+                                    id=block_id,
+                                    message_id=assistant_message_id,
+                                    run_id=run_id,
+                                    kind="tool_call",
+                                    title=_block_title_for_tool(tool_name),
+                                    body=body,
+                                    created_at=created_at,
+                                    updated_at=event.created_at,
+                                ))
+    return [
+        block for block in blocks
+        if block.kind != "text" or block.body.strip()
+    ]
+
+
+def _assistant_artifacts_from_events(events: list[DiagnosticAgentEventRecord]) -> DiagnosticAssistantArtifacts:
+    reasoning = ""
+    result_text = ""
+    timeline_items: list[DiagnosticReadableItem] = []
+    thinking_item_id: str | None = None
+    thinking_seq = 0
+    for event in events:
+        if not event.event_type.startswith("pi_event."):
+            continue
+        payload = event.payload
+        pi_event = payload.get("pi_event")
+        if not isinstance(pi_event, dict):
+            continue
+        etype = str(pi_event.get("type") or "")
+        assistant_event = pi_event.get("assistantMessageEvent")
+        if isinstance(assistant_event, dict):
+            assistant_event_type = str(assistant_event.get("type") or "")
+            partial_content_item = _extract_partial_content_item(assistant_event)
+            if assistant_event_type == "thinking_start":
+                thinking_seq += 1
+                thinking_item_id = f"thinking-{thinking_seq}"
+                _upsert_timeline_item(
+                    timeline_items,
+                    DiagnosticReadableItem(id=thinking_item_id, title="thinking", body=""),
+                )
+            elif assistant_event_type == "thinking_delta" and thinking_item_id:
+                delta = str(assistant_event.get("delta") or "")
+                current = next((item for item in timeline_items if item.id == thinking_item_id), None)
+                if current is not None:
+                    next_body = f"{current.body}{delta}"
+                    reasoning = next_body
+                    _upsert_timeline_item(
+                        timeline_items,
+                        DiagnosticReadableItem(id=thinking_item_id, title="thinking", body=next_body),
+                    )
+            elif assistant_event_type == "thinking_end" and thinking_item_id:
+                content = str(assistant_event.get("content") or "")
+                current = next((item for item in timeline_items if item.id == thinking_item_id), None)
+                next_body = content or (current.body if current is not None else "")
+                reasoning = next_body
+                _upsert_timeline_item(
+                    timeline_items,
+                    DiagnosticReadableItem(id=thinking_item_id, title="thinking", body=next_body),
+                )
+                thinking_item_id = None
+            elif assistant_event_type in {"toolcall_start", "toolcall_delta", "toolcall_end"}:
+                tool_call = assistant_event.get("toolCall") if assistant_event_type == "toolcall_end" else partial_content_item
+                if isinstance(tool_call, dict):
+                    tool_call_id = str(tool_call.get("id") or "")
+                    tool_name = str(tool_call.get("name") or "unknown")
+                    body = render_tool_command(tool_name, tool_call.get("arguments")) if assistant_event_type == "toolcall_end" else ""
+                    if tool_call_id:
+                        current = next((item for item in timeline_items if item.id == f"toolcall-{tool_call_id}"), None)
+                        next_body = _merge_stream_text(current.body if current is not None else "", body)
+                        _upsert_timeline_item(
+                            timeline_items,
+                            DiagnosticReadableItem(
+                                id=f"toolcall-{tool_call_id}",
+                                title=f"toolcall: {tool_name}",
+                                body=next_body,
+                            ),
+                        )
+            elif assistant_event_type == "text_delta":
+                result_text = _merge_stream_text(result_text, str(assistant_event.get("delta") or ""))
+            elif assistant_event_type == "text_end":
+                result_text = _merge_stream_text(result_text, str(assistant_event.get("content") or ""))
+
+        if etype == "tool_execution_start":
+            tool_id = str(pi_event.get("toolCallId") or "")
+            if tool_id:
+                _upsert_timeline_item(
+                    timeline_items,
+                    DiagnosticReadableItem(
+                        id=f"tool-result-{tool_id}",
+                        title=f"tool result: {str(pi_event.get('toolName') or 'unknown')}",
+                        body="",
+                    ),
+                )
+        elif etype == "tool_execution_update":
+            tool_id = str(pi_event.get("toolCallId") or "")
+            if tool_id:
+                body = "\n\n".join(_extract_text_parts(pi_event.get("partialResult"))) or "running..."
+                current = next((item for item in timeline_items if item.id == f"tool-result-{tool_id}"), None)
+                next_body = _merge_stream_text(current.body if current is not None else "", body)
+                _upsert_timeline_item(
+                    timeline_items,
+                    DiagnosticReadableItem(
+                        id=f"tool-result-{tool_id}",
+                        title=f"tool result: {str(pi_event.get('toolName') or 'unknown')}",
+                        body=next_body,
+                    ),
+                )
+        elif etype == "tool_execution_end":
+            tool_id = str(pi_event.get("toolCallId") or "")
+            if tool_id:
+                body = "\n\n".join(_extract_text_parts(pi_event.get("result"))) or "tool finished"
+                current = next((item for item in timeline_items if item.id == f"tool-result-{tool_id}"), None)
+                next_body = _merge_stream_text(current.body if current is not None else "", body)
+                _upsert_timeline_item(
+                    timeline_items,
+                    DiagnosticReadableItem(
+                        id=f"tool-result-{tool_id}",
+                        title=f"tool result: {str(pi_event.get('toolName') or 'unknown')}",
+                        body=next_body,
+                    ),
+                )
+        elif etype in {"message_start", "message_update", "message_end"}:
+            message = pi_event.get("message")
+            if isinstance(message, dict) and message.get("role") == "assistant":
+                content = message.get("content")
+                if isinstance(content, list):
+                    if not reasoning:
+                        reasoning = "\n\n".join(
+                            str(item.get("thinking") or "")
+                            for item in content
+                            if isinstance(item, dict) and item.get("type") == "thinking" and str(item.get("thinking") or "").strip()
+                        ).strip()
+                    if not result_text:
+                        result_text = "".join(
+                            str(item.get("text") or "")
+                            for item in content
+                            if isinstance(item, dict) and item.get("type") == "text" and str(item.get("text") or "")
+                        )
+    if result_text.strip():
+        timeline_items.append(DiagnosticReadableItem(id="result-panel", title="result", body=result_text))
+    return DiagnosticAssistantArtifacts(reasoning=reasoning, items=timeline_items)
 
 
 def get_session_detail(session_id: int) -> DiagnosticSessionDetail | None:
@@ -252,13 +651,68 @@ def get_session_detail(session_id: int) -> DiagnosticSessionDetail | None:
     file_messages = read_message_log(session_id)
     messages = file_messages or list_messages(session_id)
     artifacts: dict[int, DiagnosticAssistantArtifacts] = {}
+    blocks: list[DiagnosticConversationBlock] = []
+    runs_by_assistant_message_id: dict[int, DiagnosticAgentRunRecord] = {}
+    runs_by_user_message_id: dict[int, DiagnosticAgentRunRecord] = {}
     for run in list_agent_runs(session_id):
+        if run.user_message_id is not None:
+            runs_by_user_message_id[int(run.user_message_id)] = run
+        if run.assistant_message_id is not None:
+            runs_by_assistant_message_id[int(run.assistant_message_id)] = run
         if run.status != "completed" or run.assistant_message_id is None:
             continue
-        snapshot = _assistant_artifacts_from_events(list_agent_events(run.id))
+        snapshot = render_assistant_artifacts_from_events(list_agent_events(run.id))
         if snapshot.reasoning or snapshot.items:
             artifacts[int(run.assistant_message_id)] = snapshot
-    return DiagnosticSessionDetail(session=session, messages=messages, assistant_artifacts=artifacts)
+    for message in messages:
+        if message.role == "user":
+            blocks.append(
+                DiagnosticConversationBlock(
+                    id=f"user-{message.id}",
+                    message_id=message.id,
+                    run_id=None,
+                    kind="user",
+                    title="user",
+                    body=message.content,
+                    created_at=message.created_at,
+                )
+            )
+            run = runs_by_user_message_id.get(int(message.id))
+            if run is not None and run.assistant_message_id is None:
+                blocks.extend(
+                    render_conversation_blocks_from_events(
+                        list_agent_events(run.id),
+                        assistant_message_id=None,
+                        run_id=run.id,
+                        created_at=message.created_at,
+                    )
+                )
+            continue
+        if message.role != "assistant":
+            continue
+        run = runs_by_assistant_message_id.get(int(message.id))
+        if run is None:
+            blocks.append(
+                DiagnosticConversationBlock(
+                    id=f"text-{message.id}",
+                    message_id=message.id,
+                    run_id=None,
+                    kind="text",
+                    title="response",
+                    body=message.content,
+                    created_at=message.created_at,
+                )
+            )
+            continue
+        blocks.extend(
+            render_conversation_blocks_from_events(
+                list_agent_events(run.id),
+                assistant_message_id=message.id,
+                run_id=run.id,
+                created_at=message.created_at,
+            )
+        )
+    return DiagnosticSessionDetail(session=session, messages=messages, assistant_artifacts=artifacts, conversation_blocks=blocks)
 
 
 def add_execution(record: DiagnosticExecutionRecord) -> DiagnosticExecutionRecord:

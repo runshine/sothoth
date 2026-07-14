@@ -85,6 +85,7 @@ PROMPT_STAGE1 = """\
     - reach_driver.bin     可达性驱动输入
     - gdb_reachability.log gdb可达性转录(含入口与漏洞点断点命中+backtrace)
     - harness_report.md    结构化报告(含上述字段)
+    **所有产物(包括但不限于上述固定文件名、编译中间产物、.o/.so/临时二进制/生成的脚本/日志等)必须全部存放于{输出目录}/output目录下，严禁在该目录之外创建任何文件；如需临时文件也放在该目录内。**
 
   **任务约束**(必须遵守)：
     1.harness必须从数据流入口函数构造，模拟真实攻击入口，不得直接调用漏洞点函数。
@@ -128,6 +129,7 @@ PROMPT_STAGE2 = """\
     - gdb_trigger.log     gdb触发循环转录
     - trigger_memory.txt  触发时内存状态(寄存器+关键缓冲区)
     - poc_report.md       简体中文验证报告(或误报/不可达分析报告)
+    **所有产物(包括但不限于上述固定文件名、编译中间产物、.o/.so/临时二进制/生成的脚本/日志等)必须全部存放于{输出目录}/output目录下，严禁在该目录之外创建任何文件；如需临时文件也放在该目录内。**
 
   **任务约束**(必须遵守)：
     1.harness必须从数据流入口函数构造(阶段1已满足;本阶段若微调stub不得改为直接调用漏洞点函数)。
@@ -161,6 +163,31 @@ PROMPT_STAGE2 = """\
 """
 
 # ---------------------------------------------------------------------------
+# Stage 0 prompt: read the vuln report + extract the data-flow entry function.
+# Read-only — no binary/code analysis (that's Stage 1). Runs before Stage 1
+# when -e/--entry is absent. Writes 入口函数: <name> to stage0_report.md.
+# Placeholders: {漏洞报告路径} {输出目录}
+# ---------------------------------------------------------------------------
+PROMPT_STAGE0 = """\
+/goal 【阶段0：从漏洞报告中提取数据流入口函数】漏洞报告路径为{漏洞报告路径}。本阶段**只阅读分析漏洞报告文本**，从中提取报告所述的数据流入口函数(即外部输入/数据进入受影响代码路径的源头函数，通常是收包/接收/管道/分发等入口函数，**不是漏洞点/sink函数**)，写入{输出目录}/output/stage0_report.md。
+
+  **阶段0任务**：
+    1.阅读漏洞报告全文，理解其描述的漏洞场景与数据流路径。
+    2.提取"数据流入口函数"——即外部输入/数据进入受影响代码路径的**第一个**函数(入口/源端)。
+    3.将提取结果写入{输出目录}/output/stage0_report.md，**单独一行**格式为"入口函数: <函数名>"(该行只有"入口函数: "前缀+函数名，无其他内容)。
+
+  **阶段0约束**(必须遵守)：
+    1.**只阅读漏洞报告**，不分析二进制/代码(代码分析是后续阶段的事)。
+    2.入口函数必须是报告中**明确提及**的函数(不可臆测/编造/猜测)。
+    3.若报告中**未提及任何入口函数**或无法确定数据流入口，则写"入口函数: "(留空)并在下一行用一句话说明原因(如"报告未描述数据流入口函数")。此时流程将拒绝继续执行。
+    4.所有文本用简体中文。
+
+  **完成目标**：
+    {输出目录}/output/stage0_report.md 存在且含"入口函数: <name>"行(有则填函数名，无则留空+原因)。\
+"""
+
+
+# ---------------------------------------------------------------------------
 # v1.0 monolithic prompt (kept verbatim for --single escape hatch).
 # ---------------------------------------------------------------------------
 PROMPT_SINGLE = """\
@@ -180,6 +207,8 @@ PROMPT_SINGLE = """\
       c.严禁模式匹配杀进程：本进程(claude)的命令行包含整段任务prompt(内含"gdb"/"harness"等字样)，因此`pkill`/`killall`配合`-f`或命令行模式(如`pkill -9 -f 'gdb.*harness'`、`pkill -f gdb`、`killall gdb`)会误匹配并SIGKILL本进程自身，导致任务在无任何错误输出的情况下被异常终止。清理gdb只能用以下精确方式之一：①`tmux kill-session -t <本任务会话名>`；②`tmux send-keys -t <pane> 'quit' Enter`让gdb正常退出；③按精确PID `kill <pid>`，且PID必须由`tmux list-panes -t <本任务会话名> -F '#{pane_pid}'`等定位得出，严禁用进程名/命令行模式匹配取PID。
       d.退出前清理：任务结束(无论成功/失败/证伪)前，主动`tmux kill-session -t <本任务会话名>`销毁自己创建的会话，避免残留污染下一次运行。
       e.gdb管道约束：不要用`gdb ... | head`之类管道启动gdb(管道破开会被SIGPIPE杀掉gdb)，改用gdb的`set logging`或tmux-mcp的capture-pane采集输出。
+
+    6.**产物存放约束**：所有产物(包括但不限于harness源码/二进制、PoC输入、gdb转录日志、内存状态、报告、以及编译中间产物、.o/.so/临时二进制/生成的脚本/日志等)必须**全部**存放于`{输出目录}/output`目录下，严禁在该目录之外创建任何文件；如需临时文件也放在该目录内。
 
   **任务完成目标**（满足【路径A：确认触发】或【路径B：证伪/不可达】任一路径的全部条件方可结束；严禁编造证据，违反则任务判为失败）：
     【路径A：确认触发】（漏洞为真且可触发时）
@@ -218,6 +247,12 @@ def build_stage2_prompt(entry, report, bindir, output) -> str:
     return _substitute(PROMPT_STAGE2, entry, report, bindir, output)
 
 
+def build_stage0_prompt(report, output) -> str:
+    """Stage0 only substitutes {漏洞报告路径} + {输出目录} (it derives the entry, doesn't use it)."""
+    p = PROMPT_STAGE0.replace("{漏洞报告路径}", report)
+    return p.replace("{输出目录}", output)
+
+
 def build_single_prompt(entry, report, bindir, output) -> str:
     return _substitute(PROMPT_SINGLE, entry, report, bindir, output)
 
@@ -229,8 +264,9 @@ def parse_args(argv=None):
                     "entering via a given data-flow function. v2.0 default = two-stage/two-session.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("-e", "--entry", required=True,
-                    help="Data-flow entry function name (e.g. IPSEC_SOCKI_PipeMsg).")
+    ap.add_argument("-e", "--entry", required=False, default="",
+                    help="Data-flow entry function name (e.g. IPSEC_SOCKI_PipeMsg). "
+                         "If omitted, Stage 0 derives it from the vuln report.")
     ap.add_argument("-r", "--report", required=True,
                     help="Path to the vulnerability report file (e.g. result_001.md).")
     ap.add_argument("-b", "--bindir", required=True,
@@ -261,9 +297,10 @@ def parse_args(argv=None):
                     help="claude -p output format (default: stream-json for live progress).")
     ap.add_argument("--log", default=None,
                     help="Log file path (default: <workdir>/poc_cli_<timestamp>[_stageN].log).")
-    ap.add_argument("--no-skip-permissions", dest="skip_perms", action="store_false",
-                    help="Do NOT pass --dangerously-skip-permissions.")
-    ap.set_defaults(skip_perms=True)
+    ap.add_argument("--no-skip-permissions", dest="skip_perms", action="store_true",
+                    help="Do NOT pass --dangerously-skip-permissions (default: not passed — "
+                         "relies on settings.json defaultMode:auto instead, which works as root).")
+    ap.set_defaults(skip_perms=False)
     ap.add_argument("--dry-run", action="store_true",
                     help="Print the exact claude commands + prompts (and the gate plan) and exit (no invocation).")
     ap.add_argument("--single", action="store_true",
@@ -285,18 +322,19 @@ def parse_args(argv=None):
     return args
 
 
-def _default_output_dir(entry: str, bindir: str) -> str:
-    """Default output dir under the cwd: <entry>_<bindir-basename>_<timestamp>."""
+def _default_output_dir(entry: str, bindir: str, report: str = "") -> str:
+    """Default output dir under the cwd: <entry|report-basename>_<bindir-basename>_<timestamp>."""
     def _s(x: str) -> str:
         return re.sub(r"[^A-Za-z0-9._-]+", "_", x).strip("_") or "poc"
     base = os.path.basename(bindir.rstrip("/")) or "bindir"
-    name = f"{_s(entry)}_{_s(base)}_{time.strftime('%Y%m%d_%H%M%S')}"
+    # when entry is absent (Stage 0 will derive it), name the dir from the report basename
+    head = entry.strip() or (os.path.basename(report.rstrip("/")) or "poc")
+    name = f"{_s(head)}_{_s(base)}_{time.strftime('%Y%m%d_%H%M%S')}"
     return str(Path.cwd() / name)
 
 
 def validate(opts) -> None:
-    if not opts.entry.strip():
-        sys.exit("error: --entry must be non-empty")
+    # entry may be empty — Stage 0 derives it from the report when absent.
     rp = Path(opts.report)
     if not rp.is_file():
         sys.exit(f"error: --report not a file: {opts.report}")
@@ -306,7 +344,7 @@ def validate(opts) -> None:
     opts.report = str(rp.resolve())
     opts.bindir = str(bp.resolve())
     if not opts.output:
-        opts.output = _default_output_dir(opts.entry, opts.bindir)
+        opts.output = _default_output_dir(opts.entry, opts.bindir, opts.report)
     opts.output = str(Path(opts.output).resolve())
     Path(opts.output).mkdir(parents=True, exist_ok=True)
     opts.workdir = str(Path(opts.workdir).resolve()) if opts.workdir else opts.output
@@ -380,6 +418,8 @@ def build_claude_cmd(opts, prompt: str, session_id=None, session_name=None) -> l
     two-stage mode can pass per-stage ids without mutating opts."""
     cmd = [opts.claude_bin, "-p", prompt]
     cmd += ["--output-format", opts.output_format]
+    if opts.output_format == "stream-json":
+        cmd.append("--verbose")  # claude requires --verbose with -p + stream-json
     if opts.skip_perms:
         cmd.append("--dangerously-skip-permissions")
     if opts.model:
@@ -676,6 +716,11 @@ def _print_artifacts(opts) -> None:
 # ---------------------------------------------------------------------------
 def run_single(opts, ts) -> int:
     """v1.0 monolithic single-/goal path (one session)."""
+    if not opts.entry:
+        entry = _run_stage0(opts, ts)
+        if entry is None:
+            return 4
+        opts.entry = entry
     prompt = build_single_prompt(opts.entry, opts.report, opts.bindir, opts.output)
     log_path = opts.log or str(Path(opts.workdir) / f"poc_cli_{ts}.log")
     prompt_path = str(Path(opts.workdir) / "poc_prompt.txt")
@@ -702,6 +747,35 @@ def run_single(opts, ts) -> int:
     return rc
 
 
+def _run_stage0(opts, ts) -> str | None:
+    """Stage 0: read the vuln report + extract the data-flow entry function.
+    Returns the entry name, or None if the report mentions no entry function (refuse)."""
+    s0_sid = str(uuid.uuid4())
+    s0_name = f"{opts.session_name or 'poc'}-stage0"
+    s0_prompt = build_stage0_prompt(opts.report, opts.output)
+    s0_log = str(Path(opts.workdir) / f"poc_cli_{ts}_stage0.log")
+    s0_prompt_path = str(Path(opts.workdir) / "poc_prompt_stage0.txt")
+    s0_cmd = build_claude_cmd(opts, s0_prompt, s0_sid, s0_name)
+    Path(opts.output).joinpath("output").mkdir(parents=True, exist_ok=True)
+    print("[poc] === Stage 0: extract data-flow entry function from the vuln report ===", flush=True)
+    rc0 = _run_claude_to_log(opts, s0_cmd, s0_prompt, s0_log, s0_prompt_path, "poc:stage0", ts)
+    print(f"[poc:stage0] claude exit code: {rc0}", flush=True)
+    report_path = Path(opts.output) / "output" / "stage0_report.md"
+    entry = ""
+    if report_path.is_file():
+        txt = report_path.read_text(encoding="utf-8", errors="replace")
+        m = re.search(r"入口函数\s*[:：]\s*([A-Za-z0-9_]+)", txt)
+        if m:
+            entry = m.group(1).strip()
+    if not entry:
+        print("[poc:stage0] *** 漏洞报告未提及任何入口函数，拒绝执行 ***", flush=True)
+        print(f"[poc:stage0] stage0 log   : {s0_log}", flush=True)
+        print(f"[poc:stage0] stage0 report : {report_path}", flush=True)
+        return None
+    print(f"[poc:stage0] extracted entry function: {entry}", flush=True)
+    return entry
+
+
 def run_two_stage(opts, ts) -> int:
     """v2.0 two-stage/two-session path."""
     s1_sid = opts.session_id or str(uuid.uuid4())
@@ -709,6 +783,17 @@ def run_two_stage(opts, ts) -> int:
     base_name = opts.session_name or "poc"
     s1_name = f"{base_name}-stage1"
     s2_name = f"{base_name}-stage2"
+
+    # set up the session dir (copy settings + strip ANTHROPIC_* env) BEFORE any stage runs
+    if opts.session_dir:
+        _setup_session_dir(opts)
+
+    # --- Stage 0: derive the entry function from the report (if not given; skip in dry-run) ---
+    if not opts.entry and not opts.dry_run:
+        entry = _run_stage0(opts, ts)
+        if entry is None:
+            return 4
+        opts.entry = entry
 
     s1_prompt = build_stage1_prompt(opts.entry, opts.report, opts.bindir, opts.output)
     s2_prompt = build_stage2_prompt(opts.entry, opts.report, opts.bindir, opts.output)
@@ -723,9 +808,6 @@ def run_two_stage(opts, ts) -> int:
         return _dry_run_two_stage(opts, s1_prompt, s2_prompt, s1_cmd, s2_cmd,
                                   s1_sid, s2_sid, s1_name, s2_name,
                                   s1_log, s2_log, s1_prompt_path, s2_prompt_path)
-
-    if opts.session_dir:
-        _setup_session_dir(opts)
 
     # --- Stage 1 (skip if --stage2-only) ---
     if not opts.stage2_only:

@@ -166,7 +166,7 @@ class TaskService:
         *,
         project_id: str,
         task_name: str,
-        entry_function: str,
+        entry_function: Optional[str] = None,
         vuln_report_path: str,
         binary_dir: str,
         output_dir: Optional[str] = None,
@@ -175,7 +175,6 @@ class TaskService:
         session_name: Optional[str] = None,
         session_id: Optional[str] = None,
         session_dir: Optional[str] = None,
-        timeout: Optional[int] = None,
         task_description: Optional[str] = None,
         created_by: Optional[str] = None,
     ) -> dict:
@@ -183,16 +182,20 @@ class TaskService:
         task_id = f"poc-{_task_id_stamp()}-{uuid.uuid4().hex[:8]}"
         # default work dir on the fileserver (mounted at /data, shared by api+worker) so
         # logs / session records / artifacts live with the task and are readable from the
-        # detail view. Naming matches the `poc` CLI default (<entry>_<bindir>_<ts>).
+        # detail view. Naming: <report-basename>_<bindir-basename>_<ts>.
         workspaces_base = cfg.fileserver_root / project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
-        out_dir = output_dir or default_output_dir(entry_function, binary_dir, workspaces_base)
+        out_dir = output_dir or default_output_dir(vuln_report_path, binary_dir, workspaces_base)
         Path(out_dir).mkdir(parents=True, exist_ok=True)
+        # task name = <report-basename>_<bindir-basename>_<ts>
+        _rpt_stem = Path(vuln_report_path).stem if vuln_report_path else "poc"
+        _bin_name = Path(binary_dir).name if binary_dir else "bindir"
+        _ts = _task_id_stamp()
         row = AppPocTask(
             task_id=task_id,
             project_id=project_id,
-            task_name=task_name or f"PoC: {entry_function}",
+            task_name=task_name or f"{_rpt_stem}_{_bin_name}_{_ts}",
             task_description=task_description,
-            entry_function=entry_function,
+            entry_function=(entry_function or ""),
             vuln_report_path=vuln_report_path,
             binary_dir=binary_dir,
             output_dir=out_dir,
@@ -201,7 +204,6 @@ class TaskService:
             session_name=session_name,
             session_id=session_id,
             session_dir=session_dir,
-            timeout=timeout if timeout is not None else cfg.default_timeout,
             status="pending",
             execution_epoch=0,
             control_version=0,
@@ -262,7 +264,6 @@ class TaskService:
             "running": counts.get("running", 0),
             "succeeded": counts.get("succeeded", 0),
             "failed": counts.get("failed", 0),
-            "timeout": counts.get("timeout", 0),
             "cancelled": counts.get("cancelled", 0),
         }
 
@@ -313,6 +314,40 @@ class TaskService:
             ],
         }
 
+    def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
+        """Soft-delete a task (is_deleted=True). Optionally clean output_dir + revoke celery."""
+        row = self._get_or_404(db, task_id)
+        # revoke any running celery task
+        self._revoke_celery_task(row)
+        # kill local poc group if running
+        h = _RUNNING.get(task_id)
+        if h and h.get("pgid"):
+            try:
+                os.killpg(h["pgid"], signal.SIGKILL)
+            except OSError:
+                pass
+            h["stop"].set()
+        # clean output files
+        if delete_files and row.output_dir:
+            try:
+                import shutil as _shutil
+                _shutil.rmtree(row.output_dir, ignore_errors=True)
+            except Exception as exc:
+                logger.warning("delete output failed: %s", exc)
+        row.is_deleted = True
+        row.status = "cancelled"
+        row.finished_at = now_local()
+        row.execution_owner_id = None
+        row.execution_lease_until = None
+        row.execution_heartbeat_at = None
+        row.dispatch_status = None
+        row.celery_task_id = None
+        db.commit()
+        db.refresh(row)
+        _record_task_event(db, row, "task_deleted", "任务已删除", level="warning",
+                           status="cancelled", payload={"delete_files": delete_files})
+        return {"task_id": row.task_id, "status": "deleted"}
+
     def list_artifacts(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
         art_dir = Path(row.output_dir) / "output" if row.output_dir else None
@@ -340,6 +375,39 @@ class TaskService:
         except Exception as exc:
             raise HTTPException(status_code=500, detail=f"读取产物失败: {exc}")
         return {"task_id": row.task_id, "name": safe, "content": content, "size": len(content)}
+
+    def get_artifact_path(self, db: Session, task_id: str, name: str) -> Path:
+        """Return the safe filesystem path of an artifact (for FileResponse download)."""
+        row = self._get_or_404(db, task_id)
+        if not row.output_dir:
+            raise HTTPException(status_code=404, detail="任务无输出目录")
+        safe = Path(name).name
+        if safe != name or "/" in name or ".." in name:
+            raise HTTPException(status_code=400, detail="非法的产物文件名")
+        target = Path(row.output_dir) / "output" / safe
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail=f"产物不存在: {safe}")
+        return target
+
+    def get_artifact_paths(self, db: Session, task_id: str, names: Optional[list[str]] = None) -> list[Path]:
+        """Return safe paths for a batch (names list, or all on_disk files)."""
+        row = self._get_or_404(db, task_id)
+        if not row.output_dir:
+            raise HTTPException(status_code=404, detail="任务无输出目录")
+        art_dir = Path(row.output_dir) / "output"
+        if not art_dir.is_dir():
+            return []
+        if names:
+            paths: list[Path] = []
+            for n in names:
+                safe = Path(n).name
+                if safe != n or "/" in n or ".." in n:
+                    continue
+                p = art_dir / safe
+                if p.is_file():
+                    paths.append(p)
+            return paths
+        return sorted(p for p in art_dir.iterdir() if p.is_file())
 
     # ── session files (per-stage claude logs / stream-json / prompts / transcripts) ─
     def list_sessions(self, db: Session, task_id: str) -> dict:
@@ -540,7 +608,7 @@ class TaskService:
             # the runner log + the poc CLI's per-stage logs/sessions/artifacts all live here.
             if not row.output_dir:
                 workspaces_base = cfg.fileserver_root / row.project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
-                row.output_dir = default_output_dir(row.entry_function, row.binary_dir, workspaces_base)
+                row.output_dir = default_output_dir(row.vuln_report_path, row.binary_dir, workspaces_base)
                 db.commit()
                 db.refresh(row)
             work_dir = Path(row.output_dir)
@@ -588,6 +656,15 @@ class TaskService:
                 output_dir=row.output_dir,
                 on_popen=_on_popen, should_abort=_should_abort,
             )
+
+            # backfill the entry function from Stage0's stage0_report.md (the CLI derived it)
+            if not row.entry_function and row.output_dir:
+                s0_report = Path(row.output_dir) / "output" / "stage0_report.md"
+                if s0_report.is_file():
+                    txt = s0_report.read_text(encoding="utf-8", errors="replace")
+                    m = re.search(r"入口函数\s*[:：]\s*([A-Za-z0-9_]+)", txt)
+                    if m:
+                        row.entry_function = m.group(1).strip()
 
             finished_at = now_local()
             stages = {
@@ -693,7 +770,6 @@ class TaskService:
             "session_name": row.session_name,
             "session_id": row.session_id,
             "session_dir": row.session_dir,
-            "timeout": row.timeout,
             "cli_command": row.cli_command,
             "status": row.status,
             "error": row.error,

@@ -6,10 +6,13 @@ worker runs the `poc` CLI. Cancel/restart revoke the Celery task via Redis contr
 """
 from __future__ import annotations
 
+import io
 import shutil
+import zipfile
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 
 from .api_schemas import (
@@ -73,7 +76,6 @@ def create_task(req: PocTaskRequest, db: Session = Depends(get_db)) -> PocTaskCr
         session_name=req.session_name,
         session_id=req.session_id,
         session_dir=req.session_dir,
-        timeout=req.timeout,
         created_by=req.created_by,
     )
     return PocTaskCreateResponse(
@@ -117,6 +119,15 @@ def cancel_task(task_id: str, db: Session = Depends(get_db)) -> PocTaskStatus:
 def restart_task(task_id: str, db: Session = Depends(get_db)) -> PocTaskStatus:
     return PocTaskStatus(**get_task_service().restart_task(db, task_id))
 
+@router.delete("/tasks/{task_id}")
+def delete_task(
+    task_id: str,
+    delete_files: bool = Query(True, description="是否同时删除输出目录文件"),
+    db: Session = Depends(get_db),
+):
+    """Soft-delete a task (and optionally its output files)."""
+    return get_task_service().delete_task(db, task_id, delete_files=delete_files)
+
 
 @router.get("/tasks/{task_id}/logs", response_model=PocTaskLogsResponse)
 def get_task_logs(
@@ -137,9 +148,39 @@ def list_artifacts(task_id: str, db: Session = Depends(get_db)) -> PocArtifactsR
     return PocArtifactsResponse(**get_task_service().list_artifacts(db, task_id))
 
 
+# batch download MUST be declared before /artifacts/{name} so "download" isn't captured as {name}
+@router.get("/tasks/{task_id}/artifacts/download")
+def download_artifacts_archive(
+    task_id: str,
+    names: Optional[str] = Query(None, description="逗号分隔的产物名; 省略则打包全部"),
+    db: Session = Depends(get_db),
+):
+    """Batch-download artifacts as a zip (all on_disk, or the named subset)."""
+    name_list = [n.strip() for n in names.split(",") if n.strip()] if names else None
+    paths = get_task_service().get_artifact_paths(db, task_id, name_list)
+    if not paths:
+        raise HTTPException(status_code=404, detail="无可用产物")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in paths:
+            zf.write(p, p.name)
+    buf.seek(0)
+    return StreamingResponse(
+        buf, media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="poc-artifacts-{task_id}.zip"'},
+    )
+
+
 @router.get("/tasks/{task_id}/artifacts/{name}", response_model=PocArtifactContentResponse)
 def get_artifact_content(task_id: str, name: str, db: Session = Depends(get_db)) -> PocArtifactContentResponse:
     return PocArtifactContentResponse(**get_task_service().get_artifact_content(db, task_id, name))
+
+
+@router.get("/tasks/{task_id}/artifacts/{name}/download")
+def download_artifact(task_id: str, name: str, db: Session = Depends(get_db)):
+    """Download a single artifact as raw bytes (incl. binary harness / .bin)."""
+    path = get_task_service().get_artifact_path(db, task_id, name)
+    return FileResponse(str(path), filename=path.name, media_type="application/octet-stream")
 
 
 @router.get("/tasks/{task_id}/sessions", response_model=PocSessionListResponse)
