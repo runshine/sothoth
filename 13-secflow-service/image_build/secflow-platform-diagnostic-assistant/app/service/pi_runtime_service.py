@@ -14,6 +14,10 @@ def _service_runtime_root() -> Path:
     return db_path.parent / "pi_runtime"
 
 
+def build_session_path(session_id: int) -> Path:
+    return _service_runtime_root() / f"session-{session_id}" / "session.jsonl"
+
+
 def _build_settings_json() -> dict[str, Any]:
     return {
         "defaultThinkingLevel": "off",
@@ -90,7 +94,9 @@ def prepare_pi_runtime(
     runtime_dir.mkdir(parents=True, exist_ok=True)
     models_path = runtime_dir / "models.json"
     settings_path = runtime_dir / "settings.json"
-    session_path = runtime_dir / "session.jsonl"
+    session_path = build_session_path(session_id)
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.touch(exist_ok=True)
 
     models_json = _substitute_secret_into_models_json(
         build_models_json(providers),
