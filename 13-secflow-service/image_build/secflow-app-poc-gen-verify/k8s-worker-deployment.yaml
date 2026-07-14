@@ -5,7 +5,7 @@ metadata:
   namespace: secflow-ns
   labels: { name: secflow-app-poc-gen-verify, role: worker }
 spec:
-  replicas: 1
+  replicas: 8
   strategy:
     type: RollingUpdate
     rollingUpdate: { maxSurge: 0, maxUnavailable: 1 }   # only 1 worker down at a time
