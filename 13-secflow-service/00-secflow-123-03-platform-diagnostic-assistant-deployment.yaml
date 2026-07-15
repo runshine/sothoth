@@ -31,7 +31,7 @@ spec:
               mountPath: /app-config
               readOnly: true
             - name: app-data
-              mountPath: /data/diagnostic-assistant
+              mountPath: /data
           readinessProbe:
             httpGet:
               path: /api/diagnostic-assistant/healthz
@@ -56,4 +56,5 @@ spec:
           configMap:
             name: secflow-platform-diagnostic-assistant-config
         - name: app-data
-          emptyDir: {}
+          persistentVolumeClaim:
+            claimName: secflow-platform-fileserver-data-nfs-pvc
