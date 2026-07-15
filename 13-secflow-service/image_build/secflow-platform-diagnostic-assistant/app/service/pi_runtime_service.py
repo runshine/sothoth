@@ -82,6 +82,46 @@ def _resolve_selected_provider(
     raise RuntimeError("配置中心没有可用于 pi 的 provider")
 
 
+def resolve_selected_provider(
+    providers: list[LlmProviderConfig],
+    selected_provider_key: str | None,
+) -> LlmProviderConfig:
+    return _resolve_selected_provider(providers, selected_provider_key)
+
+
+def build_pi_runtime_artifacts(
+    runtime_dir: str | Path,
+    provider: LlmProviderConfig,
+    providers: list[LlmProviderConfig],
+    *,
+    agent_task_key_secret: str | None = None,
+) -> dict[str, Any]:
+    runtime_path = Path(runtime_dir)
+    runtime_path.mkdir(parents=True, exist_ok=True)
+    models_path = runtime_path / "models.json"
+    settings_path = runtime_path / "settings.json"
+
+    models_json = _substitute_secret_into_models_json(
+        build_models_json(providers),
+        agent_task_key_secret,
+    )
+    models_path.write_text(json.dumps(models_json, ensure_ascii=False, indent=2), encoding="utf-8")
+    settings_path.write_text(json.dumps(_build_settings_json(), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    env = os.environ.copy()
+    env.update(_filtered_runtime_env(provider))
+    env["PI_CODING_AGENT_DIR"] = str(runtime_path)
+    env["PI_MODELS_JSON"] = str(models_path)
+    return {
+        "runtime_dir": str(runtime_path),
+        "models_path": str(models_path),
+        "settings_path": str(settings_path),
+        "model_ref": f"{provider.provider_key}/{provider.model}",
+        "provider_key": provider.provider_key,
+        "env": env,
+    }
+
+
 def prepare_pi_runtime(
     session_id: int,
     providers: list[LlmProviderConfig],
@@ -92,30 +132,14 @@ def prepare_pi_runtime(
     selected_provider = _resolve_selected_provider(providers, selected_provider_key)
     runtime_dir = _service_runtime_root() / f"session-{session_id}"
     runtime_dir.mkdir(parents=True, exist_ok=True)
-    models_path = runtime_dir / "models.json"
-    settings_path = runtime_dir / "settings.json"
     session_path = build_session_path(session_id)
     session_path.parent.mkdir(parents=True, exist_ok=True)
     session_path.touch(exist_ok=True)
-
-    models_json = _substitute_secret_into_models_json(
-        build_models_json(providers),
-        agent_task_key_secret,
+    artifacts = build_pi_runtime_artifacts(
+        runtime_dir,
+        selected_provider,
+        providers,
+        agent_task_key_secret=agent_task_key_secret,
     )
-    models_path.write_text(json.dumps(models_json, ensure_ascii=False, indent=2), encoding="utf-8")
-    settings_path.write_text(json.dumps(_build_settings_json(), ensure_ascii=False, indent=2), encoding="utf-8")
 
-    env = os.environ.copy()
-    env.update(_filtered_runtime_env(selected_provider))
-    env["PI_CODING_AGENT_DIR"] = str(runtime_dir)
-    env["PI_MODELS_JSON"] = str(models_path)
-
-    return {
-        "runtime_dir": str(runtime_dir),
-        "models_path": str(models_path),
-        "settings_path": str(settings_path),
-        "session_path": str(session_path),
-        "model_ref": f"{selected_provider.provider_key}/{selected_provider.model}",
-        "provider_key": selected_provider.provider_key,
-        "env": env,
-    }
+    return {**artifacts, "session_path": str(session_path)}

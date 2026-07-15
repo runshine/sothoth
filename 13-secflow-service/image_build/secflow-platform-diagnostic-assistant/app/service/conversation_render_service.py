@@ -63,6 +63,52 @@ def _extract_partial_content_item(assistant_event: dict[str, Any]) -> dict[str, 
     return item if isinstance(item, dict) else None
 
 
+def _coerce_pi_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, (int, float)) and value > 0:
+        seconds = float(value) / 1000.0 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            try:
+                ts = float(value)
+                seconds = ts / 1000.0 if ts > 10_000_000_000 else ts
+                return datetime.fromtimestamp(seconds, tz=timezone.utc)
+            except Exception:
+                return None
+    return None
+
+
+def _pi_event_timestamp(pi_event: dict[str, Any], fallback: datetime | None = None) -> datetime:
+    candidates: list[Any] = []
+    message = pi_event.get("message")
+    if isinstance(message, dict):
+        candidates.append(message.get("timestamp"))
+        content = message.get("content")
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    candidates.append(item.get("timestamp"))
+    assistant_event = pi_event.get("assistantMessageEvent")
+    if isinstance(assistant_event, dict):
+        partial = assistant_event.get("partial")
+        if isinstance(partial, dict):
+            candidates.append(partial.get("timestamp"))
+    candidates.append(pi_event.get("timestamp"))
+    for candidate in candidates:
+        parsed = _coerce_pi_timestamp(candidate)
+        if parsed is not None:
+            return parsed
+    return fallback or datetime.now(timezone.utc)
+
+
 def render_tool_command(name: str, arguments: object) -> str:
     if not isinstance(arguments, dict):
         return name
@@ -211,6 +257,18 @@ class PiConversationRenderer:
                     )
                     changed.append(self._emit_block(next_block))
                 return changed
+        def _has_block(kind: str, *, title: str | None = None) -> bool:
+            for item in self.blocks:
+                if item.kind != kind:
+                    continue
+                if title is not None and item.title != title:
+                    continue
+                if self.assistant_message_id is not None and item.message_id not in {None, self.assistant_message_id}:
+                    continue
+                if self.run_id is not None and item.run_id not in {None, self.run_id}:
+                    continue
+                return True
+            return False
         assistant_event = pi_event.get("assistantMessageEvent")
         if isinstance(assistant_event, dict):
             assistant_event_type = str(assistant_event.get("type") or "")
@@ -408,7 +466,7 @@ class PiConversationRenderer:
                         item_type = str(item.get("type") or "")
                         if item_type == "thinking":
                             text = str(item.get("thinking") or "")
-                            if text.strip():
+                            if text.strip() and not _has_block("thinking", title="thinking"):
                                 changed.append(self._emit_block(
                                     DiagnosticConversationBlock(
                                         id=f"thinking-fallback-{self.run_id}-{len(self.blocks) + 1}",
@@ -425,7 +483,7 @@ class PiConversationRenderer:
                         elif item_type == "text":
                             text = str(item.get("text") or "")
                             if text.strip():
-                                if any(block.kind == "text" and block.body.strip() == text for block in self.blocks):
+                                if _has_block("text", title="response"):
                                     continue
                                 changed.append(self._emit_block(
                                     DiagnosticConversationBlock(
@@ -443,7 +501,7 @@ class PiConversationRenderer:
                         elif item_type == "toolCall":
                             tool_name = str(item.get("name") or "unknown")
                             tool_id = str(item.get("id") or f"fallback-{self.run_id}-{len(self.blocks) + 1}")
-                            if any(block.kind == "tool_call" and block.title == tool_name and block.body.strip() for block in self.blocks):
+                            if _has_block("tool_call", title=tool_name):
                                 continue
                             changed.append(self._emit_block(
                                 DiagnosticConversationBlock(

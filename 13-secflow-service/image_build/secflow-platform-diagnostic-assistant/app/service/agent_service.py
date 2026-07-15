@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import tempfile
+import time
 from typing import Any, AsyncIterator
 
 import httpx
 
 from app.config import get_service_yaml
 from app.models import DiagnosticAgentSummary, LlmProviderConfig
+from app.service.pi_agent_service import PiAgentError, stream_pi_agent
+from app.service.pi_runtime_service import build_pi_runtime_artifacts, resolve_selected_provider
 
 
 class AgentServiceError(RuntimeError):
@@ -262,3 +266,65 @@ def apply_agent_llm_config(token: str, agent_id: str, provider: LlmProviderConfi
                 raise AgentServiceError("下发 agent LLM 配置返回格式异常")
             return body
     raise AgentServiceError(f"下发 agent LLM 配置失败: {last_error or 'no reachable agent endpoint'}")
+
+
+def probe_agent_availability(
+    *,
+    providers: list[LlmProviderConfig],
+    selected_provider_key: str | None = None,
+    agent_task_key_secret: str | None = None,
+    prompt: str = "测试连通性，请仅回复 OK，不要调用工具。",
+) -> dict[str, Any]:
+    selected_provider = resolve_selected_provider(providers, selected_provider_key)
+    started_at = time.monotonic()
+    output_parts: list[str] = []
+    error_message: str | None = None
+
+    with tempfile.TemporaryDirectory(prefix="diagnostic-assistant-probe-") as runtime_dir:
+        artifacts = build_pi_runtime_artifacts(
+            runtime_dir,
+            selected_provider,
+            providers,
+            agent_task_key_secret=agent_task_key_secret,
+        )
+        try:
+            for event in stream_pi_agent(
+                prompt=prompt,
+                model_ref=str(artifacts["model_ref"]),
+                session_path="",
+                runtime_dir=str(artifacts["runtime_dir"]),
+                env=artifacts["env"],
+                idle_timeout_seconds=min(get_service_yaml().agent_helper.timeout, 120),
+            ):
+                event_type = str(event.get("type") or "")
+                if event_type == "response.output_text.delta":
+                    delta = str(event.get("delta") or "")
+                    if delta:
+                        output_parts.append(delta)
+                    continue
+                if event_type == "response.completed":
+                    response = event.get("response") or {}
+                    final_text = str(response.get("output_text") or "").strip()
+                    if final_text:
+                        output_parts.append(final_text)
+                    break
+                if event_type == "response.failed":
+                    error_message = str(event.get("error_message") or "agent probe failed")
+                    break
+        except PiAgentError as exc:
+            error_message = str(exc)
+        except Exception as exc:
+            error_message = str(exc)
+
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    output_text = "".join(output_parts).strip()
+    return {
+        "ok": error_message is None,
+        "agent_id": "pi",
+        "provider_key": selected_provider.provider_key,
+        "model_ref": str(artifacts["model_ref"]),
+        "api_base": selected_provider.api_base,
+        "elapsed_ms": elapsed_ms,
+        "output_text": output_text,
+        "error_message": error_message,
+    }

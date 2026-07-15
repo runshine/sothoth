@@ -117,8 +117,10 @@ class LlmProviderSummary(BaseModel):
     display_name: str
     provider_type: str
     api_base: str
+    api_key: str = ""
     model: str
     enabled: bool = True
+    is_default: bool = False
     mapped_env_keys: list[str] = Field(default_factory=list)
     mapped_file_paths: list[str] = Field(default_factory=list)
     updated_at: str | None = None
@@ -178,3 +180,20 @@ class DiagnosticAgentEventRecord(BaseModel):
             return raw if isinstance(raw, dict) else {"value": raw}
         except Exception:
             return {"raw": self.payload_json}
+
+
+class DiagnosticAgentProbeRequest(BaseModel):
+    provider_key: str | None = None
+    prompt: str | None = None
+    agent_task_key_secret: str | None = None
+
+
+class DiagnosticAgentProbeResult(BaseModel):
+    ok: bool
+    agent_id: str
+    provider_key: str
+    model_ref: str
+    api_base: str
+    elapsed_ms: int
+    output_text: str = ""
+    error_message: str | None = None

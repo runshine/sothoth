@@ -102,6 +102,7 @@ def get_provider_config(provider_key: str | None = None, token_override: str | N
 
 def list_provider_summaries(token_override: str | None = None) -> list[LlmProviderSummary]:
     providers = list_llm_providers(token_override=token_override)
+    default_provider_key = get_service_yaml().app.default_provider_key.strip()
     result: list[LlmProviderSummary] = []
     for provider in providers:
         env_bindings = provider.extra_config.get("env_bindings") if isinstance(provider.extra_config.get("env_bindings"), dict) else {}
@@ -112,8 +113,10 @@ def list_provider_summaries(token_override: str | None = None) -> list[LlmProvid
                 display_name=str(provider.extra_config.get("display_name") or provider.provider_key),
                 provider_type=provider.provider_type,
                 api_base=provider.api_base,
+                api_key=provider.api_key,
                 model=provider.model,
                 enabled=provider.enabled,
+                is_default=bool(default_provider_key and provider.provider_key == default_provider_key),
                 mapped_env_keys=sorted(str(key).strip() for key in env_bindings.keys() if str(key).strip()),
                 mapped_file_paths=sorted(
                     str(item.get("path") or "").strip()
