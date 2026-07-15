@@ -25,6 +25,7 @@ from typing import Any, Optional
 
 from fastapi import HTTPException
 from sqlalchemy import func
+from sqlalchemy.exc import OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 
 from app.config import get_config
@@ -574,6 +575,65 @@ class TaskService:
         return self._row_to_dict(row)
 
     # ── worker execution ──────────────────────────────────────────────────────
+    def _commit_terminal_retry(
+        self, task_id: str, epoch: int, control_version: int, *, max_attempts: int = 5, **commit_kw,
+    ) -> bool:
+        """Commit terminal state using FRESH db sessions with retry.
+
+        WHY: the main `_execute_task` session is opened before `run_poc_cli` and
+        held idle for the whole poc run — Stage1 routinely takes 1.5–2.6h, which
+        exceeds MySQL `wait_timeout` (3600s). The held connection is NEVER
+        returned to the pool, so `pool_pre_ping` never re-validates it; by the
+        time we commit, MySQL has closed the socket → `Lost connection during
+        query` → the session's transaction is poisoned → `PendingRollbackError`.
+        The result: the task actually SUCCEEDED (returncode 0) but the terminal
+        UPDATE never lands, so the row stays `running` forever, the scheduler
+        eventually restarts it (epoch+1), wipes the artifacts, and re-runs — an
+        infinite success→discard→rerun loop.
+
+        FIX: do NOT reuse the long-idle session. Each attempt here opens a
+        brand-new session (pool_pre_ping validates the fresh connection) and we
+        retry on the stale-connection errors. Closing each attempt's session
+        returns the (dead) connection to the pool where pre_ping will reject it
+        on the next checkout.
+        """
+        from app.db import get_db
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            gen = get_db()
+            db: Session = next(gen)
+            try:
+                ok = commit_terminal_state_if_owner(
+                    db, task_id, WORKER_ID, epoch, control_version, **commit_kw,
+                )
+                if ok:
+                    return True
+                # ownership lost (row no longer running / not ours) — don't retry
+                logger.warning("terminal commit rejected (ownership lost) task=%s", task_id)
+                return False
+            except (OperationalError, PendingRollbackError) as exc:
+                last_exc = exc
+                try:
+                    db.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                logger.warning(
+                    "terminal commit attempt %d/%d failed (stale mysql conn) task=%s: %s",
+                    attempt, max_attempts, task_id, type(exc).__name__,
+                )
+                time.sleep(min(2.0 * attempt, 10.0))
+            finally:
+                try:
+                    next(gen)  # closes the session
+                except StopIteration:
+                    pass
+        logger.error(
+            "terminal commit FAILED after %d attempts task=%s (row stuck in running → "
+            "scheduler will restart): %s", max_attempts, task_id, last_exc,
+        )
+        return False
+
     def _execute_task(self, task_id: str, epoch: int, control_version: int) -> None:
         """Run the `poc` CLI in a Celery worker prefork child + commit terminal state."""
         from app.db import get_db
@@ -657,14 +717,18 @@ class TaskService:
                 on_popen=_on_popen, should_abort=_should_abort,
             )
 
-            # backfill the entry function from Stage0's stage0_report.md (the CLI derived it)
+            # Derive (if absent) the entry function from Stage0's stage0_report.md
+            # (the CLI derived it during the run). This is a FILESYSTEM read — we do
+            # NOT write it onto the long-idle main session (whose connection is dead
+            # by now); instead we fold it into the terminal CAS commit below.
+            derived_entry: Optional[str] = None
             if not row.entry_function and row.output_dir:
                 s0_report = Path(row.output_dir) / "output" / "stage0_report.md"
                 if s0_report.is_file():
                     txt = s0_report.read_text(encoding="utf-8", errors="replace")
                     m = re.search(r"入口函数\s*[:：]\s*([A-Za-z0-9_]+)", txt)
                     if m:
-                        row.entry_function = m.group(1).strip()
+                        derived_entry = m.group(1).strip()
 
             finished_at = now_local()
             stages = {
@@ -676,11 +740,18 @@ class TaskService:
                 "returncode": result["returncode"],
                 "timed_out": result["timed_out"],
             }
-            ok = commit_terminal_state_if_owner(
-                db, task_id, WORKER_ID, epoch, control_version,
+            # Commit via FRESH sessions + retry. The main `db` session has been
+            # idle for the whole poc run (Stage1 routinely 1.5–2.6h > MySQL
+            # wait_timeout=3600s), so its connection is dead — reusing it here
+            # reproduces the success→discard→rerun loop (task succeeds but the
+            # terminal UPDATE never lands → row stuck `running` → scheduler
+            # restarts → wipes artifacts → re-runs forever).
+            ok = self._commit_terminal_retry(
+                task_id, epoch, control_version,
                 status=result["status"], finished_at=finished_at,
                 returncode=result["returncode"], artifacts_json=result["artifacts"],
                 stages_json=stages, result_json=result_json, error=result["error"],
+                entry_function=derived_entry,
             )
             if ok:
                 _record_task_event(
@@ -689,19 +760,18 @@ class TaskService:
                     payload={"returncode": result["returncode"], "error": result["error"],
                              "artifacts": result["artifacts"]},
                 )
-            else:
-                logger.warning("terminal commit rejected (ownership lost) task=%s", task_id)
+            # (else: ownership lost or commit failed — _commit_terminal_retry logged it)
         except Exception as exc:  # noqa: BLE001
             logger.exception("task execution crashed task=%s", task_id)
-            try:
-                commit_terminal_state_if_owner(
-                    db, task_id, WORKER_ID, epoch, control_version,
-                    status="failed", finished_at=now_local(), returncode=None,
-                    artifacts_json=None, stages_json={"error": str(exc)},
-                    result_json=None, error=f"{type(exc).__name__}: {exc}",
-                )
-            except Exception:
-                logger.exception("failed to commit crashed-task terminal state task=%s", task_id)
+            # Same fresh-session+retry rationale as the success path: the main
+            # `db` session is likely stale by now, so don't commit a crashed-task
+            # terminal state through it.
+            self._commit_terminal_retry(
+                task_id, epoch, control_version,
+                status="failed", finished_at=now_local(), returncode=None,
+                artifacts_json=None, stages_json={"error": str(exc)},
+                result_json=None, error=f"{type(exc).__name__}: {exc}",
+            )
         finally:
             handle["stop"].set()
             _RUNNING.pop(task_id, None)

@@ -182,7 +182,26 @@ def commit_terminal_state_if_owner(
     stages_json: dict,
     result_json: dict | None,
     error: str | None,
+    entry_function: Optional[str] = None,
 ) -> bool:
+    # Build the UPDATE set dict; fold in the Stage0-derived entry_function when
+    # supplied so it is persisted in the SAME atomic CAS commit (instead of via a
+    # separate write on the long-idle main session, which is dead by commit time).
+    values = {
+        AppPocTask.status: status,
+        AppPocTask.finished_at: finished_at,
+        AppPocTask.returncode: returncode,
+        AppPocTask.artifacts_json: artifacts_json,
+        AppPocTask.stages_json: stages_json,
+        AppPocTask.result_json: result_json,
+        AppPocTask.error: error,
+        AppPocTask.execution_owner_id: None,
+        AppPocTask.execution_lease_until: None,
+        AppPocTask.execution_heartbeat_at: None,
+        AppPocTask.dispatch_status: None,
+    }
+    if entry_function:
+        values[AppPocTask.entry_function] = entry_function
     updated = (
         db.query(AppPocTask)
         .filter(
@@ -194,19 +213,7 @@ def commit_terminal_state_if_owner(
             AppPocTask.status == "running",
         )
         .update(
-            {
-                AppPocTask.status: status,
-                AppPocTask.finished_at: finished_at,
-                AppPocTask.returncode: returncode,
-                AppPocTask.artifacts_json: artifacts_json,
-                AppPocTask.stages_json: stages_json,
-                AppPocTask.result_json: result_json,
-                AppPocTask.error: error,
-                AppPocTask.execution_owner_id: None,
-                AppPocTask.execution_lease_until: None,
-                AppPocTask.execution_heartbeat_at: None,
-                AppPocTask.dispatch_status: None,
-            },
+            values,
             synchronize_session=False,
         )
     )

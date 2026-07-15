@@ -89,7 +89,14 @@ def init_db(db_url: str, pool_size: int = 5, max_overflow: int = 10) -> None:
         pool_size=pool_size,
         max_overflow=max_overflow,
         pool_pre_ping=True,
-        pool_recycle=3600,
+        # MUST be < MySQL wait_timeout (3600s here). At recycle time SQLAlchemy
+        # re-establishes the connection; if recycle == wait_timeout it races MySQL
+        # closing the socket at the same instant. 1800s gives a safe margin.
+        # NOTE: a session HELD open for the whole poc run (1.5–2.6h) bypasses the
+        # pool entirely — pre_ping/recycle only validate connections at checkout,
+        # not while checked-out. _commit_terminal_retry therefore opens FRESH
+        # sessions for the terminal commit instead of reusing the long-idle one.
+        pool_recycle=1800,
     )
     # Long-running PoC tasks keep objects alive for up to hours while the `poc`
     # CLI (claude + gdb) runs. Keep ORM instances usable after commit.
