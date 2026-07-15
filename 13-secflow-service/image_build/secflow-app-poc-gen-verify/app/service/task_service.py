@@ -740,6 +740,24 @@ class TaskService:
                 "returncode": result["returncode"],
                 "timed_out": result["timed_out"],
             }
+            # Determine PoC outcome path from the Stage2 verification report.
+            # Path A = vuln confirmed (PoC triggered successfully).
+            # Path B = false positive / unreachable (proved the vuln can't be triggered).
+            # Absent = Stage1 failed / didn't reach Stage2 → status is "failed" anyway.
+            poc_path: Optional[str] = None
+            if result["status"] == "succeeded" and row.output_dir:
+                pr = Path(row.output_dir) / "output" / "poc_report.md"
+                if pr.is_file():
+                    try:
+                        txt = pr.read_text(encoding="utf-8", errors="replace")[:3000]
+                        if re.search(r'路径\s*A', txt) and re.search(r'(漏洞真实|验证成功|成功触发)', txt):
+                            poc_path = "a"
+                        elif re.search(r'路径\s*B', txt) and re.search(r'(证伪|不可达|误报)', txt):
+                            poc_path = "b"
+                    except Exception:
+                        pass
+            stages["poc_path"] = poc_path
+            result_json["poc_path"] = poc_path
             # Commit via FRESH sessions + retry. The main `db` session has been
             # idle for the whole poc run (Stage1 routinely 1.5–2.6h > MySQL
             # wait_timeout=3600s), so its connection is dead — reusing it here
@@ -847,6 +865,9 @@ class TaskService:
             "artifacts": row.artifacts_json or [],
             "result_json": row.result_json if include_heavy else None,
             "stages_json": row.stages_json if include_heavy else None,
+            # poc_path: extracted from stages_json/result_json for frontend verdict
+            # "a" = path A (vuln confirmed), "b" = path B (false positive), None = N/A
+            "poc_path": (row.stages_json or {}).get("poc_path") if isinstance(row.stages_json, dict) else None,
             "created_by": row.created_by,
             "created_at": isoformat_local(row.created_at),
             "updated_at": isoformat_local(row.updated_at),

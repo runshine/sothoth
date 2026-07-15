@@ -57,6 +57,11 @@ class PocTaskStatus(BaseModel):
     artifacts: List[str] = Field(default_factory=list)
     result_json: Optional[Dict[str, Any]] = None
     stages_json: Optional[Dict[str, Any]] = None
+    # PoC outcome path (derived from Stage2 poc_report.md):
+    # "a" = path A (vuln confirmed, PoC triggered successfully)
+    # "b" = path B (false positive / unreachable proved)
+    # None = Stage1 failed / no Stage2 report
+    poc_path: Optional[str] = None
     created_by: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
