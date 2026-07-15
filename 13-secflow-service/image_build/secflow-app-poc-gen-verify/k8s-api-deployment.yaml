@@ -15,7 +15,7 @@ spec:
       containers:
         - name: secflow-app-poc-gen-verify
           image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           securityContext:
             capabilities: { add: [SYS_PTRACE] }   # gdb ptrace (poc CLI may invoke gdb)
           ports: [{ name: http, containerPort: 8080 }]

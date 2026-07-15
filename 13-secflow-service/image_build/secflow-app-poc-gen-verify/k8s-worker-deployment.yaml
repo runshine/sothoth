@@ -17,7 +17,7 @@ spec:
       containers:
         - name: poc-gen-verify-worker
           image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           # Run as root: can read any file on the fileserver (600/root uploaded by other services).
           # umask 022: all created files are 644/755 → the api pod (scanner) can read them.
           # --dangerously-skip-permissions is NOT passed (claude refuses root with that flag).

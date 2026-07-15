@@ -15,7 +15,7 @@ spec:
       containers:
         - name: poc-gen-verify-dispatcher
           image: ghcr.io/runshine/secflow-app-poc-gen-verify:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           # entrypoint.sh runs first (harmless for the dispatcher; it doesn't
           # spawn claude but needs the python env), then the dispatcher loop.
           command: ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
