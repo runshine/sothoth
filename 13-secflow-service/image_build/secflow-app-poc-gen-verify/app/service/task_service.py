@@ -40,6 +40,13 @@ from app.service.execution_coordinator import (
 )
 from app.time_utils import isoformat_local, now_local
 
+# Regex patterns for detecting the PoC outcome path from poc_report.md.
+# These match the structured format mandated by the Stage2 / single prompt:
+#   - Path A: 漏洞结论：路径A（确认触发）
+#   - Path B: 漏洞结论：路径B（证伪/不可达）
+_PATH_A_RE = re.compile(r'路径\s*A\s*[（(]\s*确认触发')
+_PATH_B_RE = re.compile(r'路径\s*B\s*[（(]\s*(?:证伪|不可达)')
+
 logger = logging.getLogger("poc.task_service")
 
 # task_id → {"pgid": int|None, "stop": threading.Event} for the running task on
@@ -741,6 +748,9 @@ class TaskService:
                 "timed_out": result["timed_out"],
             }
             # Determine PoC outcome path from the Stage2 verification report.
+            # Uses the structured format mandated by the poc CLI Stage2 prompt:
+            #   Path A: 「漏洞结论：路径A（确认触发）,...」
+            #   Path B: 「漏洞结论：路径B（证伪/不可达）,...」
             # Path A = vuln confirmed (PoC triggered successfully).
             # Path B = false positive / unreachable (proved the vuln can't be triggered).
             # Absent = Stage1 failed / didn't reach Stage2 → status is "failed" anyway.
@@ -750,9 +760,9 @@ class TaskService:
                 if pr.is_file():
                     try:
                         txt = pr.read_text(encoding="utf-8", errors="replace")[:3000]
-                        if re.search(r'路径\s*A', txt) and re.search(r'(漏洞真实|验证成功|成功触发)', txt):
+                        if _PATH_A_RE.search(txt):
                             poc_path = "a"
-                        elif re.search(r'路径\s*B', txt) and re.search(r'(证伪|不可达|误报)', txt):
+                        elif _PATH_B_RE.search(txt):
                             poc_path = "b"
                     except Exception:
                         pass
