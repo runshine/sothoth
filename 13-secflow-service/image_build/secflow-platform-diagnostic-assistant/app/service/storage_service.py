@@ -30,50 +30,6 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _sanitize_session_title(text: str) -> str:
-    cleaned = "".join(ch for ch in text.strip() if ch.isprintable())
-    cleaned = cleaned.replace("\n", " ").replace("\r", " ").strip()
-    return cleaned[:24]
-
-
-def _compose_session_title(session_id: int, prompt: str) -> str:
-    suffix = _sanitize_session_title(prompt)
-    if not suffix:
-        return f"会话{session_id}"
-    return f"会话{session_id}-{suffix}"
-
-
-def _is_auto_named_session(title: str) -> bool:
-    normalized = title.strip()
-    return (
-        not normalized
-        or normalized in {"新会话", "诊断会话"}
-        or (normalized.startswith("会话") and "-" not in normalized)
-    )
-
-
-def _normalize_session_title(session: DiagnosticSessionSummary) -> DiagnosticSessionSummary:
-    normalized = session.title.strip()
-    match = re.fullmatch(r"会话(\d+)(?:-(.*))?", normalized)
-    auto_named = _is_auto_named_session(session.title) or match is not None
-    if not auto_named:
-        return session
-    first_user = get_first_user_message(session.id)
-    if first_user is None:
-        desired_title = f"会话{session.id}"
-        if normalized != desired_title:
-            updated = update_session_title(session.id, desired_title)
-            if updated is not None:
-                return updated
-        return session
-    next_title = _compose_session_title(session.id, first_user.content)
-    if next_title.strip() and next_title != normalized:
-        updated = update_session_title(session.id, next_title)
-        if updated is not None:
-            return updated
-    return session
-
-
 def _session_from_row(row) -> DiagnosticSessionSummary:
     return DiagnosticSessionSummary.model_validate(dict(row))
 
@@ -102,11 +58,11 @@ def create_session(created_by: str, title: str) -> DiagnosticSessionSummary:
     now = _utc_now()
     with get_conn() as conn:
         cursor = conn.execute(
-            "INSERT INTO diagnostic_session (title, created_by, created_at, updated_at, agent_session_id, agent_id, session_mode) VALUES (?, ?, ?, ?, NULL, NULL, NULL)",
+            "INSERT INTO diagnostic_session (title, created_by, created_at, updated_at, agent_session_id, agent_id, session_mode, provider_key) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL)",
             (title, created_by, now, now),
         )
         row = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (cursor.lastrowid,)).fetchone()
-    return _normalize_session_title(_session_from_row(row))
+    return _session_from_row(row)
 
 
 def update_session_timestamp(session_id: int) -> None:
@@ -120,17 +76,16 @@ def update_session_timestamp(session_id: int) -> None:
 def list_sessions(limit: int = 100) -> list[DiagnosticSessionSummary]:
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM diagnostic_session ORDER BY id DESC LIMIT ?",
+            "SELECT * FROM diagnostic_session ORDER BY updated_at DESC LIMIT ?",
             (limit,),
         ).fetchall()
-    return [_normalize_session_title(_session_from_row(row)) for row in rows]
+    return [_session_from_row(row) for row in rows]
 
 
 def get_session(session_id: int) -> DiagnosticSessionSummary | None:
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
-    session = _session_from_row(row) if row else None
-    return _normalize_session_title(session) if session is not None else None
+    return _session_from_row(row) if row else None
 
 
 def delete_session(session_id: int) -> bool:
@@ -164,6 +119,7 @@ def bind_agent_session(
     agent_session_id: str,
     agent_id: str | None = None,
     session_mode: str | None = None,
+    provider_key: str | None = None,
 ) -> DiagnosticSessionSummary:
     with get_conn() as conn:
         current = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
@@ -171,9 +127,10 @@ def bind_agent_session(
             raise ValueError(f"session {session_id} not found")
         next_agent_id = agent_id if agent_id is not None else current["agent_id"]
         next_session_mode = session_mode if session_mode is not None else current["session_mode"]
+        next_provider_key = provider_key if provider_key is not None else current["provider_key"]
         conn.execute(
-            "UPDATE diagnostic_session SET agent_session_id = ?, agent_id = ?, session_mode = ?, updated_at = ? WHERE id = ?",
-            (agent_session_id, next_agent_id, next_session_mode, _utc_now(), session_id),
+            "UPDATE diagnostic_session SET agent_session_id = ?, agent_id = ?, session_mode = ?, provider_key = ?, updated_at = ? WHERE id = ?",
+            (agent_session_id, next_agent_id, next_session_mode, next_provider_key, _utc_now(), session_id),
         )
         row = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
     return _session_from_row(row)
@@ -191,25 +148,6 @@ def add_message(session_id: int, role: str, content: str) -> DiagnosticMessageRe
     record = _message_from_row(row)
     append_message_log(record)
     return record
-
-
-def get_first_user_message(session_id: int) -> DiagnosticMessageRecord | None:
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT * FROM diagnostic_message WHERE session_id = ? AND role = 'user' ORDER BY id ASC LIMIT 1",
-            (session_id,),
-        ).fetchone()
-    return _message_from_row(row) if row else None
-
-
-def update_session_title(session_id: int, title: str) -> DiagnosticSessionSummary | None:
-    with get_conn() as conn:
-        current = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
-        if current is None:
-            return None
-        conn.execute("UPDATE diagnostic_session SET title = ?, updated_at = ? WHERE id = ?", (title, _utc_now(), session_id))
-        row = conn.execute("SELECT * FROM diagnostic_session WHERE id = ?", (session_id,)).fetchone()
-    return _session_from_row(row) if row else None
 
 
 def list_messages(session_id: int, limit: int | None = None) -> list[DiagnosticMessageRecord]:
@@ -938,4 +876,3 @@ def list_agent_events(run_id: int, limit: int | None = None) -> list[DiagnosticA
                 (run_id,),
             ).fetchall()
     return [_event_from_row(row) for row in rows]
-import re

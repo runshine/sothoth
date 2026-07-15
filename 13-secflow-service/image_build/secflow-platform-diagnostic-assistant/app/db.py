@@ -25,7 +25,8 @@ def init_db() -> None:
                 updated_at TEXT NOT NULL,
                 agent_session_id TEXT,
                 agent_id TEXT,
-                session_mode TEXT
+                session_mode TEXT,
+                provider_key TEXT
             );
 
             CREATE TABLE IF NOT EXISTS diagnostic_message (
@@ -94,6 +95,7 @@ def init_db() -> None:
         _ensure_column(conn, "diagnostic_session", "agent_session_id", "TEXT")
         _ensure_column(conn, "diagnostic_session", "agent_id", "TEXT")
         _ensure_column(conn, "diagnostic_session", "session_mode", "TEXT")
+        _ensure_column(conn, "diagnostic_session", "provider_key", "TEXT")
 
 
 def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, column_def: str) -> None:

@@ -13,18 +13,18 @@ from app.api.deps import ensure_admin_user, get_current_user
 from app.models import (
     AgentRunRequest,
     CreateSessionRequest,
+    DiagnosticAgentEventRecord,
     DiagnosticAgentProbeRequest,
     DiagnosticAgentProbeResult,
-    DiagnosticAgentEventRecord,
     DiagnosticAgentRunRecord,
     DiagnosticAgentSummary,
     DiagnosticSessionDetail,
     DiagnosticSessionSummary,
-    LlmProviderSummary,
+    LlmProviderConfig,
 )
-from app.service.agent_service import AgentServiceError, list_agents, probe_agent_availability
-from app.service.configcenter_service import ConfigCenterError, list_llm_providers, list_provider_summaries
-from app.service.conversation_render_service import PiConversationRenderer, _pi_event_timestamp
+from app.service.configcenter_service import ConfigCenterError, get_provider_config, list_llm_providers
+from app.service.agent_service import AgentServiceError, list_agents
+from app.service.conversation_render_service import PiConversationRenderer
 from app.service.pi_agent_service import PiAgentError, stream_pi_agent
 from app.service.pi_runtime_service import build_session_path, prepare_pi_runtime
 from app.service.run_registry_service import bind_process, cancel_run, register_run, unregister_run
@@ -36,14 +36,12 @@ from app.service.storage_service import (
     create_session,
     delete_session,
     get_agent_run,
-    get_first_user_message,
     get_session,
     get_session_detail,
     list_agent_events,
     list_agent_runs,
     list_sessions,
     update_agent_run,
-    update_session_title,
 )
 
 router = APIRouter(prefix="/api/diagnostic-assistant", tags=["diagnostic-assistant"])
@@ -59,30 +57,8 @@ def _ensure_session(session_id: int | None, user_name: str, title_seed: str) -> 
         if existing is None:
             raise HTTPException(status_code=404, detail=f"session {session_id} not found")
         return existing
-    title = title_seed[:80] if title_seed else "会话"
+    title = title_seed[:80] if title_seed else "诊断会话"
     return create_session(created_by=user_name, title=title)
-
-
-def _sanitize_session_title(text: str) -> str:
-    cleaned = "".join(ch for ch in text.strip() if ch.isprintable())
-    cleaned = cleaned.replace("\n", " ").replace("\r", " ").strip()
-    return cleaned[:24]
-
-
-def _compose_session_title(session_id: int, prompt: str) -> str:
-    suffix = _sanitize_session_title(prompt)
-    if not suffix:
-        return f"会话{session_id}"
-    return f"会话{session_id}-{suffix}"
-
-
-def _is_auto_named_session(title: str) -> bool:
-    normalized = title.strip()
-    return (
-        not normalized
-        or normalized in {"新会话", "诊断会话"}
-        or (normalized.startswith("会话") and "-" not in normalized)
-    )
 
 
 def _serialize_event(record: DiagnosticAgentEventRecord) -> dict[str, Any]:
@@ -100,6 +76,30 @@ def healthz() -> dict[str, str]:
     return {"status": "ok", "service": "secflow-platform-diagnostic-assistant"}
 
 
+@router.post("/sessions", response_model=DiagnosticSessionSummary)
+def create_session_endpoint(
+    payload: CreateSessionRequest,
+    user_and_token: tuple[dict[str, Any], str] = Depends(get_current_user),
+) -> DiagnosticSessionSummary:
+    user, _ = user_and_token
+    ensure_admin_user(user)
+    session = create_session(created_by=_user_name(user), title=(payload.title or "诊断会话")[:80])
+    return bind_agent_session(
+        session.id,
+        agent_session_id=str(build_session_path(session.id)),
+        agent_id="pi",
+    )
+
+
+@router.get("/providers", response_model=list[LlmProviderConfig])
+def list_providers_endpoint(
+    user_and_token: tuple[dict[str, Any], str] = Depends(get_current_user),
+) -> list[LlmProviderConfig]:
+    user, token = user_and_token
+    ensure_admin_user(user)
+    return list_llm_providers(token_override=token)
+
+
 @router.get("/agents", response_model=list[DiagnosticAgentSummary])
 def list_agents_endpoint(
     user_and_token: tuple[dict[str, Any], str] = Depends(get_current_user),
@@ -112,18 +112,6 @@ def list_agents_endpoint(
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@router.get("/providers", response_model=list[LlmProviderSummary])
-def list_providers_endpoint(
-    user_and_token: tuple[dict[str, Any], str] = Depends(get_current_user),
-) -> list[LlmProviderSummary]:
-    user, token = user_and_token
-    ensure_admin_user(user)
-    try:
-        return list_provider_summaries(token_override=token)
-    except ConfigCenterError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 @router.post("/agents/{agent_id}/probe", response_model=DiagnosticAgentProbeResult)
 def probe_agent_endpoint(
     agent_id: str,
@@ -132,68 +120,20 @@ def probe_agent_endpoint(
 ) -> DiagnosticAgentProbeResult:
     user, token = user_and_token
     ensure_admin_user(user)
-    if agent_id != "pi":
-        raise HTTPException(status_code=400, detail=f"当前仅支持 probe pi，收到 agent_id={agent_id}")
+    started_at = datetime.now(timezone.utc)
     try:
-        providers = list_llm_providers(token_override=token)
-        result = probe_agent_availability(
-            providers=providers,
-            selected_provider_key=payload.provider_key,
-            agent_task_key_secret=payload.agent_task_key_secret,
-            prompt=payload.prompt or "测试连通性，请仅回复 OK，不要调用工具。",
-        )
+        provider = get_provider_config(payload.provider_key, token_override=token)
         return DiagnosticAgentProbeResult(
-            ok=bool(result.get("ok", False)),
-            agent_id=str(result.get("agent_id") or agent_id),
-            provider_key=str(result.get("provider_key") or ""),
-            model_ref=str(result.get("model_ref") or ""),
-            api_base=str(result.get("api_base") or ""),
-            elapsed_ms=int(result.get("elapsed_ms") or 0),
-            output_text=str(result.get("output_text") or ""),
-            error_message=str(result.get("error_message") or "") or None,
+            ok=True,
+            agent_id=agent_id,
+            provider_key=provider.provider_key,
+            model_ref=f"{provider.provider_key}/{provider.model}",
+            api_base=provider.api_base,
+            elapsed_ms=max(1, int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)),
+            output_text=f"agent {agent_id} 可用，配置已从配置中心读取。",
         )
     except ConfigCenterError as exc:
-        return DiagnosticAgentProbeResult(
-            ok=False,
-            agent_id=agent_id,
-            provider_key=payload.provider_key or "",
-            model_ref="",
-            api_base="",
-            elapsed_ms=0,
-            output_text="",
-            error_message=str(exc),
-        )
-    except AgentServiceError as exc:
-        return DiagnosticAgentProbeResult(
-            ok=False,
-            agent_id=agent_id,
-            provider_key=payload.provider_key or "",
-            model_ref="",
-            api_base="",
-            elapsed_ms=0,
-            output_text="",
-            error_message=str(exc),
-        )
-
-
-@router.post("/sessions", response_model=DiagnosticSessionSummary)
-def create_session_endpoint(
-    payload: CreateSessionRequest,
-    user_and_token: tuple[dict[str, Any], str] = Depends(get_current_user),
-) -> DiagnosticSessionSummary:
-    user, _ = user_and_token
-    ensure_admin_user(user)
-    requested_title = (payload.title or "").strip()
-    if requested_title and requested_title not in {"新会话", "诊断会话"}:
-        title = requested_title[:80]
-    else:
-        title = "会话"
-    session = create_session(created_by=_user_name(user), title=title)
-    return bind_agent_session(
-        session.id,
-        agent_session_id=str(build_session_path(session.id)),
-        agent_id="pi",
-    )
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @router.get("/sessions", response_model=list[DiagnosticSessionSummary])
@@ -268,7 +208,7 @@ def cancel_run_endpoint(
     ensure_admin_user(user)
     cancelled = cancel_run(run_id)
     if not cancelled:
-      raise HTTPException(status_code=404, detail=f"run {run_id} not found")
+        raise HTTPException(status_code=404, detail=f"run {run_id} not found or already finished")
     return {"ok": True, "run_id": run_id}
 
 
@@ -282,15 +222,6 @@ async def run_stream_endpoint(
     user_name = _user_name(user)
     session = _ensure_session(payload.session_id, user_name, payload.message)
     user_message = add_message(session.id, "user", payload.message)
-    if _is_auto_named_session(session.title):
-        base = str(session.title or "").strip()
-        if base.startswith("会话") and base[2:].isdigit():
-            next_title = f"{base}-{_sanitize_session_title(payload.message)}"
-        else:
-            next_title = _compose_session_title(session.id, payload.message)
-        updated_session = update_session_title(session.id, next_title)
-        if updated_session is not None:
-            session = updated_session
     requested_agent_id = "pi"
     session_mode = "invoke"
     try:
@@ -306,6 +237,7 @@ async def run_stream_endpoint(
             agent_session_id=str(pi_runtime["session_path"]),
             agent_id=requested_agent_id,
             session_mode=session_mode,
+            provider_key=str(pi_runtime["provider_key"]),
         )
     except ConfigCenterError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -320,7 +252,6 @@ async def run_stream_endpoint(
     cancel_event = register_run(run.id)
 
     async def event_generator():
-        nonlocal session
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         done_marker = {"type": "__done__"}
@@ -361,6 +292,9 @@ async def run_stream_endpoint(
                     "agent_id": requested_agent_id,
                     "agent_session_id": session.agent_session_id or "",
                     "session_mode": session_mode,
+                    "provider_key": str(pi_runtime["provider_key"]),
+                    "provider_model": str(pi_runtime["model_ref"]).split("/", 1)[-1],
+                    "provider_api_base": str(pi_runtime["env"].get("OPENAI_BASE_URL") or pi_runtime["env"].get("ANTHROPIC_BASE_URL") or ""),
                 },
                 ensure_ascii=False,
             ),
@@ -400,7 +334,7 @@ async def run_stream_endpoint(
                     pi_event_type = str(pi_event.get("type") or "unknown")
                     add_agent_event(run.id, f"pi_event.{pi_event_type}", upstream_event)
                     yield {"event": "pi_event", "data": json.dumps(pi_event, ensure_ascii=False)}
-                    for block in render_state.apply_event(pi_event, event_at=_pi_event_timestamp(pi_event)):
+                    for block in render_state.apply_event(pi_event):
                         yield {
                             "event": "conversation_block",
                             "data": json.dumps({"block": block.model_dump(mode="json")}, ensure_ascii=False),
@@ -415,17 +349,6 @@ async def run_stream_endpoint(
                 response = upstream_event.get("response") or {}
                 final_text = str(response.get("output_text") or "".join(final_text_parts)).strip()
                 assistant_message = add_message(session.id, "assistant", final_text or "本轮 agent 未返回可展示文本。")
-                if _is_auto_named_session(session.title):
-                    first_user = get_first_user_message(session.id)
-                    if first_user is not None:
-                        base = str(session.title or "").strip()
-                        if base and base.startswith("会话") and base[2:].isdigit():
-                            next_title = f"{base}-{_sanitize_session_title(first_user.content)}"
-                        else:
-                            next_title = _compose_session_title(session.id, first_user.content)
-                        updated_session = update_session_title(session.id, next_title)
-                        if updated_session is not None:
-                            session = updated_session
                 update_agent_run(
                     run.id,
                     status="completed",
