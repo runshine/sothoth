@@ -43,6 +43,7 @@ def claim_specific_task(db: Session, owner_id: str, task_id: str) -> ClaimedTask
     if status != "pending":
         return None  # running or terminal → skip (no re-claim)
     new_epoch = int(candidate.execution_epoch or 0) + 1
+    now = now_local()
     updated = (
         db.query(AppPocTask)
         .filter(
