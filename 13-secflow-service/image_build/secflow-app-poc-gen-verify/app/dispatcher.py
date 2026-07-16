@@ -1,102 +1,40 @@
-"""poc-gen-verify scheduler sidecar: DB→Celery pump + startup reset + stale scan.
+"""poc-gen-verify scheduler sidecar: DB→Celery pump only.
 
-Runs on the scheduler pod (alongside Redis). Pure threading, no asyncio (CLAUDE.md
-compliant). DB is the source of truth; Redis is a transient queue. Redis loss /
-restart → `_startup_reset` re-queues all running→pending + clears stale
-celery_task_id, then the pump re-publishes. Worker death → `_stale_loop` uses
-`inspect.active()` to find DB-running tasks with no live worker → reset pending.
+No startup_reset, no stale scan, no lease/heartbeat. Tasks run ONCE:
+- Worker death = task stays in "running" (user can manually restart).
+- Scheduler restart = no tasks are reset or re-published.
+- No automatic re-delivery (acks_late=False).
 
 Entry: `python -m app.dispatcher`
 """
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import threading
 import time
 
-logger = logging.getLogger("poc.dispatcher")
+from app.runtime_context import DISPATCH_POLL_INTERVAL_SECONDS as PUMP_INTERVAL, PUMP_BATCH
 
-from app.runtime_context import (
-    DISPATCH_POLL_INTERVAL_SECONDS as PUMP_INTERVAL,
-    STALE_SCAN_INTERVAL_SECONDS as STALE_INTERVAL,
-    STALE_HEARTBEAT_SECONDS,
-    PUMP_BATCH,
-    INSPECT_TIMEOUT,
-)
+logger = logging.getLogger("poc.dispatcher")
 
 
 class Dispatcher:
+    """Pump pending tasks (celery_task_id IS NULL) → publish to Celery. Nothing else."""
+
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
         self._stop.clear()
-        self._startup_reset()
         t = threading.Thread(target=self._pump_loop, name="poc_disp_pump", daemon=True)
         t.start()
         self._threads.append(t)
-        t = threading.Thread(target=self._stale_loop, name="poc_disp_stale", daemon=True)
-        t.start()
-        self._threads.append(t)
-        logger.info("Dispatcher started: pump=%ss stale=%ss", PUMP_INTERVAL, STALE_INTERVAL)
+        logger.info("Dispatcher started: pump=%ss (no stale scan, no startup reset)", PUMP_INTERVAL)
 
     def stop(self) -> None:
         self._stop.set()
-
-    # ── startup reset: Redis queue lost → running back to pending + clear stale celery_id ──
-    def _startup_reset(self) -> None:
-        from app.db import get_db
-        from app.db.models import AppPocTask
-        db_gen = get_db()
-        db = next(db_gen)
-        try:
-            n_running = (
-                db.query(AppPocTask)
-                .filter(AppPocTask.status == "running", AppPocTask.is_deleted.is_(False))
-                .update(
-                    {
-                        AppPocTask.status: "pending",
-                        AppPocTask.celery_task_id: None,
-                        AppPocTask.execution_owner_id: None,
-                        AppPocTask.execution_lease_until: None,
-                        AppPocTask.execution_heartbeat_at: None,  # ★ clear stale heartbeat too
-                        AppPocTask.dispatch_status: None,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            n_pending = (
-                db.query(AppPocTask)
-                .filter(
-                    AppPocTask.status == "pending",
-                    AppPocTask.is_deleted.is_(False),
-                    AppPocTask.celery_task_id.is_not(None),
-                )
-                .update(
-                    {
-                        AppPocTask.celery_task_id: None,
-                        AppPocTask.execution_owner_id: None,
-                        AppPocTask.execution_lease_until: None,
-                        AppPocTask.execution_heartbeat_at: None,  # ★ clear stale heartbeat too
-                        AppPocTask.dispatch_status: None,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            db.commit()
-            if n_running or n_pending:
-                logger.warning(
-                    "startup_reset: %d running→pending, %d pending stale celery_id cleared (redis queue rebuilt)",
-                    n_running, n_pending,
-                )
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
 
     # ── pump: pending (celery_task_id IS NULL) → publish to Celery ──
     def _pump_loop(self) -> None:
@@ -143,87 +81,6 @@ class Dispatcher:
             except StopIteration:
                 pass
         return published
-
-    # ── stale scan: DB running but no live worker running it → reset pending ──
-    def _stale_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                self._stale_once()
-            except Exception as exc:
-                logger.warning("stale loop error: %s", exc, exc_info=True)
-            self._stop.wait(STALE_INTERVAL)
-
-    def _stale_once(self) -> int:
-        from app.db import get_db
-        from app.db.models import AppPocTask
-        from app.time_utils import now_local
-        from app.celery_app import app as celery_app
-
-        # 1. Collect celery_ids of all tasks actively running on live workers.
-        active_ids: set[str] = set()
-        try:
-            inspect = celery_app.control.inspect(timeout=INSPECT_TIMEOUT)
-            active = inspect.active() or {}
-            for _pod, tasks in active.items():
-                for t in (tasks or []):
-                    cid = t.get("id") if isinstance(t, dict) else None
-                    if cid:
-                        active_ids.add(cid)
-        except Exception as exc:
-            logger.warning("inspect.active failed: %s (skip this round)", exc)
-            return 0
-
-        # 2. DB running tasks: celery_id not in active AND heartbeat stale → orphan/stuck.
-        db_gen = get_db()
-        db = next(db_gen)
-        reset = 0
-        try:
-            now = now_local()
-            rows = (
-                db.query(AppPocTask)
-                .filter(AppPocTask.status == "running", AppPocTask.is_deleted.is_(False))
-                .all()
-            )
-            for row in rows:
-                cid = row.celery_task_id
-                in_active = cid is not None and cid in active_ids
-                heartbeat_stale = (
-                    row.execution_heartbeat_at is None
-                    or (now - row.execution_heartbeat_at).total_seconds() > STALE_HEARTBEAT_SECONDS
-                )
-                # The DB lease heartbeat is the ground truth: a fresh heartbeat means the
-                # worker is alive and running the task. celery inspect.active() is
-                # unreliable under load (short timeout, false-negatives) — do NOT reset a
-                # task just because it's missing from the active set; that caused a 60s
-                # reset-loop (worker loses lease → re-queue → re-run from scratch). Only
-                # reset when the heartbeat has actually gone stale (worker dead/stuck).
-                if not heartbeat_stale:
-                    continue
-                # heartbeat stale → orphan (not in active) or stuck (in active but not
-                # heartbeating) → revoke + reset to pending for re-queue.
-                if cid:
-                    try:
-                        celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
-                    except Exception:
-                        pass
-                row.status = "pending"
-                row.celery_task_id = None
-                row.execution_owner_id = None
-                row.execution_lease_until = None
-                row.dispatch_status = None
-                reset += 1
-                logger.warning(
-                    "stale reset task=%s celery_id=%s in_active=%s hb_stale=%s",
-                    row.task_id, cid, in_active, heartbeat_stale,
-                )
-            if reset:
-                db.commit()
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
-        return reset
 
 
 _dispatcher: Dispatcher | None = None

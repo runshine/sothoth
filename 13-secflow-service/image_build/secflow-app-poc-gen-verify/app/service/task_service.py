@@ -6,9 +6,9 @@ API pod calls `create_task` / `list_tasks` / `get_task` / `cancel_task` /
 dispatcher pump publishes to Celery).
 
 Worker pod (Celery prefork child) calls `_execute_task(task_id, epoch, cv)`: it
-CAS-claims running, starts a lease heartbeat, runs the `poc` CLI as a subprocess
+CAS-claims running, runs the `poc` CLI as a subprocess
 (in its own session so revoke can killpg the whole poc+claude+gdb tree), and
-CAS-commits the terminal state. Ownership drift → lease heartbeat killpgs + aborts.
+CAS-commits the terminal state. No lease/heartbeat — tasks run to completion.
 """
 from __future__ import annotations
 
@@ -31,11 +31,10 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.db.models import AppPocTask, AppPocTaskEvent
 from app.runner import build_poc_cmd, default_output_dir, run_poc_cli
-from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, WORKER_ID
+from app.runtime_context import WORKER_ID
 from app.service.execution_coordinator import (
     begin_execution_if_owner,
     commit_terminal_state_if_owner,
-    renew_lease,
     still_owner,
 )
 from app.time_utils import isoformat_local, now_local
@@ -49,8 +48,8 @@ _PATH_B_RE = re.compile(r'路径\s*B\s*[（(]\s*(?:证伪|不可达)')
 
 logger = logging.getLogger("poc.task_service")
 
-# task_id → {"pgid": int|None, "stop": threading.Event} for the running task on
-# this worker. The lease-heartbeat thread and the streaming abort-check share it.
+# task_id → {"pgid": int|None, "stop": threading.Event} for cancel support only.
+# No lease heartbeat — tasks run to completion.
 _RUNNING: dict[str, dict] = {}
 
 
@@ -575,7 +574,7 @@ class TaskService:
             celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
             logger.info("celery revoke sent task=%s celery_id=%s", row.task_id, cid)
         except Exception as exc:
-            logger.warning("celery revoke failed task=%s: %s (stale scan will recover)", row.task_id, exc)
+            logger.warning("celery revoke failed task=%s: %s", row.task_id, exc)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -708,7 +707,6 @@ class TaskService:
         db: Session = next(db_gen)
         handle: dict = {"pgid": None, "stop": threading.Event()}
         _RUNNING[task_id] = handle
-        lease_thread = None
         try:
             row = db.query(AppPocTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":
@@ -754,7 +752,7 @@ class TaskService:
             db.commit()
             db.refresh(row)
 
-            lease_thread = self._start_lease_heartbeat(task_id, epoch, control_version, handle)
+            # No lease heartbeat — tasks run to completion once started.
 
             def _on_popen(proc):
                 try:
@@ -774,6 +772,7 @@ class TaskService:
                     pass
 
             def _should_abort() -> bool:
+                # Only abort on user-initiated cancel (handle["stop"] is set by cancel_task).
                 return handle["stop"].is_set()
 
             result = run_poc_cli(
@@ -865,46 +864,6 @@ class TaskService:
                 next(db_gen)
             except StopIteration:
                 pass
-
-    def _start_lease_heartbeat(self, task_id: str, epoch: int, control_version: int, handle: dict) -> threading.Thread:
-        from app.db import get_db
-
-        def _worker() -> None:
-            while True:
-                h = _RUNNING.get(task_id)
-                if h is None or h["stop"].is_set():
-                    return
-                # wait for one interval (or stop signal)
-                if h["stop"].wait(HEARTBEAT_INTERVAL_SECONDS):
-                    return
-                h = _RUNNING.get(task_id)
-                if h is None or h["stop"].is_set():
-                    return
-                db_gen = get_db()
-                db: Session = next(db_gen)
-                try:
-                    ok = renew_lease(db, task_id, WORKER_ID, epoch)
-                    if not ok or not still_owner(db, task_id, WORKER_ID, epoch, control_version):
-                        logger.warning("lease lost during heartbeat task=%s", task_id)
-                        pgid = h.get("pgid")
-                        if pgid:
-                            try:
-                                os.killpg(pgid, signal.SIGKILL)
-                            except OSError:
-                                pass
-                        h["stop"].set()
-                        return
-                except Exception:
-                    logger.debug("lease heartbeat error task=%s", task_id, exc_info=True)
-                finally:
-                    try:
-                        next(db_gen)
-                    except StopIteration:
-                        pass
-
-        t = threading.Thread(target=_worker, name=f"poc_lease_{task_id}", daemon=True)
-        t.start()
-        return t
 
     # ── serialization ─────────────────────────────────────────────────────────
     def _log_path(self, output_dir: Optional[str]) -> Path:
