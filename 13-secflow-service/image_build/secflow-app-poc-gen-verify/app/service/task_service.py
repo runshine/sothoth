@@ -53,6 +53,42 @@ logger = logging.getLogger("poc.task_service")
 _RUNNING: dict[str, dict] = {}
 
 
+def _heartbeat_updater(task_id: str) -> None:
+    """Lightweight heartbeat: update execution_heartbeat_at every 60s while task runs.
+
+    This is NOT a lease — it does NOT abort the task. It only lets the scheduler
+    detect worker death (heartbeat goes stale → scheduler marks task as failed).
+    """
+    while True:
+        h = _RUNNING.get(task_id)
+        if h is None or h["stop"].is_set():
+            return
+        if h["stop"].wait(60):
+            return
+        h = _RUNNING.get(task_id)
+        if h is None or h["stop"].is_set():
+            return
+        try:
+            from app.db import get_db
+            from app.db.models import AppPocTask
+            from app.time_utils import now_local
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                db.query(AppPocTask).filter_by(task_id=task_id).update(
+                    {AppPocTask.execution_heartbeat_at: now_local()},
+                    synchronize_session=False,
+                )
+                db.commit()
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+        except Exception:
+            pass  # best-effort — don't crash the task for a heartbeat failure
+
+
 def _task_id_stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
@@ -707,6 +743,14 @@ class TaskService:
         db: Session = next(db_gen)
         handle: dict = {"pgid": None, "stop": threading.Event()}
         _RUNNING[task_id] = handle
+        # Lightweight heartbeat thread: just updates execution_heartbeat_at every 60s
+        # so the scheduler can detect worker death. No lease/abort logic — tasks run
+        # to completion. If the worker dies, the heartbeat goes stale and the scheduler
+        # marks the task as failed (NOT re-run).
+        hb_thread = threading.Thread(
+            target=_heartbeat_updater, args=(task_id,), name=f"poc_hb_{task_id}", daemon=True
+        )
+        hb_thread.start()
         try:
             row = db.query(AppPocTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":

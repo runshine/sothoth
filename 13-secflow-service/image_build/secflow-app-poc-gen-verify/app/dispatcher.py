@@ -14,9 +14,14 @@ import signal
 import threading
 import time
 
-from app.runtime_context import DISPATCH_POLL_INTERVAL_SECONDS as PUMP_INTERVAL, PUMP_BATCH
+from app.runtime_context import DISPATCH_POLL_INTERVAL_SECONDS as PUMP_INTERVAL, PUMP_BATCH, INSPECT_TIMEOUT
 
 logger = logging.getLogger("poc.dispatcher")
+
+# Worker death detection: if a running task's heartbeat is older than this, AND
+# the worker pod is not reachable via Celery inspect.ping(), the task is marked
+# as 'failed' (NOT re-run — just so the user knows the worker died).
+DEAD_WORKER_HEARTBEAT_SECONDS = 600  # 10 minutes with no heartbeat = likely dead
 
 
 class Dispatcher:
@@ -31,7 +36,10 @@ class Dispatcher:
         t = threading.Thread(target=self._pump_loop, name="poc_disp_pump", daemon=True)
         t.start()
         self._threads.append(t)
-        logger.info("Dispatcher started: pump=%ss (no stale scan, no startup reset)", PUMP_INTERVAL)
+        t = threading.Thread(target=self._dead_worker_scan_loop, name="poc_disp_dead", daemon=True)
+        t.start()
+        self._threads.append(t)
+        logger.info("Dispatcher started: pump=%ss dead-scan=60s (mark dead, no rerun)", PUMP_INTERVAL)
 
     def stop(self) -> None:
         self._stop.set()
@@ -81,6 +89,82 @@ class Dispatcher:
             except StopIteration:
                 pass
         return published
+
+    # ── dead worker detection: heartbeat stale + worker unreachable → mark failed ──
+    def _dead_worker_scan_loop(self) -> None:
+        """Every 60s, check if any running task's worker has died.
+
+        If heartbeat is stale (>DEAD_WORKER_HEARTBEAT_SECONDS) AND the worker pod
+        is not in Celery's ping response, mark the task as 'failed' with a clear
+        message. This does NOT re-run the task — it just informs the user.
+        """
+        while not self._stop.is_set():
+            try:
+                self._dead_worker_scan_once()
+            except Exception as exc:
+                logger.warning("dead worker scan error: %s", exc, exc_info=True)
+            self._stop.wait(60)
+
+    def _dead_worker_scan_once(self) -> int:
+        from app.db import get_db
+        from app.db.models import AppPocTask
+        from app.time_utils import now_local
+        from app.celery_app import app as celery_app
+
+        # Get set of live worker names
+        try:
+            inspect = celery_app.control.inspect(timeout=INSPECT_TIMEOUT)
+            ping_results = inspect.ping() or {}
+            live_workers = set(ping_results.keys())
+        except Exception as exc:
+            logger.warning("dead scan: inspect.ping failed: %s (skip this round)", exc)
+            return 0
+
+        now = now_local()
+        db_gen = get_db()
+        db = next(db_gen)
+        marked = 0
+        try:
+            rows = (
+                db.query(AppPocTask)
+                .filter(AppPocTask.status == "running", AppPocTask.is_deleted.is_(False))
+                .all()
+            )
+            for row in rows:
+                hb = row.execution_heartbeat_at
+                if hb is None:
+                    continue  # not started yet (or just claimed)
+                hb_age = (now - hb).total_seconds()
+                if hb_age <= DEAD_WORKER_HEARTBEAT_SECONDS:
+                    continue  # heartbeat fresh — worker alive
+                # Heartbeat is stale. Check if the owning worker is still alive.
+                owner = row.execution_owner_id or ""
+                # Owner is the pod name (e.g. secflow-app-poc-gen-verify-worker-xxx)
+                # Live workers from ping are like "poc-worker@secflow-app-poc-gen-verify-worker-xxx"
+                worker_alive = any(owner in w for w in live_workers)
+                if worker_alive:
+                    continue  # worker is alive but heartbeat thread might have a DB issue
+                # Worker is dead → mark task as failed (NOT re-run)
+                row.status = "failed"
+                row.error = f"Worker pod died (heartbeat stale {int(hb_age)}s, owner={owner})"
+                row.finished_at = now
+                row.execution_owner_id = None
+                row.execution_lease_until = None
+                row.execution_heartbeat_at = None
+                row.dispatch_status = None
+                marked += 1
+                logger.warning(
+                    "dead worker detected: task=%s owner=%s hb_age=%ds → marked failed",
+                    row.task_id, owner, int(hb_age),
+                )
+            if marked:
+                db.commit()
+        finally:
+            try:
+                next(db_gen)
+            except StopIteration:
+                pass
+        return marked
 
 
 _dispatcher: Dispatcher | None = None
