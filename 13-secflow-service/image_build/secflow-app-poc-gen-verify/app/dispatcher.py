@@ -57,10 +57,45 @@ class Dispatcher:
         from app.db import get_db
         from app.db.models import AppPocTask
         from app.celery_tasks import run_poc_task
+        from app.celery_app import app as celery_app
         db_gen = get_db()
         db = next(db_gen)
         published = 0
         try:
+            # First: clear stale celery_task_id on pending tasks whose celery message
+            # was already consumed (acked) but the task never started running.
+            # With acks_late=False, a consumed message is gone — the celery_id is
+            # stale. We detect this by checking if the celery_id is NOT in any
+            # worker's active set (meaning the message was consumed and failed).
+            try:
+                inspect = celery_app.control.inspect(timeout=3)
+                active = inspect.active() or {}
+                active_ids = set()
+                for _worker, tasks in active.items():
+                    for t in (tasks or []):
+                        cid = t.get("id") if isinstance(t, dict) else None
+                        if cid:
+                            active_ids.add(cid)
+            except Exception:
+                active_ids = set()  # inspect failed → don't clear anything this round
+
+            stale_rows = (
+                db.query(AppPocTask)
+                .filter(
+                    AppPocTask.status == "pending",
+                    AppPocTask.is_deleted.is_(False),
+                    AppPocTask.celery_task_id.is_not(None),
+                )
+                .all()
+            )
+            for row in stale_rows:
+                if row.celery_task_id not in active_ids:
+                    row.celery_task_id = None
+                    logger.info("cleared stale celery_id task=%s (message consumed but task not running)", row.task_id)
+            if stale_rows:
+                db.commit()
+
+            # Then: publish pending tasks with no celery_task_id
             rows = (
                 db.query(AppPocTask)
                 .filter(
