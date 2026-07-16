@@ -136,8 +136,8 @@ def build_worker_cluster_snapshot() -> dict:
         "total_workers": len(workers),
         "healthy_workers": healthy_count,
         "total_capacity": total_capacity,
-        "total_running": total_running,
-        "total_available": max(0, total_capacity - total_running),
+        "total_running": len(running_rows),  # DB is source of truth
+        "total_available": max(0, total_capacity - len(running_rows)),
         "pending_count": pending_count,
         "workers": workers,
     }
