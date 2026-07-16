@@ -62,24 +62,17 @@ def build_worker_cluster_snapshot() -> dict:
     try:
         inspect = celery_app.control.inspect(timeout=INSPECT_TIMEOUT)
         ping_results = inspect.ping() or {}
-        active_results = inspect.active() or {}
     except Exception as exc:
-        logger.warning("celery inspect failed: %s", exc)
+        logger.warning("celery inspect.ping failed: %s", exc)
         return {
             "total_workers": 0, "healthy_workers": 0,
             "total_capacity": 0, "total_running": 0, "total_available": 0,
             "workers": [], "error": str(exc),
         }
 
-    # Build set of active celery task IDs
-    active_celery_ids: set[str] = set()
-    for _worker, tasks in active_results.items():
-        for t in (tasks or []):
-            cid = t.get("id") if isinstance(t, dict) else None
-            if cid:
-                active_celery_ids.add(cid)
-
-    # Query DB for running tasks
+    # Query DB for running tasks (reliable — DB is source of truth, unlike
+    # inspect.active() which is unreliable from the API pod due to short
+    # timeout and broker connectivity issues).
     db_gen = get_db()
     db = next(db_gen)
     try:
@@ -88,10 +81,6 @@ def build_worker_cluster_snapshot() -> dict:
             .filter(AppPocTask.status == "running", AppPocTask.is_deleted.is_(False))
             .all()
         )
-        # Map celery_id → row for quick lookup
-        running_map: dict[str, AppPocTask] = {
-            row.celery_task_id: row for row in running_rows if row.celery_task_id
-        }
         pending_count = db.query(AppPocTask).filter(
             AppPocTask.status == "pending", AppPocTask.is_deleted.is_(False)
         ).count()
@@ -104,8 +93,10 @@ def build_worker_cluster_snapshot() -> dict:
     for worker_name in sorted(ping_results.keys()):
         # Each worker has concurrency=1 (celery -c 1)
         max_jobs = 1
-        active = active_results.get(worker_name, []) or []
-        running_count = len(active)
+        # Use DB running count instead of inspect.active() (unreliable from API pod).
+        # Map running tasks to workers by execution_owner_id.
+        worker_running = [r for r in running_rows if (r.execution_owner_id or "") and (r.execution_owner_id in worker_name or worker_name in (r.execution_owner_id or ""))]
+        running_count = len(worker_running)
         available = max(0, max_jobs - running_count)
         total_capacity += max_jobs
         total_running += running_count
@@ -113,37 +104,20 @@ def build_worker_cluster_snapshot() -> dict:
             healthy_count += 1
 
         job_snapshots: list = []
-        for task_info in active:
-            cid = task_info.get("id") if isinstance(task_info, dict) else None
-            row = running_map.get(cid) if cid else None
-            if row:
-                job_snapshots.append({
-                    "task_id": row.task_id,
-                    "task_name": row.task_name,
-                    "status": row.status,
-                    "started_at": isoformat_local(row.started_at),
-                    "updated_at": isoformat_local(row.updated_at),
-                    "dispatch_status": row.dispatch_status,
-                    "execution_owner_id": row.execution_owner_id,
-                    "execution_lease_until": isoformat_local(row.execution_lease_until),
-                    "execution_heartbeat_at": isoformat_local(row.execution_heartbeat_at),
-                    "mapped": True,
-                    "mapping_reason": "celery_active",
-                })
-            else:
-                job_snapshots.append({
-                    "task_id": cid or "unknown",
-                    "task_name": "unknown",
-                    "status": "running",
-                    "started_at": None,
-                    "updated_at": None,
-                    "dispatch_status": None,
-                    "execution_owner_id": None,
-                    "execution_lease_until": None,
-                    "execution_heartbeat_at": None,
-                    "mapped": False,
-                    "mapping_reason": "celery_active_unmapped",
-                })
+        for row in worker_running:
+            job_snapshots.append({
+                "task_id": row.task_id,
+                "task_name": row.task_name,
+                "status": row.status,
+                "started_at": isoformat_local(row.started_at),
+                "updated_at": isoformat_local(row.updated_at),
+                "dispatch_status": row.dispatch_status,
+                "execution_owner_id": row.execution_owner_id,
+                "execution_lease_until": isoformat_local(row.execution_lease_until),
+                "execution_heartbeat_at": isoformat_local(row.execution_heartbeat_at),
+                "mapped": True,
+                "mapping_reason": "db_running",
+            })
 
         workers.append({
             "worker_id": worker_name,
