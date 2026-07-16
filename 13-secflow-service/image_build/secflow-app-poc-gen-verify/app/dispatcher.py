@@ -62,6 +62,7 @@ class Dispatcher:
                         AppPocTask.celery_task_id: None,
                         AppPocTask.execution_owner_id: None,
                         AppPocTask.execution_lease_until: None,
+                        AppPocTask.execution_heartbeat_at: None,  # ★ clear stale heartbeat too
                         AppPocTask.dispatch_status: None,
                     },
                     synchronize_session=False,
@@ -79,6 +80,7 @@ class Dispatcher:
                         AppPocTask.celery_task_id: None,
                         AppPocTask.execution_owner_id: None,
                         AppPocTask.execution_lease_until: None,
+                        AppPocTask.execution_heartbeat_at: None,  # ★ clear stale heartbeat too
                         AppPocTask.dispatch_status: None,
                     },
                     synchronize_session=False,
