@@ -169,6 +169,7 @@ def verify_task_result(task_id: str, db: Session = Depends(get_db)) -> PocVerifi
     from app.service.poc_verifier import verify_poc_result
     poc_path = (row.stages_json or {}).get("poc_path") if isinstance(row.stages_json, dict) else None
     result = verify_poc_result(row.output_dir or "", row.returncode, poc_path)
+    result["task_id"] = task_id
     return PocVerificationResult(**result)
 
 # ── Worker cluster capacity ───────────────────────────────────────────────────
