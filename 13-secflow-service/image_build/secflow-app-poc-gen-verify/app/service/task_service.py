@@ -266,6 +266,24 @@ class TaskService:
             q = q.filter(AppPocTask.project_id == project_id)
         rows = q.group_by(AppPocTask.status).all()
         counts = {str(s or ""): int(c or 0) for s, c in rows}
+        # PoC verdict breakdown: count succeeded tasks by poc_path in stages_json
+        from sqlalchemy import text
+        verified = 0
+        false_positive = 0
+        try:
+            verdict_rows = db.execute(text(
+                "SELECT JSON_UNQUOTE(JSON_EXTRACT(stages_json, '$.poc_path')) AS pp, COUNT(*) AS cnt "
+                "FROM secflow_app_poc_tasks WHERE is_deleted = 0 AND status = 'succeeded' "
+                + ("AND project_id = :pid " if project_id else "") +
+                "GROUP BY pp"
+            ), {"pid": project_id} if project_id else {}).fetchall()
+            for pp, cnt in verdict_rows:
+                if pp == "a":
+                    verified = int(cnt)
+                elif pp == "b":
+                    false_positive = int(cnt)
+        except Exception:
+            pass
         return {
             "total": sum(counts.values()),
             "pending": counts.get("pending", 0),
@@ -273,6 +291,8 @@ class TaskService:
             "succeeded": counts.get("succeeded", 0),
             "failed": counts.get("failed", 0),
             "cancelled": counts.get("cancelled", 0),
+            "verified": verified,
+            "false_positive": false_positive,
         }
 
     def get_task(self, db: Session, task_id: str) -> dict:
@@ -321,6 +341,44 @@ class TaskService:
                 for e in events
             ],
         }
+
+    def clear_timeline(self, db: Session, task_id: str) -> dict:
+        """Delete all timeline events for a task."""
+        row = self._get_or_404(db, task_id)
+        count = (
+            db.query(AppPocTaskEvent)
+            .filter(AppPocTaskEvent.task_id == row.task_id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        _record_task_event(db, row, "timeline_cleared", f"时间线已清空 ({count} 条事件)",
+                           level="warning", payload={"deleted_count": count})
+        return {"status": "ok", "task_id": row.task_id, "message": f"Deleted {count} events", "deleted_event_count": count}
+
+    def delete_timeline_event(self, db: Session, task_id: str, event_id: str) -> dict:
+        """Delete a single timeline event by id."""
+        row = self._get_or_404(db, task_id)
+        ev = db.query(AppPocTaskEvent).filter_by(id=event_id, task_id=row.task_id).first()
+        if ev is None:
+            raise HTTPException(status_code=404, detail=f"Event not found: {event_id}")
+        db.delete(ev)
+        db.commit()
+        return {"status": "ok", "task_id": row.task_id, "message": "Deleted", "deleted_event_count": 1}
+
+    def update_feature_flags(self, db: Session, task_id: str, feature_flags: dict) -> dict:
+        """Merge feature_flags into task_config_json.feature_flags."""
+        row = self._get_or_404(db, task_id)
+        config = dict(row.task_config_json or {})
+        current_flags = dict(config.get("feature_flags") or {})
+        current_flags.update(feature_flags)
+        config["feature_flags"] = current_flags
+        row.task_config_json = config
+        db.commit()
+        db.refresh(row)
+        _record_task_event(db, row, "feature_flags_updated",
+                           f"Feature flags updated: {list(feature_flags.keys())}",
+                           level="info", payload={"feature_flags": current_flags})
+        return self._row_to_dict(row)
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
         """Soft-delete a task (is_deleted=True). Optionally clean output_dir + revoke celery."""
@@ -878,6 +936,8 @@ class TaskService:
             # poc_path: extracted from stages_json/result_json for frontend verdict
             # "a" = path A (vuln confirmed), "b" = path B (false positive), None = N/A
             "poc_path": (row.stages_json or {}).get("poc_path") if isinstance(row.stages_json, dict) else None,
+            "task_config_json": row.task_config_json if include_heavy else None,
+            "latest_abnormal_reason_json": row.latest_abnormal_reason_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": isoformat_local(row.created_at),
             "updated_at": isoformat_local(row.updated_at),

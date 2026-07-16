@@ -62,6 +62,10 @@ class AppPocTask(Base):
     artifacts_json: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
     result_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
     stages_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # Per-task config overrides (e.g. {"feature_flags": {"poc_verifier": true}})
+    task_config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    # Latest abnormal reason for observability (e.g. {"kind": "timeout", "detail": "..."})
+    latest_abnormal_reason_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
     created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
@@ -114,3 +118,66 @@ class AppPocTaskEvent(Base):
     @payload.setter
     def payload(self, value: dict[str, Any] | None) -> None:
         self.payload_json = json.dumps(value or {}, ensure_ascii=False)
+
+
+class AppPocPromptTemplate(Base):
+    """Reusable prompt templates for secflow-app-poc-gen-verify."""
+    __tablename__ = "secflow_app_poc_prompt_templates"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    prompt_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    category: Mapped[str] = mapped_column(String(64), nullable=False, default="general")
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    variables_json: Mapped[Optional[List[str]]] = mapped_column(JSON, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    created_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    updated_by: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class AppPocProjectConfig(Base):
+    """Global PoC gen-verify configuration blob (project_id="" is the singleton)."""
+    __tablename__ = "secflow_app_poc_project_configs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+
+
+class AppPocFailureDebug(Base):
+    """任务失败时 LLM 自动调试生成的故障定位报告."""
+    __tablename__ = "secflow_app_poc_failure_debug"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+    project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    task_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # status: pending | running | done | error | skipped
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", index=True)
+    error_kind: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    failing_stage: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    summary: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    report_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    report_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    debug_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)
+
+
+class AppPocDebugConfig(Base):
+    """Singleton config blob for the debugger role (e.g. debug model selection)."""
+    __tablename__ = "secflow_app_poc_debug_config"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    config_key: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True, default="global")
+    config_json: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=now_local, onupdate=now_local)

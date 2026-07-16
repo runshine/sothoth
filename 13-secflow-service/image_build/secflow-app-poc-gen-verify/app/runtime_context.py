@@ -39,6 +39,7 @@ INSPECT_TIMEOUT = float(os.environ.get("POC_DISPATCHER_INSPECT_TIMEOUT", "3"))
 ROLE = str(os.environ.get("POC_ROLE", "all")).strip().lower() or "all"
 PUBLIC_API_ENABLED = _env_bool("POC_ENABLE_PUBLIC_API", ROLE in {"all", "api"})
 REGISTRY_ENABLED = _env_bool("POC_ENABLE_REGISTRY", ROLE in {"all", "api"})
+DEBUGGER_ENABLED = _env_bool("POC_ENABLE_DEBUGGER", ROLE in {"all", "debugger"})
 
 
 def is_api_role() -> bool:

@@ -39,6 +39,18 @@ _MIGRATIONS: list[Migration] = [
         name="cli_command",
         statement="ALTER TABLE secflow_app_poc_tasks ADD COLUMN cli_command TEXT NULL",
     ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_poc_tasks",
+        name="task_config_json",
+        statement="ALTER TABLE secflow_app_poc_tasks ADD COLUMN task_config_json JSON NULL",
+    ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_poc_tasks",
+        name="latest_abnormal_reason_json",
+        statement="ALTER TABLE secflow_app_poc_tasks ADD COLUMN latest_abnormal_reason_json JSON NULL",
+    ),
 ]
 
 
