@@ -65,6 +65,21 @@ class DbConfig:
 
 
 @dataclass
+class AuthConfig:
+    host: str = "secflow-platform-auth"
+    port: int = 80
+    validate_token_path: str = "/api/auth/validate-token"
+    service_machine_token: str = ""
+    timeout: int = 10
+    token_cache_enabled: bool = True
+    token_cache_ttl_minutes: int = 15
+
+    @property
+    def validate_url(self) -> str:
+        return f"http://{self.host}:{self.port}{self.validate_token_path}"
+
+
+@dataclass
 class MenuLevelConfig:
     name: Optional[str] = None
     name_en: Optional[str] = None
@@ -107,6 +122,7 @@ class AppConfig:
 @dataclass
 class ServiceYaml:
     database: DbConfig = field(default_factory=DbConfig)
+    auth_service: AuthConfig = field(default_factory=AuthConfig)
     registry: RegistryConfig = field(default_factory=RegistryConfig)
     app: AppConfig = field(default_factory=AppConfig)
 
@@ -150,6 +166,17 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> ServiceYaml:
         max_overflow=int(db_raw.get("max_overflow", 10)),
     )
 
+    auth_raw = raw.get("auth_service", {})
+    auth = AuthConfig(
+        host=auth_raw.get("host", "secflow-platform-auth"),
+        port=int(auth_raw.get("port", 80)),
+        validate_token_path=auth_raw.get("validate_token_path", "/api/auth/validate-token"),
+        service_machine_token=auth_raw.get("service_machine_token", ""),
+        timeout=int(auth_raw.get("timeout", 10)),
+        token_cache_enabled=bool(auth_raw.get("token_cache_enabled", True)),
+        token_cache_ttl_minutes=int(auth_raw.get("token_cache_ttl_minutes", 15)),
+    )
+
     reg_raw = raw.get("registry", {})
     registry = RegistryConfig(
         enabled=bool(reg_raw.get("enabled", True)),
@@ -173,7 +200,7 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> ServiceYaml:
         debug=bool(app_raw.get("debug", False)),
     )
 
-    return ServiceYaml(database=db, registry=registry, app=app_cfg)
+    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg)
 
 
 _service_yaml: Optional[ServiceYaml] = None

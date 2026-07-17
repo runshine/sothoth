@@ -57,6 +57,11 @@ class PocTaskStatus(BaseModel):
     artifacts: List[str] = Field(default_factory=list)
     result_json: Optional[Dict[str, Any]] = None
     stages_json: Optional[Dict[str, Any]] = None
+    # PoC outcome path (derived from Stage2 poc_report.md):
+    # "a" = path A (vuln confirmed, PoC triggered successfully)
+    # "b" = path B (false positive / unreachable proved)
+    # None = Stage1 failed / no Stage2 report
+    poc_path: Optional[str] = None
     created_by: Optional[str] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -85,6 +90,9 @@ class PocTaskStatsResponse(BaseModel):
     failed: int = 0
     timeout: int = 0  # legacy (unused — no timeout mechanism)
     cancelled: int = 0
+    # PoC verdict breakdown (subset of succeeded/failed by poc_path)
+    verified: int = 0       # poc_path=a (vuln confirmed)
+    false_positive: int = 0  # poc_path=b (false positive / unreachable)
 
 
 class PocTaskLogsResponse(BaseModel):
@@ -147,3 +155,189 @@ class ActionResponse(BaseModel):
     status: str = "ok"
     task_id: str
     message: str
+
+
+# ─── Timeline management ─────────────────────────────────────────────────────
+
+class TimelineClearResponse(BaseModel):
+    status: str = "ok"
+    task_id: str
+    message: str
+    deleted_event_count: int
+
+
+class TimelineEventDeleteResponse(BaseModel):
+    status: str = "ok"
+    task_id: str
+    message: str
+    deleted_event_count: int
+
+
+# ─── Feature flags / task config override ────────────────────────────────────
+
+class FeatureFlagsRequest(BaseModel):
+    """PATCH /tasks/{task_id}/feature-flags: merge into task_config_json.feature_flags."""
+    feature_flags: Dict[str, bool]
+
+
+# ─── Prompt templates ────────────────────────────────────────────────────────
+
+class PromptTemplateCreateRequest(BaseModel):
+    prompt_id: str
+    name: str
+    category: str = "general"
+    description: Optional[str] = None
+    content: str
+    variables: List[str] = Field(default_factory=list)
+    is_default: bool = False
+    is_enabled: bool = True
+    created_by: Optional[str] = None
+
+
+class PromptTemplateUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    category: Optional[str] = None
+    description: Optional[str] = None
+    content: Optional[str] = None
+    variables: Optional[List[str]] = None
+    is_default: Optional[bool] = None
+    is_enabled: Optional[bool] = None
+    updated_by: Optional[str] = None
+
+
+class PromptTemplateResponse(BaseModel):
+    id: int
+    prompt_id: str
+    name: str
+    category: str
+    description: Optional[str] = None
+    content: str
+    variables: List[str] = Field(default_factory=list)
+    version: int
+    is_default: bool
+    is_enabled: bool
+    created_by: Optional[str] = None
+    updated_by: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class PromptTemplateListResponse(BaseModel):
+    items: List[PromptTemplateResponse]
+    total: int
+
+
+# ─── Service config ──────────────────────────────────────────────────────────
+
+class ServiceConfigResponse(BaseModel):
+    default_model: str = "glm-5.2"
+    default_effort: str = "medium"
+    available_models: List[Dict[str, str]] = Field(default_factory=list)
+    available_efforts: List[str] = Field(default_factory=list)
+    updated_at: Optional[str] = None
+
+
+class ServiceConfigUpdateRequest(BaseModel):
+    default_model: Optional[str] = None
+    default_effort: Optional[str] = None
+
+
+# ─── Worker cluster capacity ────────────────────────────────────────────────
+
+class WorkerJobSnapshot(BaseModel):
+    task_id: str
+    task_name: str
+    status: str
+    started_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    dispatch_status: Optional[str] = None
+    execution_owner_id: Optional[str] = None
+    execution_lease_until: Optional[str] = None
+    execution_heartbeat_at: Optional[str] = None
+    mapped: bool = True
+    mapping_reason: str = "celery_active"
+
+
+class WorkerSnapshot(BaseModel):
+    worker_id: str
+    host_name: str = ""
+    pod_name: str = ""
+    healthy: bool = True
+    max_concurrent_jobs: int = 1
+    running_jobs: int = 0
+    available_slots: int = 0
+    source: str = "celery"
+    last_heartbeat_at: Optional[str] = None
+    running_job_snapshots: List[WorkerJobSnapshot] = Field(default_factory=list)
+
+
+class WorkerClusterCapacityResponse(BaseModel):
+    total_workers: int = 0
+    healthy_workers: int = 0
+    total_capacity: int = 0
+    total_running: int = 0
+    total_available: int = 0
+    workers: List[WorkerSnapshot] = Field(default_factory=list)
+
+
+# ─── Agent observability (process snapshot) ──────────────────────────────────
+
+class AgentProcessSnapshot(BaseModel):
+    pid: int
+    name: str = ""
+    cmd: str = ""
+    cpu_percent: float = 0.0
+    memory_mb: float = 0.0
+    status: str = ""
+    create_time: Optional[str] = None
+
+
+class AgentProcessKillResponse(BaseModel):
+    status: str = "ok"
+    killed: int = 0
+    message: str = ""
+
+
+# ─── PoC verification (structured result verification) ──────────────────────
+
+class PocVerificationResult(BaseModel):
+    task_id: str
+    verified: bool = False
+    poc_path: Optional[str] = None
+    checks: List[Dict[str, Any]] = Field(default_factory=list)
+    summary: str = ""
+
+
+# ─── Failure debug ───────────────────────────────────────────────────────────
+
+class FailureDebugReportResponse(BaseModel):
+    id: int
+    task_id: str
+    project_id: str
+    task_name: str
+    status: str
+    error_kind: Optional[str] = None
+    failing_stage: Optional[str] = None
+    summary: Optional[str] = None
+    report_path: Optional[str] = None
+    report_json: Optional[Dict[str, Any]] = None
+    debug_error: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class FailureDebugReportListResponse(BaseModel):
+    items: List[FailureDebugReportResponse]
+    total: int
+    page: int
+    per_page: int
+
+
+class FailureDebugConfigResponse(BaseModel):
+    model: str = "glm-5.2"
+    available_models: List[Dict[str, str]] = Field(default_factory=list)
+    updated_at: Optional[str] = None
+
+
+class FailureDebugConfigUpdateRequest(BaseModel):
+    model: str

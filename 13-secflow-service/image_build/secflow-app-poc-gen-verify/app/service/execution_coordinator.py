@@ -1,26 +1,18 @@
-"""Execution-coordination primitives: DB-lease CAS claim/commit for Celery workers.
+"""Execution-coordination primitives: CAS claim/commit for Celery workers.
 
-Lifted from dataflow-vuln-scan's execution_coordinator (trimmed: poc-gen-verify has
-no parent/binary-security orchestration). DB is the source of truth; these CAS
-UPDATEs make a Celery worker the unique owner of a task for one execution epoch.
-
-- `claim_specific_task`: worker claims a specific task_id (non-competitive). Only
-  claims pending, or running-with-expired-lease (acks_late re-deliver / orphan).
-  Returns ClaimedTask(task_id, epoch, control_version) or None.
-- `begin_execution_if_owner`: CAS pending→running, filtered by owner/epoch/cv.
-- `commit_terminal_state_if_owner`: CAS running→terminal, clears owner/lease.
-- `renew_lease` / `still_owner`: heartbeat + ownership guard.
+Simplified for run-ONCE semantics: no lease, no heartbeat, no re-claim.
+- `claim_specific_task`: only claims pending tasks. Running → None (no re-claim).
+- `begin_execution_if_owner`: CAS pending→running.
+- `commit_terminal_state_if_owner`: CAS running→terminal, clears owner.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
 from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from app.db.models import AppPocTask
-from app.runtime_context import LEASE_TTL_SECONDS
 from app.time_utils import now_local
 
 
@@ -32,18 +24,11 @@ class ClaimedTask:
     dispatch_status: Optional[str] = None
 
 
-def _lease_deadline():
-    return now_local() + timedelta(seconds=LEASE_TTL_SECONDS)
-
-
 def claim_specific_task(db: Session, owner_id: str, task_id: str) -> ClaimedTask | None:
-    """Celery worker claims a specific task_id (non-competitive, by dispatcher routing).
+    """Claim a specific task_id. Only claims pending tasks (no re-claim of running).
 
-    Only claims pending (normal) or running-with-expired-lease (acks_late re-deliver /
-    orphan). Running with a fresh lease → None (another live worker owns it; this
-    message is acked away without execution).
+    Returns ClaimedTask or None (if not pending / already terminal / already running).
     """
-    now = now_local()
     candidate = (
         db.query(AppPocTask)
         .filter(
@@ -55,37 +40,30 @@ def claim_specific_task(db: Session, owner_id: str, task_id: str) -> ClaimedTask
     if candidate is None:
         return None
     status = str(candidate.status or "pending")
-    if status == "pending":
-        expected_status = "pending"
-    elif status == "running" and (
-        candidate.execution_lease_until is None or candidate.execution_lease_until < now
-    ):
-        expected_status = "running"  # orphan / lease-expired → re-claim
-    else:
-        return None  # running+fresh-lease or terminal → skip
+    if status != "pending":
+        return None  # running or terminal → skip (no re-claim)
     new_epoch = int(candidate.execution_epoch or 0) + 1
-    update_fields = {
-        AppPocTask.execution_owner_id: owner_id,
-        AppPocTask.execution_lease_until: _lease_deadline(),
-        AppPocTask.execution_heartbeat_at: now,
-        AppPocTask.execution_epoch: new_epoch,
-        AppPocTask.dispatch_status: "leased",
-        AppPocTask.started_at: now,
-        AppPocTask.finished_at: None,
-        AppPocTask.error: None,
-    }
-    if expected_status == "running":
-        update_fields[AppPocTask.status] = "pending"  # orphan → back to pending first
+    now = now_local()
     updated = (
         db.query(AppPocTask)
         .filter(
             AppPocTask.id == candidate.id,
             AppPocTask.is_deleted.is_(False),
-            AppPocTask.status == expected_status,
-            ((AppPocTask.execution_lease_until.is_(None)) | (AppPocTask.execution_lease_until < now))
-            if expected_status == "running" else AppPocTask.status.is_not(None),
+            AppPocTask.status == "pending",
         )
-        .update(update_fields, synchronize_session=False)
+        .update(
+            {
+                AppPocTask.execution_owner_id: owner_id,
+                AppPocTask.execution_lease_until: None,
+                AppPocTask.execution_heartbeat_at: now,
+                AppPocTask.execution_epoch: new_epoch,
+                AppPocTask.dispatch_status: "leased",
+                AppPocTask.started_at: now,
+                AppPocTask.finished_at: None,
+                AppPocTask.error: None,
+            },
+            synchronize_session=False,
+        )
     )
     db.commit()
     if not updated:
@@ -98,30 +76,8 @@ def claim_specific_task(db: Session, owner_id: str, task_id: str) -> ClaimedTask
     )
 
 
-def renew_lease(db: Session, task_id: str, owner_id: str, epoch: int) -> bool:
-    now = now_local()
-    updated = (
-        db.query(AppPocTask)
-        .filter(
-            AppPocTask.task_id == task_id,
-            AppPocTask.execution_owner_id == owner_id,
-            AppPocTask.execution_epoch == epoch,
-            AppPocTask.is_deleted.is_(False),
-            AppPocTask.status == "running",
-        )
-        .update(
-            {
-                AppPocTask.execution_lease_until: _lease_deadline(),
-                AppPocTask.execution_heartbeat_at: now,
-            },
-            synchronize_session=False,
-        )
-    )
-    db.commit()
-    return bool(updated)
-
-
 def still_owner(db: Session, task_id: str, owner_id: str, epoch: int, control_version: int) -> bool:
+    """Check if this worker still owns the task (no lease expiry — just ownership)."""
     row = (
         db.query(AppPocTask)
         .filter(
@@ -184,9 +140,6 @@ def commit_terminal_state_if_owner(
     error: str | None,
     entry_function: Optional[str] = None,
 ) -> bool:
-    # Build the UPDATE set dict; fold in the Stage0-derived entry_function when
-    # supplied so it is persisted in the SAME atomic CAS commit (instead of via a
-    # separate write on the long-idle main session, which is dead by commit time).
     values = {
         AppPocTask.status: status,
         AppPocTask.finished_at: finished_at,

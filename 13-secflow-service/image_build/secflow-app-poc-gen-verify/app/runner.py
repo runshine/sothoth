@@ -5,7 +5,7 @@ The in-memory task store + threading from the old single-process model is gone
 - `build_poc_cmd`: unpack task fields into `poc` CLI argv (`-e/-r/-b/-o` + options).
 - `default_output_dir`: the `<entry>_<bindir>_<ts>` naming convention.
 - `run_poc_cli`: subprocess.Popen the `poc` CLI in its own session, stream stdout
-  to a log file, kill the whole process group on timeout/abort, collect artifacts.
+  to a log file, kill the whole process group on cancel, collect artifacts.
 
 `run_poc_cli` is called by `task_service._execute_task` (the Celery worker side).
 """

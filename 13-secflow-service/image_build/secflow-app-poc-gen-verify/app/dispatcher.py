@@ -1,100 +1,48 @@
-"""poc-gen-verify scheduler sidecar: DB→Celery pump + startup reset + stale scan.
+"""poc-gen-verify scheduler sidecar: DB→Celery pump only.
 
-Runs on the scheduler pod (alongside Redis). Pure threading, no asyncio (CLAUDE.md
-compliant). DB is the source of truth; Redis is a transient queue. Redis loss /
-restart → `_startup_reset` re-queues all running→pending + clears stale
-celery_task_id, then the pump re-publishes. Worker death → `_stale_loop` uses
-`inspect.active()` to find DB-running tasks with no live worker → reset pending.
+No startup_reset, no stale scan, no lease/heartbeat. Tasks run ONCE:
+- Worker death = task stays in "running" (user can manually restart).
+- Scheduler restart = no tasks are reset or re-published.
+- No automatic re-delivery (acks_late=False).
 
 Entry: `python -m app.dispatcher`
 """
 from __future__ import annotations
 
 import logging
-import os
 import signal
 import threading
 import time
 
+from app.runtime_context import DISPATCH_POLL_INTERVAL_SECONDS as PUMP_INTERVAL, PUMP_BATCH, INSPECT_TIMEOUT
+
 logger = logging.getLogger("poc.dispatcher")
 
-from app.runtime_context import (
-    DISPATCH_POLL_INTERVAL_SECONDS as PUMP_INTERVAL,
-    STALE_SCAN_INTERVAL_SECONDS as STALE_INTERVAL,
-    STALE_HEARTBEAT_SECONDS,
-    PUMP_BATCH,
-    INSPECT_TIMEOUT,
-)
+# Worker death detection: if a running task's heartbeat is older than this, AND
+# the worker pod is not reachable via Celery inspect.ping(), the task is marked
+# as 'failed' (NOT re-run — just so the user knows the worker died).
+DEAD_WORKER_HEARTBEAT_SECONDS = 600  # 10 minutes with no heartbeat = likely dead
 
 
 class Dispatcher:
+    """Pump pending tasks (celery_task_id IS NULL) → publish to Celery. Nothing else."""
+
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
         self._stop.clear()
-        self._startup_reset()
         t = threading.Thread(target=self._pump_loop, name="poc_disp_pump", daemon=True)
         t.start()
         self._threads.append(t)
-        t = threading.Thread(target=self._stale_loop, name="poc_disp_stale", daemon=True)
+        t = threading.Thread(target=self._dead_worker_scan_loop, name="poc_disp_dead", daemon=True)
         t.start()
         self._threads.append(t)
-        logger.info("Dispatcher started: pump=%ss stale=%ss", PUMP_INTERVAL, STALE_INTERVAL)
+        logger.info("Dispatcher started: pump=%ss dead-scan=60s (mark dead, no rerun)", PUMP_INTERVAL)
 
     def stop(self) -> None:
         self._stop.set()
-
-    # ── startup reset: Redis queue lost → running back to pending + clear stale celery_id ──
-    def _startup_reset(self) -> None:
-        from app.db import get_db
-        from app.db.models import AppPocTask
-        db_gen = get_db()
-        db = next(db_gen)
-        try:
-            n_running = (
-                db.query(AppPocTask)
-                .filter(AppPocTask.status == "running", AppPocTask.is_deleted.is_(False))
-                .update(
-                    {
-                        AppPocTask.status: "pending",
-                        AppPocTask.celery_task_id: None,
-                        AppPocTask.execution_owner_id: None,
-                        AppPocTask.execution_lease_until: None,
-                        AppPocTask.dispatch_status: None,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            n_pending = (
-                db.query(AppPocTask)
-                .filter(
-                    AppPocTask.status == "pending",
-                    AppPocTask.is_deleted.is_(False),
-                    AppPocTask.celery_task_id.is_not(None),
-                )
-                .update(
-                    {
-                        AppPocTask.celery_task_id: None,
-                        AppPocTask.execution_owner_id: None,
-                        AppPocTask.execution_lease_until: None,
-                        AppPocTask.dispatch_status: None,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            db.commit()
-            if n_running or n_pending:
-                logger.warning(
-                    "startup_reset: %d running→pending, %d pending stale celery_id cleared (redis queue rebuilt)",
-                    n_running, n_pending,
-                )
-        finally:
-            try:
-                next(db_gen)
-            except StopIteration:
-                pass
 
     # ── pump: pending (celery_task_id IS NULL) → publish to Celery ──
     def _pump_loop(self) -> None:
@@ -109,10 +57,45 @@ class Dispatcher:
         from app.db import get_db
         from app.db.models import AppPocTask
         from app.celery_tasks import run_poc_task
+        from app.celery_app import app as celery_app
         db_gen = get_db()
         db = next(db_gen)
         published = 0
         try:
+            # First: clear stale celery_task_id on pending tasks whose celery message
+            # was already consumed (acked) but the task never started running.
+            # With acks_late=False, a consumed message is gone — the celery_id is
+            # stale. We detect this by checking if the celery_id is NOT in any
+            # worker's active set (meaning the message was consumed and failed).
+            try:
+                inspect = celery_app.control.inspect(timeout=3)
+                active = inspect.active() or {}
+                active_ids = set()
+                for _worker, tasks in active.items():
+                    for t in (tasks or []):
+                        cid = t.get("id") if isinstance(t, dict) else None
+                        if cid:
+                            active_ids.add(cid)
+            except Exception:
+                active_ids = set()  # inspect failed → don't clear anything this round
+
+            stale_rows = (
+                db.query(AppPocTask)
+                .filter(
+                    AppPocTask.status == "pending",
+                    AppPocTask.is_deleted.is_(False),
+                    AppPocTask.celery_task_id.is_not(None),
+                )
+                .all()
+            )
+            for row in stale_rows:
+                if row.celery_task_id not in active_ids:
+                    row.celery_task_id = None
+                    logger.info("cleared stale celery_id task=%s (message consumed but task not running)", row.task_id)
+            if stale_rows:
+                db.commit()
+
+            # Then: publish pending tasks with no celery_task_id
             rows = (
                 db.query(AppPocTask)
                 .filter(
@@ -142,86 +125,81 @@ class Dispatcher:
                 pass
         return published
 
-    # ── stale scan: DB running but no live worker running it → reset pending ──
-    def _stale_loop(self) -> None:
+    # ── dead worker detection: heartbeat stale + worker unreachable → mark failed ──
+    def _dead_worker_scan_loop(self) -> None:
+        """Every 60s, check if any running task's worker has died.
+
+        If heartbeat is stale (>DEAD_WORKER_HEARTBEAT_SECONDS) AND the worker pod
+        is not in Celery's ping response, mark the task as 'failed' with a clear
+        message. This does NOT re-run the task — it just informs the user.
+        """
         while not self._stop.is_set():
             try:
-                self._stale_once()
+                self._dead_worker_scan_once()
             except Exception as exc:
-                logger.warning("stale loop error: %s", exc, exc_info=True)
-            self._stop.wait(STALE_INTERVAL)
+                logger.warning("dead worker scan error: %s", exc, exc_info=True)
+            self._stop.wait(60)
 
-    def _stale_once(self) -> int:
+    def _dead_worker_scan_once(self) -> int:
         from app.db import get_db
         from app.db.models import AppPocTask
         from app.time_utils import now_local
         from app.celery_app import app as celery_app
 
-        # 1. Collect celery_ids of all tasks actively running on live workers.
-        active_ids: set[str] = set()
+        # Get set of live worker names
         try:
             inspect = celery_app.control.inspect(timeout=INSPECT_TIMEOUT)
-            active = inspect.active() or {}
-            for _pod, tasks in active.items():
-                for t in (tasks or []):
-                    cid = t.get("id") if isinstance(t, dict) else None
-                    if cid:
-                        active_ids.add(cid)
+            ping_results = inspect.ping() or {}
+            live_workers = set(ping_results.keys())
         except Exception as exc:
-            logger.warning("inspect.active failed: %s (skip this round)", exc)
+            logger.warning("dead scan: inspect.ping failed: %s (skip this round)", exc)
             return 0
 
-        # 2. DB running tasks: celery_id not in active AND heartbeat stale → orphan/stuck.
+        now = now_local()
         db_gen = get_db()
         db = next(db_gen)
-        reset = 0
+        marked = 0
         try:
-            now = now_local()
             rows = (
                 db.query(AppPocTask)
                 .filter(AppPocTask.status == "running", AppPocTask.is_deleted.is_(False))
                 .all()
             )
             for row in rows:
-                cid = row.celery_task_id
-                in_active = cid is not None and cid in active_ids
-                heartbeat_stale = (
-                    row.execution_heartbeat_at is None
-                    or (now - row.execution_heartbeat_at).total_seconds() > STALE_HEARTBEAT_SECONDS
-                )
-                # The DB lease heartbeat is the ground truth: a fresh heartbeat means the
-                # worker is alive and running the task. celery inspect.active() is
-                # unreliable under load (short timeout, false-negatives) — do NOT reset a
-                # task just because it's missing from the active set; that caused a 60s
-                # reset-loop (worker loses lease → re-queue → re-run from scratch). Only
-                # reset when the heartbeat has actually gone stale (worker dead/stuck).
-                if not heartbeat_stale:
-                    continue
-                # heartbeat stale → orphan (not in active) or stuck (in active but not
-                # heartbeating) → revoke + reset to pending for re-queue.
-                if cid:
-                    try:
-                        celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
-                    except Exception:
-                        pass
-                row.status = "pending"
-                row.celery_task_id = None
+                hb = row.execution_heartbeat_at
+                if hb is None:
+                    continue  # not started yet (or just claimed)
+                hb_age = (now - hb).total_seconds()
+                if hb_age <= DEAD_WORKER_HEARTBEAT_SECONDS:
+                    continue  # heartbeat fresh — worker alive
+                # Heartbeat is stale. Check if the owning worker is still alive.
+                owner = row.execution_owner_id or ""
+                # Owner is the pod name (e.g. secflow-app-poc-gen-verify-worker-xxx)
+                # Live workers from ping are like "poc-worker@secflow-app-poc-gen-verify-worker-xxx"
+                worker_alive = any(owner in w for w in live_workers)
+                if worker_alive:
+                    continue  # worker is alive but heartbeat thread might have a DB issue
+                # Worker is dead → mark task as failed (NOT re-run)
+                row.status = "failed"
+                row.error = f"Worker pod died (heartbeat stale {int(hb_age)}s, owner={owner})"
+                row.finished_at = now
                 row.execution_owner_id = None
                 row.execution_lease_until = None
+                row.execution_heartbeat_at = None
                 row.dispatch_status = None
-                reset += 1
+                marked += 1
                 logger.warning(
-                    "stale reset task=%s celery_id=%s in_active=%s hb_stale=%s",
-                    row.task_id, cid, in_active, heartbeat_stale,
+                    "dead worker detected: task=%s owner=%s hb_age=%ds → marked failed",
+                    row.task_id, owner, int(hb_age),
                 )
-            if reset:
+            if marked:
                 db.commit()
         finally:
             try:
                 next(db_gen)
             except StopIteration:
                 pass
-        return reset
+        return marked
 
 
 _dispatcher: Dispatcher | None = None

@@ -14,13 +14,21 @@ data:
     maturity: alpha
     description: "PoC 生成与 GDB 验证服务"
     database:
-      host: "mysql.sothothv2-ns.svc.cluster.local"
+      host: "secflow-app-poc-gen-verify-mysql"
       port: 3306
-      username: "secflow"
+      username: "secflow_poc_gen_verify"
       password: "Huawei12#$"
-      name: "secflow"
+      name: "secflow_poc_gen_verify"
       pool_size: 5
       max_overflow: 10
+    auth_service:
+      host: "secflow-platform-auth"
+      port: 80
+      validate_token_path: "/api/auth/validate-token"
+      service_machine_token: "k7adi5IagKAZ54aNxS77NsDZSpWveyPn6iaxmrwl-G4LXnETGWMbEaSsX1KVuqh8"
+      timeout: 10
+      token_cache_enabled: true
+      token_cache_ttl_minutes: 15
     registry:
       enabled: true
       menu_service_url: "http://secflow-platform-menu:80"

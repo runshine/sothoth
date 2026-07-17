@@ -6,9 +6,9 @@ API pod calls `create_task` / `list_tasks` / `get_task` / `cancel_task` /
 dispatcher pump publishes to Celery).
 
 Worker pod (Celery prefork child) calls `_execute_task(task_id, epoch, cv)`: it
-CAS-claims running, starts a lease heartbeat, runs the `poc` CLI as a subprocess
+CAS-claims running, runs the `poc` CLI as a subprocess
 (in its own session so revoke can killpg the whole poc+claude+gdb tree), and
-CAS-commits the terminal state. Ownership drift → lease heartbeat killpgs + aborts.
+CAS-commits the terminal state. No lease/heartbeat — tasks run to completion.
 """
 from __future__ import annotations
 
@@ -31,20 +31,62 @@ from sqlalchemy.orm import Session
 from app.config import get_config
 from app.db.models import AppPocTask, AppPocTaskEvent
 from app.runner import build_poc_cmd, default_output_dir, run_poc_cli
-from app.runtime_context import HEARTBEAT_INTERVAL_SECONDS, WORKER_ID
+from app.runtime_context import WORKER_ID
 from app.service.execution_coordinator import (
     begin_execution_if_owner,
     commit_terminal_state_if_owner,
-    renew_lease,
     still_owner,
 )
 from app.time_utils import isoformat_local, now_local
 
+# Regex patterns for detecting the PoC outcome path from poc_report.md.
+# These match the structured format mandated by the Stage2 / single prompt:
+#   - Path A: 漏洞结论：路径A（确认触发）
+#   - Path B: 漏洞结论：路径B（证伪/不可达）
+_PATH_A_RE = re.compile(r'路径\s*A\s*[（(]\s*确认触发')
+_PATH_B_RE = re.compile(r'路径\s*B\s*[（(]\s*(?:证伪|不可达)')
+
 logger = logging.getLogger("poc.task_service")
 
-# task_id → {"pgid": int|None, "stop": threading.Event} for the running task on
-# this worker. The lease-heartbeat thread and the streaming abort-check share it.
+# task_id → {"pgid": int|None, "stop": threading.Event} for cancel support only.
+# No lease heartbeat — tasks run to completion.
 _RUNNING: dict[str, dict] = {}
+
+
+def _heartbeat_updater(task_id: str) -> None:
+    """Lightweight heartbeat: update execution_heartbeat_at every 60s while task runs.
+
+    This is NOT a lease — it does NOT abort the task. It only lets the scheduler
+    detect worker death (heartbeat goes stale → scheduler marks task as failed).
+    """
+    while True:
+        h = _RUNNING.get(task_id)
+        if h is None or h["stop"].is_set():
+            return
+        if h["stop"].wait(60):
+            return
+        h = _RUNNING.get(task_id)
+        if h is None or h["stop"].is_set():
+            return
+        try:
+            from app.db import get_db
+            from app.db.models import AppPocTask
+            from app.time_utils import now_local
+            db_gen = get_db()
+            db = next(db_gen)
+            try:
+                db.query(AppPocTask).filter_by(task_id=task_id).update(
+                    {AppPocTask.execution_heartbeat_at: now_local()},
+                    synchronize_session=False,
+                )
+                db.commit()
+            finally:
+                try:
+                    next(db_gen)
+                except StopIteration:
+                    pass
+        except Exception:
+            pass  # best-effort — don't crash the task for a heartbeat failure
 
 
 def _task_id_stamp() -> str:
@@ -259,6 +301,24 @@ class TaskService:
             q = q.filter(AppPocTask.project_id == project_id)
         rows = q.group_by(AppPocTask.status).all()
         counts = {str(s or ""): int(c or 0) for s, c in rows}
+        # PoC verdict breakdown: count succeeded tasks by poc_path in stages_json
+        from sqlalchemy import text
+        verified = 0
+        false_positive = 0
+        try:
+            verdict_rows = db.execute(text(
+                "SELECT JSON_UNQUOTE(JSON_EXTRACT(stages_json, '$.poc_path')) AS pp, COUNT(*) AS cnt "
+                "FROM secflow_app_poc_tasks WHERE is_deleted = 0 AND status = 'succeeded' "
+                + ("AND project_id = :pid " if project_id else "") +
+                "GROUP BY pp"
+            ), {"pid": project_id} if project_id else {}).fetchall()
+            for pp, cnt in verdict_rows:
+                if pp == "a":
+                    verified = int(cnt)
+                elif pp == "b":
+                    false_positive = int(cnt)
+        except Exception:
+            pass
         return {
             "total": sum(counts.values()),
             "pending": counts.get("pending", 0),
@@ -266,6 +326,8 @@ class TaskService:
             "succeeded": counts.get("succeeded", 0),
             "failed": counts.get("failed", 0),
             "cancelled": counts.get("cancelled", 0),
+            "verified": verified,
+            "false_positive": false_positive,
         }
 
     def get_task(self, db: Session, task_id: str) -> dict:
@@ -314,6 +376,44 @@ class TaskService:
                 for e in events
             ],
         }
+
+    def clear_timeline(self, db: Session, task_id: str) -> dict:
+        """Delete all timeline events for a task."""
+        row = self._get_or_404(db, task_id)
+        count = (
+            db.query(AppPocTaskEvent)
+            .filter(AppPocTaskEvent.task_id == row.task_id)
+            .delete(synchronize_session=False)
+        )
+        db.commit()
+        _record_task_event(db, row, "timeline_cleared", f"时间线已清空 ({count} 条事件)",
+                           level="warning", payload={"deleted_count": count})
+        return {"status": "ok", "task_id": row.task_id, "message": f"Deleted {count} events", "deleted_event_count": count}
+
+    def delete_timeline_event(self, db: Session, task_id: str, event_id: str) -> dict:
+        """Delete a single timeline event by id."""
+        row = self._get_or_404(db, task_id)
+        ev = db.query(AppPocTaskEvent).filter_by(id=event_id, task_id=row.task_id).first()
+        if ev is None:
+            raise HTTPException(status_code=404, detail=f"Event not found: {event_id}")
+        db.delete(ev)
+        db.commit()
+        return {"status": "ok", "task_id": row.task_id, "message": "Deleted", "deleted_event_count": 1}
+
+    def update_feature_flags(self, db: Session, task_id: str, feature_flags: dict) -> dict:
+        """Merge feature_flags into task_config_json.feature_flags."""
+        row = self._get_or_404(db, task_id)
+        config = dict(row.task_config_json or {})
+        current_flags = dict(config.get("feature_flags") or {})
+        current_flags.update(feature_flags)
+        config["feature_flags"] = current_flags
+        row.task_config_json = config
+        db.commit()
+        db.refresh(row)
+        _record_task_event(db, row, "feature_flags_updated",
+                           f"Feature flags updated: {list(feature_flags.keys())}",
+                           level="info", payload={"feature_flags": current_flags})
+        return self._row_to_dict(row)
 
     def delete_task(self, db: Session, task_id: str, *, delete_files: bool = True) -> dict:
         """Soft-delete a task (is_deleted=True). Optionally clean output_dir + revoke celery."""
@@ -510,7 +610,7 @@ class TaskService:
             celery_app.control.revoke(cid, terminate=True, signal="SIGKILL")
             logger.info("celery revoke sent task=%s celery_id=%s", row.task_id, cid)
         except Exception as exc:
-            logger.warning("celery revoke failed task=%s: %s (stale scan will recover)", row.task_id, exc)
+            logger.warning("celery revoke failed task=%s: %s", row.task_id, exc)
 
     def cancel_task(self, db: Session, task_id: str) -> dict:
         row = self._get_or_404(db, task_id)
@@ -643,7 +743,14 @@ class TaskService:
         db: Session = next(db_gen)
         handle: dict = {"pgid": None, "stop": threading.Event()}
         _RUNNING[task_id] = handle
-        lease_thread = None
+        # Lightweight heartbeat thread: just updates execution_heartbeat_at every 60s
+        # so the scheduler can detect worker death. No lease/abort logic — tasks run
+        # to completion. If the worker dies, the heartbeat goes stale and the scheduler
+        # marks the task as failed (NOT re-run).
+        hb_thread = threading.Thread(
+            target=_heartbeat_updater, args=(task_id,), name=f"poc_hb_{task_id}", daemon=True
+        )
+        hb_thread.start()
         try:
             row = db.query(AppPocTask).filter_by(task_id=task_id).first()
             if not row or row.status == "cancelled":
@@ -689,7 +796,7 @@ class TaskService:
             db.commit()
             db.refresh(row)
 
-            lease_thread = self._start_lease_heartbeat(task_id, epoch, control_version, handle)
+            # No lease heartbeat — tasks run to completion once started.
 
             def _on_popen(proc):
                 try:
@@ -709,6 +816,7 @@ class TaskService:
                     pass
 
             def _should_abort() -> bool:
+                # Only abort on user-initiated cancel (handle["stop"] is set by cancel_task).
                 return handle["stop"].is_set()
 
             result = run_poc_cli(
@@ -740,6 +848,27 @@ class TaskService:
                 "returncode": result["returncode"],
                 "timed_out": result["timed_out"],
             }
+            # Determine PoC outcome path from the Stage2 verification report.
+            # Uses the structured format mandated by the poc CLI Stage2 prompt:
+            #   Path A: 「漏洞结论：路径A（确认触发）,...」
+            #   Path B: 「漏洞结论：路径B（证伪/不可达）,...」
+            # Path A = vuln confirmed (PoC triggered successfully).
+            # Path B = false positive / unreachable (proved the vuln can't be triggered).
+            # Absent = Stage1 failed / didn't reach Stage2 → status is "failed" anyway.
+            poc_path: Optional[str] = None
+            if result["status"] == "succeeded" and row.output_dir:
+                pr = Path(row.output_dir) / "output" / "poc_report.md"
+                if pr.is_file():
+                    try:
+                        txt = pr.read_text(encoding="utf-8", errors="replace")[:3000]
+                        if _PATH_A_RE.search(txt):
+                            poc_path = "a"
+                        elif _PATH_B_RE.search(txt):
+                            poc_path = "b"
+                    except Exception:
+                        pass
+            stages["poc_path"] = poc_path
+            result_json["poc_path"] = poc_path
             # Commit via FRESH sessions + retry. The main `db` session has been
             # idle for the whole poc run (Stage1 routinely 1.5–2.6h > MySQL
             # wait_timeout=3600s), so its connection is dead — reusing it here
@@ -780,46 +909,6 @@ class TaskService:
             except StopIteration:
                 pass
 
-    def _start_lease_heartbeat(self, task_id: str, epoch: int, control_version: int, handle: dict) -> threading.Thread:
-        from app.db import get_db
-
-        def _worker() -> None:
-            while True:
-                h = _RUNNING.get(task_id)
-                if h is None or h["stop"].is_set():
-                    return
-                # wait for one interval (or stop signal)
-                if h["stop"].wait(HEARTBEAT_INTERVAL_SECONDS):
-                    return
-                h = _RUNNING.get(task_id)
-                if h is None or h["stop"].is_set():
-                    return
-                db_gen = get_db()
-                db: Session = next(db_gen)
-                try:
-                    ok = renew_lease(db, task_id, WORKER_ID, epoch)
-                    if not ok or not still_owner(db, task_id, WORKER_ID, epoch, control_version):
-                        logger.warning("lease lost during heartbeat task=%s", task_id)
-                        pgid = h.get("pgid")
-                        if pgid:
-                            try:
-                                os.killpg(pgid, signal.SIGKILL)
-                            except OSError:
-                                pass
-                        h["stop"].set()
-                        return
-                except Exception:
-                    logger.debug("lease heartbeat error task=%s", task_id, exc_info=True)
-                finally:
-                    try:
-                        next(db_gen)
-                    except StopIteration:
-                        pass
-
-        t = threading.Thread(target=_worker, name=f"poc_lease_{task_id}", daemon=True)
-        t.start()
-        return t
-
     # ── serialization ─────────────────────────────────────────────────────────
     def _log_path(self, output_dir: Optional[str]) -> Path:
         """Runner log lives in the task's work dir (output_dir/poc_cli.log)."""
@@ -847,6 +936,11 @@ class TaskService:
             "artifacts": row.artifacts_json or [],
             "result_json": row.result_json if include_heavy else None,
             "stages_json": row.stages_json if include_heavy else None,
+            # poc_path: extracted from stages_json/result_json for frontend verdict
+            # "a" = path A (vuln confirmed), "b" = path B (false positive), None = N/A
+            "poc_path": (row.stages_json or {}).get("poc_path") if isinstance(row.stages_json, dict) else None,
+            "task_config_json": row.task_config_json if include_heavy else None,
+            "latest_abnormal_reason_json": row.latest_abnormal_reason_json if include_heavy else None,
             "created_by": row.created_by,
             "created_at": isoformat_local(row.created_at),
             "updated_at": isoformat_local(row.updated_at),

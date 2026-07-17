@@ -17,6 +17,11 @@ from sqlalchemy.orm import Session
 
 from .api_schemas import (
     ActionResponse,
+    FailureDebugConfigResponse,
+    FailureDebugConfigUpdateRequest,
+    FailureDebugReportListResponse,
+    FailureDebugReportResponse,
+    FeatureFlagsRequest,
     PocArtifactContentResponse,
     PocArtifactsResponse,
     PocSessionContentResponse,
@@ -29,6 +34,16 @@ from .api_schemas import (
     PocTaskStatsResponse,
     PocTaskStatus,
     PocTaskTimelineResponse,
+    PocVerificationResult,
+    PromptTemplateCreateRequest,
+    PromptTemplateListResponse,
+    PromptTemplateResponse,
+    PromptTemplateUpdateRequest,
+    ServiceConfigResponse,
+    ServiceConfigUpdateRequest,
+    TimelineClearResponse,
+    TimelineEventDeleteResponse,
+    WorkerClusterCapacityResponse,
 )
 from .config import get_config
 from .db import get_db
@@ -127,6 +142,149 @@ def delete_task(
 ):
     """Soft-delete a task (and optionally its output files)."""
     return get_task_service().delete_task(db, task_id, delete_files=delete_files)
+
+@router.patch("/tasks/{task_id}/feature-flags", response_model=PocTaskStatus)
+def update_feature_flags(
+    task_id: str,
+    req: FeatureFlagsRequest,
+    db: Session = Depends(get_db),
+) -> PocTaskStatus:
+    """Update per-task feature flags (merged into task_config_json.feature_flags)."""
+    return PocTaskStatus(**get_task_service().update_feature_flags(db, task_id, req.feature_flags))
+
+@router.delete("/tasks/{task_id}/timeline", response_model=TimelineClearResponse)
+def clear_timeline(task_id: str, db: Session = Depends(get_db)) -> TimelineClearResponse:
+    """Delete all timeline events for a task."""
+    return TimelineClearResponse(**get_task_service().clear_timeline(db, task_id))
+
+@router.delete("/tasks/{task_id}/timeline/{event_id}", response_model=TimelineEventDeleteResponse)
+def delete_timeline_event(task_id: str, event_id: str, db: Session = Depends(get_db)) -> TimelineEventDeleteResponse:
+    """Delete a single timeline event by id."""
+    return TimelineEventDeleteResponse(**get_task_service().delete_timeline_event(db, task_id, event_id))
+
+@router.get("/tasks/{task_id}/verification", response_model=PocVerificationResult)
+def verify_task_result(task_id: str, db: Session = Depends(get_db)) -> PocVerificationResult:
+    """Run deterministic structural checks on the poc CLI output."""
+    row = get_task_service()._get_or_404(db, task_id)
+    from app.service.poc_verifier import verify_poc_result
+    poc_path = (row.stages_json or {}).get("poc_path") if isinstance(row.stages_json, dict) else None
+    result = verify_poc_result(row.output_dir or "", row.returncode, poc_path)
+    result["task_id"] = task_id
+    return PocVerificationResult(**result)
+
+# ── Worker cluster capacity ───────────────────────────────────────────────────
+
+@router.get("/workers/cluster-capacity", response_model=WorkerClusterCapacityResponse)
+def get_cluster_capacity() -> WorkerClusterCapacityResponse:
+    """Live cluster capacity snapshot from Celery inspect + DB."""
+    from app.service.worker_snapshot import build_worker_cluster_snapshot
+    return WorkerClusterCapacityResponse(**build_worker_cluster_snapshot())
+
+# ── Agent observability ───────────────────────────────────────────────────────
+
+@router.get("/agent-observability/processes")
+def get_agent_processes():
+    """List poc/claude/gdb/node processes on this pod."""
+    from app.service.agent_observability import get_local_process_snapshot
+    return get_local_process_snapshot()
+
+@router.post("/agent-observability/processes/kill-orphans")
+def kill_orphan_processes():
+    """Kill residual poc/claude/gdb processes on this pod."""
+    from app.service.agent_observability import kill_local_orphan_processes
+    return kill_local_orphan_processes()
+
+# ── Prompt templates ──────────────────────────────────────────────────────────
+
+@router.get("/prompts", response_model=PromptTemplateListResponse)
+def list_prompts(
+    category: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> PromptTemplateListResponse:
+    from app.service.prompt_service import list_templates
+    return PromptTemplateListResponse(**list_templates(db, category=category, page=page, per_page=per_page))
+
+@router.get("/prompts/{prompt_id}", response_model=PromptTemplateResponse)
+def get_prompt(prompt_id: str, db: Session = Depends(get_db)) -> PromptTemplateResponse:
+    from app.service.prompt_service import get_template
+    return PromptTemplateResponse(**get_template(db, prompt_id))
+
+@router.post("/prompts", response_model=PromptTemplateResponse, status_code=201)
+def create_prompt(req: PromptTemplateCreateRequest, db: Session = Depends(get_db)) -> PromptTemplateResponse:
+    from app.service.prompt_service import create_template
+    return PromptTemplateResponse(**create_template(
+        db, prompt_id=req.prompt_id, name=req.name, content=req.content,
+        category=req.category, description=req.description, variables=req.variables,
+        is_default=req.is_default, is_enabled=req.is_enabled, created_by=req.created_by,
+    ))
+
+@router.put("/prompts/{prompt_id}", response_model=PromptTemplateResponse)
+def update_prompt(prompt_id: str, req: PromptTemplateUpdateRequest, db: Session = Depends(get_db)) -> PromptTemplateResponse:
+    from app.service.prompt_service import update_template
+    return PromptTemplateResponse(**update_template(db, prompt_id, req.model_dump(exclude_unset=True)))
+
+@router.delete("/prompts/{prompt_id}")
+def delete_prompt(prompt_id: str, db: Session = Depends(get_db)):
+    from app.service.prompt_service import delete_template
+    return delete_template(db, prompt_id)
+
+# ── Service config ────────────────────────────────────────────────────────────
+
+@router.get("/config", response_model=ServiceConfigResponse)
+def get_config_(project_id: str = Query(""), db: Session = Depends(get_db)) -> ServiceConfigResponse:
+    from app.service.config_service import get_config
+    return ServiceConfigResponse(**get_config(db, project_id))
+
+@router.put("/config", response_model=ServiceConfigResponse)
+def save_config_(req: ServiceConfigUpdateRequest, project_id: str = Query(""), db: Session = Depends(get_db)) -> ServiceConfigResponse:
+    from app.service.config_service import save_config
+    return ServiceConfigResponse(**save_config(db, project_id, req.model_dump(exclude_unset=True)))
+
+# ── Failure debug ─────────────────────────────────────────────────────────────
+
+@router.get("/failure-debug/reports", response_model=FailureDebugReportListResponse)
+def list_failure_debug(
+    project_id: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    per_page: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> FailureDebugReportListResponse:
+    from app.service.failure_debug import list_reports
+    return FailureDebugReportListResponse(**list_reports(
+        db, project_id=project_id, status=status, page=page, per_page=per_page,
+    ))
+
+@router.get("/failure-debug/reports/{report_id}", response_model=FailureDebugReportResponse)
+def get_failure_debug(report_id: int, db: Session = Depends(get_db)) -> FailureDebugReportResponse:
+    from app.service.failure_debug import get_report
+    return FailureDebugReportResponse(**get_report(db, report_id))
+
+@router.get("/failure-debug/reports/{report_id}/download")
+def download_failure_debug(report_id: int, db: Session = Depends(get_db)):
+    from app.service.failure_debug import get_report_content
+    content = get_report_content(db, report_id)
+    return StreamingResponse(
+        iter([content]), media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="failure-debug-{report_id}.md"'},
+    )
+
+@router.delete("/failure-debug/reports/{report_id}")
+def delete_failure_debug(report_id: int, db: Session = Depends(get_db)):
+    from app.service.failure_debug import delete_report
+    return delete_report(db, report_id)
+
+@router.get("/failure-debug/config", response_model=FailureDebugConfigResponse)
+def get_failure_debug_config(db: Session = Depends(get_db)) -> FailureDebugConfigResponse:
+    from app.service.failure_debug import get_debug_config
+    return FailureDebugConfigResponse(**get_debug_config(db))
+
+@router.put("/failure-debug/config", response_model=FailureDebugConfigResponse)
+def save_failure_debug_config(req: FailureDebugConfigUpdateRequest, db: Session = Depends(get_db)) -> FailureDebugConfigResponse:
+    from app.service.failure_debug import save_debug_config
+    return FailureDebugConfigResponse(**save_debug_config(db, req.model))
 
 
 @router.get("/tasks/{task_id}/logs", response_model=PocTaskLogsResponse)

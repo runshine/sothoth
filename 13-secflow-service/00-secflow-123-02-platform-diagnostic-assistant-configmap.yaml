@@ -6,7 +6,7 @@ metadata:
 data:
   service.yaml: |
     database:
-      sqlite_path: /data/diagnostic-assistant/diagnostic_assistant.db
+      sqlite_path: /data/files/platform/secflow-platform-diagnostic-assistant/diagnostic_assistant.db
 
     auth_service:
       host: secflow-platform-auth
