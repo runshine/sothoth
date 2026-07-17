@@ -50,11 +50,13 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -505,6 +507,119 @@ def _short_cmd(cmd: list) -> str:
     return shlex.join(parts)
 
 
+# ---------------------------------------------------------------------------
+# Process-tree reaping: ensure claude + its gdb/gcc/tmux descendants die with
+# poc_cli. Without this, a SIGTERM/SIGKILL/OOM of poc_cli leaves claude (a Node
+# process that holds a large and growing conversation transcript in memory)
+# reparented to tini and still running — orphaned claude instances then stack up
+# across tasks until the worker OOMs. See run_poc_task/_execute_task for the
+# matching Celery-side sweep and PDEATHSIG on the `poc` child itself.
+# ---------------------------------------------------------------------------
+_ACTIVE_PGID: int | None = None  # pgid of the current claude group (G_claude)
+
+
+def _set_pdeathsig() -> None:
+    """preexec_fn for the `claude` child: PR_SET_PDEATHSIG=SIGKILL so claude is
+    auto-killed by the kernel the instant its parent (poc_cli) dies. Covers the
+    uncatchable case (poc_cli SIGKILL'd / OOM-killed) where no signal handler or
+    finally can run. Runs in the child after fork, before exec."""
+    import ctypes
+    libc = None
+    try:
+        libc = ctypes.CDLL(None)
+    except OSError:
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+        except OSError:
+            return
+    try:
+        PR_SET_PDEATHSIG = 1
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                               ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl.restype = ctypes.c_int
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except (AttributeError, OSError):
+        pass
+
+
+def _kill_claude_group() -> None:
+    """SIGTERM→SIGKILL the claude process group (G_claude, claude's own group set
+    via start_new_session). Idempotent; safe from finally, atexit, and the abort
+    path. Reaping the group (not just the claude PID) is what also clears the
+    gdb/gcc descendants claude may have left behind (tmux-spawned gdb excluded —
+    it's a child of the tmux server, see the Stage prompt rules).
+
+    Only acts when a claude group was registered (_ACTIVE_PGID set) — deliberately
+    does NOT fall back to os.getpgid(0), so a bare import / a poc_cli that hasn't
+    spawned claude yet can never SIGTERM its own (or its parent shell's) group."""
+    pgid = _ACTIVE_PGID
+    if pgid is None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, OSError):
+            return
+        if sig == signal.SIGTERM:
+            time.sleep(2.0)
+
+
+def _kill_task_tmux(workdir: str) -> None:
+    """Kill this task's tmux sessions — the one descendant killpg(G_claude) can't
+    reach. gdb that claude runs via tmux is a child of the tmux *server*, not of
+    claude, so it's outside G_claude and survives a killpg. The Stage prompt asks
+    claude to `tmux kill-session` on exit, but claude sometimes forgets — this is
+    the deterministic backstop so leftover tmux-gdb doesn't stack across a long
+    session (each idle gdb holds the binary + symbols; dozens stack to GBs).
+
+    Safe: with Celery concurrency=1, the only tmux sessions on the pod belong to
+    the current task; we further filter by the task-unique workdir slug (timestamp
+    in the dir name) so we never touch another task's session. Best-effort — never
+    raises (tmux cleanup failure must not fail the task)."""
+    try:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", os.path.basename(workdir.rstrip("/"))).strip("_")
+        out = subprocess.run(["tmux", "list-sessions", "-F", "#{session_name}"],
+                              capture_output=True, text=True, timeout=5)
+        if out.returncode != 0:
+            return  # no tmux server / no sessions — nothing to clean
+        for line in out.stdout.splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            # only kill this task's sessions: name must embed the task workdir slug,
+            # OR (defensive) be a generic "poc_*" session when slug is empty
+            if slug and slug not in name:
+                continue
+            if not slug and not name.startswith("poc_"):
+                continue
+            try:
+                subprocess.run(["tmux", "kill-session", "-t", name],
+                               capture_output=True, timeout=5)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+class _PocAbort(SystemExit):
+    """Raised from the SIGTERM/SIGHUP handler so the run_claude finally block can
+    do the group-kill on the main thread (signal handlers should stay minimal)."""
+    pass
+
+
+def _abort_handler(signum, frame):  # noqa: ANN001 (signal signature)
+    raise _PocAbort(143 if signum == signal.SIGTERM else 129)
+
+
+# Install once at import (poc_cli is single-process; covers both stages).
+for _s in (signal.SIGTERM, signal.SIGHUP):
+    try:
+        signal.signal(_s, _abort_handler)
+    except (ValueError, OSError):
+        pass  # not the main thread / unsupported platform
+atexit.register(_kill_claude_group)
+
+
 def run_claude(cmd, opts, logfh, label="poc", jsonlfh=None, prompt_path=None) -> int:
     # Preamble is tee'd to logfh so the .log opens with the same lines the terminal shows.
     _tee(f"[{label}] workdir : {opts.workdir}", logfh)
@@ -521,11 +636,25 @@ def run_claude(cmd, opts, logfh, label="poc", jsonlfh=None, prompt_path=None) ->
     _tee("-" * 78, logfh)
     is_json = opts.output_format == "stream-json"
     try:
+        # start_new_session=True: claude becomes its OWN session/group leader
+        # (G_claude, pgid=claude.pid) — separate from poc_cli's G_poc. This lets
+        # killpg(G_claude) reap claude + its gdb/gcc descendants WITHOUT touching
+        # poc_cli (which must survive normal stage completion to run the next stage
+        # / collect results). preexec_fn=_set_pdeathsig: claude auto-dies if poc_cli
+        # is SIGKILL'd/OOM-killed (the uncatchable case). task_revoked (killpg G_poc)
+        # still reaches claude: poc_cli's SIGTERM handler → finally killpg(G_claude),
+        # or PDEATHSIG when poc is SIGKILL'd.
         proc = subprocess.Popen(
             cmd, cwd=opts.workdir, env=_claude_env(opts),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+            start_new_session=True, preexec_fn=_set_pdeathsig)
     except FileNotFoundError:
         sys.exit(f"error: claude binary not found: {opts.claude_bin} (set --claude-bin)")
+    global _ACTIVE_PGID
+    try:
+        _ACTIVE_PGID = os.getpgid(proc.pid)  # = G_claude; gdb/gcc (non-tmux) join it
+    except OSError:
+        _ACTIVE_PGID = None
     rc = 1
     try:
         assert proc.stdout is not None
@@ -538,10 +667,19 @@ def run_claude(cmd, opts, logfh, label="poc", jsonlfh=None, prompt_path=None) ->
                 logfh.write(line); logfh.flush()
         proc.wait()
         rc = proc.returncode if proc.returncode is not None else 1
-    except KeyboardInterrupt:
-        proc.kill()
-        _tee(f"\n[{label}] interrupted - killed claude.", logfh)
-        rc = 130
+    except (KeyboardInterrupt, _PocAbort) as exc:
+        _tee(f"\n[{label}] aborted ({type(exc).__name__}) - killing claude group.", logfh)
+        rc = exc.code if isinstance(exc, _PocAbort) else 130
+    finally:
+        # Reap claude + any gdb/gcc descendants it left behind, on EVERY exit path
+        # (normal completion, abort, exception). Two layers:
+        #  - killpg(G_claude): claude + non-tmux gdb/gcc (in G_claude). Never
+        #    touches poc_cli (separate group G_poc) or the Celery child.
+        #  - _kill_task_tmux: gdb run via tmux is a child of the tmux *server*,
+        #    outside G_claude — killpg can't reach it, so kill the session by name.
+        _kill_claude_group()
+        _kill_task_tmux(opts.workdir)
+        _ACTIVE_PGID = None
     return rc
 
 
