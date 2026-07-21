@@ -70,6 +70,36 @@ def build_poc_cmd(
     return cmd
 
 
+def _set_pdeathsig():
+    """preexec_fn for the `poc` child: set PR_SET_PDEATHSIG=SIGKILL so the `poc`
+    process (and, via its own PDEATHSIG, the `claude` it spawns) is auto-killed by
+    the kernel the moment its parent (the Celery prefork child) dies.
+
+    This covers the case the in-process cleanup can't: the parent being SIGKILL'd
+    or OOM-killed mid-task (no Python signal handler / finally runs). Without it,
+    `poc`+`claude`+`gdb` get reparented to tini and keep running → memory leak
+    that eventually OOMs the worker again. Runs in the child after fork, before
+    exec; preserved across execve, reset only on fork (irrelevant here).
+    """
+    import ctypes
+    libc = None
+    try:
+        libc = ctypes.CDLL(None)            # resolves libc via RTLD_DEFAULT on glibc
+    except OSError:
+        try:
+            libc = ctypes.CDLL("libc.so.6")
+        except OSError:
+            return
+    try:
+        PR_SET_PDEATHSIG = 1
+        libc.prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong,
+                               ctypes.c_ulong, ctypes.c_ulong]
+        libc.prctl.restype = ctypes.c_int
+        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except (AttributeError, OSError):
+        pass  # prctl unavailable (non-Linux) — signal/finally fallback still covers catchable exits
+
+
 def _kill_pg(proc: subprocess.Popen, killed: dict) -> None:
     """Kill the whole process group (poc + claude + gdb + tmux children)."""
     if proc.poll() is not None:
@@ -119,10 +149,13 @@ def run_poc_cli(
             logfh.flush()
             # start_new_session=True → poc is a session leader; killpg(poc.pid)
             # reaches poc + claude + gdb + tmux children that stayed in its group.
+            # preexec_fn=_set_pdeathsig → poc auto-dies if the Celery child dies
+            # (SIGKILL/OOM), cascading to claude; closes the orphan-leak path.
             proc = subprocess.Popen(
                 cmd, cwd=str(work_dir), stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, bufsize=1,
                 start_new_session=True,
+                preexec_fn=_set_pdeathsig,
             )
             if on_popen:
                 on_popen(proc)

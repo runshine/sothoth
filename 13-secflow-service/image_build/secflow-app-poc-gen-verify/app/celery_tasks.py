@@ -13,7 +13,9 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import subprocess
 import threading
+import time
 
 from celery.signals import task_revoked
 
@@ -72,8 +74,31 @@ def run_poc_task(self, task_id: str) -> dict:
         svc._execute_task(task_id, claimed.epoch, claimed.control_version)
         return {"task_id": task_id, "status": "done"}
     finally:
+        # Defense-in-depth: sweep the poc/claude/gdb process group on EVERY task
+        # exit (normal, exception, SIGTERM that finally catches). task_revoked
+        # covers user cancel; PDEATHSIG on `poc`+`claude` covers the uncatchable
+        # SIGKILL/OOM of the parent. This finally closes the catchable-exit gap
+        # where poc_cli itself died without reaping claude/gdb → orphan leak.
+        # Harmless on normal completion: poc_cli already exited, group is empty.
         with _PGID_LOCK:
-            _PGID.pop(celery_id, None)
+            pgid = _PGID.pop(celery_id, None)
+        if pgid is not None:
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(pgid, sig)
+                except (ProcessLookupError, OSError):
+                    break
+                if sig == signal.SIGTERM:
+                    time.sleep(0.5)
+        # Reap the tmux server too: gdb run via tmux is a child of the tmux *server*
+        # (outside G_poc/G_claude), so killpg can't reach it. poc_cli's per-stage
+        # finally kills it by session name, but if poc_cli was SIGKILL'd that didn't
+        # run — this is the backstop. Safe: Celery concurrency=1 and the worker pod
+        # runs tmux only for poc tasks, so every tmux session belongs to this task.
+        try:
+            subprocess.run(["tmux", "kill-server"], capture_output=True, timeout=5)
+        except Exception:
+            pass
 
 
 @task_revoked.connect
@@ -99,5 +124,4 @@ def _on_revoked(sender, request, **kwargs):
         except OSError:
             return
         if sig == signal.SIGTERM:
-            import time
             time.sleep(0.5)
