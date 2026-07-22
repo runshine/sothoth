@@ -34,6 +34,12 @@ spec:
             - { name: ANTHROPIC_BASE_URL, value: "http://172.31.29.10" }
             - { name: ANTHROPIC_MODEL, value: glm-5.2 }
             - { name: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, value: "1" }
+            # 漏洞判定引擎契约（Contract v2.3）—— 环境变量覆盖 service.yaml engine 段
+            - { name: SECFLOW_ENGINE_NAME, value: "secflow-app-poc-gen-verify" }
+            - { name: SECFLOW_ENGINE_VERSION, value: "1.0.0" }
+            - { name: SECFLOW_VULN_CONFIRM_HEARTBEAT_URL, value: "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/engines/heartbeat" }
+            - { name: SECFLOW_ENGINE_RESULTS_PUSH_URL, value: "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/results/push" }
+            - { name: SECFLOW_ENGINE_VULN_CATEGORIES_URL, value: "http://secflow-platform-vuln/api/vuln/vuln-categories" }
             - name: POC_POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
           envFrom:

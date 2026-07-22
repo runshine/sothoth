@@ -113,6 +113,29 @@ class RegistryConfig:
 
 
 @dataclass
+class EngineConfig:
+    """漏洞判定引擎契约（Contract v2.3）相关配置。
+
+    engine.name 必须与平台管理员预注册的 engine_name 完全一致（契约 §5.1 C6）。
+    所有字段为部署期静态参数，由 service.yaml `engine` 段 + 环境变量覆盖。
+    """
+    name: str = "secflow-app-poc-gen-verify"
+    version: str = "1.0.0"
+    endpoint_prefix: str = "/api/app/poc-gen-verify/intake"
+    heartbeat_url: str = "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/engines/heartbeat"
+    heartbeat_interval_seconds: int = 30
+    heartbeat_request_timeout_seconds: float = 5.0
+    results_push_url: str = "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/results/push"
+    results_push_timeout_seconds: float = 5.0
+    vuln_categories_url: str = "http://secflow-platform-vuln/api/vuln/vuln-categories"
+    vuln_categories_timeout_seconds: float = 5.0
+    vuln_categories_cache_ttl_seconds: int = 1800
+    # 路径A（GDB 触发崩溃 = 内存安全类）默认分类候选；推送前经接口6校验存在才填
+    emit_confirmed_category: bool = True
+    default_confirmed_category: str = "内存安全类型"
+
+
+@dataclass
 class AppConfig:
     host: str = "0.0.0.0"
     port: int = 8080
@@ -124,6 +147,7 @@ class ServiceYaml:
     database: DbConfig = field(default_factory=DbConfig)
     auth_service: AuthConfig = field(default_factory=AuthConfig)
     registry: RegistryConfig = field(default_factory=RegistryConfig)
+    engine: EngineConfig = field(default_factory=EngineConfig)
     app: AppConfig = field(default_factory=AppConfig)
 
 
@@ -193,6 +217,23 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> ServiceYaml:
         menu=_parse_menu(reg_raw.get("menu", {})),
     )
 
+    eng_raw = raw.get("engine", {})
+    engine = EngineConfig(
+        name=eng_raw.get("name", "secflow-app-poc-gen-verify"),
+        version=eng_raw.get("version", "1.0.0"),
+        endpoint_prefix=eng_raw.get("endpoint_prefix", "/api/app/poc-gen-verify/intake"),
+        heartbeat_url=eng_raw.get("heartbeat_url", "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/engines/heartbeat"),
+        heartbeat_interval_seconds=int(eng_raw.get("heartbeat_interval_seconds", 30)),
+        heartbeat_request_timeout_seconds=float(eng_raw.get("heartbeat_request_timeout_seconds", 5.0)),
+        results_push_url=eng_raw.get("results_push_url", "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/results/push"),
+        results_push_timeout_seconds=float(eng_raw.get("results_push_timeout_seconds", 5.0)),
+        vuln_categories_url=eng_raw.get("vuln_categories_url", "http://secflow-platform-vuln/api/vuln/vuln-categories"),
+        vuln_categories_timeout_seconds=float(eng_raw.get("vuln_categories_timeout_seconds", 5.0)),
+        vuln_categories_cache_ttl_seconds=int(eng_raw.get("vuln_categories_cache_ttl_seconds", 1800)),
+        emit_confirmed_category=bool(eng_raw.get("emit_confirmed_category", True)),
+        default_confirmed_category=eng_raw.get("default_confirmed_category", "内存安全类型"),
+    )
+
     app_raw = raw.get("app", {})
     app_cfg = AppConfig(
         host=app_raw.get("host", "0.0.0.0"),
@@ -200,7 +241,7 @@ def load_service_yaml(yaml_path: str = SERVICE_YAML_PATH) -> ServiceYaml:
         debug=bool(app_raw.get("debug", False)),
     )
 
-    return ServiceYaml(database=db, auth_service=auth, registry=registry, app=app_cfg)
+    return ServiceYaml(database=db, auth_service=auth, registry=registry, engine=engine, app=app_cfg)
 
 
 _service_yaml: Optional[ServiceYaml] = None
@@ -211,5 +252,62 @@ def get_service_yaml() -> ServiceYaml:
     if _service_yaml is None:
         _service_yaml = load_service_yaml()
     return _service_yaml
+
+
+# ─── engine contract config (service.yaml + env overrides) ───────────────────
+
+def _env_str(name: str, default: str) -> str:
+    v = os.environ.get(name)
+    return v.strip() if v and v.strip() else default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_engine_config: Optional[EngineConfig] = None
+
+
+def get_engine_config() -> EngineConfig:
+    """Return engine contract config: service.yaml `engine` section + env overrides.
+
+    Env overrides mirror vuln-verify-v2 naming (SECFLOW_ENGINE_*, SECFLOW_VULN_CONFIRM_*).
+    """
+    global _engine_config
+    if _engine_config is None:
+        base = get_service_yaml().engine
+        _engine_config = EngineConfig(
+            name=_env_str("SECFLOW_ENGINE_NAME", base.name),
+            version=_env_str("SECFLOW_ENGINE_VERSION", base.version),
+            endpoint_prefix=_env_str("SECFLOW_ENGINE_ENDPOINT_PREFIX", base.endpoint_prefix),
+            heartbeat_url=_env_str("SECFLOW_VULN_CONFIRM_HEARTBEAT_URL", base.heartbeat_url),
+            heartbeat_interval_seconds=_env_int("SECFLOW_ENGINE_HEARTBEAT_INTERVAL_SECONDS", base.heartbeat_interval_seconds),
+            heartbeat_request_timeout_seconds=_env_float("SECFLOW_ENGINE_HEARTBEAT_REQUEST_TIMEOUT_SECONDS", base.heartbeat_request_timeout_seconds),
+            results_push_url=_env_str("SECFLOW_ENGINE_RESULTS_PUSH_URL", base.results_push_url),
+            results_push_timeout_seconds=_env_float("SECFLOW_ENGINE_RESULTS_PUSH_TIMEOUT_SECONDS", base.results_push_timeout_seconds),
+            vuln_categories_url=_env_str("SECFLOW_ENGINE_VULN_CATEGORIES_URL", base.vuln_categories_url),
+            vuln_categories_timeout_seconds=_env_float("SECFLOW_ENGINE_VULN_CATEGORIES_TIMEOUT_SECONDS", base.vuln_categories_timeout_seconds),
+            vuln_categories_cache_ttl_seconds=_env_int("SECFLOW_ENGINE_VULN_CATEGORIES_CACHE_TTL_SECONDS", base.vuln_categories_cache_ttl_seconds),
+            emit_confirmed_category=_env_bool("SECFLOW_ENGINE_EMIT_CONFIRMED_CATEGORY", base.emit_confirmed_category),
+            default_confirmed_category=_env_str("SECFLOW_ENGINE_DEFAULT_CONFIRMED_CATEGORY", base.default_confirmed_category),
+        )
+    return _engine_config
 
 # timeout mechanism removed per request (runner runs until done/aborted)

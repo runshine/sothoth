@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session
 
 from app.config import get_config
 from app.db.models import AppPocTask, AppPocTaskEvent
-from app.runner import build_poc_cmd, default_output_dir, run_poc_cli
+from app.runner import _slug, build_poc_cmd, default_output_dir, run_poc_cli
 from app.runtime_context import WORKER_ID
 from app.service.execution_coordinator import (
     begin_execution_if_owner,
@@ -87,6 +87,27 @@ def _heartbeat_updater(task_id: str) -> None:
                     pass
         except Exception:
             pass  # best-effort — don't crash the task for a heartbeat failure
+
+
+def _best_effort_push_terminal(task_id: str) -> None:
+    """契约接口4：best-effort 推送终态结果（仅契约任务 vuln_id 非空）。
+
+    任何异常只记 warning，不向 worker 主链路抛出（契约 §5.2.4 失败有 polling 兖底）。
+    """
+    try:
+        from app.results_push import push_task_terminal
+        push_task_terminal(task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("best-effort results push failed task=%s: %s", task_id, exc, exc_info=True)
+
+
+def _best_effort_push_running(task_id: str) -> None:
+    """契约接口4：best-effort 推送「进行中」（仅契约任务）。"""
+    try:
+        from app.results_push import push_task_running
+        push_task_running(task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("best-effort running push failed task=%s: %s", task_id, exc, exc_info=True)
 
 
 def _task_id_stamp() -> str:
@@ -262,6 +283,68 @@ class TaskService:
             f"任务已创建: poc -e {entry_function} -r {vuln_report_path} -b {binary_dir}",
             payload={"entry_function": entry_function, "binary_dir": binary_dir,
                      "vuln_report_path": vuln_report_path, "output_dir": out_dir},
+        )
+        return self._row_to_dict(row)
+
+    def create_contract_task(
+        self,
+        db: Session,
+        *,
+        project_id: str,
+        vuln_id: str,
+        task_name: str,
+        entry_function: str,
+        binary_dir: str,
+        report_markdown: str,
+        created_by: Optional[str] = None,
+    ) -> dict:
+        """契约接口1入参 → 创建一条 pending 任务（与前端 POST /tasks 同链路）。
+
+        与 create_task 的差异：
+        - 携带平台漏洞 Case ID（vuln_id），用于接口2/4/5 路由。
+        - intake 只给 raw_report.markdown（无文件路径），需先写成 poc CLI 的 -r 报告文件。
+        - binary_dir 取自 subject.source_root（漏洞/固件根目录）。
+        调用方应在调用前做幂等检查（同 vuln_id 已存在则不重复创建）。
+        """
+        cfg = get_config()
+        task_id = f"poc-{_task_id_stamp()}-{uuid.uuid4().hex[:8]}"
+        workspaces_base = cfg.fileserver_root / project_id / "app" / "secflow-app-poc-gen-verify" / "workspaces"
+        # 报告文件名用 vuln_id 的 slug，便于追溯
+        _rpt_stem = _slug(vuln_id) or "intake"
+        _bin_name = Path(binary_dir).name if binary_dir else "bindir"
+        _ts = _task_id_stamp()
+        out_dir = str(workspaces_base / f"{_rpt_stem}_{_slug(_bin_name)}_{_ts}")
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        # 写入报告文件（<output_dir>/input/vuln_report.md）
+        report_path = str(Path(out_dir) / "input" / "vuln_report.md")
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text(report_markdown, encoding="utf-8")
+
+        row = AppPocTask(
+            task_id=task_id,
+            project_id=project_id,
+            vuln_id=vuln_id,
+            task_name=task_name,
+            entry_function=(entry_function or ""),
+            vuln_report_path=report_path,
+            binary_dir=binary_dir,
+            output_dir=out_dir,
+            status="pending",
+            execution_epoch=0,
+            control_version=0,
+            dispatch_status="pending",
+            celery_task_id=None,
+            created_by=created_by,
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        _record_task_event(
+            db, row, "task_created",
+            f"契约任务已创建: poc -e {entry_function} -r {report_path} -b {binary_dir}",
+            payload={"vuln_id": vuln_id, "entry_function": entry_function,
+                     "binary_dir": binary_dir, "vuln_report_path": report_path,
+                     "output_dir": out_dir},
         )
         return self._row_to_dict(row)
 
@@ -769,6 +852,9 @@ class TaskService:
                 payload={"entry_function": row.entry_function, "binary_dir": row.binary_dir,
                          "vuln_report_path": row.vuln_report_path},
             )
+            # 契约接口4：claim 后主动推送「进行中」（仅契约任务 vuln_id 非空）
+            if row.vuln_id:
+                _best_effort_push_running(task_id)
 
             model = row.model or cfg.default_model
             # work dir = the task's output_dir on the fileserver (shared by api+worker);
@@ -889,6 +975,8 @@ class TaskService:
                     payload={"returncode": result["returncode"], "error": result["error"],
                              "artifacts": result["artifacts"]},
                 )
+                # 契约接口4：终态提交后主动推送结果（仅契约任务 vuln_id 非空）
+                _best_effort_push_terminal(task_id)
             # (else: ownership lost or commit failed — _commit_terminal_retry logged it)
         except Exception as exc:  # noqa: BLE001
             logger.exception("task execution crashed task=%s", task_id)
@@ -901,6 +989,8 @@ class TaskService:
                 artifacts_json=None, stages_json={"error": str(exc)},
                 result_json=None, error=f"{type(exc).__name__}: {exc}",
             )
+            # 契约接口4：崩溃路径也推 送失败终态（仅契约任务）
+            _best_effort_push_terminal(task_id)
         finally:
             handle["stop"].set()
             _RUNNING.pop(task_id, None)
@@ -918,6 +1008,7 @@ class TaskService:
         return {
             "task_id": row.task_id,
             "project_id": row.project_id,
+            "vuln_id": row.vuln_id,
             "task_name": row.task_name,
             "task_description": row.task_description,
             "entry_function": row.entry_function,

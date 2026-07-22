@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_config
+from .contract import build_contract_router
 from .routes import router
 from .service.runtime_bootstrap import get_runtime_bootstrap
 
@@ -31,6 +32,7 @@ def create_app() -> FastAPI:
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True,
                        allow_methods=["*"], allow_headers=["*"])
     app.include_router(router)
+    app.include_router(build_contract_router())
     return app
 
 

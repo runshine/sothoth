@@ -53,3 +53,18 @@ data:
       host: "0.0.0.0"
       port: 8080
       debug: false
+    engine:
+      # 漏洞判定引擎契约（Contract v2.3）。name 必须与平台管理员预注册的 engine_name 一致。
+      name: secflow-app-poc-gen-verify
+      version: "1.0.0"
+      endpoint_prefix: /api/app/poc-gen-verify/intake
+      heartbeat_url: "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/engines/heartbeat"
+      heartbeat_interval_seconds: 30
+      heartbeat_request_timeout_seconds: 5.0
+      results_push_url: "http://secflow-platform-vuln/api/vuln/internal/vuln-confirm/results/push"
+      results_push_timeout_seconds: 5.0
+      vuln_categories_url: "http://secflow-platform-vuln/api/vuln/vuln-categories"
+      vuln_categories_timeout_seconds: 5.0
+      vuln_categories_cache_ttl_seconds: 1800
+      emit_confirmed_category: true
+      default_confirmed_category: "内存安全类型"

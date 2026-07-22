@@ -53,6 +53,11 @@ class RuntimeBootstrap:
             get_registry_service().stop()
         except Exception as _e:
             logger.warning("registry stop error: %s", _e, exc_info=True)
+        try:
+            from app.engine_heartbeat import get_engine_heartbeat
+            get_engine_heartbeat().stop()
+        except Exception as _e:
+            logger.warning("engine heartbeat stop error: %s", _e, exc_info=True)
         if self._task and self._task.is_alive():
             self._task.join(timeout=5.0)
         self._task = None
@@ -63,6 +68,13 @@ class RuntimeBootstrap:
 
     def _bootstrap_loop(self, app: FastAPI) -> None:
         svc_yaml = get_service_yaml()
+        # 引擎心跳不依赖 DB，与 DB 初始化并行启动（仅 API 角色进程走 runtime_bootstrap）。
+        # 契约接口3：启动后立即首次心跳，30s 周期（契约 §5.1.4）。
+        try:
+            from app.engine_heartbeat import get_engine_heartbeat
+            get_engine_heartbeat().start()
+        except Exception as exc:
+            logger.warning("engine heartbeat start failed: %s", exc, exc_info=True)
         while not self._stop_event.is_set():
             made_progress = False
             if not self._status.db_ready:

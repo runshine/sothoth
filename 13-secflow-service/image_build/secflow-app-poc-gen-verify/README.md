@@ -148,3 +148,68 @@ requirements.txt
 
 ## notes
 - image pre-installs `file` + `xxd` (per session analysis of the completed IPSEC task — the agent hit "command not found" for both).
+
+## 漏洞判定引擎契约接入（Contract v2.3）
+
+本服务已按《漏洞判定引擎接入手册》（Contract v2.3）改造为平台可调度的漏洞判定引擎：
+收到平台 intake 请求后生成 PoC 并在 GDB 下触发验证，把「是不是漏洞」的结论推回平台。
+
+### 角色映射
+PoC 验证结果 → 契约结论：
+
+| 内部状态 | poc_path | 契约状态 | 契约结果 | 说明 |
+|---|---|---|---|---|
+| `pending` | — | 等待中 | null | 已入队 |
+| `running` | — | 进行中 | null | poc CLI 执行中 |
+| `succeeded` | `a` | 已完成 | 是 | GDB 成功触发（漏洞确认）|
+| `succeeded` | `b` | 已完成 | 不是 | 证伪/不可达（误报）|
+| `succeeded` | None | 已完成 | 不可证 | 未达 Stage2 |
+| `failed`/`timeout`/`cancelled` | — | 失败 | null | 引擎内部无法得出结论 |
+
+路径A（GDB 触发崩溃 = 内存安全类）默认携带 `confirmed_category=内存安全类型`，推送前经接口6目录校验存在才填。
+
+### 六个接口实现
+
+**平台调用本服务（接口1/2/5，挂载在 `EngineConfig.endpoint_prefix`=`/api/app/poc-gen-verify/intake`）：**
+
+| # | 方法+路径 | 用途 |
+|---|---|---|
+| 1 | `POST /api/app/poc-gen-verify/intake` | 接收漏洞确认请求（intake submission + `vuln_id`）；同步返「等待中」|
+| 2 | `POST /api/app/poc-gen-verify/intake/results/batch` | 批量结果查询（兖底）|
+| 5 | `POST /api/app/poc-gen-verify/intake/results/confirmed` | 按北京时间窗口查询已确认漏洞（对账）|
+
+**本服务调用平台（接口3/4/6，由 `app/engine_heartbeat.py` / `app/results_push.py` / `app/category_catalog.py` 实现）：**
+
+| # | 接口 | 用途 | 触发点 |
+|---|---|---|---|
+| 3 | `POST /api/vuln/internal/vuln-confirm/engines/heartbeat` | 心跳保活 | API pod 启动后立即首次，30s 周期（线程）|
+| 4 | `POST /api/vuln/internal/vuln-confirm/results/push` | 主动推送结果 | worker claim 后推「进行中」；终态提交后推终态 |
+| 6 | `GET /api/vuln/vuln-categories` | 漏洞分类目录 | 启动/缓存失效时拉取（验证 `confirmed_category`）|
+
+### 关键设计
+
+- **PUSH 为主、PULL 兑底**：worker 完成后立即接口4推送终态（秒级）；平台接口2每 60s 兖底拉取丢失的 case。
+- **幂等**：接口1 同 `vuln_id` 重试不重复创建任务（已存在则返「等待中」）。
+- **同步响应永不返终态**：接口1 统一返「等待中」/「进行中」，终态只走接口4/接口2。
+- **中文键严格匹配**：`漏洞ID`/`推理引擎.{引擎名称,引擎版本}`/`状态`/`结果`/`理由`/`confirmed_category`。
+- **新数据列**：`secflow_app_poc_tasks.vuln_id`（NULL=前端任务；非 NULL=契约任务，自动迁移）。
+- **不破坏现有链路**：前端 `POST /tasks` 与 poc CLI 子进程调用链不变；契约任务是同一条 pending→Celery→worker 管道。
+
+### 部署注意
+- 平台管理员需在漏洞中心后台预注册引擎：`engine_name=secflow-app-poc-gen-verify`、`endpoint=<ingress>/api/app/poc-gen-verify/intake`、`bind_tools=<产出二进制漏洞的工具 toolid>`。
+- `subject.source_root` 须指向漏洞/固件根目录（映射为 `poc -b binary_dir`）。
+- 引擎配置可通过 service.yaml `engine` 段或环境变量覆盖（`SECFLOW_ENGINE_NAME` / `SECFLOW_VULN_CONFIRM_HEARTBEAT_URL` / `SECFLOW_ENGINE_RESULTS_PUSH_URL` / `SECFLOW_ENGINE_VULN_CATEGORIES_URL` 等）。
+
+### 相关文件
+```
+app/contract.py             契约适配层（接口1/2/5 路由 + 状态映射 + 中文 schema）
+app/results_push.py         接口4 主动推送 + build_push_payload
+app/engine_heartbeat.py     接口3 心跳线程（threading + time.sleep，遵循项目规则）
+app/category_catalog.py     接口6 分类目录客户端（缓存 + 兜底默认）
+app/config.py               EngineConfig + get_engine_config()（service.yaml + env 覆盖）
+app/db/models.py            AppPocTask.vuln_id 新列
+app/db/__init__.py           vuln_id 列 + 索引迁移
+app/service/task_service.py create_contract_task + 推送集成（running/terminal）
+app/service/runtime_bootstrap.py  启动/停止引擎心跳
+app/main.py                 挂载契约路由
+```

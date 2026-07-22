@@ -30,11 +30,15 @@ class AppPocTask(Base):
         Index("ix_poc_tasks_sched", "is_deleted", "status", "execution_lease_until", "created_at", "id"),
         Index("ix_poc_tasks_owner", "execution_owner_id", "status"),
         Index("ix_poc_tasks_project_deleted_created_id", "project_id", "is_deleted", "created_at", "id"),
+        Index("ix_poc_tasks_vuln_id", "vuln_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     task_id: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
     project_id: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    # 平台漏洞 Case ID（契约接口1追加字段）。前端创建的任务为 NULL；
+    # 契约任务非空，用于接口2/4/5 路由与去重。NULL 允许多行（MySQL 索引不限制多 NULL）。
+    vuln_id: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     task_name: Mapped[str] = mapped_column(String(255), nullable=False)
     task_description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 

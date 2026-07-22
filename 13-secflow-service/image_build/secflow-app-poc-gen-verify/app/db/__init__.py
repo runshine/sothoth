@@ -51,6 +51,18 @@ _MIGRATIONS: list[Migration] = [
         name="latest_abnormal_reason_json",
         statement="ALTER TABLE secflow_app_poc_tasks ADD COLUMN latest_abnormal_reason_json JSON NULL",
     ),
+    Migration(
+        kind="column",
+        table_name="secflow_app_poc_tasks",
+        name="vuln_id",
+        statement="ALTER TABLE secflow_app_poc_tasks ADD COLUMN vuln_id VARCHAR(128) NULL",
+    ),
+    Migration(
+        kind="index",
+        table_name="secflow_app_poc_tasks",
+        name="ix_poc_tasks_vuln_id",
+        statement="CREATE INDEX ix_poc_tasks_vuln_id ON secflow_app_poc_tasks (vuln_id)",
+    ),
 ]
 
 

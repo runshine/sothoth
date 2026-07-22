@@ -38,6 +38,7 @@ class PocTaskCreateResponse(BaseModel):
 class PocTaskStatus(BaseModel):
     task_id: str
     project_id: str
+    vuln_id: Optional[str] = None
     task_name: str
     task_description: Optional[str] = None
     entry_function: Optional[str] = None
