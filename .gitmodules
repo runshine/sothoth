@@ -102,3 +102,7 @@
 	path = 13-secflow-service/image_build/secflow-app-binary-info-collector
 	url = git@github.com:GaiaSecHW/secflow-app-binary-info-collector.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-app-poc-gen-verify"]
+	path = 13-secflow-service/image_build/secflow-app-poc-gen-verify
+	url = git@github.com:GaiaSecHW/secflow-app-poc-gen-verify.git
+	branch = main
