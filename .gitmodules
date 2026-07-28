@@ -106,3 +106,7 @@
 	path = 13-secflow-service/image_build/secflow-app-poc-gen-verify
 	url = git@github.com:GaiaSecHW/secflow-app-poc-gen-verify.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-app-entry-purify"]
+	path = 13-secflow-service/image_build/secflow-app-entry-purify
+	url = https://github.com/GaiaSecHW/secflow-app-entry-purify.git
+	branch = main
