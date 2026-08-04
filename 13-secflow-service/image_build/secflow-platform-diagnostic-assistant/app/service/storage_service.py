@@ -54,6 +54,31 @@ def _event_from_row(row) -> DiagnosticAgentEventRecord:
     return DiagnosticAgentEventRecord.model_validate(dict(row))
 
 
+def _coerce_message_records(value: object) -> list[DiagnosticMessageRecord]:
+    if isinstance(value, list):
+        result: list[DiagnosticMessageRecord] = []
+        for item in value:
+            if isinstance(item, DiagnosticMessageRecord):
+                result.append(item)
+            elif isinstance(item, dict):
+                try:
+                    result.append(DiagnosticMessageRecord.model_validate(item))
+                except Exception:
+                    continue
+        return result
+    if isinstance(value, dict):
+        for key in ("messages", "items", "records", "data"):
+            nested = value.get(key)
+            records = _coerce_message_records(nested)
+            if records:
+                return records
+        try:
+            return [DiagnosticMessageRecord.model_validate(value)]
+        except Exception:
+            return []
+    return []
+
+
 def create_session(created_by: str, title: str) -> DiagnosticSessionSummary:
     now = _utc_now()
     with get_conn() as conn:
@@ -650,8 +675,8 @@ def get_session_detail(session_id: int) -> DiagnosticSessionDetail | None:
     session = get_session(session_id)
     if session is None:
         return None
-    file_messages = read_message_log(session_id)
-    messages = file_messages or list_messages(session_id)
+    file_messages = _coerce_message_records(read_message_log(session_id))
+    messages = file_messages or _coerce_message_records(list_messages(session_id))
     artifacts: dict[int, DiagnosticAssistantArtifacts] = {}
     blocks: list[DiagnosticConversationBlock] = []
     runs_by_assistant_message_id: dict[int, DiagnosticAgentRunRecord] = {}
