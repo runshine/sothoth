@@ -38,6 +38,22 @@ def append_message_log(record: DiagnosticMessageRecord) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def _iter_message_payloads(payload: object) -> list[object]:
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("messages", "items", "records", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = _iter_message_payloads(value)
+                if nested:
+                    return nested
+        return [payload]
+    return []
+
+
 def read_message_log(session_id: int) -> list[DiagnosticMessageRecord]:
     path = _session_dir(session_id) / "messages.jsonl"
     if not path.is_file():
@@ -48,7 +64,9 @@ def read_message_log(session_id: int) -> list[DiagnosticMessageRecord]:
             continue
         try:
             payload = json.loads(line)
-            rows.append(DiagnosticMessageRecord.model_validate(payload))
+            for item in _iter_message_payloads(payload):
+                if isinstance(item, dict):
+                    rows.append(DiagnosticMessageRecord.model_validate(item))
         except Exception:
             continue
     return rows

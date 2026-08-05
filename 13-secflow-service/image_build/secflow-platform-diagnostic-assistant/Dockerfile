@@ -1,6 +1,8 @@
-FROM python:3.11-slim
+ARG SECFLOW_PI_AGENT_RUNTIME_IMAGE=ghcr.io/runshine/secflow-base-pi-agent-runtime:20260602
+FROM ${SECFLOW_PI_AGENT_RUNTIME_IMAGE}
 
 ENV PYTHONUNBUFFERED=1
+ENV PI_CODING_AGENT_DIR=/root/.pi/agent
 
 WORKDIR /app
 
@@ -22,6 +24,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 COPY main.py service.yaml.example ./
+
+RUN mkdir -p /root/.pi/agent
 
 RUN mkdir -p /data/files/platform/secflow-platform-diagnostic-assistant
 
