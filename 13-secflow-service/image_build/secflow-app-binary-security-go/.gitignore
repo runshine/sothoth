@@ -1,0 +1,4 @@
+bin/
+*.db
+*.sqlite
+secflow-app-binary-security-go

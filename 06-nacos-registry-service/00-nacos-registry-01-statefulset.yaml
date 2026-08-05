@@ -68,7 +68,7 @@ spec:
       containers:
         - name: nacos
           imagePullPolicy: Always
-          image: nacos/nacos-server:latest
+          image: nacos/nacos-server:v3.1.0
           resources:
             requests:
               memory: "2Gi"
@@ -86,7 +86,7 @@ spec:
               name: console
           env:
             - name: NACOS_REPLICAS
-              value: "3"
+              value: "1"
             - name: MYSQL_SERVICE_HOST
               valueFrom:
                 configMapKeyRef:

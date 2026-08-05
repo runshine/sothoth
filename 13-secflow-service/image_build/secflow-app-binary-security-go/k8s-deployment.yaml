@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: secflow-app-binary-security-go
+  namespace: secflow-ns
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: secflow-app-binary-security-go}
+  template:
+    metadata:
+      labels: {app: secflow-app-binary-security-go}
+    spec:
+      securityContext:
+        fsGroup: 65532
+      containers:
+      - name: api
+        image: ghcr.io/gaiasechw/secflow-app-binary-security-go:latest
+        args: ["--role=api"]
+        env:
+        - name: DATABASE_PATH
+          value: /data/secflow-binary-security-go.sqlite
+        - name: DOWNSTREAM_FIRMWARE_UNPACK_BASE_URL
+          value: http://secflow-app-firmware-unpacker
+        - name: DOWNSTREAM_SYSTEM_ANALYSIS_BASE_URL
+          value: http://secflow-app-system-analyse
+        - name: DOWNSTREAM_BINARY_TO_SOURCE_BASE_URL
+          value: http://secflow-app-binary-to-source-manager
+        - name: DOWNSTREAM_ENTRY_ANALYSIS_BASE_URL
+          value: http://secflow-app-entry-analyse
+        - name: DOWNSTREAM_DATAFLOW_VULN_SCAN_BASE_URL
+          value: http://secflow-app-dataflow-vuln-scan
+        - name: KNOWLEDGE_GRAPH_AUDIT_BASE_URL
+          value: http://codemap-manager.secflow-ns.svc.cluster.local:8090
+        ports: [{containerPort: 8080}]
+        volumeMounts: [{name: data, mountPath: /data}]
+        readinessProbe: {httpGet: {path: /api/app/binary-security/ready, port: 8080}}
+        livenessProbe: {httpGet: {path: /api/app/binary-security/health, port: 8080}}
+      - name: worker
+        image: ghcr.io/gaiasechw/secflow-app-binary-security-go:latest
+        args: ["--role=worker"]
+        env:
+        - name: DATABASE_PATH
+          value: /data/secflow-binary-security-go.sqlite
+        - name: DOWNSTREAM_FIRMWARE_UNPACK_BASE_URL
+          value: http://secflow-app-firmware-unpacker
+        - name: DOWNSTREAM_SYSTEM_ANALYSIS_BASE_URL
+          value: http://secflow-app-system-analyse
+        - name: DOWNSTREAM_BINARY_TO_SOURCE_BASE_URL
+          value: http://secflow-app-binary-to-source-manager
+        - name: DOWNSTREAM_ENTRY_ANALYSIS_BASE_URL
+          value: http://secflow-app-entry-analyse
+        - name: DOWNSTREAM_DATAFLOW_VULN_SCAN_BASE_URL
+          value: http://secflow-app-dataflow-vuln-scan
+        - name: KNOWLEDGE_GRAPH_AUDIT_BASE_URL
+          value: http://codemap-manager.secflow-ns.svc.cluster.local:8090
+      volumes:
+      - name: data
+        persistentVolumeClaim: {claimName: secflow-platform-fileserver-data-nfs-pvc}
