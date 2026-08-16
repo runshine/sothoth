@@ -110,3 +110,10 @@
 	path = 13-secflow-service/image_build/secflow-app-entry-purify
 	url = https://github.com/GaiaSecHW/secflow-app-entry-purify.git
 	branch = main
+[submodule "13-secflow-service/image_build/secflow-app-real-world-poc"]
+	path = 13-secflow-service/image_build/secflow-app-real-world-poc
+	url = https://github.com/GaiaSecHW/secflow-app-real-world-poc.git
+[submodule "13-secflow-service/image_build/secflow-app-environment-analyse"]
+	path = 13-secflow-service/image_build/secflow-app-environment-analyse
+	url = https://github.com/GaiaSecHW/secflow-app-environment-analyse.git
+	branch = main
